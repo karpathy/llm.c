@@ -825,17 +825,11 @@ void gpt2_backward(GPT2 *model) {
 
         // get the pointers of the weights for this layer
         float* l_ln1w = params.ln1w + l * C;
-        float* l_ln1b = params.ln1b + l * C;
         float* l_qkvw = params.qkvw + l * 3*C * C;
-        float* l_qkvb = params.qkvb + l * 3*C;
         float* l_attprojw = params.attprojw + l * C * C;
-        float* l_attprojb = params.attprojb + l * C;
         float* l_ln2w = params.ln2w + l * C;
-        float* l_ln2b = params.ln2b + l * C;
         float* l_fcw = params.fcw + l * 4*C * C;
-        float* l_fcb = params.fcb + l * 4*C;
         float* l_fcprojw = params.fcprojw + l * C * 4*C;
-        float* l_fcprojb = params.fcprojb + l * C;
         // get the pointers of the gradients of the weights for this layer
         float* dl_ln1w = grads.ln1w + l * C;
         float* dl_ln1b = grads.ln1b + l * C;
@@ -855,17 +849,13 @@ void gpt2_backward(GPT2 *model) {
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         float* l_qkv = acts.qkv + l * B * T * 3*C;
         float* l_atty = acts.atty + l * B * T * C;
-        float* l_preatt = acts.preatt + l * B * NH * T * T;
         float* l_att = acts.att + l * B * NH * T * T;
-        float* l_attproj = acts.attproj + l * B * T * C;
         float* l_residual2 = acts.residual2 + l * B * T * C;
         float* l_ln2 = acts.ln2 + l * B * T * C;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         float* l_fch = acts.fch + l * B * T * 4*C;
         float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
-        float* l_fcproj = acts.fcproj + l * B * T * C;
-        float* l_residual3 = acts.residual3 + l * B * T * C;
         // get the pointers of the gradients of the activations for this layer
         float* dl_ln1 = grads_acts.ln1 + l * B * T * C;
         float* dl_qkv = grads_acts.qkv + l * B * T * 3*C;
