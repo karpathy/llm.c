@@ -106,8 +106,6 @@ make test_gpt2
 
 This now loads the `gpt2_124M_debug_state.bin` file, runs a forward pass, compares the logits and loss with the PyTorch reference implementation, then it does 10 iterations of training with Adam and makes sure the losses match PyTorch.
 
-```
-
 ## license
 
 MIT
