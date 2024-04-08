@@ -7,7 +7,7 @@ int check_tensor(float *a, float *b, int n, char* label) {
     int ok = 1;
     printf("%s\n", label);
     for (int i = 0; i < n; i++) {
-        if (fabs(a[i] - b[i]) <= 1e-2) {
+        if (fabsf(a[i] - b[i]) <= 1e-2) {
             if (i < print_upto) { printf("OK "); }
         } else {
             if (i < print_upto) { printf("NOT OK "); }
@@ -91,7 +91,7 @@ int main(int argc, char *argv[]) {
                 if(i < 3) {
                     printf("%f %f\n", expected_logits[i], model.acts.logits[i]);
                 }
-                if (fabs(expected_logits[i] - model.acts.logits[i]) >= 1e-2) {
+                if (fabsf(expected_logits[i] - model.acts.logits[i]) >= 1e-2) {
                     printf("MISMATCH AT INDEX %d: ", i);
                     printf("%f %f\n", expected_logits[i],model.acts.logits[i]);
                     logits_ok = 0;
@@ -103,7 +103,7 @@ int main(int argc, char *argv[]) {
             allok = allok && logits_ok;
 
             // compare the achieved loss
-            if (fabs(model.mean_loss - *expected_loss) >= 1e-2) {
+            if (fabsf(model.mean_loss - *expected_loss) >= 1e-2) {
                 printf("LOSS MISMATCH: %f %f\n", model.mean_loss, *expected_loss);
                 allok = 0;
             } else {
@@ -142,7 +142,7 @@ int main(int argc, char *argv[]) {
     }
 
     // expected losses are as follows, from Python
-    float expected_losses[10] = {
+    double expected_losses[10] = {
         5.270007133483887,
         4.059706687927246,
         3.3751230239868164,
