@@ -18,6 +18,14 @@ There will be other versions of this code that specialize it and make it fast.
 #include <omp.h>
 #endif
 
+inline float dot_product(float* xs, float* ys, int n){
+    float val = 0.0f;
+    for (int i = 0; i < n; i++) {
+        val += xs[i] * ys[i];
+    }
+    return val;
+}
+
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
 
@@ -153,12 +161,9 @@ void matmul_forward(float* out,
             float* out_bt = out + b * T * OC + t * OC;
             float* inp_bt = inp + b * T * C + t * C;
             for (int o = 0; o < OC; o++) {
-                float val = (bias != NULL) ? bias[o] : 0.0f;
+                float o_bias = (bias != NULL) ? bias[o] : 0.0f;
                 float* wrow = weight + o*C;
-                for (int i = 0; i < C; i++) {
-                    val += inp_bt[i] * wrow[i];
-                }
-                out_bt[o] = val;
+                out_bt[o] = o_bias + dot_product(inp_bt, wrow, C);
             }
         }
     }
@@ -204,14 +209,6 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     }
 }
 
-inline float query_dot_key(float* query_t, float* key_t2, int hs){
-    float val = 0.0f;
-    for (int i = 0; i < hs; i++) {
-        val += query_t[i] * key_t2[i];
-    }
-    return val;
-}
-
 void attention_forward(float* out, float* preatt, float* att,
                        float* inp,
                        int B, int T, int C, int NH) {
@@ -233,13 +230,13 @@ void attention_forward(float* out, float* preatt, float* att,
                 // pass 1: calculate query dot key and maxval
                 int t2 = 0;
                 float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-                float val = query_dot_key(query_t, key_t2, hs) * scale;
+                float val = dot_product(query_t, key_t2, hs) * scale;
                 preatt_bth[t2] = val;
                 float maxval = val;
 
                 for (t2 = 1; t2 <= t; t2++) {
                     key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C;
-                    val = query_dot_key(query_t, key_t2, hs) * scale;
+                    val = dot_product(query_t, key_t2, hs) * scale;
                     preatt_bth[t2] = val;
                     if (val > maxval) {
                         maxval = val;
