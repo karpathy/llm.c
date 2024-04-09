@@ -330,7 +330,7 @@ if __name__ == "__main__":
         tokens = np.frombuffer(f.read(), dtype=np.int32)
 
     # np -> tensor, long, on device
-    tokens = torch.from_numpy(tokens)
+    tokens = torch.tensor(tokens)
     tokens = tokens.to(torch.long)
     tokens = tokens.to(device)
 
