@@ -7,15 +7,17 @@ int check_tensor(float *a, float *b, int n, char* label) {
     int ok = 1;
     printf("%s\n", label);
     for (int i = 0; i < n; i++) {
-        if (fabs(a[i] - b[i]) <= 1e-2) {
-            if (i < print_upto) { printf("OK "); }
+        if ((a[i] - b[i]) * (a[i] - b[i]) <= 1e-4) {
+            if (i < print_upto) {
+                printf("OK %f %f\n", a[i], b[i]);
+            }
         } else {
-            if (i < print_upto) { printf("NOT OK "); }
             ok = 0;
+            if (i < print_upto) {
+                printf("NOT OK %f %f\n", a[i], b[i]);
+            }
         }
-        if (i < print_upto) { printf("%f %f\n", a[i], b[i]); }
     }
-    // print the final result
     if (ok) {
         printf("TENSOR OK\n");
     } else {
