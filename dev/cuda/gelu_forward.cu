@@ -8,6 +8,14 @@ version 1 is naive port from CPU code to kernel
 ./gelu_forward 1
 */
 
+/*
+If encountering "error: identifier "M_PI" is undefined", add the following lines to the top of the file:
+
+#define _USE_MATH_DEFINES
+#include <math.h>  OR  #include <cmath>
+
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
