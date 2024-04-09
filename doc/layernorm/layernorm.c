@@ -161,6 +161,15 @@ int main() {
     check_tensor(c_dw, dw, C, "dw");
     check_tensor(c_db, db, C, "db");
 
-    // TODO free stuff
+    free(x);
+    free(w);
+    free(b);
+    free(out);
+    free(mean);
+    free(rstd);
+    free(dout);
+    free(dx);
+    free(dw);
+    free(db);
     return 0;
 }
