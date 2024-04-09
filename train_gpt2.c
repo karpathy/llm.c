@@ -204,6 +204,14 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     }
 }
 
+inline float query_dot_key(float* query_t, float* key_t2, int hs){
+    float val = 0.0f;
+    for (int i = 0; i < hs; i++) {
+        val += query_t[i] * key_t2[i];
+    }
+    return val;
+}
+
 void attention_forward(float* out, float* preatt, float* att,
                        float* inp,
                        int B, int T, int C, int NH) {
@@ -223,21 +231,19 @@ void attention_forward(float* out, float* preatt, float* att,
                 float* att_bth = att + b*NH*T*T + h*T*T + t*T;
 
                 // pass 1: calculate query dot key and maxval
-                float maxval = -10000.0f; // TODO something better
-                for (int t2 = 0; t2 <= t; t2++) {
-                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                int t2 = 0;
+                float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                float val = query_dot_key(query_t, key_t2, hs) * scale;
+                preatt_bth[t2] = val;
+                float maxval = val;
 
-                    // (query_t) dot (key_t2)
-                    float val = 0.0f;
-                    for (int i = 0; i < hs; i++) {
-                        val += query_t[i] * key_t2[i];
-                    }
-                    val *= scale;
+                for (t2 = 1; t2 <= t; t2++) {
+                    key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C;
+                    val = query_dot_key(query_t, key_t2, hs) * scale;
+                    preatt_bth[t2] = val;
                     if (val > maxval) {
                         maxval = val;
                     }
-
-                    preatt_bth[t2] = val;
                 }
 
                 // pass 2: calculate the exp and keep track of sum
