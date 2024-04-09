@@ -18,15 +18,17 @@ There will be other versions of this code that specialize it and make it fast.
 #include <omp.h>
 #endif
 
-#define CHECK_NULL(ptr) \
+#ifndef NDEBUG // Make zero cost when not debugging
+    #define CHECK_NULL(ptr) \
     if ((ptr) == NULL) { \
         fprintf(stderr, "Null pointer encountered at %s:%d\n", __FILE__, __LINE__); \
         fflush(stdout);  \
         fflush(stderr);  \
         exit(1); \
     } 
-
-
+#else  
+     #define CHECK_NULL(ptr) ((void)0)
+#endif
 
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
