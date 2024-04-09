@@ -381,8 +381,8 @@ void softmax_forward(float* probs, float* logits, int B, int T, int V) {
             float* logits_bt = logits + b * T * V + t * V;
             float* probs_bt = probs + b * T * V + t * V;
 
-            float maxval = -10000.0f; // TODO something better
-            for (int i = 0; i < V; i++) {
+            float maxval = logits_bt[0]; 
+            for (int i = 1; i < V; i++) {
                 if (logits_bt[i] > maxval) {
                     maxval = logits_bt[i];
                 }
