@@ -39,7 +39,16 @@ You'll recognize this code from nanoGPT as a simple GPT-2 reference implementati
 make train_gpt2
 ```
 
-You can have a look inside the `Makefile` and its comments. It will try to autodetect if OpenMP is available on your system, which is very helpful for speeding up the code at very low cost of code complexity. Once `train_gpt2` is compiled, you can run it:
+You can have a look inside the `Makefile` and its comments. It will try to autodetect if OpenMP is available on your system, which is very helpful for speeding up the code at very low cost of code complexity. Some people seem to experience problems compiling on Ubuntu, have a look at [Issue 19](https://github.com/karpathy/llm.c/issues/19), TLDR you'd want to modify the `CFLAGS`:
+
+```
+# try this first
+CFLAGS = -O3 -Ofast -fno-fast-math -Wno-unused-result
+# try this second
+CFLAGS = -O3 -Wno-unused-result
+```
+
+Once `train_gpt2` is compiled, you can run it:
 
 ```bash
 OMP_NUM_THREADS=8 ./train_gpt2
