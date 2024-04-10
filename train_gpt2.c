@@ -589,22 +589,22 @@ void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
     printf("channels: %d\n", C);
 
     // allocate space for all the parameters and read them in
-    model->param_sizes[0] = V * C;
-    model->param_sizes[1] = maxT * C;
-    model->param_sizes[2] = L * C;
-    model->param_sizes[3] = L * C;
-    model->param_sizes[4] = L * (3 * C) * C;
-    model->param_sizes[5] = L * (3 * C);
-    model->param_sizes[6] = L * C * C;
-    model->param_sizes[7] = L * C;
-    model->param_sizes[8] = L * C;
-    model->param_sizes[9] = L * C;
-    model->param_sizes[10] = L * (4 * C) * C;
-    model->param_sizes[11] = L * (4 * C);
-    model->param_sizes[12] = L * C * (4 * C);
-    model->param_sizes[13] = L * C;
-    model->param_sizes[14] = C;
-    model->param_sizes[15] = C;
+    model->param_sizes[0] = V * C; // ParameterTensors -> wte
+    model->param_sizes[1] = maxT * C; // ParameterTensors -> wpe
+    model->param_sizes[2] = L * C; // ParameterTensors -> ln1w
+    model->param_sizes[3] = L * C; // ParameterTensors -> ln1b
+    model->param_sizes[4] = L * (3 * C) * C; // ParameterTensors -> qkvw
+    model->param_sizes[5] = L * (3 * C); // ParameterTensors -> qkvb
+    model->param_sizes[6] = L * C * C; // ParameterTensors -> attprojw
+    model->param_sizes[7] = L * C; // ParameterTensors -> attprojb
+    model->param_sizes[8] = L * C; // ParameterTensors -> ln2w
+    model->param_sizes[9] = L * C; // ParameterTensors -> ln2b
+    model->param_sizes[10] = L * (4 * C) * C; // ParameterTensors -> fcw
+    model->param_sizes[11] = L * (4 * C); // ParameterTensors -> fcb
+    model->param_sizes[12] = L * C * (4 * C); // ParameterTensors -> fcprojw
+    model->param_sizes[13] = L * C; // ParameterTensors -> fcprojb
+    model->param_sizes[14] = C; // ParameterTensors -> lnfw
+    model->param_sizes[15] = C; // ParameterTensors -> lnfb
 
     // cound the number of paramaters
     size_t num_parameters = 0;
