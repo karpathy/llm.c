@@ -99,7 +99,7 @@ I like how Netflix comes up, it's clear that the shadow of the training past is 
 
 I am also attaching a simple unit test for making sure our C code agrees with the PyTorch code. Compile and run with:
 
-```
+```bash
 make test_gpt2
 ./test_gpt2
 ```
