@@ -2,7 +2,7 @@
 Kernels for attention forward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math attention_forward.cu -o attention_forward
+nvcc -O3 --use_fast_math attention_forward.cu -o attention_forward -lcublas
 
 version 1 is naive port from CPU code to kernel, parallelize over batch, time, heads only
 ./attention_forward 1
@@ -13,10 +13,17 @@ and with help from
 https://github.com/leloykun/flash-hyperbolic-attention-minimal
 sadly, this flash attention version seems about 3X slower than the naive version
 ./attention_forward 2
+
+version 3 is a cuBLAS + softmax version, similar to the PyTorch implementation
+cuBLAS is used both to calculate the QK^T and the final weighted sum
+the softmax is calculated using a custom, efficient kernel as well
+this turns out to be ~20X faster than (1) nice
+./attention_forward 3
 */
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 // ----------------------------------------------------------------------------
@@ -71,6 +78,10 @@ void attention_forward_cpu(float* out, float* preatt, float* att,
 
                     preatt_bth[t2] = val;
                 }
+                // pad with -INFINITY outside of autoregressive region for debugging comparisons
+                for (int t2 = t+1; t2 < T; t2++) {
+                    preatt_bth[t2] = -INFINITY;
+                }
 
                 // pass 2: calculate the exp and keep track of sum
                 float expsum = 0.0f;
@@ -118,7 +129,11 @@ __global__ void attention_query_key_kernel1(float* preatt, float* inp,
     if (idx < total_threads) {
         int t2 = idx % T;
         int t = (idx / T) % T;
-        if (t2 > t) { return; } // autoregressive mask
+        if (t2 > t) {
+            // autoregressive mask
+            preatt[idx] = -INFINITY;
+            return;
+        }
         int h = (idx / (T * T)) % NH;
         int b = idx / (NH * T * T);
 
@@ -178,6 +193,112 @@ __global__ void attention_softmax_kernel1(float* att, float* preatt,
                 att_bth[t2] = 0.0f;
             }
         }
+    }
+}
+
+// warp-level reduction for finding the maximum value
+__device__ float warpReduceMax(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+    }
+    return val;
+}
+
+// warp-level reduction for summing values
+__device__ float warpReduceSum(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
+__global__ void softmax_forward_kernel4(float* out, float* inp, int N, int C) {
+    // out is (N, C) just like inp. Each row of inp will get softmaxed.
+    // same as kernel3, but can handle any block size (multiple of 32)
+    // each row of C elements is handled by block_size threads
+    // furthermore, each block_size threads get executed in warps of 32 threads
+
+    // special reduction operations warpReduceMax/warpReduceSum are used for intra-warp reductions
+    // shared memory is used for inter-warp reduction
+    extern __shared__ float shared[];
+    int idx = blockIdx.x;
+    int tid = threadIdx.x;
+    int warpId = threadIdx.x / 32; // warp index within a block
+    int laneId = threadIdx.x % 32; // thread index within a warp
+
+    // the number of warps per block. recall that blockDim.x is block_size
+    int warpsPerBlock = blockDim.x / 32;
+
+    // shared[] must be allocated to have 2 * warpsPerBlock elements
+    // first half for max values, the second half for sum values
+    float* maxvals = shared;
+    float* sumvals = &shared[warpsPerBlock];
+
+    // one row of inp, i.e. inp[idx, :] of shape (C,)
+    float* x = inp + idx * C;
+
+    // first, thread coarsening by directly accessing global memory in series
+    float maxval = -INFINITY;
+    for (int i = tid; i < C; i += blockDim.x) {
+        maxval = fmaxf(maxval, x[i]);
+    }
+    // now within-warp reductions for maxval
+    maxval = warpReduceMax(maxval);
+
+    // the 0th thread of each warp writes the maxval of that warp to shared memory
+    if (laneId == 0) maxvals[warpId] = maxval;
+    __syncthreads();
+
+    // now the 0th thread reduces the maxvals in shared memory, i.e. across warps
+    if (tid == 0) {
+        float val = maxvals[tid];
+        for (int i = 1; i < warpsPerBlock; i++) {
+            val = fmaxf(val, maxvals[i]);
+        }
+        // store the final max in the first position
+        maxvals[0] = val;
+    }
+    __syncthreads();
+    // broadcast the max to all threads
+    float offset = maxvals[0];
+
+    // compute expf and write the result to global memory
+    for (int i = tid; i < C; i += blockDim.x) {
+        // subtract max for numerical stability
+        out[idx * C + i] = expf(x[i] - offset);
+    }
+
+    // okay now we calculated exp(x - max(x))
+    // step 2: sum all the values and divide by the sum
+
+    // thread coarsening for sum
+    x = out + idx * C;
+    float sumval = 0.0f;
+    for (int i = tid; i < C; i += blockDim.x) {
+        sumval += x[i];
+    }
+    // within-warp reduction for sumval
+    sumval = warpReduceSum(sumval);
+
+    // write sumval to shared memory
+    if (laneId == 0) sumvals[warpId] = sumval;
+    __syncthreads();
+
+    // inter-thread reduction of sum
+    if (tid == 0) {
+        float val = sumvals[tid];
+        for (int i = 1; i < warpsPerBlock; ++i) {
+            val += sumvals[i];
+        }
+        sumvals[0] = val;
+    }
+    __syncthreads();
+    // broadcast the sum to all threads
+    float sum = sumvals[0];
+
+    // divide the whole row by the sum
+    for (int i = tid; i < C; i += blockDim.x) {
+        out[idx * C + i] = x[i] / sum;
     }
 }
 
@@ -370,6 +491,23 @@ __global__ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, i
     }
 }
 
+__global__ void scale_kernel(float* inp, float scale, int B, int NH, int T) {
+    // scales the pre-softmax attention scores by scale
+    // and sets the autoregressive locations to -INFINITY
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < B * NH * T * T) {
+        int rest = idx % (NH * T * T);
+        rest = rest % (T * T);
+        int t2 = rest / T;
+        int t = rest % T;
+        if (t > t2) {
+            inp[idx] = -INFINITY;
+        } else {
+            inp[idx] *= scale;
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -463,9 +601,85 @@ void attention_forward2(float* out,
     cudaCheck(cudaFree(v));
 }
 
+void attention_forward3(float* out, float* qkvr, float* preatt, float* att,
+                       float* inp,
+                       int B, int T, int C, int NH,
+                       const int block_size) {
+    // inp is (B, T, 3C) QKV
+    // preatt, att are (B, NH, T, T)
+    // output is (B, T, C)
+    int HS = C / NH; // head size
+
+    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
+    float *q, *k, *v;
+    q = qkvr + 0 * B * T * C;
+    k = qkvr + 1 * B * T * C;
+    v = qkvr + 2 * B * T * C;
+    int total_threads = B * NH * T * HS;
+    int num_blocks = CEIL_DIV(total_threads, block_size);
+    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+
+    // batched matrix multiply with cuBLAS
+    cublasHandle_t handle;
+    cublasStatus_t stat = cublasCreate(&handle);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    stat = cublasSgemmStridedBatched(handle,
+                            CUBLAS_OP_T, CUBLAS_OP_N,
+                            T, T, HS,
+                            &alpha,
+                            k, HS, T * HS,
+                            q, HS, T * HS,
+                            &beta,
+                            preatt, T, T * T,
+                            B * NH);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        printf("cublasSgemm failed\n");
+        exit(1);
+    }
+
+    // multiply all elements of preatt elementwise by scale
+    float scale = 1.0 / sqrtf(HS);
+    total_threads = B * NH * T * T;
+    num_blocks = CEIL_DIV(total_threads, block_size);
+    scale_kernel<<<num_blocks, block_size>>>(preatt, scale, B, NH, T);
+
+    // softmax. preatt is (B, NH, T, T) but we view it as (B * NH * T, T) and use the softmax kernel
+    int softmax_block_size = 256;
+    int grid_size = B * NH * T;
+    size_t shared_mem_size = 2 * softmax_block_size / 32 * sizeof(float);
+    softmax_forward_kernel4<<<grid_size, softmax_block_size, shared_mem_size>>>(att, preatt, B * NH * T, T);
+
+    // new approach: first cuBLAS another batched matmul
+    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+    float* vaccum;
+    cudaCheck(cudaMalloc(&vaccum, B * NH * T * HS * sizeof(float)));
+    stat = cublasSgemmStridedBatched(handle,
+                            CUBLAS_OP_N, CUBLAS_OP_N,
+                            HS, T, T,
+                            &alpha,
+                            v, HS, T * HS,
+                            att, T, T * T,
+                            &beta,
+                            vaccum, HS, T * HS,
+                            B * NH);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        printf("cublasSgemm failed\n");
+        exit(1);
+    }
+
+    // now unpermute
+    // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+    num_blocks = CEIL_DIV(B * T * C, block_size);
+    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+
+    // cleanups
+    cublasDestroy(handle);
+}
+
 // kernel version dispatch
 void attention_forward(int kernel_num,
-                       float* out, float* preatt, float* att,
+                       float* out, float* qkvr, float* preatt, float* att,
                        float* inp,
                        int B, int T, int C, int NH,
                        const int block_size) {
@@ -475,6 +689,9 @@ void attention_forward(int kernel_num,
             break;
         case 2:
             attention_forward2(out, inp, B, T, C, NH, block_size);
+            break;
+        case 3:
+            attention_forward3(out, qkvr, preatt, att, inp, B, T, C, NH, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -514,10 +731,12 @@ int main(int argc, char **argv) {
 
     // move to GPU
     float* d_out;
+    float* d_qkvr;
     float* d_preatt;
     float* d_att;
     float* d_inp;
     cudaCheck(cudaMalloc(&d_out, B * T * C * sizeof(float)));
+    cudaCheck(cudaMalloc(&d_qkvr, B * T * 3 * C * sizeof(float)));
     cudaCheck(cudaMalloc(&d_preatt, B * NH * T * T * sizeof(float)));
     cudaCheck(cudaMalloc(&d_att, B * NH * T * T * sizeof(float)));
     cudaCheck(cudaMalloc(&d_inp, B * T * 3 * C * sizeof(float)));
@@ -532,8 +751,9 @@ int main(int argc, char **argv) {
 
     // first check the correctness of the kernel
     attention_forward_cpu(out, preatt, att, inp, B, T, C, NH);
-    attention_forward(kernel_num, d_out, d_preatt, d_att, d_inp, B, T, C, NH, 256);
+    attention_forward(kernel_num, d_out, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, 256);
 
+    // compare the output
     float* out_gpu = (float*)malloc(B * T * C * sizeof(float));
     cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * C * sizeof(float), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B * T * C; i++) {
@@ -561,7 +781,7 @@ int main(int argc, char **argv) {
         cudaCheck(cudaEventCreate(&stop));
         cudaCheck(cudaEventRecord(start, 0));
         for (int i = 0; i < repeat_times; i++) {
-            attention_forward(kernel_num, d_out, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+            attention_forward(kernel_num, d_out, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
         }
         cudaCheck(cudaEventRecord(stop, 0));
         cudaCheck(cudaEventSynchronize(start));
@@ -579,6 +799,7 @@ int main(int argc, char **argv) {
     free(inp);
     free(out_gpu);
     cudaCheck(cudaFree(d_out));
+    cudaCheck(cudaFree(d_qkvr));
     cudaCheck(cudaFree(d_preatt));
     cudaCheck(cudaFree(d_att));
     cudaCheck(cudaFree(d_inp));
