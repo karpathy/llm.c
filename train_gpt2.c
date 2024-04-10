@@ -606,7 +606,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
     model->param_sizes[14] = C;
     model->param_sizes[15] = C;
 
-    // cound the number of paramaters
+    // count the number of paramaters
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += model->param_sizes[i];
