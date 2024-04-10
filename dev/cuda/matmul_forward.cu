@@ -90,7 +90,7 @@ __global__ void matmul_forward_kernel1(float* out,
 __global__ void add_bias(float* out, float* bias, int B, int T, int OC) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
-    for (int i = idx; i < B*T*OC; i += stride) {
+    for (int i = idx; i < B * T * OC; i += stride) {
         int col = i % OC;
         out[i] += bias[col];
     }
@@ -133,10 +133,10 @@ void matmul_forward2(float* out,
     // where A is mxk, B is kxn, C is mxn
     // now, because we use row-major storage, cuBLAS (which is column-major) sees our matrices transposed.
     // algorithmically / in e.g. PyTorch we want to do: out = inp @ weight.T
-    // but because cuBLAS is column-major, we actually want to get it to calculate out^T. Mathematically, this is:
-    // out^T = weight @ inp^T
+    // but because cuBLAS is column-major, we actually want to get it to calculate out.T . Mathematically, this is:
+    // out.T = weight @ inp.T
     // but again, our variables look transposed, so using the actual weight/inp we have here in this function, this becomes
-    // out^T = weight.T @ inp
+    // out.T = weight.T @ inp
     // so we need to get cuBLAS to calculate weight.T @ inp (the variables here are the actual ones in this function)
     // => need to call cuBLAS with A = weight, B = inp
     // => need to call cuBLAS with transa = CUBLAS_OP_T, transb = CUBLAS_OP_N
