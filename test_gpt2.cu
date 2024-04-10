@@ -7,7 +7,7 @@ int check_tensor(float *a, float *b, int n, char* label) {
     int ok = 1;
     printf("%s\n", label);
     for (int i = 0; i < n; i++) {
-        if (fabs(a[i] - b[i]) <= 1e-2) {
+        if (fabsf(a[i] - b[i]) <= 1e-2) {
             if (i < print_upto) { printf("OK "); }
         } else {
             if (i < print_upto) { printf("NOT OK "); }
@@ -89,7 +89,7 @@ int main(int argc, char *argv[]) {
                 if(i < 3) {
                     printf("%f %f\n", expected_logits[i], logits_cpu[i]);
                 }
-                if (fabs(expected_logits[i] - logits_cpu[i]) >= 1e-2) {
+                if (fabsf(expected_logits[i] - logits_cpu[i]) >= 1e-2) {
                     printf("MISMATCH AT INDEX %d: ", i);
                     printf("%f %f\n", expected_logits[i],logits_cpu[i]);
                     logits_ok = 0;
@@ -102,7 +102,7 @@ int main(int argc, char *argv[]) {
             free(logits_cpu);
 
             // compare the achieved loss
-            if (fabs(model.mean_loss - *expected_loss) >= 1e-2) {
+            if (fabsf(model.mean_loss - *expected_loss) >= 1e-2) {
                 printf("LOSS MISMATCH: %f %f\n", model.mean_loss, *expected_loss);
                 allok = 0;
             } else {
