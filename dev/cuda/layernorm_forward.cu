@@ -233,7 +233,7 @@ void layernorm_forward(int kernel_num,
 // random utils
 
 float* make_random_float(int N) {
-    float* arr = (float*)malloc(N * sizeof(float));
+    float* arr = malloc(N * sizeof(float));
     for (int i = 0; i < N; i++) {
         arr[i] = ((float)rand() / RAND_MAX) * 2.0 - 1.0;
     }
@@ -253,9 +253,9 @@ int main(int argc, char **argv) {
     cudaCheck(cudaSetDevice(deviceIdx));
 
     // create host memory of random numbers
-    float* out = (float*)malloc(B * T * C * sizeof(float));
-    float* mean = (float*)malloc(B * T * sizeof(float));
-    float* rstd = (float*)malloc(B * T * sizeof(float));
+    float* out = malloc(B * T * C * sizeof(float));
+    float* mean = malloc(B * T * sizeof(float));
+    float* rstd = malloc(B * T * sizeof(float));
     float* inp = make_random_float(B * T * C);
     float* weight = make_random_float(C);
     float* bias = make_random_float(C);
@@ -287,7 +287,7 @@ int main(int argc, char **argv) {
     // first check the correctness of the kernel
     layernorm_forward_cpu(out, mean, rstd, inp, weight, bias, B, T, C);
     layernorm_forward(kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, B, T, C, 256);
-    float* out_gpu = (float*)malloc(B * T * C * sizeof(float));
+    float* out_gpu = malloc(B * T * C * sizeof(float));
     cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * C * sizeof(float), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B * T * C; i++) {
         // print the first few comparisons

@@ -524,7 +524,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     if (on_device) {
         cudaCheck(cudaMalloc((void**)&params_memory, num_parameters * sizeof(float)));
     } else {
-        params_memory = (float*)malloc(num_parameters * sizeof(float));
+        params_memory = malloc(num_parameters * sizeof(float));
     }
     // assign all the tensors their place in the array
     float** ptrs[] = {
@@ -685,7 +685,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
 
     // read in all the parameters from file and copy them to device
-    float* params_memory_cpu = (float*)malloc(num_parameters * sizeof(float));
+    float* params_memory_cpu = malloc(num_parameters * sizeof(float));
     fread(params_memory_cpu, sizeof(float), num_parameters, model_file);
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     free(params_memory_cpu);
@@ -845,7 +845,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         // for convenience also evaluate the mean loss
         // move the (B,T) losses to CPU
         // TODO get rid of inline mallocs
-        float* cpu_losses = (float*)malloc(B * T * sizeof(float));
+        float* cpu_losses = malloc(B * T * sizeof(float));
         cudaCheck(cudaMemcpy(cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
         float mean_loss = 0.0f;
         for (int i=0; i<B*T; i++) { mean_loss += cpu_losses[i]; }
@@ -1006,7 +1006,7 @@ int main() {
     unsigned long long rng_state = 1337;
     const int gen_max_length = 64;
     int gen_tokens[gen_max_length];
-    float* cpu_probs = (float*)malloc(model.config.vocab_size * sizeof(float));
+    float* cpu_probs = malloc(model.config.vocab_size * sizeof(float));
 
     // train
     struct timespec start, end;

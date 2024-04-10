@@ -342,7 +342,7 @@ void softmax_forward(int kernel_num, float* out, float* inp, int N, int C, const
 // random utils
 
 float* make_random_float(int N) {
-    float* arr = (float*)malloc(N * sizeof(float));
+    float* arr = malloc(N * sizeof(float));
     for (int i = 0; i < N; i++) {
         arr[i] = ((float)rand() / RAND_MAX) * 2.0 - 1.0;
     }
@@ -361,7 +361,7 @@ int main(int argc, char **argv) {
     cudaCheck(cudaSetDevice(deviceIdx));
 
     // create host memory of random numbers
-    float* out = (float*)malloc(B * T * T * sizeof(float));
+    float* out = malloc(B * T * T * sizeof(float));
     float* inp = make_random_float(B * T * T);
 
     // move to GPU
@@ -379,7 +379,7 @@ int main(int argc, char **argv) {
     printf("Using kernel %d\n", kernel_num);
 
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
-    float* out_gpu = (float*)malloc(B * T * T * sizeof(float));
+    float* out_gpu = malloc(B * T * T * sizeof(float));
 
     // first check the correctness of the kernel
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {

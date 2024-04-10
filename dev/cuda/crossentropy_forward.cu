@@ -95,7 +95,7 @@ void crossentropy_forward(int kernel_num,
 // random utils
 
 float* make_random_float(int N) {
-    float* arr = (float*)malloc(N * sizeof(float));
+    float* arr = malloc(N * sizeof(float));
     for (int i = 0; i < N; i++) {
         arr[i] = ((float)rand() / RAND_MAX); // [0,1)
     }
@@ -103,7 +103,7 @@ float* make_random_float(int N) {
 }
 
 int* make_random_int(int N, int V) {
-    int* arr = (int*)malloc(N * sizeof(int));
+    int* arr = malloc(N * sizeof(int));
     for (int i = 0; i < N; i++) {
         arr[i] = rand() % V;
     }
@@ -123,7 +123,7 @@ int main(int argc, char **argv) {
     cudaCheck(cudaSetDevice(deviceIdx));
 
     // create host memory of random numbers
-    float* out = (float*)malloc(B * T * sizeof(float));
+    float* out = malloc(B * T * sizeof(float));
     float* probs = make_random_float(B * T * V);
     int* targets = make_random_int(B * T, V);
 
@@ -147,7 +147,7 @@ int main(int argc, char **argv) {
     // first check the correctness of the kernel
     crossentropy_forward_cpu(out, probs, targets, B, T, V);
     crossentropy_forward(kernel_num, d_out, d_probs, d_targets, B, T, V, 256);
-    float* out_gpu = (float*)malloc(B * T * sizeof(float));
+    float* out_gpu = malloc(B * T * sizeof(float));
     cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * sizeof(float), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B * T; i++) {
         // print the first few comparisons
