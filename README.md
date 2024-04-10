@@ -12,6 +12,15 @@ For the repo, I'd like to maintain both clean, simple reference implementations 
 
 ## quick start
 
+As a reminder, the Python commands should be executed in virtual environment.
+You can use Python built-in `venv` package to create the virtual environment
+then activate it:
+
+```bash
+python -v venv venv
+source ./venv/bin/activate
+```
+
 Download and tokenize a dataset. The [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset is the fastest to download and tokenize:
 
 ```bash
