@@ -925,7 +925,7 @@ void gpt2_free(GPT2 *model) {
 }
 
 #ifndef TESTING
-// if we are TESTING (see test.c), we'll skip the int main below
+// if we are TESTING (see test_gpt2.c), we'll skip the int main below
 
 // ----------------------------------------------------------------------------
 // data loader lite

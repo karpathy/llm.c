@@ -75,7 +75,8 @@ The generation just gives you the token ids for now, which we have to decode bac
 ```python
 import tiktoken
 enc = tiktoken.get_encoding("gpt2")
-print(enc.decode(list(map(int, "50256 16773 18162 21986 11 198 13681 263 23875 198 3152 262 11773 2910 198 1169 6002 6386 2583 286 262 11858 198 20424 428 3135 7596 995 3675 13 198 40 481 407 736 17903 11 329 703 6029 706 4082 198 42826 1028 1128 633 263 11 198 10594 407 198 2704 454 680 1028 262 1027 28860 286 198 3237 323".split()))))
+ptok = lambda x: print(enc.decode(list(map(int, x.strip().split()))))
+ptok("50256 16773 18162 21986 11 198 13681 263 23875 198 3152 262 11773 2910 198 1169 6002 6386 2583 286 262 11858 198 20424 428 3135 7596 995 3675 13 198 40 481 407 736 17903 11 329 703 6029 706 4082 198 42826 1028 1128 633 263 11 198 10594 407 198 2704 454 680 1028 262 1027 28860 286 198 3237 323")
 ```
 
 which prints:
@@ -99,7 +100,7 @@ I like how Netflix comes up, it's clear that the shadow of the training past is 
 
 I am also attaching a simple unit test for making sure our C code agrees with the PyTorch code. Compile and run with:
 
-```
+```bash
 make test_gpt2
 ./test_gpt2
 ```
@@ -113,6 +114,50 @@ I attached a very small tutorial here, in [doc/layernorm/layernorm.md](doc/layer
 ## cuda
 
 CUDA port is WIP, I'm keeping the growing collection of kernels in the `dev` folder, e.g. see [dev/cuda/README.md](dev/cuda/README.md).
+
+As of April 10, 2024 the full forward pass is now implemented in pure CUDA in one file. First we can check that all of the logits and the final loss matches the PyTorch reference:
+
+```bash
+make test_gpt2cu
+./test_gpt2cu
+```
+
+This prints `overall okay: 1`. Now that we are calculating all the right values, we can time our code. We can't train yet because the backward pass + update are not implemented yet, but we can run the training loop and see the timings:
+
+```bash
+make train_gpt2cu
+./train_gpt2cu
+```
+
+This will run GPT-2 (124M) in one file of pure CUDA (see [train_gpt2.cu](train_gpt2.cu)), using batch size 4 and sequence length 1024. This will print a bunch of hyperparameters and then the "training":
+
+```
+val loss 4.517294
+step 0: train loss 4.367857 (took 112.135004 ms)
+step 1: train loss 4.406483 (took 112.555327 ms)
+step 2: train loss 4.484838 (took 111.380248 ms)
+...
+```
+
+The loss is changing because we are still loading real data batches from our dataset, but there is no training so they won't go down over time. In any case, on my A100 40GB PCIe GPU we are seeing about 111ms/iteration. We can compare this to PyTorch fp32 training by calling our python script like this:
+
+```bash
+python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4
+```
+
+Which shows time per iteration with the same hyperparameters (batch 4, time 1024) at 180ms/iteration. We can then enable `torch.compile` by adding the `--compile 1` flag:
+
+```bash
+python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4 --compile 1
+```
+
+And see that the first iteration now takes 20 seconds (compilation time), but all following iterations take ~86ms. And if we additionally turn on the use of fp32 tensorcores (only GPUs since Volta) with `--tensorcores 1`:
+
+```bash
+python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4 --compile 1 --tensorcores 1
+```
+
+The time drops down to 26ms/iteration. So we have a gap to close :)! At the current 111ms we are about 4.2X slower.
 
 ## license
 

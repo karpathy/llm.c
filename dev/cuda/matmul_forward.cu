@@ -8,7 +8,7 @@ nvcc -O3 --use_fast_math -Xcompiler -fopenmp matmul_forward.cu -o matmul_forward
 version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
 OMP_NUM_THREADS=32 ./matmul_forward 1
 
-version 2 parallelizes over all of B,T,C
+version 2 calls cuBLAS, very fast
 OMP_NUM_THREADS=32 ./matmul_forward 2
 */
 
