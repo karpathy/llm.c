@@ -150,8 +150,9 @@ void matmul_forward2(float* out,
     }
     // and now we still have to add the bias... (ew)
     if (bias != NULL) {
+        int coarse_factor = 1; // thread coarsening factor, an int greater than or equal to 1
         int block_size = sqrt_block_size * sqrt_block_size;
-        int grid_size = CEIL_DIV(OC * B * T, block_size);
+        int grid_size = CEIL_DIV(OC * B * T, block_size * coarse_factor);
         add_bias<<<grid_size, block_size>>>(out, bias, B, T, OC);
         cudaCheck(cudaGetLastError());
     }
