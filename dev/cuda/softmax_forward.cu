@@ -24,11 +24,9 @@ version 6 is softmax_online that parallelizes over all of B,T,C
 ./softmax_forward 6
 */
 
-#include <cuda_runtime.h>
-#include "device_launch_parameters.h"
-#include <math.h> 
 #include <stdio.h>
 #include <stdlib.h>
+#include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
