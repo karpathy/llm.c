@@ -14,6 +14,9 @@ version 2 parallelizes over all of B,T,C
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
+#include <assert.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -181,6 +184,57 @@ __global__ void normalization_kernel(float* out, float* inp, float* mean, float*
 }
 
 // ----------------------------------------------------------------------------
+
+__global__ void layernorm_kernel_cg(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+                                    const float*  __restrict__ inp, const float*  __restrict__ weight,
+                                    const float* __restrict__ bias, int N, int C) {
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if(idx >= N) {
+        return;
+    }
+
+    const float* x = inp + idx * C;
+    // mean part
+    float sum = 0.0f;
+    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+        sum += x[i];
+    }
+
+    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    // write the final result (at thread 0) to global memory
+    float m = sum / C;
+    if(warp.thread_rank() == 0 && mean != nullptr) {
+        __stcs(mean + idx, m);
+    }
+
+    // rstd part
+    sum = 0.0f;
+    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+        float diff = x[i] - m;
+        sum += diff * diff;
+    }
+    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    float s = rsqrtf(sum / C + 1e-5f);
+
+    if(warp.thread_rank() == 0 && rstd != nullptr) {
+        __stcs(rstd + idx, s);
+    }
+
+    // final scaling
+    float* o = out + idx * C;
+    for (int c = warp.thread_rank(); c < C; c += warp.size()) {
+        // Load and store features using .cs "streaming" hint, so that they don't pollute
+        // caches, and we get more cache-hits for weight and bias parameters, which actually
+        // are reusable  here.
+        float n = s * (__ldcs(x+c) - m);
+        __stcs(o+c, n * weight[c] + bias[c]);
+    }
+}
+
+// ----------------------------------------------------------------------------
 // kernel launcher
 
 void layernorm_forward1(float* out, float* mean, float* rstd,
@@ -210,6 +264,17 @@ void layernorm_forward2(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
+void layernorm_forward3(float* out, float* mean, float* rstd,
+                       const float* inp, const float* weight, const float* bias,
+                       int B, int T, int C,
+                       const int block_size) {
+    int N = B * T;
+    assert(block_size % 32 == 0);
+    // in mean and rstd, threads cooperate within blocks via reductions
+    layernorm_kernel_cg<<<B * T  * 32 / block_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void layernorm_forward(int kernel_num,
                     float* out, float* mean, float* rstd,
@@ -222,6 +287,9 @@ void layernorm_forward(int kernel_num,
             break;
         case 2:
             layernorm_forward2(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
+            break;
+        case 3:
+            layernorm_forward3(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
