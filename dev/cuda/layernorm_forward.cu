@@ -21,7 +21,19 @@ version 2 parallelizes over all of B,T,C
 // ----------------------------------------------------------------------------
 // CUDA utils
 
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+template<class T>
+T ceil_div(T dividend, T divisor) {
+    return (dividend + divisor - 1) / divisor;
+}
+
+__device__ float& vec_at(float4& vec, int index) {
+    return reinterpret_cast<float*>(&vec)[index];
+}
+
+__device__ float vec_at(const float4& vec, int index) {
+    return reinterpret_cast<const float*>(&vec)[index];
+}
+
 
 // error checking
 void cudaCheck(cudaError_t error, const char *file, int line) {
@@ -187,7 +199,7 @@ __global__ void normalization_kernel(float* out, float* inp, float* mean, float*
 
 template<int SubGroupSize>
 __global__ void layernorm_kernel_cg(float* __restrict__ out, const float*  __restrict__ inp,
-                                    const float*  __restrict__ weight, const float* __restrict__ bias,
+                                    const float* __restrict__ weight, const float* __restrict__ bias,
                                     int N, int C) {
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
@@ -197,34 +209,48 @@ __global__ void layernorm_kernel_cg(float* __restrict__ out, const float*  __res
         return;
     }
 
-    const float* x = inp + idx * C;
+    const float4* x = reinterpret_cast<const float4*>(inp + idx * C);
+
     // mean part
     float sum = 0.0f;
-    for (int i = sub.thread_rank(); i < C; i += sub.size()) {
-        sum += x[i];
+    for (int i = sub.thread_rank(); i < C / 4; i += sub.size()) {
+        float4 local = x[i];
+        for(int k = 0; k < 4; ++k) {
+            sum += vec_at(local, k);
+        }
     }
 
     sum = cg::reduce(sub, sum, cg::plus<float>{});
-    // write the final result (at thread 0) to global memory
     float m = sum / C;
 
     // rstd part
     sum = 0.0f;
-    for (int i = sub.thread_rank(); i < C; i += sub.size()) {
-        float diff = x[i] - m;
-        sum += diff * diff;
+    for (int i = sub.thread_rank(); i < C / 4; i += sub.size()) {
+        float4 local = x[i];
+        for(int k = 0; k < 4; ++k) {
+            float diff = vec_at(local, k) - m;
+            sum += diff * diff;
+        }
     }
     sum = cg::reduce(sub, sum, cg::plus<float>{});
-    float s = 1.0f / sqrtf(sum / C + 1e-5f);
+    float s = rsqrtf(sum / C + 1e-5f);
 
     // final scaling
-    float* o = out + idx * C;
-    for (int c = sub.thread_rank(); c < C; c += sub.size()) {
+    float4* o = reinterpret_cast<float4*>(out + idx * C);
+
+    for (int c = sub.thread_rank(); c < C / 4; c += sub.size()) {
         // Load and store features using .cs "streaming" hint, so that they don't pollute
         // caches, and we get more cache-hits for weight and bias parameters, which actually
-        // are reusable  here.
-        float n = s * (__ldcs(x+c) - m);
-        __stcs(o+c, n * weight[c] + bias[c]);
+        // are reusable here.
+        float4 local = __ldcs(x+c);
+        float4 w = __ldcs((const float4*)(weight+4*c));
+        float4 b = __ldcs((const float4*)(bias+4*c));
+        float4 r;
+        for(int k = 0; k < 4; ++k) {
+            float n = s * (vec_at(local, k) - m);
+            vec_at(r, k) = n * vec_at(w, k) + vec_at(b, k);
+        }
+        __stcs(o+c, r);
     }
 }
 
@@ -236,7 +262,7 @@ void layernorm_forward1(float* out, float* mean, float* rstd,
                            int B, int T, int C,
                            const int block_size) {
     const int N = B * T;
-    const int grid_size = CEIL_DIV(N, block_size);
+    const int grid_size = ceil_div(N, block_size);
     layernorm_forward_kernel1<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
@@ -253,7 +279,7 @@ void layernorm_forward2(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
     // in the normalization, everything just gets flattened out
     const int block_size2 = 256;
-    const int grid_size = CEIL_DIV(B * T * C, block_size2);
+    const int grid_size = ceil_div(B * T * C, block_size2);
     normalization_kernel<<<grid_size, block_size2>>>(out, inp, mean, rstd, weight, bias, B, T, C);
     cudaCheck(cudaGetLastError());
 }
@@ -264,22 +290,20 @@ void layernorm_forward3(float* out, float* mean, float* rstd,
                        int block_size) {
     int N = B * T;
     assert(block_size % 32 == 0);
-    // in mean and rstd, threads cooperate within blocks via reductions
-    int desired_threads_per_token = C / 8;
+    // this is a very crude heuristic, but I wanted to avoid having two tunable parameters for now.
+    int desired_threads_per_token = min(C / 8, block_size);
     if(desired_threads_per_token <= 32) {
         layernorm_kernel_cg<32><<<B * T * 32 / block_size, block_size>>>(out, inp, weight, bias, N, C);
     } else if(desired_threads_per_token <= 64) {
-        block_size = max(block_size, 64);
         layernorm_kernel_cg<64><<<B * T * 64 / block_size, block_size>>>(out, inp, weight, bias, N, C);
     } else if(desired_threads_per_token <= 128) {
-        block_size = max(block_size, 128);
         layernorm_kernel_cg<128><<<B * T * 128 / block_size, block_size>>>(out, inp, weight, bias, N, C);
     } else if(desired_threads_per_token <= 256) {
-        block_size = max(block_size, 256);
         layernorm_kernel_cg<256><<<B * T * 256 / block_size, block_size>>>(out, inp, weight, bias, N, C);
-    }else if(desired_threads_per_token <= 512) {
-        block_size = max(block_size, 512);
+    } else if(desired_threads_per_token <= 512) {
         layernorm_kernel_cg<512><<<B * T * 512 / block_size, block_size>>>(out, inp, weight, bias, N, C);
+    } else {
+        layernorm_kernel_cg<1024><<<B * T * 1024 / block_size, block_size>>>(out, inp, weight, bias, N, C);
     }
     cudaCheck(cudaGetLastError());
 }
