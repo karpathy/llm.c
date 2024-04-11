@@ -19,6 +19,12 @@ ifeq ($(shell uname), Darwin)
     LDLIBS += -lomp
     INCLUDES += -I/opt/homebrew/opt/libomp/include
     $(info NICE Compiling with OpenMP support)
+  else ifeq ($(shell [ -d /usr/local/opt/libomp/lib ] && echo "exists"), exists)
+    CFLAGS += -Xclang -fopenmp -DOMP
+    LDFLAGS += -L/usr/local/opt/libomp/lib
+    LDLIBS += -lomp
+    INCLUDES += -I/usr/local/opt/libomp/include
+    $(info NICE Compiling with OpenMP support)
   else
     $(warning OOPS Compiling without OpenMP support)
   endif
