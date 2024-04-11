@@ -9,11 +9,17 @@ version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops ov
 
 version 2 parallelizes over all of B,T,C
 ./layernorm_forward 2
+
+version 3 uses cooperative groups to parallelize over all of B,T,C
+./layernorm_forward 3
 */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
+#include <assert.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -181,6 +187,56 @@ __global__ void normalization_kernel(float* out, float* inp, float* mean, float*
 }
 
 // ----------------------------------------------------------------------------
+
+__global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+                                    const float*  __restrict__ inp, const float*  __restrict__ weight,
+                                    const float* __restrict__ bias, int N, int C) {
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if(idx >= N) {
+        return;
+    }
+
+    // the row of input that this group of threads is responsible for
+    const float* x = inp + idx * C;
+
+    // mean
+    float sum = 0.0f;
+    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+        sum += x[i];
+    }
+    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    float m = sum / C;
+    if(warp.thread_rank() == 0 && mean != nullptr) {
+        __stcs(mean + idx, m);
+    }
+
+    // rstd
+    sum = 0.0f;
+    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+        float diff = x[i] - m;
+        sum += diff * diff;
+    }
+    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    float s = rsqrtf(sum / C + 1e-5f);
+    if(warp.thread_rank() == 0 && rstd != nullptr) {
+        __stcs(rstd + idx, s);
+    }
+
+    // final normalization and scaling by weight/bias
+    float* o = out + idx * C;
+    for (int c = warp.thread_rank(); c < C; c += warp.size()) {
+        // load and store using the .cs "streaming" hint to the compiler,
+        // indicating that this data will not be reused soon, and can be streamed through the caches
+        // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
+        float n = s * (__ldcs(x+c) - m);
+        __stcs(o+c, n * weight[c] + bias[c]);
+    }
+}
+
+// ----------------------------------------------------------------------------
 // kernel launcher
 
 void layernorm_forward1(float* out, float* mean, float* rstd,
@@ -210,6 +266,17 @@ void layernorm_forward2(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
+void layernorm_forward3(float* out, float* mean, float* rstd,
+                       const float* inp, const float* weight, const float* bias,
+                       int B, int T, int C,
+                       const int block_size) {
+    assert(block_size % 32 == 0);
+    const int N = B * T;
+    const int grid_size = CEIL_DIV(N * 32, block_size);
+    layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void layernorm_forward(int kernel_num,
                     float* out, float* mean, float* rstd,
@@ -222,6 +289,9 @@ void layernorm_forward(int kernel_num,
             break;
         case 2:
             layernorm_forward2(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
+            break;
+        case 3:
+            layernorm_forward3(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -284,27 +354,46 @@ int main(int argc, char **argv) {
     }
     printf("Using kernel %d\n", kernel_num);
 
-    // first check the correctness of the kernel
-    layernorm_forward_cpu(out, mean, rstd, inp, weight, bias, B, T, C);
-    layernorm_forward(kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, B, T, C, 256);
+    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
     float* out_gpu = (float*)malloc(B * T * C * sizeof(float));
-    cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * C * sizeof(float), cudaMemcpyDeviceToHost));
-    for (int i = 0; i < B * T * C; i++) {
-        // print the first few comparisons
-        if (i < 5) {
-            printf("%f %f\n", out[i], out_gpu[i]);
+    float* mean_gpu = (float*)malloc(B * T * sizeof(float));
+    float* rstd_gpu = (float*)malloc(B * T * sizeof(float));
+
+    // check the correctness of the kernel at all block sizes
+    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+        layernorm_forward_cpu(out, mean, rstd, inp, weight, bias, B, T, C);
+        layernorm_forward(kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, B, T, C, 256);
+        cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * C * sizeof(float), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaMemcpy(mean_gpu, d_mean, B * T * sizeof(float), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaMemcpy(rstd_gpu, d_rstd, B * T * sizeof(float), cudaMemcpyDeviceToHost));
+
+        for (int i = 0; i < B * T * C; i++) {
+            // print the first few comparisons
+            if (i < 5) {
+                printf("%f %f\n", out[i], out_gpu[i]);
+            }
+            // ensure correctness for all elements
+            if (fabs(out[i] - out_gpu[i]) > 1e-5) {
+                printf("Mismatch at %d: %f vs %f\n", i, out[i], out_gpu[i]);
+                exit(1);
+            }
         }
-        // ensure correctness for all elements
-        if (fabs(out[i] - out_gpu[i]) > 1e-5) {
-            printf("Mismatch at %d: %f vs %f\n", i, out[i], out_gpu[i]);
-            exit(1);
+        for (int i = 0; i < B * T; i++) {
+            if (fabs(mean[i] - mean_gpu[i]) > 1e-5) {
+                printf("Mismatch at mean %d: %f vs %f\n", i, mean[i], mean_gpu[i]);
+                exit(1);
+            }
         }
+        for (int i = 0; i < B * T; i++) {
+            if (fabs(rstd[i] - rstd_gpu[i]) > 1e-5) {
+                printf("Mismatch at rstd %d: %f vs %f\n", i, rstd[i], rstd_gpu[i]);
+                exit(1);
+            }
+        }
+        printf("Results match at block size %d\n", block_sizes[j]);
     }
-    printf("Results match at block_size=256!\n");
 
     // time the kernel at different block sizes
-    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
-
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
 
