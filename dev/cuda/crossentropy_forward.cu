@@ -33,9 +33,9 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
 void crossentropy_forward_cpu(float* losses,
                             float* probs, int* targets,
                             int B, int T, int V) {
-    // output: losses is (B,T) of the individual losses at each position
+    // output: losses are (B,T) of the individual loss at each position
     // input: probs are (B,T,V) of the probabilities
-    // input: targets is (B,T) of integers giving the correct index in logits
+    // input: targets are (B,T) of integers giving the correct index in logits
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // loss = -log(probs[target])
