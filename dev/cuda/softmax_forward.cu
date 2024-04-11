@@ -70,7 +70,7 @@ void softmax_forward_cpu(float* out, float* inp, int N, int C) {
 
 // Implement the online version of softmax on CPU from the paper:
 // Online normalizer calculation for softmax
-void softmax_forward_cpu_online(float* out, float* inp, int N, int C) {
+void softmax_forward_online_cpu(float* out, float* inp, int N, int C) {
     // inp is (N, C)
     // out is (N, C), each row of inp will get softmaxed
     for (int i = 0; i < N; i++) {
