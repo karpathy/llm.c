@@ -14,7 +14,6 @@ There will be other versions of this code that specialize it and make it fast.
 #define _USE_MATH_DEFINES
 #endif
 #include <math.h>
-#include <time.h>
 #include <string.h>
 #if defined(OMP) && !(_OPENMP < 202011)
 #include <omp.h>
