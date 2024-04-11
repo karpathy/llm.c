@@ -1,4 +1,5 @@
 #define TESTING
+#include "platform_utils.h"
 #include "train_gpt2.cu"
 
 // poor man's tensor checker
@@ -30,10 +31,10 @@ int main(int argc, char *argv[]) {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
-    int C = model.config.channels;
+    //int C = model.config.channels;
     int V = model.config.vocab_size;
-    int maxT = model.config.max_seq_len;
-    int L = model.config.num_layers;
+    //int maxT = model.config.max_seq_len;
+    //int L = model.config.num_layers;
 
     // load additional information that we will use for debugging and error checking
     FILE *state_file = fopen("gpt2_124M_debug_state.bin", "rb");
@@ -69,13 +70,12 @@ int main(int argc, char *argv[]) {
     int allok = 1;
 
     // let's do 10 training iterations, following the pytorch code
-    float losses[10];
+    //float losses[10];
     for (int step = 0; step < 10; step++) {
-        struct timespec start, end;
-        clock_gettime(CLOCK_MONOTONIC, &start);
+        const double start_time_ms = get_time_ms();
         gpt2_forward(&model, x, y, B, T);
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        const double end_time_ms = get_time_ms();
+        double time_elapsed_s = (end_time_ms - start_time_ms) / 1000.0;
 
         if (step == 0) {
             // error checking at step 0 for reference activations

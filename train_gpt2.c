@@ -10,13 +10,21 @@ There will be other versions of this code that specialize it and make it fast.
 
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#define _USE_MATH_DEFINES
+#endif
 #include <math.h>
 #include <time.h>
 #include <string.h>
-#include <unistd.h>
-#ifdef OMP
+#if defined(OMP) && !(_OPENMP < 202011)
 #include <omp.h>
+#define OMP_ENABLED
+#else
+#pragma message \
+    "The installed OpenMP version is less than 5.2, you may need update to the latest standard to enable to OpenMP directives"
 #endif
+
+#include "platform_utils.h"
 
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
@@ -157,7 +165,9 @@ void matmul_forward(float* out,
     // OC is short for "output channels"
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
     // out will be (B,T,OC)
+#ifdef OMP_ENABLED
     #pragma omp parallel for collapse(2)
+#endif
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             float* out_bt = out + b * T * OC + t * OC;
@@ -182,7 +192,9 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     // but that doesn't afford an efficient parallelization strategy
 
     // backward into inp first, parallelize over B,T
+#ifdef OMP_ENABLED
     #pragma omp parallel for collapse(2)
+#endif
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             float* dout_bt = dout + b * T * OC + t * OC;
@@ -197,7 +209,9 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
         }
     }
     // backward into weight/bias, parallelize over output channels OC
+#ifdef OMP_ENABLED
     #pragma omp parallel for
+#endif
     for (int o = 0; o < OC; o++) {
         for (int b = 0; b < B; b++) {
             for (int t = 0; t < T; t++) {
@@ -228,7 +242,9 @@ void attention_forward(float* out, float* preatt, float* att,
     int hs = C / NH; // head size
     float scale = 1.0 / sqrtf(hs);
 
+#ifdef OMP_ENABLED
     #pragma omp parallel for collapse(3)
+#endif
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
@@ -389,7 +405,9 @@ void residual_backward(float* dinp1, float* dinp2, float* dout, int N) {
 void softmax_forward(float* probs, float* logits, int B, int T, int V) {
     // output: probs are (B,T,V) of the probabilities (sums to 1.0 in each b,t position)
     // input: logits is (B,T,V) of the unnormalized log probabilities
+#ifdef OMP_ENABLED
     #pragma omp parallel for collapse(2)
+#endif
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // probs <- softmax(logits)
@@ -1048,6 +1066,10 @@ int sample_mult(float* probabilities, int n, float coin) {
 
 // ----------------------------------------------------------------------------
 // main training loop
+
+// during inference step we'll generate sequences of this many tokens
+#define GEN_MAX_LENGTH 64
+
 int main() {
 
     // build the GPT-2 model from a checkpoint
@@ -1059,8 +1081,8 @@ int main() {
     char* tiny_stories_val = "data/TinyStories_val.bin";
     char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
     char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
-    char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
-    char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
+    char* train_tokens = file_exists(tiny_shakespeare_train) ? tiny_shakespeare_train : tiny_stories_train;
+    char* val_tokens = file_exists(tiny_shakespeare_val) ? tiny_shakespeare_val : tiny_stories_val;
     int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
     int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader;
@@ -1073,11 +1095,9 @@ int main() {
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    const int gen_max_length = 64; // during inference step we'll generate sequences of this many tokens
-    int gen_tokens[gen_max_length];
+    int gen_tokens[GEN_MAX_LENGTH];
 
     // train
-    struct timespec start, end;
     for (int step = 0; step <= 20; step++) {
 
         // once in a while estimate the validation loss
@@ -1096,7 +1116,7 @@ int main() {
         // once in a while do model inference to print generated text
         if (step > 0 && step % 20 == 0) {
             gen_tokens[0] = GPT2_EOT; // the GPT-2 EOT token kicks off the generation
-            for (int t = 1; t < gen_max_length; t++) {
+            for (int t = 1; t < GEN_MAX_LENGTH; t++) {
                 // note that inference is wasteful here because
                 // for each t, we re-compute all activations between 0 and t
                 // leaving this alone because you want separate code for inference anyway
@@ -1108,22 +1128,22 @@ int main() {
                 gen_tokens[t] = next_token;
             }
             printf("generated: ");
-            for (int t = 0; t < gen_max_length; t++) {
+            for (int t = 0; t < GEN_MAX_LENGTH; t++) {
                 printf("%d ", gen_tokens[t]);
             }
             printf("\n");
         }
 
         // do a training step
-        clock_gettime(CLOCK_MONOTONIC, &start);
+        const double start_time_ms = get_time_ms();
         dataloader_next_batch(&train_loader);
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
+        const double end_time_ms = get_time_ms();
+        const double time_elapsed_ms = end_time_ms - start_time_ms;
+        printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_ms);
     }
 
     // free

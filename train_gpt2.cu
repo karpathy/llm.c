@@ -4,15 +4,18 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#define _USE_MATH_DEFINES
+#endif
 #include <math.h>
-#include <time.h>
 #include <string.h>
-#include <unistd.h>
 #include <assert.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+
+#include "platform_utils.h"
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -963,8 +966,8 @@ int main() {
     char* tiny_stories_val = "data/TinyStories_val.bin";
     char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
     char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
-    char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
-    char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
+    char* train_tokens = file_exists(tiny_shakespeare_train) ? tiny_shakespeare_train : tiny_stories_train;
+    char* val_tokens = file_exists(tiny_shakespeare_val) ? tiny_shakespeare_val : tiny_stories_val;
     int B = 4;
     int T = 1024;
     DataLoader train_loader;
@@ -985,7 +988,6 @@ int main() {
     float* cpu_probs = (float*)malloc(model.config.vocab_size * sizeof(float));
 
     // train
-    struct timespec start, end;
     for (int step = 0; step <= 40; step++) {
 
         // once in a while estimate the validation loss
@@ -1025,7 +1027,7 @@ int main() {
         }
 
         // do a training step
-        clock_gettime(CLOCK_MONOTONIC, &start);
+        const double start_time_ms = get_time_ms();
         dataloader_next_batch(&train_loader);
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         // these are still TODO
@@ -1033,9 +1035,9 @@ int main() {
         // gpt2_backward(&model);
         // gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
+        const double end_time_ms = get_time_ms();
+        const double time_elapsed_ms = end_time_ms - start_time_ms;
+        printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_ms);
     }
 
     // free
