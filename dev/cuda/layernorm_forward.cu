@@ -9,6 +9,9 @@ version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops ov
 
 version 2 parallelizes over all of B,T,C
 ./layernorm_forward 2
+
+version 3 uses cooperative groups to parallelize over all of B,T,C
+./layernorm_forward 3
 */
 
 #include <stdio.h>
@@ -185,7 +188,7 @@ __global__ void normalization_kernel(float* out, float* inp, float* mean, float*
 
 // ----------------------------------------------------------------------------
 
-__global__ void layernorm_kernel_cg(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+__global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const float*  __restrict__ inp, const float*  __restrict__ weight,
                                     const float* __restrict__ bias, int N, int C) {
     namespace cg = cooperative_groups;
@@ -196,21 +199,21 @@ __global__ void layernorm_kernel_cg(float* __restrict__ out, float* __restrict__
         return;
     }
 
+    // the row of input that this group of threads is responsible for
     const float* x = inp + idx * C;
-    // mean part
+
+    // mean
     float sum = 0.0f;
     for (int i = warp.thread_rank(); i < C; i += warp.size()) {
         sum += x[i];
     }
-
     sum = cg::reduce(warp, sum, cg::plus<float>{});
-    // write the final result (at thread 0) to global memory
     float m = sum / C;
     if(warp.thread_rank() == 0 && mean != nullptr) {
         __stcs(mean + idx, m);
     }
 
-    // rstd part
+    // rstd
     sum = 0.0f;
     for (int i = warp.thread_rank(); i < C; i += warp.size()) {
         float diff = x[i] - m;
@@ -218,17 +221,16 @@ __global__ void layernorm_kernel_cg(float* __restrict__ out, float* __restrict__
     }
     sum = cg::reduce(warp, sum, cg::plus<float>{});
     float s = rsqrtf(sum / C + 1e-5f);
-
     if(warp.thread_rank() == 0 && rstd != nullptr) {
         __stcs(rstd + idx, s);
     }
 
-    // final scaling
+    // final normalization and scaling by weight/bias
     float* o = out + idx * C;
     for (int c = warp.thread_rank(); c < C; c += warp.size()) {
-        // Load and store features using .cs "streaming" hint, so that they don't pollute
-        // caches, and we get more cache-hits for weight and bias parameters, which actually
-        // are reusable  here.
+        // load and store using the .cs "streaming" hint to the compiler,
+        // indicating that this data will not be reused soon, and can be streamed through the caches
+        // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
         float n = s * (__ldcs(x+c) - m);
         __stcs(o+c, n * weight[c] + bias[c]);
     }
@@ -268,10 +270,10 @@ void layernorm_forward3(float* out, float* mean, float* rstd,
                        const float* inp, const float* weight, const float* bias,
                        int B, int T, int C,
                        const int block_size) {
-    int N = B * T;
     assert(block_size % 32 == 0);
-    // in mean and rstd, threads cooperate within blocks via reductions
-    layernorm_kernel_cg<<<B * T  * 32 / block_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
+    const int N = B * T;
+    const int grid_size = N * 32 / block_size;
+    layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
 
