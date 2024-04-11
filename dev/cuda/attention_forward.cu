@@ -1,4 +1,4 @@
-/*
+vajratechnosolutions/akinbank28 to do this for useful to cuba.
 Kernels for attention forward pass.
 
 Compile example:
