@@ -332,16 +332,16 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     float sumval = 0.0f;
     for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
         // subtract max for numerical stability
-        float ev = expf(inv_temperature * (__ldcs(x + i) - offset));
-        out[idx * T + i] = ev;
-        sumval += ev;
+        sumval += expf(inv_temperature * (x[i] - offset));
     }
     float sum = cg::reduce(warp, sumval, cg::plus<float>{});
     float norm = 1.f / sum;
 
     // divide the whole row by the sum
     for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
-        out[idx * T + i] *= norm;
+        // recalculation is faster than doing the round-trip through memory.
+        float ev = expf(inv_temperature * (__ldcs(x + i) - offset));
+        __stcs(out + idx * T + i, ev * norm);
     }
 }
 
