@@ -387,6 +387,8 @@ if __name__ == "__main__":
                 write_state(model, x, y, logits, loss, "gpt2_124M_debug_state.bin")
             optimizer.step()
         torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         t1 = time.time()
         print(f"iteration {i}, loss: {loss.item()}, time: {(t1-t0)*1000:.3f}ms")
 
