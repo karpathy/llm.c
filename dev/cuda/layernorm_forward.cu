@@ -354,27 +354,46 @@ int main(int argc, char **argv) {
     }
     printf("Using kernel %d\n", kernel_num);
 
-    // first check the correctness of the kernel
-    layernorm_forward_cpu(out, mean, rstd, inp, weight, bias, B, T, C);
-    layernorm_forward(kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, B, T, C, 256);
+    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
     float* out_gpu = (float*)malloc(B * T * C * sizeof(float));
-    cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * C * sizeof(float), cudaMemcpyDeviceToHost));
-    for (int i = 0; i < B * T * C; i++) {
-        // print the first few comparisons
-        if (i < 5) {
-            printf("%f %f\n", out[i], out_gpu[i]);
+    float* mean_gpu = (float*)malloc(B * T * sizeof(float));
+    float* rstd_gpu = (float*)malloc(B * T * sizeof(float));
+
+    // check the correctness of the kernel at all block sizes
+    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+        layernorm_forward_cpu(out, mean, rstd, inp, weight, bias, B, T, C);
+        layernorm_forward(kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, B, T, C, 256);
+        cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * C * sizeof(float), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaMemcpy(mean_gpu, d_mean, B * T * sizeof(float), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaMemcpy(rstd_gpu, d_rstd, B * T * sizeof(float), cudaMemcpyDeviceToHost));
+
+        for (int i = 0; i < B * T * C; i++) {
+            // print the first few comparisons
+            if (i < 5) {
+                printf("%f %f\n", out[i], out_gpu[i]);
+            }
+            // ensure correctness for all elements
+            if (fabs(out[i] - out_gpu[i]) > 1e-5) {
+                printf("Mismatch at %d: %f vs %f\n", i, out[i], out_gpu[i]);
+                exit(1);
+            }
         }
-        // ensure correctness for all elements
-        if (fabs(out[i] - out_gpu[i]) > 1e-5) {
-            printf("Mismatch at %d: %f vs %f\n", i, out[i], out_gpu[i]);
-            exit(1);
+        for (int i = 0; i < B * T; i++) {
+            if (fabs(mean[i] - mean_gpu[i]) > 1e-5) {
+                printf("Mismatch at mean %d: %f vs %f\n", i, mean[i], mean_gpu[i]);
+                exit(1);
+            }
         }
+        for (int i = 0; i < B * T; i++) {
+            if (fabs(rstd[i] - rstd_gpu[i]) > 1e-5) {
+                printf("Mismatch at rstd %d: %f vs %f\n", i, rstd[i], rstd_gpu[i]);
+                exit(1);
+            }
+        }
+        printf("Results match at block size %d\n", block_sizes[j]);
     }
-    printf("Results match at block_size=256!\n");
 
     // time the kernel at different block sizes
-    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
-
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
 
