@@ -272,7 +272,7 @@ void layernorm_forward3(float* out, float* mean, float* rstd,
                        const int block_size) {
     assert(block_size % 32 == 0);
     const int N = B * T;
-    const int grid_size = N * 32 / block_size;
+    const int grid_size = CEIL_DIV(N * 32, block_size);
     layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
