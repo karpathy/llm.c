@@ -1,0 +1,77 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired":
+    {
+        "major": 3,
+        "minor": 23,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "gpt2",
+            "description": "Implementation of GPT-2",
+            "hidden": true,
+            "binaryDir": "${sourceDir}/build"
+        },
+        {
+            "name": "gpt2-cuda",
+            "inherits": "gpt2",
+            "hidden": true,
+            "cacheVariables": {
+                "ENABLE_CUDA": "ON"
+            }
+        },
+        {
+            "name": "gpt2-tinyshakespeare",
+            "hidden": false,
+            "inherits": "gpt2"
+        },
+        {
+            "name": "gpt2-tinyshakespeare-cuda",
+            "hidden": false,
+            "inherits": "gpt2-cuda"
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "gpt2",
+            "hidden": true,
+            "targets": [
+                "train_gpt2"
+            ]
+        },
+        {
+            "name": "gpt2-test",
+            "hidden": true,
+            "inherits": "gpt2",
+            "targets": [
+                "train_gpt2",
+                "test_gpt2"
+            ]
+        },
+        {
+            "name": "gpt2-tinyshakespeare",
+            "hidden": false,
+            "inherits": "gpt2",
+            "configurePreset": "gpt2-tinyshakespeare"
+        },
+        {
+            "name": "gpt2-tinyshakespeare-cuda",
+            "hidden": false,
+            "inherits": "gpt2",
+            "configurePreset": "gpt2-tinyshakespeare-cuda"
+        },
+        {
+            "name": "gpt2-tinyshakespeare-test",
+            "hidden": false,
+            "inherits": "gpt2-test",
+            "configurePreset": "gpt2-tinyshakespeare"
+        },
+        {
+            "name": "gpt2-tinyshakespeare-cuda-test",
+            "hidden": false,
+            "inherits": "gpt2-test",
+            "configurePreset": "gpt2-tinyshakespeare-cuda"
+        }
+    ]
+}

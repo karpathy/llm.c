@@ -1,4 +1,5 @@
 .vscode/
 data/
+build/
 gpt2_124M.bin
 gpt2_124M_debug_state.bin
