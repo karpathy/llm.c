@@ -79,15 +79,16 @@ void softmax_forward_online_cpu(float* out, float* inp, int N, int C) {
 
         float maxval = -INFINITY;
         float sum = 0.0f;
-        for (int j = 0; j < C; j++) {
-            float maxval_prev = maxval;
-            if (inp_row[j] > maxval) {
-                maxval = inp_row[j];
-                sum = sum * expf(maxval_prev - maxval) + expf(inp_row[j] - maxval);
-            } else {
+		for (int j = 0; j < C; j++) {
+			float maxval_prev = maxval;
+			if (inp_row[j] > maxval) {
+				maxval = inp_row[j];
+				sum = sum * expf(maxval_prev - maxval) + expf(inp_row[j] - maxval);
+			}
+			else {
 				sum += expf(inp_row[j] - maxval);
 			}
-        }
+		}
 
         for (int j = 0; j < C; j++) {
             out_row[j] = expf(inp_row[j] - maxval) / sum;
@@ -332,14 +333,14 @@ __global__ void softmax_forward_online_kernel1(float* out, float* inp, int N, in
         float sum = 0.0f;
         for (int j = 0; j < C; j++) {
             float maxval_prev = maxval;
-            if (inp_row[j] > maxval) {
-                maxval = inp_row[j];
-                sum = sum * expf(maxval_prev - maxval) + expf(inp_row[j] - maxval);
-            }
-            else {
-                sum += expf(inp_row[j] - maxval);
-            }
-        }
+			if (inp_row[j] > maxval) {
+				maxval = inp_row[j];
+				sum = sum * expf(maxval_prev - maxval) + expf(inp_row[j] - maxval);
+			}
+			else {
+				sum += expf(inp_row[j] - maxval);
+			}
+		}
 
         for (int j = 0; j < C; j++) {
             out_row[j] = expf(inp_row[j] - maxval) / sum;
