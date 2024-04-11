@@ -185,9 +185,9 @@ __global__ void normalization_kernel(float* out, float* inp, float* mean, float*
 
 // ----------------------------------------------------------------------------
 
-__global__ void layernorm_kernel_cg(float* __restrict__ out, const float*  __restrict__ inp,
-                                    const float*  __restrict__ weight, const float* __restrict__ bias,
-                                    int N, int C) {
+__global__ void layernorm_kernel_cg(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+                                    const float*  __restrict__ inp, const float*  __restrict__ weight,
+                                    const float* __restrict__ bias, int N, int C) {
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
@@ -206,6 +206,9 @@ __global__ void layernorm_kernel_cg(float* __restrict__ out, const float*  __res
     sum = cg::reduce(warp, sum, cg::plus<float>{});
     // write the final result (at thread 0) to global memory
     float m = sum / C;
+    if(warp.thread_rank() == 0 && mean != nullptr) {
+        __stcs(mean + idx, m);
+    }
 
     // rstd part
     sum = 0.0f;
@@ -214,7 +217,11 @@ __global__ void layernorm_kernel_cg(float* __restrict__ out, const float*  __res
         sum += diff * diff;
     }
     sum = cg::reduce(warp, sum, cg::plus<float>{});
-    float s = 1.0f / sqrtf(sum / C + 1e-5f);
+    float s = rsqrtf(sum / C + 1e-5f);
+
+    if(warp.thread_rank() == 0 && rstd != nullptr) {
+        __stcs(rstd + idx, s);
+    }
 
     // final scaling
     float* o = out + idx * C;
@@ -258,13 +265,13 @@ void layernorm_forward2(float* out, float* mean, float* rstd,
 }
 
 void layernorm_forward3(float* out, float* mean, float* rstd,
-                       float* inp, float* weight, float* bias,
+                       const float* inp, const float* weight, const float* bias,
                        int B, int T, int C,
                        const int block_size) {
     int N = B * T;
     assert(block_size % 32 == 0);
     // in mean and rstd, threads cooperate within blocks via reductions
-    layernorm_kernel_cg<<<B * T  * 32 / block_size, block_size>>>(out, inp, weight, bias, N, C);
+    layernorm_kernel_cg<<<B * T  * 32 / block_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
 
