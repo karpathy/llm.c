@@ -239,12 +239,12 @@ int main(int argc, char **argv) {
             printf("%f %f\n", out[i], out_gpu[i]);
         }
         // ensure correctness for all elements
-        if (i >= 5 && fabs(out[i] - out_gpu[i]) > 1e-4) {
+        if (fabs(out[i] - out_gpu[i]) > 1e-4) {
             printf("Mismatch at %d: %f vs %f\n", i, out[i], out_gpu[i]);
             exit(1);
         }
     }
-    printf("Results match at block_size=256!\n");
+    printf("Results match at block_size=1024!\n");
 
     // time the kernel at different block sizes
     int sqrt_block_sizes[] = {4, 8, 16, 32};

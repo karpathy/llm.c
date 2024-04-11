@@ -38,12 +38,13 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
 // ----------------------------------------------------------------------------
 // CPU code reference
 
+#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
+
 void gelu_forward_cpu(float* out, float* inp, int N) {
-    float s = sqrtf(2.0f / M_PI);
     for (int i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
-        out[i] = 0.5f * x * (1.0f + tanhf(s * (x + cube)));
+        out[i] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
     }
 }
 
@@ -53,11 +54,10 @@ void gelu_forward_cpu(float* out, float* inp, int N) {
 // elementwise ops are nice and ez
 __global__ void gelu_kernel(float* out, const float* inp, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    float s = sqrtf(2.0f / M_PI);
     if (i < N) {
         float xi = inp[i];
         float cube = 0.044715f * xi * xi * xi;
-        out[i] = 0.5f * xi * (1.0f + tanhf(s * (xi + cube)));
+        out[i] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
     }
 }
 

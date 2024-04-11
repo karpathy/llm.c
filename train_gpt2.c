@@ -20,10 +20,15 @@ There will be other versions of this code that specialize it and make it fast.
 
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
+// B = batch_size, T = sequence_length, C = channels, V = vocab_size
 
 void encoder_forward(float* out,
                    int* inp, float* wte, float* wpe,
                    int B, int T, int C) {
+    // out is (B,T,C). At each position (b,t), a C-dimensional vector summarizing token & position
+    // inp is (B,T) of integers, holding the token ids at each (b,t) position
+    // wte is (V,C) of token embeddings, short for "weight token embeddings"
+    // wpe is (maxT,C) of position embeddings, short for "weight positional embedding"
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // seek to the output position in out[b,t,:]
@@ -63,6 +68,11 @@ void encoder_backward(float* dwte, float* dwpe,
 void layernorm_forward(float* out, float* mean, float* rstd,
                        float* inp, float* weight, float* bias,
                        int B, int T, int C) {
+    // reference: https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
+    // both inp and out are (B,T,C) of the activations
+    // mean and rstd are (B,T) buffers, to be used later in backward pass
+    // at each position (b,t) of the input, the C-dimensional vector
+    // of activations gets normalized, then scaled and shifted
     float eps = 1e-5f;
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
@@ -81,13 +91,13 @@ void layernorm_forward(float* out, float* mean, float* rstd,
                 v += xshift * xshift;
             }
             v = v/C;
-            // calculate the rstd
+            // calculate the rstd (reciprocal standard deviation)
             float s = 1.0f / sqrtf(v + eps);
             // seek to the output position in out[b,t,:]
             float* out_bt = out + b * T * C + t * C;
             for (int i = 0; i < C; i++) {
-                float n = (s * (x[i] - m)); // normalized output
-                float o = n * weight[i] + bias[i]; // scale and shift it
+                float n = (s * (x[i] - m)); // normalize
+                float o = n * weight[i] + bias[i]; // scale and shift
                 out_bt[i] = o; // write
             }
             // cache the mean and rstd for the backward pass later
@@ -207,9 +217,13 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
 void attention_forward(float* out, float* preatt, float* att,
                        float* inp,
                        int B, int T, int C, int NH) {
-    // input is (B, T, 3C) Q,K,V
-    // preatt, att are (B, NH, T, T)
+    // input is (B, T, 3C) holding the query, key, value (Q, K, V) vectors
+    // preatt, att are (B, NH, T, T). NH = number of heads, T = sequence length
+    // that holds the pre-attention and post-attention scores (used in backward)
     // output is (B, T, C)
+    // attention is the only layer that mixes information across time
+    // every other operation is applied at every (b,t) position independently
+    // (and of course, no layer mixes information across batch)
     int C3 = C*3;
     int hs = C / NH; // head size
     float scale = 1.0 / sqrtf(hs);
@@ -241,6 +255,7 @@ void attention_forward(float* out, float* preatt, float* att,
                 }
 
                 // pass 2: calculate the exp and keep track of sum
+                // maxval is being calculated and subtracted only for numerical stability
                 float expsum = 0.0f;
                 for (int t2 = 0; t2 <= t; t2++) {
                     float expv = expf(preatt_bth[t2] - maxval);
@@ -335,25 +350,25 @@ void attention_backward(float* dinp, float* dpreatt, float* datt,
     }
 }
 
+#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 void gelu_forward(float* out, float* inp, int N) {
-    float s = sqrtf(2.0f / M_PI);
+    // (approximate) GeLU elementwise non-linearity in the MLP block of Transformer
     for (int i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
-        out[i] = 0.5f * x * (1.0f + tanhf(s * (x + cube)));
+        out[i] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
     }
 }
 
 void gelu_backward(float* dinp, float* inp, float* dout, int N) {
-    float s = sqrtf(2.0f / M_PI);
     for (int i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
-        float tanh_arg = s * (x + cube);
+        float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
         float tanh_out = tanhf(tanh_arg);
         float coshf_out = coshf(tanh_arg);
         float sech_out = 1.0f / (coshf_out * coshf_out);
-        float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * s * (1.0f + 3.0f * 0.044715f * x * x);
+        float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
         dinp[i] += local_grad * dout[i];
     }
 }
@@ -372,7 +387,7 @@ void residual_backward(float* dinp1, float* dinp2, float* dout, int N) {
 }
 
 void softmax_forward(float* probs, float* logits, int B, int T, int V) {
-    // output: probs are (B,T,V) of the probabilities
+    // output: probs are (B,T,V) of the probabilities (sums to 1.0 in each b,t position)
     // input: logits is (B,T,V) of the unnormalized log probabilities
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
@@ -381,6 +396,7 @@ void softmax_forward(float* probs, float* logits, int B, int T, int V) {
             float* logits_bt = logits + b * T * V + t * V;
             float* probs_bt = probs + b * T * V + t * V;
 
+            // maxval is only calculated and subtracted for numerical stability
             float maxval = -10000.0f; // TODO something better
             for (int i = 0; i < V; i++) {
                 if (logits_bt[i] > maxval) {
@@ -537,7 +553,7 @@ typedef struct {
 
 typedef struct {
     GPT2Config config;
-    // the weights of the model, and their sizes
+    // the weights (parameters) of the model, and their sizes
     ParameterTensors params;
     size_t param_sizes[NUM_PARAMETER_TENSORS];
     float* params_memory;
@@ -589,22 +605,22 @@ void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
     printf("channels: %d\n", C);
 
     // allocate space for all the parameters and read them in
-    model->param_sizes[0] = V * C;
-    model->param_sizes[1] = maxT * C;
-    model->param_sizes[2] = L * C;
-    model->param_sizes[3] = L * C;
-    model->param_sizes[4] = L * (3 * C) * C;
-    model->param_sizes[5] = L * (3 * C);
-    model->param_sizes[6] = L * C * C;
-    model->param_sizes[7] = L * C;
-    model->param_sizes[8] = L * C;
-    model->param_sizes[9] = L * C;
-    model->param_sizes[10] = L * (4 * C) * C;
-    model->param_sizes[11] = L * (4 * C);
-    model->param_sizes[12] = L * C * (4 * C);
-    model->param_sizes[13] = L * C;
-    model->param_sizes[14] = C;
-    model->param_sizes[15] = C;
+    model->param_sizes[0] = V * C; // wte
+    model->param_sizes[1] = maxT * C; // wpe
+    model->param_sizes[2] = L * C; // ln1w
+    model->param_sizes[3] = L * C; // ln1b
+    model->param_sizes[4] = L * (3 * C) * C; // qkvw
+    model->param_sizes[5] = L * (3 * C); // qkvb
+    model->param_sizes[6] = L * C * C; // attprojw
+    model->param_sizes[7] = L * C; // attprojb
+    model->param_sizes[8] = L * C; // ln2w
+    model->param_sizes[9] = L * C; // ln2b
+    model->param_sizes[10] = L * (4 * C) * C; // fcw
+    model->param_sizes[11] = L * (4 * C); // fcb
+    model->param_sizes[12] = L * C * (4 * C); // fcprojw
+    model->param_sizes[13] = L * C; // fcprojb
+    model->param_sizes[14] = C; // lnfw
+    model->param_sizes[15] = C; // lnfb
 
     // count the number of paramaters
     size_t num_parameters = 0;
@@ -653,29 +669,29 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         model->batch_size = B;
         model->seq_len = T;
         // and now allocate the space
-        model->act_sizes[0] = B * T * C;
-        model->act_sizes[1] = L * B * T * C;
-        model->act_sizes[2] = L * B * T;
-        model->act_sizes[3] = L * B * T;
-        model->act_sizes[4] = L * B * T * 3*C;
-        model->act_sizes[5] = L * B * T * C;
-        model->act_sizes[6] = L * B * NH * T * T;
-        model->act_sizes[7] = L * B * NH * T * T;
-        model->act_sizes[8] = L * B * T * C;
-        model->act_sizes[9] = L * B * T * C;
-        model->act_sizes[10] = L * B * T * C;
-        model->act_sizes[11] = L * B * T;
-        model->act_sizes[12] = L * B * T;
-        model->act_sizes[13] = L * B * T * 4*C;
-        model->act_sizes[14] = L * B * T * 4*C;
-        model->act_sizes[15] = L * B * T * C;
-        model->act_sizes[16] = L * B * T * C;
-        model->act_sizes[17] = B * T * C;
-        model->act_sizes[18] = B * T;
-        model->act_sizes[19] = B * T;
-        model->act_sizes[20] = B * T * V;
-        model->act_sizes[21] = B * T * V;
-        model->act_sizes[22] = B * T;
+        model->act_sizes[0] = B * T * C; // encoded
+        model->act_sizes[1] = L * B * T * C; // ln1
+        model->act_sizes[2] = L * B * T;  // ln1_mean
+        model->act_sizes[3] = L * B * T;  // ln1_rstd
+        model->act_sizes[4] = L * B * T * 3*C; // qkv
+        model->act_sizes[5] = L * B * T * C;  // atty
+        model->act_sizes[6] = L * B * NH * T * T;  // preatt
+        model->act_sizes[7] = L * B * NH * T * T;  // att
+        model->act_sizes[8] = L * B * T * C; // attproj
+        model->act_sizes[9] = L * B * T * C; // residual2
+        model->act_sizes[10] = L * B * T * C; // ln2
+        model->act_sizes[11] = L * B * T; // ln2_mean
+        model->act_sizes[12] = L * B * T; // ln2_rstd
+        model->act_sizes[13] = L * B * T * 4*C; // fch
+        model->act_sizes[14] = L * B * T * 4*C; // fch_gelu
+        model->act_sizes[15] = L * B * T * C; // fcproj
+        model->act_sizes[16] = L * B * T * C; // residual3
+        model->act_sizes[17] = B * T * C; // lnf
+        model->act_sizes[18] = B * T; // lnf_mean
+        model->act_sizes[19] = B * T; // lnf_rstd
+        model->act_sizes[20] = B * T * V; // logits
+        model->act_sizes[21] = B * T * V; // probs
+        model->act_sizes[22] = B * T; // losses
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
@@ -802,13 +818,15 @@ void gpt2_backward(GPT2 *model) {
     int NH = model->config.num_heads;
     int C = model->config.channels;
 
-    // backward pass
+    // backward pass: go in the reverse order of the forward pass, and call backward() functions
     ParameterTensors params = model->params; // for brevity
     ParameterTensors grads = model->grads;
     ActivationTensors acts = model->acts;
     ActivationTensors grads_acts = model->grads_acts;
 
-    // we kick off the chain by filling in dlosses with 1.0f/(B*T), to get the mean loss
+    // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
+    // technically this is a small, inline backward() pass of calculating
+    // total, final loss as the mean over all losses over all (B,T) positions in the batch
     float dloss_mean = 1.0f / (B*T);
     for (int i = 0; i < B*T; i++) { grads_acts.losses[i] = dloss_mean; }
 
@@ -933,8 +951,8 @@ void gpt2_free(GPT2 *model) {
 
 typedef struct {
     // hyperparameters
-    int B;
-    int T;
+    int B; // batch size
+    int T; // sequence length
     // input handling and its state
     FILE* tokens_file;
     long file_size;
@@ -1001,6 +1019,7 @@ void dataloader_free(DataLoader *loader) {
 // ----------------------------------------------------------------------------
 // sampler
 
+// the GPT-2 end-of-text token id
 #define GPT2_EOT 50256
 
 unsigned int random_u32(unsigned long long *state) {
@@ -1042,8 +1061,8 @@ int main() {
     char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
     char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
-    int B = 4;
-    int T = 64;
+    int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
+    int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader;
     dataloader_init(&train_loader, train_tokens, B, T);
     printf("train dataset num_batches: %d\n", train_loader.num_batches);
@@ -1054,12 +1073,12 @@ int main() {
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    const int gen_max_length = 64;
+    const int gen_max_length = 64; // during inference step we'll generate sequences of this many tokens
     int gen_tokens[gen_max_length];
 
     // train
     struct timespec start, end;
-    for (int step = 0; step <= 40; step++) {
+    for (int step = 0; step <= 20; step++) {
 
         // once in a while estimate the validation loss
         if (step % 10 == 0) {
