@@ -371,9 +371,9 @@ void softmax_forward4(float* out, float* inp, int N, int C, int block_size) {
 }
 
 void softmax_forward_online1(float* out, float* inp, int N, int C, int block_size) {
-    int grid_size = N;
-    size_t shared_mem_size = 2 * block_size / 32 * sizeof(float);
-    softmax_forward_online_kernel1 << <grid_size, block_size, shared_mem_size >> > (out, inp, N, C);
+    const int grid_size = CEIL_DIV(N, block_size);
+    softmax_forward_online_kernel1 << <grid_size, block_size >> > (out, inp, N, C);
+    cudaCheck(cudaGetLastError());
 }
 
 // kernel version dispatch
