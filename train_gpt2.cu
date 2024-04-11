@@ -305,13 +305,13 @@ __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, in
     }
 }
 
+#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 __global__ void gelu_kernel(float* out, const float* inp, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    float s = sqrtf(2.0f / M_PI);
     if (i < N) {
         float xi = inp[i];
         float cube = 0.044715f * xi * xi * xi;
-        out[i] = 0.5f * xi * (1.0f + tanhf(s * (xi + cube)));
+        out[i] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
     }
 }
 
