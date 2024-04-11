@@ -61,12 +61,39 @@ __global__ void gelu_kernel(float* out, const float* inp, int N) {
     }
 }
 
+// use hardware intrinsics for marginally faster performance
+//  use restrict keyword on data pointers
+__global__ void gelu_kernel_2(
+  float* __restrict__ out, 
+  const float* __restrict__ inp, 
+  int N
+) {
+    int ti = blockIdx.x * blockDim.x + threadIdx.x;
+    int chunk_size = blockDim.x * gridDim.x;
+
+    float s = __fsqrt_rn(__fdiv_rn(2.0f, M_PI));
+    
+    #pragma unroll
+    for (int i = ti; i < N; i += chunk_size) {
+        const float xi = inp[i];
+        float cdf = 1.0f + tanhf(s * (xi + 0.044715f * (xi * xi * xi)));
+        cdf *= 0.5f;
+        out[i] = xi * cdf;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
 void gelu_forward1(float* out, float* inp, int N, const int block_size) {
     const int grid_size = CEIL_DIV(N, block_size);
     gelu_kernel<<<grid_size, block_size>>>(out, inp, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void gelu_forward2(float* out, float* inp, int N, const int block_size) {
+    const int grid_size = CEIL_DIV(N, block_size);
+    gelu_kernel_2<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -79,6 +106,9 @@ void gelu_forward(int kernel_num,
     switch (kernel_num) {
         case 1:
             gelu_forward1(out, inp, B * T * C, block_size);
+            break;
+        case 2:
+            gelu_forward2(out, inp, B * T * C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
