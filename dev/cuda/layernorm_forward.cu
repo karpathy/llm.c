@@ -185,13 +185,14 @@ __global__ void normalization_kernel(float* out, float* inp, float* mean, float*
 
 // ----------------------------------------------------------------------------
 
+template<int SubGroupSize>
 __global__ void layernorm_kernel_cg(float* __restrict__ out, const float*  __restrict__ inp,
                                     const float*  __restrict__ weight, const float* __restrict__ bias,
                                     int N, int C) {
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    cg::thread_block_tile<SubGroupSize> sub = cg::tiled_partition<SubGroupSize>(block);
+    int idx = blockIdx.x * sub.meta_group_size() + sub.meta_group_rank();
     if(idx >= N) {
         return;
     }
@@ -199,26 +200,26 @@ __global__ void layernorm_kernel_cg(float* __restrict__ out, const float*  __res
     const float* x = inp + idx * C;
     // mean part
     float sum = 0.0f;
-    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+    for (int i = sub.thread_rank(); i < C; i += sub.size()) {
         sum += x[i];
     }
 
-    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    sum = cg::reduce(sub, sum, cg::plus<float>{});
     // write the final result (at thread 0) to global memory
     float m = sum / C;
 
     // rstd part
     sum = 0.0f;
-    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+    for (int i = sub.thread_rank(); i < C; i += sub.size()) {
         float diff = x[i] - m;
         sum += diff * diff;
     }
-    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    sum = cg::reduce(sub, sum, cg::plus<float>{});
     float s = 1.0f / sqrtf(sum / C + 1e-5f);
 
     // final scaling
     float* o = out + idx * C;
-    for (int c = warp.thread_rank(); c < C; c += warp.size()) {
+    for (int c = sub.thread_rank(); c < C; c += sub.size()) {
         // Load and store features using .cs "streaming" hint, so that they don't pollute
         // caches, and we get more cache-hits for weight and bias parameters, which actually
         // are reusable  here.
@@ -260,11 +261,26 @@ void layernorm_forward2(float* out, float* mean, float* rstd,
 void layernorm_forward3(float* out, float* mean, float* rstd,
                        float* inp, float* weight, float* bias,
                        int B, int T, int C,
-                       const int block_size) {
+                       int block_size) {
     int N = B * T;
     assert(block_size % 32 == 0);
     // in mean and rstd, threads cooperate within blocks via reductions
-    layernorm_kernel_cg<<<B * T  * 32 / block_size, block_size>>>(out, inp, weight, bias, N, C);
+    int desired_threads_per_token = C / 8;
+    if(desired_threads_per_token <= 32) {
+        layernorm_kernel_cg<32><<<B * T * 32 / block_size, block_size>>>(out, inp, weight, bias, N, C);
+    } else if(desired_threads_per_token <= 64) {
+        block_size = max(block_size, 64);
+        layernorm_kernel_cg<64><<<B * T * 64 / block_size, block_size>>>(out, inp, weight, bias, N, C);
+    } else if(desired_threads_per_token <= 128) {
+        block_size = max(block_size, 128);
+        layernorm_kernel_cg<128><<<B * T * 128 / block_size, block_size>>>(out, inp, weight, bias, N, C);
+    } else if(desired_threads_per_token <= 256) {
+        block_size = max(block_size, 256);
+        layernorm_kernel_cg<256><<<B * T * 256 / block_size, block_size>>>(out, inp, weight, bias, N, C);
+    }else if(desired_threads_per_token <= 512) {
+        block_size = max(block_size, 512);
+        layernorm_kernel_cg<512><<<B * T * 512 / block_size, block_size>>>(out, inp, weight, bias, N, C);
+    }
     cudaCheck(cudaGetLastError());
 }
 
@@ -308,7 +324,7 @@ int main(int argc, char **argv) {
 
     int B = 8;
     int T = 1024;
-    int C = 768;
+    int C = 4096;
 
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
