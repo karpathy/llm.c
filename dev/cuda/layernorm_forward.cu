@@ -14,6 +14,7 @@ version 2 parallelizes over all of B,T,C
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
+#include <assert.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
@@ -218,7 +219,10 @@ __global__ void layernorm_kernel_cg(float* __restrict__ out, const float*  __res
     // final scaling
     float* o = out + idx * C;
     for (int c = warp.thread_rank(); c < C; c += warp.size()) {
-        float n = s * (x[c] - m);
+        // Load and store features using .cs "streaming" hint, so that they don't pollute
+        // caches, and we get more cache-hits for weight and bias parameters, which actually
+        // are reusable  here.
+        float n = s * (__ldcs(x+c) - m);
         __stcs(o+c, n * weight[c] + bias[c]);
     }
 }
@@ -258,8 +262,9 @@ void layernorm_forward3(float* out, float* mean, float* rstd,
                        int B, int T, int C,
                        const int block_size) {
     int N = B * T;
+    assert(block_size % 32 == 0);
     // in mean and rstd, threads cooperate within blocks via reductions
-    layernorm_kernel_cg<<<B * T, block_size>>>(out, inp, weight, bias, N, C);
+    layernorm_kernel_cg<<<B * T  * 32 / block_size, block_size>>>(out, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
 
