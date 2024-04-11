@@ -43,7 +43,7 @@ You can have a look inside the `Makefile` and its comments. It will try to autod
 
 ```
 # try this first
-CFLAGS = -O3 -Ofast -fno-fast-math -Wno-unused-result
+CFLAGS = -Ofast -fno-fast-math -Wno-unused-result
 # try this second
 CFLAGS = -O3 -Wno-unused-result
 ```
