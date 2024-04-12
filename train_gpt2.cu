@@ -19,9 +19,7 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 #define ENABLE_ACTIVATION_COMPRESSION
 //#define MASK_ONE_BYTE_COMPRESSION
 //#define MASK_TWO_BYTES_COMPRESSION
-//#define MASK_THREE_BYTES_COMPRESSION
 //#define MASK_ALL_BYTES_COMPRESSION
-size_t activation_size = 0; // We need to keep track of the activation size for freeing the memory *sigh*
 
 // ----------------------------------------------------------------------------
 // CUDA utils & global variables
@@ -74,8 +72,6 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 __device__ float mask_lsb_byte(float in) {
 #if defined(MASK_ALL_BYTES_COMPRESSION)
     return 0.0f;
-#elif defined(MASK_THREE_BYTES_COMPRESSION)
-    return __uint_as_float(__float_as_uint(in) & 0xFF000000);
 #elif defined(MASK_TWO_BYTES_COMPRESSION)
     return __uint_as_float(__float_as_uint(in) & 0xFFFF0000);
 #elif defined(MASK_ONE_BYTE_COMPRESSION)
@@ -83,93 +79,6 @@ __device__ float mask_lsb_byte(float in) {
 #else
     return in;
 #endif
-}
-
-cudaError_t setProp(CUmemAllocationProp *prop, bool UseCompressibleMemory)
-{
-    CUdevice currentDevice;
-    if (cuCtxGetDevice(&currentDevice) != CUDA_SUCCESS)
-        return cudaErrorMemoryAllocation;
-
-    memset(prop, 0, sizeof(CUmemAllocationProp));
-    prop->type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop->location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop->location.id = currentDevice;
-
-    if (UseCompressibleMemory)
-        prop->allocFlags.compressionType = CU_MEM_ALLOCATION_COMP_GENERIC;
-
-    return cudaSuccess;
-}
-
-cudaError_t allocateCompressible(void **adr, size_t size, bool UseCompressibleMemory)
-{
-    CUmemAllocationProp prop = {};
-    cudaError_t err = setProp(&prop, UseCompressibleMemory);
-    if (err != cudaSuccess)
-        return err;
-
-    size_t granularity = 0;
-    if (cuMemGetAllocationGranularity(&granularity, &prop,
-                                      CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS)
-        return cudaErrorMemoryAllocation;
-    size = ((size - 1) / granularity + 1) * granularity;
-
-    CUdeviceptr dptr;
-    if (cuMemAddressReserve(&dptr, size, 0, 0, 0) != CUDA_SUCCESS)
-        return cudaErrorMemoryAllocation;
-
-    CUmemGenericAllocationHandle allocationHandle;
-    if (cuMemCreate(&allocationHandle, size, &prop, 0) != CUDA_SUCCESS)
-        return cudaErrorMemoryAllocation;
-
-    // Check if cuMemCreate was able to allocate compressible memory.
-    if (UseCompressibleMemory) {
-        CUmemAllocationProp allocationProp = {};
-        cuMemGetAllocationPropertiesFromHandle(&allocationProp, allocationHandle);
-        if (allocationProp.allocFlags.compressionType != CU_MEM_ALLOCATION_COMP_GENERIC) {
-            printf("Could not allocate compressible memory... so waiving execution\n");
-            exit(EXIT_FAILURE);
-        }
-    }
-
-    if (cuMemMap(dptr, size, 0, allocationHandle, 0) != CUDA_SUCCESS)
-        return cudaErrorMemoryAllocation;
-
-    if (cuMemRelease(allocationHandle) != CUDA_SUCCESS)
-        return cudaErrorMemoryAllocation;
-
-    CUmemAccessDesc accessDescriptor;
-    accessDescriptor.location.id = prop.location.id;
-    accessDescriptor.location.type = prop.location.type;
-    accessDescriptor.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-
-    if (cuMemSetAccess(dptr, size, &accessDescriptor, 1) != CUDA_SUCCESS)
-        return cudaErrorMemoryAllocation;
-
-    *adr = (void *)dptr;
-    return cudaSuccess;
-}
-
-cudaError_t freeCompressible(void *ptr, size_t size, bool UseCompressibleMemory)
-{
-    CUmemAllocationProp prop = {};
-    cudaError_t err = setProp(&prop, UseCompressibleMemory);
-    if (err != cudaSuccess)
-        return err;
-
-    size_t granularity = 0;
-    if (cuMemGetAllocationGranularity(&granularity, &prop,
-                                      CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS)
-        return cudaErrorMemoryAllocation;
-    size = ((size - 1) / granularity + 1) * granularity;
-
-    if (ptr == NULL)
-        return cudaSuccess;
-    if (cuMemUnmap((CUdeviceptr)ptr, size) != CUDA_SUCCESS ||
-        cuMemAddressFree((CUdeviceptr)ptr, size) != CUDA_SUCCESS)
-        return cudaErrorInvalidValue;
-    return cudaSuccess;
 }
 
 // ----------------------------------------------------------------------------
@@ -810,6 +719,65 @@ void crossentropy_forward(float* losses,
 }
 
 // ----------------------------------------------------------------------------
+// CUDA memory allocation with compressible memory support
+
+CUmemAllocationProp prepareCompressible(size_t *size, bool *UseCompressibleMemory)
+{
+    int compressionAvailable;
+    cuDeviceGetAttribute(&compressionAvailable, CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED, 0);
+    *UseCompressibleMemory = *UseCompressibleMemory && compressionAvailable;
+
+    CUmemAllocationProp prop = {};
+    memset(&prop, 0, sizeof(CUmemAllocationProp));
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = 0; // force device 0 for now
+    prop.allocFlags.compressionType = *UseCompressibleMemory ? CU_MEM_ALLOCATION_COMP_GENERIC : 0;
+
+    size_t granularity = 0;
+    assert(!cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    *size = ((*size - 1) / granularity + 1) * granularity;
+
+    return prop;
+}
+
+void allocateCompressible(void **adr, size_t size, bool UseCompressibleMemory)
+{
+    cudaCheck(cudaSetDevice(0)); // required to avoid initialisation issues
+
+    CUdeviceptr dptr;
+    CUmemAllocationProp prop = prepareCompressible(&size, &UseCompressibleMemory);
+    assert(!cuMemAddressReserve(&dptr, size, 0, 0, 0));
+    CUmemGenericAllocationHandle allocationHandle;
+    assert(!cuMemCreate(&allocationHandle, size, &prop, 0));
+
+    // Check if cuMemCreate was able to allocate compressible memory.
+    if (UseCompressibleMemory) {
+        CUmemAllocationProp allocationProp = {};
+        assert(!cuMemGetAllocationPropertiesFromHandle(&allocationProp, allocationHandle));
+        assert(allocationProp.allocFlags.compressionType == CU_MEM_ALLOCATION_COMP_GENERIC);
+    }
+    assert(!cuMemMap(dptr, size, 0, allocationHandle, 0));
+    assert(!cuMemRelease(allocationHandle));
+
+    CUmemAccessDesc accessDescriptor;
+    accessDescriptor.location.id = prop.location.id;
+    accessDescriptor.location.type = prop.location.type;
+    accessDescriptor.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    assert(!cuMemSetAccess(dptr, size, &accessDescriptor, 1));
+
+    *adr = (void *)dptr;
+}
+
+void freeCompressible(void *ptr, size_t size, bool UseCompressibleMemory)
+{
+    if (ptr == NULL)
+        return;
+    CUmemAllocationProp prop = prepareCompressible(&size, &UseCompressibleMemory);
+    assert(!cuMemUnmap((CUdeviceptr)ptr, size) && !cuMemAddressFree((CUdeviceptr)ptr, size));
+}
+
+// ----------------------------------------------------------------------------
 // GPT-2 model definition
 
 // the parameters of the model
@@ -903,8 +871,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
     float* acts_memory;
 
 #if defined(ENABLE_ACTIVATION_COMPRESSION)
-    activation_size = num_activations * sizeof(float);
-    allocateCompressible((void**)&acts_memory, activation_size, true);
+    allocateCompressible((void**)&acts_memory, num_activations * sizeof(float), true);
 #else
     cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
 #endif
@@ -1240,7 +1207,11 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->targets));
 
 #if defined(ENABLE_ACTIVATION_COMPRESSION)
-    freeCompressible((void**)&model->acts_memory, activation_size, true);
+    size_t num_activations = 0;
+    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+        num_activations += model->act_sizes[i];
+    }
+    freeCompressible((void**)&model->acts_memory, num_activations * sizeof(float), true);
 #else
     cudaCheck(cudaFree(model->acts_memory));
 #endif
@@ -1372,8 +1343,6 @@ int sample_mult(float* probabilities, int n, float coin) {
 // ----------------------------------------------------------------------------
 // main training loop
 int main() {
-    cudaCheck(cudaSetDevice(0));
-
     // build the GPT-2 model from a checkpoint
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
