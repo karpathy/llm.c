@@ -141,20 +141,21 @@ make train_gpt2cu
 This will run GPT-2 (124M) in one file of pure CUDA (see [train_gpt2.cu](train_gpt2.cu)), using batch size 4 and sequence length 1024. This will print a bunch of hyperparameters and then the "training":
 
 ```
-val loss 4.517294
-step 0: train loss 4.367857 (took 112.135004 ms)
-step 1: train loss 4.406483 (took 112.555327 ms)
-step 2: train loss 4.484838 (took 111.380248 ms)
+val loss 4.517441
+step 0: train loss 4.368073 (took 59.232557 ms)
+step 1: train loss 4.406571 (took 59.237347 ms)
+step 2: train loss 4.485021 (took 59.227433 ms)
+step 3: train loss 4.345403 (took 59.682419 ms)
 ...
 ```
 
-The loss is changing because we are still loading real data batches from our dataset, but there is no training so they won't go down over time. In any case, on my A100 40GB PCIe GPU we are seeing about 111ms/iteration. We can compare this to PyTorch fp32 training by calling our python script like this:
+The loss is changing because we are still loading real data batches from our dataset, but there is no training so they won't go down over time. In any case, on my A100 40GB PCIe GPU we are seeing about 59ms/iteration. We can compare this to PyTorch fp32 training by calling our python script like this:
 
 ```bash
 python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4
 ```
 
-Which shows time per iteration with the same hyperparameters (batch 4, time 1024) at 180ms/iteration. We can then enable `torch.compile` by adding the `--compile 1` flag:
+Which shows time per iteration with the same hyperparameters (batch 4, time 1024) at 104ms/iteration. We can then enable `torch.compile` by adding the `--compile 1` flag:
 
 ```bash
 python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4 --compile 1
@@ -166,7 +167,7 @@ And see that the first iteration now takes 20 seconds (compilation time), but al
 python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4 --compile 1 --tensorcores 1
 ```
 
-The time drops down to 26ms/iteration. So we have a gap to close :)! At the current 111ms we are about 4.2X slower.
+The time drops down to 26ms/iteration. So we have a gap to close :)! At the current 59ms we are about 2.3X slower.
 
 ## discussions
 
