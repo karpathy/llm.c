@@ -276,7 +276,7 @@ void matmul_forward(int kernel_num,
 // random utils
 
 float* make_random_float(int N) {
-    float* arr = (float*)malloc(N * sizeof(float));
+    float* arr = malloc(N * sizeof(float));
     for (int i = 0; i < N; i++) {
         arr[i] = ((float)rand() / RAND_MAX) * 2.0 - 1.0;
     }
@@ -313,7 +313,7 @@ int main(int argc, char **argv) {
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     // create host memory of random numbers
-    float* out = (float*)malloc(B * T * OC * sizeof(float));
+    float* out = malloc(B * T * OC * sizeof(float));
     float* inp = make_random_float(B * T * C);
     float* weight = make_random_float(OC * C);
     float* bias = make_random_float(OC);
@@ -342,7 +342,7 @@ int main(int argc, char **argv) {
     matmul_forward_cpu(out, inp, weight, bias, B, T, C, OC);
     matmul_forward(kernel_num, d_out, d_inp, d_weight, d_bias, B, T, C, OC, 32);
 
-    float* out_gpu = (float*)malloc(B * T * OC * sizeof(float));
+    float* out_gpu = malloc(B * T * OC * sizeof(float));
     cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * OC * sizeof(float), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B * T * OC; i++) {
         // print the first few comparisons

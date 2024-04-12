@@ -141,7 +141,7 @@ void encoder_forward(int kernel_num,
 // random utils
 
 float* make_random_float(int N) {
-    float* arr = (float*)malloc(N * sizeof(float));
+    float* arr = malloc(N * sizeof(float));
     for (int i = 0; i < N; i++) {
         arr[i] = ((float)rand() / RAND_MAX) * 2.0 - 1.0;
     }
@@ -149,7 +149,7 @@ float* make_random_float(int N) {
 }
 
 int* make_random_int(int N, int V) {
-    int* arr = (int*)malloc(N * sizeof(int));
+    int* arr = malloc(N * sizeof(int));
     for (int i = 0; i < N; i++) {
         arr[i] = rand() % V;
     }
@@ -170,7 +170,7 @@ int main(int argc, char **argv) {
     cudaCheck(cudaSetDevice(deviceIdx));
 
     // create host memory of random numbers
-    float* out = (float*)malloc(B * T * C * sizeof(float));
+    float* out = malloc(B * T * C * sizeof(float));
     int* inp = make_random_int(B * T, V);
     float* wte = make_random_float(V * C);
     float* wpe = make_random_float(T * C);
@@ -198,7 +198,7 @@ int main(int argc, char **argv) {
     // first check the correctness of the kernel
     encoder_forward_cpu(out, inp, wte, wpe, B, T, C);
     encoder_forward(kernel_num, d_out, d_inp, d_wte, d_wpe, B, T, C, 256);
-    float* out_gpu = (float*)malloc(B * T * C * sizeof(float));
+    float* out_gpu = malloc(B * T * C * sizeof(float));
     cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * C * sizeof(float), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B * T * C; i++) {
         // print the first few comparisons

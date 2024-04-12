@@ -1,23 +1,67 @@
-# llm.c
+CC ?= clang
+CFLAGS = -O3 -Ofast -Wno-unused-result
+LDFLAGS =
+LDLIBS = -lm
+INCLUDES =
 
-LLM training in simple, pure C/CUDA. There is no need for 245MB of PyTorch or 107MB of cPython. For example, training GPT-2 (CPU, fp32) is ~1,000 lines of clean code in a single file. It compiles and runs instantly, and exactly matches the PyTorch reference implementation. I chose GPT-2 as the first working example because it is the grand-daddy of LLMs, the first time the modern stack was put together.
+# Check if OpenMP is available
+# This is done by attempting to compile an empty file with OpenMP flags
+# OpenMP makes the code a lot faster so I advise installing it
+# e.g. on MacOS: brew install libomp
+# e.g. on Ubuntu: sudo apt-get install libomp-dev
+# later, run the program by prepending the number of threads, e.g.: OMP_NUM_THREADS=8 ./gpt2
+ifeq ($(shell uname), Darwin)
+  # Check if the libomp directory exists
+  ifeq ($(shell [ -d /opt/homebrew/opt/libomp/lib ] && echo "exists"), exists)
+    # macOS with Homebrew and directory exists
+    CFLAGS += -Xclang -fopenmp -DOMP
+    LDFLAGS += -L/opt/homebrew/opt/libomp/lib
+    LDLIBS += -lomp
+    INCLUDES += -I/opt/homebrew/opt/libomp/include
+    $(info NICE Compiling with OpenMP support)
+  else ifeq ($(shell [ -d /usr/local/opt/libomp/lib ] && echo "exists"), exists)
+    CFLAGS += -Xclang -fopenmp -DOMP
+    LDFLAGS += -L/usr/local/opt/libomp/lib
+    LDLIBS += -lomp
+    INCLUDES += -I/usr/local/opt/libomp/include
+    $(info NICE Compiling with OpenMP support)
+  else
+    $(warning OOPS Compiling without OpenMP support)
+  endif
+else
+  ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
+    # Ubuntu or other Linux distributions
+    CFLAGS += -fopenmp -DOMP
+    LDLIBS += -lgomp
+    $(info NICE Compiling with OpenMP support)
+  else
+    $(warning OOPS Compiling without OpenMP support)
+  endif
+endif
 
-Currently, I am working on:
+# PHONY means these targets will always be executed
+.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu
 
-- direct CUDA implementation, which will be significantly faster and probably come close to PyTorch.
-- speed up the CPU version with SIMD instructions, AVX2 on x86 / NEON on ARM (e.g. Apple Silicon).
-- more modern architectures, e.g. Llama2, Gemma, etc.
+# default target is all
+all: train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu
 
-For the repo, I'd like to maintain both clean, simple reference implementations alongside a also lot more optimized versions that can come close to PyTorch, but in a tiny fraction of the code and dependencies.
+train_gpt2: train_gpt2.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
 
-## quick start
+test_gpt2: test_gpt2.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
 
-Download and tokenize a dataset. The [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset is the fastest to download and tokenize:
+# possibly may want to disable warnings? e.g. append -Xcompiler -Wno-unused-result
+train_gpt2cu: train_gpt2.cu
+	nvcc -O3 --use_fast_math $< -lcublas -o $@
 
-```bash
-python prepro_tinyshakespeare.py
-```
+test_gpt2cu: test_gpt2.cu
+	nvcc -O3 --use_fast_math $< -lcublas -o $@
 
+<<<<<<< HEAD
+clean:
+	rm -f train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu
+=======
 This prints:
 
 ```
@@ -180,3 +224,4 @@ Ways of organizing development:
 ## license
 
 MIT
+>>>>>>> upstream/master

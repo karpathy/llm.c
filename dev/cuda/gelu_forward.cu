@@ -90,7 +90,7 @@ void gelu_forward(int kernel_num,
 // random utils
 
 float* make_random_float(int N) {
-    float* arr = (float*)malloc(N * sizeof(float));
+    float* arr = malloc(N * sizeof(float));
     for (int i = 0; i < N; i++) {
         arr[i] = ((float)rand() / RAND_MAX) * 2.0 - 1.0;
     }
@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
     cudaCheck(cudaSetDevice(deviceIdx));
 
     // create host memory of random numbers
-    float* out = (float*)malloc(B * T * C * sizeof(float));
+    float* out = malloc(B * T * C * sizeof(float));
     float* inp = make_random_float(B * T * C);
 
     // move to GPU
@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
     // first check the correctness of the kernel
     gelu_forward_cpu(out, inp, B * T * C);
     gelu_forward(kernel_num, d_out, d_inp, B, T, C, 128);
-    float* out_gpu = (float*)malloc(B * T * C * sizeof(float));
+    float* out_gpu = malloc(B * T * C * sizeof(float));
     cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * C * sizeof(float), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B * T * C; i++) {
         // print the first few comparisons

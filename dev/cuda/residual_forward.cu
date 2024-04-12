@@ -77,7 +77,7 @@ void residual_forward(int kernel_num,
 // random utils
 
 float* make_random_float(int N) {
-    float* arr = (float*)malloc(N * sizeof(float));
+    float* arr = malloc(N * sizeof(float));
     for (int i = 0; i < N; i++) {
         arr[i] = ((float)rand() / RAND_MAX) * 2.0 - 1.0;
     }
@@ -97,7 +97,7 @@ int main(int argc, char **argv) {
     cudaCheck(cudaSetDevice(deviceIdx));
 
     // create host memory of random numbers
-    float* out = (float*)malloc(B * T * C * sizeof(float));
+    float* out = malloc(B * T * C * sizeof(float));
     float* inp1 = make_random_float(B * T * C);
     float* inp2 = make_random_float(B * T * C);
 
@@ -121,7 +121,7 @@ int main(int argc, char **argv) {
     // first check the correctness of the kernel
     residual_forward_cpu(out, inp1, inp2, B * T * C);
     residual_forward(kernel_num, d_out, d_inp1, d_inp2, B * T * C, 256);
-    float* out_gpu = (float*)malloc(B * T * C * sizeof(float));
+    float* out_gpu = malloc(B * T * C * sizeof(float));
     cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * C * sizeof(float), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B * T * C; i++) {
         // print the first few comparisons
