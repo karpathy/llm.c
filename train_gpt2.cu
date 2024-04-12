@@ -11,13 +11,17 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 #include <assert.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
 // ----------------------------------------------------------------------------
 // CUDA utils
 
-// error checking
+// convenience macro for calculating grid/block dimensions for kernels
+#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+
+// CUDA error checking
 void cudaCheck(cudaError_t error, const char *file, int line) {
   if (error != cudaSuccess) {
     printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
@@ -26,7 +30,23 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
   }
 };
 #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+
+// cuBLAS error checking
+void cublasCheck(cublasStatus_t status, const char *file, int line)
+{
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        printf("[cuBLAS ERROR]: %d %s %d\n", status, file, line);
+        exit(EXIT_FAILURE);
+    }
+}
+#define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
+
+// cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
+static size_t cublaslt_workspace_size = 32 * 1024 * 1024;
+static void* cublaslt_workspace = NULL;
+
+// whether to use TF32 precision for matmuls (less accurate, much much faster)
+static int enable_tf32 = 0;
 
 // ----------------------------------------------------------------------------
 // all the kernels
@@ -334,8 +354,8 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
-// kernel 1 is the most naive matmul kernel
-void matmul_forward(float* out,
+// uses cuBLAS
+void matmul_forward_cublas(float* out,
                     float* inp, float* weight, float* bias,
                     int B, int T, int C, int OC) {
     const int sqrt_block_size = 32;
@@ -344,11 +364,8 @@ void matmul_forward(float* out,
     cublasStatus_t stat = cublasCreate(&handle); // initialize CUBLAS context
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    stat = cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC);
-    if (stat != CUBLAS_STATUS_SUCCESS) {
-        printf("cublasSgemm failed\n");
-        exit(1);
-    }
+    cublasCheck(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC));
+
     // and now we still have to add the bias... (ew)
     if (bias != NULL) {
         int block_size = sqrt_block_size * sqrt_block_size;
@@ -357,6 +374,94 @@ void matmul_forward(float* out,
         cudaCheck(cudaGetLastError());
     }
     cublasDestroy(handle);
+}
+
+// uses cuBLASLt to fuse the bias and gelu. does not work with OC = 50257 (last layer)
+// https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
+// https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtSgemm/sample_cublasLt_LtSgemm.cu
+void matmul_forward_cublaslt(float* out,
+                     float* inp, float* weight, float* bias,
+                     int B, int T, int C, int OC) {
+    int has_bias = (bias != NULL);
+
+    // check bias alignment
+    if(((uintptr_t)bias % 16) != 0) {
+        printf("Bias pointer is not aligned (cuBLASLt requirement)!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // setup cuBLAS and cuBLASLt handles
+    cublasHandle_t cublas_handle;
+    cublasLtHandle_t cublaslt_handle;
+    cublasCheck(cublasCreate(&cublas_handle));
+    cublasCheck(cublasLtCreate(&cublaslt_handle));
+
+    // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
+    cublasComputeType_t cublas_compute_type;
+    cublasMath_t cublas_math_mode;
+    if (enable_tf32) {
+        cublas_compute_type = CUBLAS_COMPUTE_32F_FAST_TF32;
+        cublas_math_mode = CUBLAS_TF32_TENSOR_OP_MATH;
+    } else {
+        cublas_compute_type = CUBLAS_COMPUTE_32F;
+        cublas_math_mode = CUBLAS_DEFAULT_MATH;
+    }
+    cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
+
+    int returnedResults = 0;
+    cublasLtMatmulDesc_t operationDesc;
+    cublasLtMatmulPreference_t preference;
+    cublasLtMatrixLayout_t weightLayout;
+    cublasLtMatrixLayout_t inputLayout;
+    cublasLtMatrixLayout_t outputLayout;
+    cublasLtMatrixLayout_t biasLayout;
+    cublasLtMatmulHeuristicResult_t heuristic;
+
+    // create the operation descriptor
+    cublasOperation_t opNoTranspose = CUBLAS_OP_N;
+    cublasOperation_t opTranspose = CUBLAS_OP_T;
+    cublasLtEpilogue_t epilogueBias = CUBLASLT_EPILOGUE_BIAS;
+    cublasCheck(cublasLtMatmulDescCreate(&operationDesc, cublas_compute_type, CUDA_R_32F));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opNoTranspose, sizeof(opNoTranspose)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias, sizeof(epilogueBias)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+
+    // define matrix layouts
+    cublasCheck(cublasLtMatrixLayoutCreate(&weightLayout, CUDA_R_32F, C, OC, C));
+    cublasCheck(cublasLtMatrixLayoutCreate(&inputLayout, CUDA_R_32F, C, B*T, C));
+    cublasCheck(cublasLtMatrixLayoutCreate(&outputLayout, CUDA_R_32F, OC, B*T, OC));
+    cublasCheck(cublasLtMatrixLayoutCreate(&biasLayout, CUDA_R_32F, OC, 1, OC));
+
+    // create a preference handle with specified max workspace
+    cublasCheck(cublasLtMatmulPreferenceCreate(&preference));
+    cublasCheck(cublasLtMatmulPreferenceSetAttribute(preference,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &cublaslt_workspace_size, sizeof(cublaslt_workspace_size)));
+
+    // find a suitable algorithm
+    cublasCheck(cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc,
+        weightLayout, inputLayout, outputLayout, outputLayout,
+        preference, 1, &heuristic, &returnedResults));
+    if (returnedResults == 0) {
+        printf("No cuBLASLt algorithm: B: %d, T: %d, C: %d, OC: %d, bias: %d, gelu: %d\n", B, T, C, OC, has_bias);
+        exit(EXIT_FAILURE);
+    }
+
+    // call the matmul
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
+        &alpha, weight, weightLayout, inp, inputLayout, &beta,
+        out, outputLayout, out, outputLayout, &heuristic.algo,
+        cublaslt_workspace, cublaslt_workspace_size, 0));
+
+    // cleanups
+    cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
+    cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
+    cublasCheck(cublasLtMatrixLayoutDestroy(weightLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(inputLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(outputLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
 }
 
 void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
@@ -798,20 +903,20 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward(l_atty, l_v_accum, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH);
-        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
+    matmul_forward_cublas(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
     softmax_forward(acts.probs, acts.logits, B*T, V);
 
     // also forward the cross-entropy loss function if we have the targets
@@ -953,6 +1058,15 @@ int sample_mult(float* probabilities, int n, float coin) {
 // ----------------------------------------------------------------------------
 // main training loop
 int main() {
+
+    // set up the device
+    int deviceIdx = 0;
+    cudaCheck(cudaSetDevice(deviceIdx));
+
+    // setup (global) cuBLASLt workspace
+    cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
+    printf("[Run]\n");
+    printf("enable_tf32: %d\n", enable_tf32);
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;

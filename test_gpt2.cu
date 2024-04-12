@@ -26,6 +26,15 @@ int check_tensor(float *a, float *b, int n, char* label) {
 
 int main(int argc, char *argv[]) {
 
+    // set up the device
+    int deviceIdx = 0;
+    cudaCheck(cudaSetDevice(deviceIdx));
+
+    // setup (global) cuBLASLt workspace
+    cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
+    printf("[System]\n");
+    printf("enable_tf32: %d\n", enable_tf32);
+
     // build the GPT-2 model from a checkpoint
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
