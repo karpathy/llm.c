@@ -9,15 +9,40 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 #include <string.h>
 #include <unistd.h>
 #include <assert.h>
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
 // ----------------------------------------------------------------------------
-// CUDA utils
+// CUDA utils & global variables
+// TODO A lot of global variables sadly required, could refactor into struct?
 
-// error checking
+// TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
+#define ENABLE_TF32
+#ifdef ENABLE_TF32
+static const cublasComputeType_t cublas_compute_type = CUBLAS_COMPUTE_32F_FAST_TF32;
+static const cublasMath_t cublas_math_mode = CUBLAS_TF32_TENSOR_OP_MATH;
+#else
+static const cublasComputeType_t cublas_compute_type = CUBLAS_COMPUTE_32F;
+static const cublasMath_t cublas_math_mode = CUBLAS_DEFAULT_MATH;
+#endif
+
+// CUDA stream & graph (stream is global as it needs to be used for all kernels)
+static cudaStream_t stream = 0; // graph generation cannot use default stream sadly
+static cudaGraph_t graph;
+static cudaGraphExec_t instance;
+static bool graph_created = false;
+static int graph_created_B = 0, graph_created_T = 0;
+
+// cuBLAS & cuBLASLt handles + workspace
+static cublasLtHandle_t cublaslt_handle = NULL;
+static cublasHandle_t cublas_handle = NULL;
+static size_t cublaslt_workspace_size = 64 * 1024 * 1024; // TODO what's a good size?
+static void* cublaslt_workspace = NULL;
+
+// CUDA & cuBLAS error checking
 void cudaCheck(cudaError_t error, const char *file, int line) {
   if (error != cudaSuccess) {
     printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
@@ -25,7 +50,17 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
     exit(EXIT_FAILURE);
   }
 };
+void cublasCheck(cublasStatus_t status, const char *file, int line)
+{
+    if (status != CUBLAS_STATUS_SUCCESS)
+    {
+        printf("[cuBLAS ERROR]: %d %s %d\n", status, file, line);
+        exit(EXIT_FAILURE);
+    }
+}
 #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
+#define cudaCheckErrors() (cudaCheck(cudaPeekAtLastError())) // peek = graph friendly
+#define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
 // ----------------------------------------------------------------------------
@@ -33,6 +68,7 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
 
 // warp-level reduction for finding the maximum value
 __device__ float warpReduceMax(float val) {
+    #pragma unroll // unrolled for higher performance
     for (int offset = 16; offset > 0; offset /= 2) {
         val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
     }
@@ -41,6 +77,7 @@ __device__ float warpReduceMax(float val) {
 
 // warp-level reduction for summing values
 __device__ float warpReduceSum(float val) {
+    #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         val += __shfl_down_sync(0xFFFFFFFF, val, offset);
     }
@@ -117,15 +154,6 @@ __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __rest
     }
 }
 
-__global__ void add_bias(float* out, float* bias, int B, int T, int OC) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-    for (int i = idx; i < B*T*OC; i += stride) {
-        int col = i % OC;
-        out[i] += bias[col];
-    }
-}
-
 
 __global__ void permute_kernel(float* q, float* k, float* v,
                                const float* inp,
@@ -175,16 +203,20 @@ __global__ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, i
     }
 }
 
+__device__ bool scale_is_autoregressive(int idx, int NH, int T) {
+    int rest = idx % (NH * T * T);
+    rest = rest % (T * T);
+    int t2 = rest / T;
+    int t = rest % T;
+    return t > t2;
+}
+
 __global__ void scale_kernel(float* inp, float scale, int B, int NH, int T) {
     // scales the pre-softmax attention scores by scale
     // and sets the autoregressive locations to -INFINITY
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < B * NH * T * T) {
-        int rest = idx % (NH * T * T);
-        rest = rest % (T * T);
-        int t2 = rest / T;
-        int t = rest % T;
-        if (t > t2) {
+        if (scale_is_autoregressive(idx, NH, T)) {
             inp[idx] = -INFINITY;
         } else {
             inp[idx] *= scale;
@@ -192,14 +224,11 @@ __global__ void scale_kernel(float* inp, float scale, int B, int NH, int T) {
     }
 }
 
-__global__ void softmax_forward_kernel4(float* out, float* inp, int N, int C) {
+__global__ void softmax_forward_kernel5_scale(float* out, float* inp, float scale, int B, int NH, int C) {
     // out is (N, C) just like inp. Each row of inp will get softmaxed.
-    // same as kernel3, but can handle any block size (multiple of 32)
-    // each row of C elements is handled by block_size threads
-    // furthermore, each block_size threads get executed in warps of 32 threads
+    // same as kernel4, but assumes blocks of 512 threads (correct but slower with other sizes)
+    // supports fused scaling & autoregressive masking with no additional writes to global memory
 
-    // special reduction operations warpReduceMax/warpReduceSum are used for intra-warp reductions
-    // shared memory is used for inter-warp reduction
     extern __shared__ float shared[];
     int idx = blockIdx.x;
     int tid = threadIdx.x;
@@ -207,20 +236,50 @@ __global__ void softmax_forward_kernel4(float* out, float* inp, int N, int C) {
     int laneId = threadIdx.x % 32; // thread index within a warp
 
     // the number of warps per block. recall that blockDim.x is block_size
-    int warpsPerBlock = blockDim.x / 32;
+    // this is now hardcoded to 16 (=512 threads) so some loops below can be fully unrolled
+    int warpsPerBlock = 16; // blockDim.x / 32;
 
     // shared[] must be allocated to have 2 * warpsPerBlock elements
     // first half for max values, the second half for sum values
     float* maxvals = shared;
     float* sumvals = &shared[warpsPerBlock];
 
+    // sanity checks to keep this function fully generic when called with an incorrect block size
+    // do we actually need this - probably overkill?
+    if (warpId > warpsPerBlock) {
+        return;
+    }
+    if ((blockDim.x/32) < warpsPerBlock) {
+        for (int i = warpId; i < warpsPerBlock; i += blockDim.x/32) {
+            maxvals[i] = -INFINITY;
+            sumvals[i] = 0.0f;
+        }
+    }
+    if (tid >= C) {
+        maxvals[warpId] = -INFINITY;
+        sumvals[warpId] = 0.0f;
+        return;
+    }
+
     // one row of inp, i.e. inp[idx, :] of shape (C,)
     float* x = inp + idx * C;
 
     // first, thread coarsening by directly accessing global memory in series
     float maxval = -INFINITY;
-    for (int i = tid; i < C; i += blockDim.x) {
-        maxval = fmaxf(maxval, x[i]);
+    if (scale != 1.0f) {
+        for (int i = tid; i < C; i += blockDim.x) {
+            float value;
+            if (scale_is_autoregressive(idx * C + i, NH, C)) {
+                value = -INFINITY;
+            } else {
+                value = x[i] * scale;
+            }
+            maxval = fmaxf(maxval, value);
+        }
+    } else {
+        for (int i = tid; i < C; i += blockDim.x) {
+            maxval = fmaxf(maxval, x[i]);
+        }
     }
     // now within-warp reductions for maxval
     maxval = warpReduceMax(maxval);
@@ -232,6 +291,120 @@ __global__ void softmax_forward_kernel4(float* out, float* inp, int N, int C) {
     // now the 0th thread reduces the maxvals in shared memory, i.e. across warps
     if (tid == 0) {
         float val = maxvals[tid];
+        #pragma unroll
+        for (int i = 1; i < 16; i++) {
+            val = fmaxf(val, maxvals[i]);
+        }
+        // store the final max in the first position
+        maxvals[0] = val;
+    }
+    __syncthreads();
+    // broadcast the max to all threads
+    float offset = maxvals[0];
+
+    // compute expf and write the result to global memory
+    // + thread coarsening for sum (to avoid rereading x[i] again)
+    float sumval = 0.0f;
+    if (scale != 1.0f) {
+        for (int i = tid; i < C; i += blockDim.x) {
+            float value;
+            if (scale_is_autoregressive(idx * C + i, NH, C)) {
+                value = -INFINITY;
+            } else {
+                // __ldcs to reduce cache persistence (not read again)
+                value = __ldcs(&x[i]) * scale;
+            }
+            float output = expf(value - offset);
+            out[idx * C + i] = output;
+            sumval += output; // combined into the same loop unlike kernel3
+        }
+    } else {
+        for (int i = tid; i < C; i += blockDim.x) {
+            float output = expf(__ldcs(&x[i]) - offset);
+            out[idx * C + i] = output;
+            sumval += output;
+        }
+    }
+
+    // okay now we calculated exp(x - max(x))
+    // step 2: sum all the values and divide by the sum
+
+    // within-warp reduction for sumval
+    sumval = warpReduceSum(sumval);
+    // write sumval to shared memory
+    if (laneId == 0) sumvals[warpId] = sumval;
+    __syncthreads();
+
+    // inter-thread reduction of sum
+    if (tid == 0) {
+        float val = sumvals[tid];
+        #pragma unroll
+        for (int i = 1; i < 16; ++i) {
+            val += sumvals[i];
+        }
+        sumvals[0] = val;
+    }
+    __syncthreads();
+    // broadcast the sum to all threads
+    float sum = sumvals[0];
+
+    // divide the whole row by the sum
+    for (int i = tid; i < C; i += blockDim.x) {
+        out[idx * C + i] = out[idx * C + i] / sum;
+    }
+}
+
+__global__ void softmax_forward_kernel6_largeC(float* out, float* inp, int N, int C) {
+    // out is (N, C) just like inp. Each row of inp will get softmaxed.
+    // same as kernel4, but optimised for very large Cs with advanced unrolling
+
+    // The trick is to read into a register array (all indices known at compile time)
+    // and always read UNROLL_FACTOR values to maximise memory level parallelism
+    // even if we would be out of bounds, we set the index to min(C-1, idx)
+    // so we just do some unnecessary reads (obviously bad for small C)
+    // the writes are in a separate loop with a conditional check for out of bounds
+    // making it separate is necessary to convince the compiler to do the right thing
+    const int UNROLL_FACTOR = 8;
+    const int warpsPerBlock = blockDim.x / 32;
+
+    extern __shared__ float shared[];
+    int idx = blockIdx.x;
+    int tid = threadIdx.x;
+    int warpId = threadIdx.x / 32; // warp index within a block
+    int laneId = threadIdx.x % 32; // thread index within a warp
+
+    // shared[] must be allocated to have 2 * warpsPerBlock elements
+    // first half for max values, the second half for sum values
+    float* maxvals = shared;
+    float* sumvals = &shared[warpsPerBlock];
+    
+    if (tid >= C) {
+        maxvals[warpId] = -INFINITY;
+        sumvals[warpId] = 0.0f;
+        return;
+    }
+
+    float* x = inp + idx * C; // input
+    float* y = out + idx * C; // output
+
+    // first, thread coarsening by directly accessing global memory in series
+    float maxval = -INFINITY;
+    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
+        #pragma unroll
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            maxval = fmaxf(maxval, x[min(C - 1, i + u*blockDim.x)]);
+        }
+    }
+
+    // now within-warp reductions for maxval
+    maxval = warpReduceMax(maxval);
+    // the 0th thread of each warp writes the maxval of that warp to shared memory
+    if (laneId == 0) maxvals[warpId] = maxval;
+    __syncthreads();
+    // now the 0th thread reduces the maxvals in shared memory, i.e. across warps
+    if (tid == 0) {
+        float val = maxvals[tid];
+        #pragma unroll
         for (int i = 1; i < warpsPerBlock; i++) {
             val = fmaxf(val, maxvals[i]);
         }
@@ -243,29 +416,36 @@ __global__ void softmax_forward_kernel4(float* out, float* inp, int N, int C) {
     float offset = maxvals[0];
 
     // compute expf and write the result to global memory
-    for (int i = tid; i < C; i += blockDim.x) {
-        out[idx * C + i] = expf(x[i] - offset);
+    // + thread coarsening for sum
+    float sumval = 0.0f;
+    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
+        float reg_array[UNROLL_FACTOR];
+        #pragma unroll
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            reg_array[u] = __ldcs(&x[min(C - 1, i + u*blockDim.x)]);
+        }
+        #pragma unroll
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            if (i + u*blockDim.x < C) {
+                float output = expf(reg_array[u] - offset);
+                y[min(C - 1, i + u*blockDim.x)] = output; // compiler likes redundant min()?!
+                sumval += output; // combined into the same loop unlike kernel3
+            }
+        }
     }
 
     // okay now we calculated exp(x - max(x))
     // step 2: sum all the values and divide by the sum
 
-    // thread coarsening for sum
-    x = out + idx * C;
-    float sumval = 0.0f;
-    for (int i = tid; i < C; i += blockDim.x) {
-        sumval += x[i];
-    }
     // within-warp reduction for sumval
     sumval = warpReduceSum(sumval);
-
     // write sumval to shared memory
     if (laneId == 0) sumvals[warpId] = sumval;
     __syncthreads();
-
     // inter-thread reduction of sum
     if (tid == 0) {
         float val = sumvals[tid];
+        #pragma unroll
         for (int i = 1; i < warpsPerBlock; ++i) {
             val += sumvals[i];
         }
@@ -276,15 +456,27 @@ __global__ void softmax_forward_kernel4(float* out, float* inp, int N, int C) {
     float sum = sumvals[0];
 
     // divide the whole row by the sum
-    for (int i = tid; i < C; i += blockDim.x) {
-        out[idx * C + i] = x[i] / sum;
+    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
+        float reg_array[UNROLL_FACTOR];
+        #pragma unroll
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            reg_array[u] = y[min(C - 1, i + u*blockDim.x)];
+        }
+        #pragma unroll
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            if (i + u*blockDim.x < C) {
+                y[i + u*blockDim.x] = reg_array[u] / sum;
+            }
+        }
     }
 }
+
 
 __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
-        out[idx] = inp1[idx] + inp2[idx];
+        // __ldcs to reduce cache persistence (not read again after this)
+        out[idx] = __ldcs(&inp1[idx]) + __ldcs(&inp2[idx]);
     }
 }
 
@@ -320,8 +512,8 @@ void encoder_forward(float* out,
     const int N = B * T * C;
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
-    encoder_forward_kernel2<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
-    cudaCheck(cudaGetLastError());
+    encoder_forward_kernel2<<<grid_size, block_size, 0, stream>>>(out, inp, wte, wpe, B, T, C);
+    cudaCheckErrors();
 }
 
 void layernorm_forward(float* out, float* mean, float* rstd,
@@ -330,33 +522,83 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = CEIL_DIV(N * 32, block_size);
-    layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
-    cudaCheck(cudaGetLastError());
+    layernorm_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
+    cudaCheckErrors();
 }
 
-// kernel 1 is the most naive matmul kernel
-void matmul_forward(float* out,
-                    float* inp, float* weight, float* bias,
-                    int B, int T, int C, int OC) {
-    const int sqrt_block_size = 32;
+void matmul_forward(float* out, float* inp, float* weight, float* bias,
+                    int B, int T, int C, int OC, int has_bias, int has_gelu) {
+    int returnedResults = 0;
+    cublasLtMatmulDesc_t operationDesc;
+    cublasLtMatmulPreference_t preference;
+    cublasLtMatrixLayout_t weightLayout;
+    cublasLtMatrixLayout_t inputLayout;
+    cublasLtMatrixLayout_t outputLayout;
+    cublasLtMatrixLayout_t biasLayout;
+    cublasLtMatmulHeuristicResult_t heuristic;
 
-    cublasHandle_t handle; // cuBLAS context
-    cublasStatus_t stat = cublasCreate(&handle); // initialize CUBLAS context
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    stat = cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC);
-    if (stat != CUBLAS_STATUS_SUCCESS) {
-        printf("cublasSgemm failed\n");
-        exit(1);
+    if(((uintptr_t)bias % 16) != 0) {
+        printf("Bias pointer is not aligned (cuBLASLt requirement)!\n");
+        exit(EXIT_FAILURE);
     }
-    // and now we still have to add the bias... (ew)
-    if (bias != NULL) {
-        int block_size = sqrt_block_size * sqrt_block_size;
-        int grid_size = CEIL_DIV(OC * B * T, block_size);
-        add_bias<<<grid_size, block_size>>>(out, bias, B, T, OC);
-        cudaCheck(cudaGetLastError());
+
+    cublasOperation_t opNoTranspose = CUBLAS_OP_N;
+    cublasOperation_t opTranspose = CUBLAS_OP_T;
+    cublasLtEpilogue_t epilogueBias = CUBLASLT_EPILOGUE_DEFAULT;
+    if (has_bias && has_gelu) {
+        epilogueBias = CUBLASLT_EPILOGUE_GELU_BIAS;
+    } else if (has_bias) {
+        epilogueBias = CUBLASLT_EPILOGUE_BIAS;
+    } else if (has_gelu) {
+        epilogueBias = CUBLASLT_EPILOGUE_GELU;
     }
-    cublasDestroy(handle);
+
+    cublasCheck(cublasLtMatmulDescCreate(&operationDesc, cublas_compute_type, CUDA_R_32F));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc,
+        CUBLASLT_MATMUL_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc,
+        CUBLASLT_MATMUL_DESC_TRANSB, &opNoTranspose, sizeof(opNoTranspose)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc,
+        CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias, sizeof(epilogueBias)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, 
+        CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+
+    // Define matrix layouts
+    cublasCheck(cublasLtMatrixLayoutCreate(&weightLayout, CUDA_R_32F, C, OC, C));
+    cublasCheck(cublasLtMatrixLayoutCreate(&inputLayout, CUDA_R_32F, C, B*T, C));
+    cublasCheck(cublasLtMatrixLayoutCreate(&outputLayout, CUDA_R_32F, OC, B*T, OC));
+    cublasCheck(cublasLtMatrixLayoutCreate(&biasLayout, CUDA_R_32F, OC, 1, OC));
+
+    // Create a preference handle with specified max workspace
+    cublasCheck(cublasLtMatmulPreferenceCreate(&preference));
+    cublasCheck(cublasLtMatmulPreferenceSetAttribute(preference,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &cublaslt_workspace_size, sizeof(cublaslt_workspace_size)));
+
+    // Find a suitable algorithm
+    cublasCheck(cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc,
+        weightLayout, inputLayout, outputLayout, outputLayout,
+        preference, 1, &heuristic, &returnedResults));
+
+    if (returnedResults == 0) {
+        printf("No cuBLASLt algorithm: B: %d, T: %d, C: %d, OC: %d, bias: %d, gelu: %d\n",
+            B, T, C, OC, has_bias, has_gelu);
+        exit(EXIT_FAILURE);
+    }
+
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
+        &alpha, weight, weightLayout, inp, inputLayout, &beta,
+        out, outputLayout, out, outputLayout, &heuristic.algo,
+        cublaslt_workspace, cublaslt_workspace_size, stream));
+
+    // Cleanup
+    cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
+    cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
+    cublasCheck(cublasLtMatrixLayoutDestroy(weightLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(inputLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(outputLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
 }
 
 void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
@@ -372,14 +614,14 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
     v = qkvr + 2 * B * T * C;
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
-    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+    permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, B, T, NH, HS);
 
     // batched matrix multiply with cuBLAS
-    cublasHandle_t handle;
-    cublasStatus_t stat = cublasCreate(&handle);
+    // TODO investigate cuBLASLt options for this
+    cublasStatus_t stat;
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    stat = cublasSgemmStridedBatched(handle,
+    stat = cublasSgemmStridedBatched(cublas_handle,
                             CUBLAS_OP_T, CUBLAS_OP_N,
                             T, T, HS,
                             &alpha,
@@ -392,22 +634,17 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
         printf("cublasSgemm failed\n");
         exit(1);
     }
-
-    // multiply all elements of preatt elementwise by scale
-    float scale = 1.0 / sqrtf(HS);
-    total_threads = B * NH * T * T;
-    num_blocks = CEIL_DIV(total_threads, block_size);
-    scale_kernel<<<num_blocks, block_size>>>(preatt, scale, B, NH, T);
-
     // softmax. preatt is (B, NH, T, T) but we view it as (B * NH * T, T) and use the softmax kernel
-    int softmax_block_size = 256;
+    // + fused elementwise scale and autoregressive masking
+    float scale = 1.0 / sqrtf(HS);
+    int softmax_block_size = 512;
     int grid_size = B * NH * T;
     size_t shared_mem_size = 2 * softmax_block_size / 32 * sizeof(float);
-    softmax_forward_kernel4<<<grid_size, softmax_block_size, shared_mem_size>>>(att, preatt, B * NH * T, T);
+    softmax_forward_kernel5_scale<<<grid_size, softmax_block_size, shared_mem_size, stream>>>(att, preatt, scale, B, NH, T);
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    stat = cublasSgemmStridedBatched(handle,
+    stat = cublasSgemmStridedBatched(cublas_handle,
                             CUBLAS_OP_N, CUBLAS_OP_N,
                             HS, T, T,
                             &alpha,
@@ -424,32 +661,33 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
-
-    // cleanups
-    cublasDestroy(handle);
+    unpermute_kernel<<<num_blocks, block_size, 0, stream>>>(vaccum, out, B, T, NH, HS);
 }
 
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
-    residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
-    cudaCheck(cudaGetLastError());
+    residual_forward_kernel<<<grid_size, block_size, 0, stream>>>(out, inp1, inp2, N);
+    cudaCheckErrors();
 }
 
 
 void gelu_forward(float* out, const float* inp, int N) {
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N, block_size);
-    gelu_kernel<<<grid_size, block_size>>>(out, inp, N);
-    cudaCheck(cudaGetLastError());
+    gelu_kernel<<<grid_size, block_size, 0, stream>>>(out, inp, N);
+    cudaCheckErrors();
 }
 
 void softmax_forward(float* out, float* inp, int N, int C) {
-    const int block_size = 256;
+    const int block_size = 512;
     int grid_size = N;
     size_t shared_mem_size = 2 * block_size / 32 * sizeof(float);
-    softmax_forward_kernel4<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
+    if (C >= 4096) { // TODO find optimal heuristic
+        softmax_forward_kernel6_largeC<<<grid_size, block_size, shared_mem_size, stream>>>(out, inp, N, C);
+    } else {
+        softmax_forward_kernel5_scale<<<grid_size, block_size, shared_mem_size, stream>>>(out, inp, 1.0f, 0, 0, C);
+    }
 }
 
 void crossentropy_forward(float* losses,
@@ -458,8 +696,8 @@ void crossentropy_forward(float* losses,
     const int block_size = 128;
     const int N = B * T;
     const int grid_size = CEIL_DIV(N, block_size);
-    crossentropy_forward_kernel1<<<grid_size, block_size>>>(losses, probs, targets, B, T, V);
-    cudaCheck(cudaGetLastError());
+    crossentropy_forward_kernel1<<<grid_size, block_size, 0, stream>>>(losses, probs, targets, B, T, V);
+    cudaCheckErrors();
 }
 
 // ----------------------------------------------------------------------------
@@ -745,11 +983,26 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
             exit(1);
         }
     }
+    
+    // TODO lazy initialisation, is there any better place to do this?
+    if (stream == 0) {
+        cudaCheck(cudaStreamCreate(&stream));
+    }
+    if (!cublaslt_workspace) {
+        cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size);
+    }
+    if (cublas_handle == NULL) {
+        cublasCheck(cublasLtCreate(&cublaslt_handle));
+        cublasCheck(cublasCreate(&cublas_handle));
+        cublasCheck(cublasSetStream(cublas_handle, stream));
+        cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
+    }
 
     // copy inputs/targets to the model
-    cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
+    // asynchronous on our non-default CUDA stream, avoiding unnecessary CPU/GPU sync points
+    cudaCheck(cudaMemcpyAsync(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice, stream));
     if (targets != NULL) {
-        cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
+        cudaCheck(cudaMemcpyAsync(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice, stream));
     }
 
     // forward pass
@@ -758,71 +1011,95 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     float* residual;
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
 
-    for (int l = 0; l < L; l++) {
-
-        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
-
-        // get the pointers of the weights for this layer
-        float* l_ln1w = params.ln1w + l * C;
-        float* l_ln1b = params.ln1b + l * C;
-        float* l_qkvw = params.qkvw + l * 3*C * C;
-        float* l_qkvb = params.qkvb + l * 3*C;
-        float* l_attprojw = params.attprojw + l * C * C;
-        float* l_attprojb = params.attprojb + l * C;
-        float* l_ln2w = params.ln2w + l * C;
-        float* l_ln2b = params.ln2b + l * C;
-        float* l_fcw = params.fcw + l * 4*C * C;
-        float* l_fcb = params.fcb + l * 4*C;
-        float* l_fcprojw = params.fcprojw + l * C * 4*C;
-        float* l_fcprojb = params.fcprojb + l * C;
-
-        // get the pointers of the activations for this layer
-        float* l_ln1 = acts.ln1 + l * B * T * C;
-        float* l_ln1_mean = acts.ln1_mean + l * B * T;
-        float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float* l_qkv = acts.qkv + l * B * T * 3*C;
-        float* l_qkvr = acts.qkvr + l * B * T * 3*C;
-        float* l_atty = acts.atty + l * B * T * C;
-        float* l_preatt = acts.preatt + l * B * NH * T * T;
-        float* l_att = acts.att + l * B * NH * T * T;
-        float* l_v_accum = acts.v_accum + l * B * T * C;
-        float* l_attproj = acts.attproj + l * B * T * C;
-        float* l_residual2 = acts.residual2 + l * B * T * C;
-        float* l_ln2 = acts.ln2 + l * B * T * C;
-        float* l_ln2_mean = acts.ln2_mean + l * B * T;
-        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        float* l_fch = acts.fch + l * B * T * 4*C;
-        float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
-        float* l_fcproj = acts.fcproj + l * B * T * C;
-        float* l_residual3 = acts.residual3 + l * B * T * C;
-
-        // now do the forward pass
-        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward(l_atty, l_v_accum, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH);
-        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-        residual_forward(l_residual2, residual, l_attproj, B*T*C);
-        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
-        gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
-        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+    // the CUDA graph is only valid for given B/T values, we must recreate it if they change for any reason
+    if (graph_created && (B != graph_created_B || T != graph_created_T)) {
+        cudaGraphDestroy(graph);
+        cudaGraphExecDestroy(instance);
+        graph_created = false;
     }
 
-    residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
-    softmax_forward(acts.probs, acts.logits, B*T, V);
+    // create a CUDA graph on the first run, then launch it for higher performance
+    // (nothing is actually executed on the GPU during stream capture)
+    if (!graph_created) {
+        cudaCheckErrors();
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
+        for (int l = 0; l < L; l++) {
+
+            residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
+
+            // get the pointers of the weights for this layer
+            float* l_ln1w = params.ln1w + l * C;
+            float* l_ln1b = params.ln1b + l * C;
+            float* l_qkvw = params.qkvw + l * 3*C * C;
+            float* l_qkvb = params.qkvb + l * 3*C;
+            float* l_attprojw = params.attprojw + l * C * C;
+            float* l_attprojb = params.attprojb + l * C;
+            float* l_ln2w = params.ln2w + l * C;
+            float* l_ln2b = params.ln2b + l * C;
+            float* l_fcw = params.fcw + l * 4*C * C;
+            float* l_fcb = params.fcb + l * 4*C;
+            float* l_fcprojw = params.fcprojw + l * C * 4*C;
+            float* l_fcprojb = params.fcprojb + l * C;
+
+            // get the pointers of the activations for this layer
+            float* l_ln1 = acts.ln1 + l * B * T * C;
+            float* l_ln1_mean = acts.ln1_mean + l * B * T;
+            float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
+            float* l_qkv = acts.qkv + l * B * T * 3*C;
+            float* l_qkvr = acts.qkvr + l * B * T * 3*C;
+            float* l_atty = acts.atty + l * B * T * C;
+            float* l_preatt = acts.preatt + l * B * NH * T * T;
+            float* l_att = acts.att + l * B * NH * T * T;
+            float* l_v_accum = acts.v_accum + l * B * T * C;
+            float* l_attproj = acts.attproj + l * B * T * C;
+            float* l_residual2 = acts.residual2 + l * B * T * C;
+            float* l_ln2 = acts.ln2 + l * B * T * C;
+            float* l_ln2_mean = acts.ln2_mean + l * B * T;
+            float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
+            float* l_fch = acts.fch + l * B * T * 4*C;
+            float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
+            float* l_fcproj = acts.fcproj + l * B * T * C;
+            float* l_residual3 = acts.residual3 + l * B * T * C;
+
+            // now do the forward pass
+            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+            matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, true, false);
+            attention_forward(l_atty, l_v_accum, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH);
+            matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C, true, false);
+            residual_forward(l_residual2, residual, l_attproj, B*T*C);
+            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+            matmul_forward(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, true, true);
+            //gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+            matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, true, false);
+            residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+        }
+        
+        residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
+        layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
+        matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V, false, false);
+        softmax_forward(acts.probs, acts.logits, B*T, V);
+        
+        graph_created = true;
+        cudaStreamEndCapture(stream, &graph);
+        cudaGraphInstantiate(&instance, graph, NULL, NULL, 0);
+    }
+    // launch the graph but don't wait on it until needed for the cudaMemcpyAsync below
+    // this allows us to run keep the GPU running without waiting on the CPU
+    cudaGraphLaunch(instance, stream);
+    cudaCheckErrors();
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
+        // crossentropy_forward is not the graph (in case targets is not always provided)
         crossentropy_forward(acts.losses, acts.probs, model->targets, B, T, V);
 
         // for convenience also evaluate the mean loss
         // move the (B,T) losses to CPU
         // TODO get rid of inline mallocs
         float* cpu_losses = (float*)malloc(B * T * sizeof(float));
-        cudaCheck(cudaMemcpy(cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaMemcpyAsync(cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost, 0));
+        cudaStreamSynchronize(stream);
         float mean_loss = 0.0f;
         for (int i=0; i<B*T; i++) { mean_loss += cpu_losses[i]; }
         mean_loss /= B*T;
@@ -832,6 +1109,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     } else {
         // if we don't have targets, we don't have a loss
         model->mean_loss = -1.0f;
+        cudaStreamSynchronize(stream);
     }
 }
 
@@ -844,6 +1122,25 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->grads_acts_memory));
     cudaCheck(cudaFree(model->inputs));
     cudaCheck(cudaFree(model->targets));
+
+    // free the cublas handles and CUDA stream
+    if (cublaslt_handle != NULL) {
+        cublasCheck(cublasLtDestroy(cublaslt_handle));
+        cublasCheck(cublasDestroy(cublas_handle));
+        cudaStreamDestroy(stream);
+    }
+
+    // free the cublaslt workspace memory
+    if (cublaslt_workspace) {
+        cudaFree(cublaslt_workspace);
+    }
+
+    // destroy the graph
+    if (graph_created) {
+        cudaGraphDestroy(graph);
+        cudaGraphExecDestroy(instance);
+        graph_created = false;
+    }
 }
 
 #ifndef TESTING
