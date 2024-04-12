@@ -789,7 +789,7 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
     int softmax_block_size = 256;
-    int grid_size = B * NH * T * 32 / softmax_block_size;
+    int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
     softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
 
     // new approach: first cuBLAS another batched matmul
