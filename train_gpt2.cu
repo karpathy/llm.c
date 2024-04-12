@@ -16,6 +16,7 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 #include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include "decode_gpt2.c"
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -1222,7 +1223,7 @@ int main() {
             }
             printf("generated: ");
             for (int t = 0; t < gen_max_length; t++) {
-                printf("%d ", gen_tokens[t]);
+                printf("%s", decode(gen_tokens[t]));
             }
             printf("\n");
         }

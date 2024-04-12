@@ -14,6 +14,7 @@ There will be other versions of this code that specialize it and make it fast.
 #include <time.h>
 #include <string.h>
 #include <unistd.h>
+#include "decode_gpt2.c"
 #ifdef OMP
 #include <omp.h>
 #endif
@@ -1109,7 +1110,7 @@ int main() {
             }
             printf("generated: ");
             for (int t = 0; t < gen_max_length; t++) {
-                printf("%d ", gen_tokens[t]);
+                printf("%s", decode(gen_tokens[t]));
             }
             printf("\n");
         }

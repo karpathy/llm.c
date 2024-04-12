@@ -1,4 +1,5 @@
 #define TESTING
+#include <string.h>
 #include "train_gpt2.cu"
 
 // poor man's tensor checker
@@ -20,6 +21,26 @@ int check_tensor(float *a, float *b, int n, char* label) {
         printf("TENSOR OK\n");
     } else {
         printf("TENSOR NOT OK\n");
+    }
+    return ok;
+}
+
+int check_decoder() {
+    static int tokens[] = {50256, 16773, 18162, 21986, 11, 198, 13681, 263, 23875, 198, 3152, 262, 11773, 2910, 198, 1169, 6002, 6386, 2583, 286, 262, 11858, 198, 20424, 428, 3135, 7596, 995, 3675, 13, 198, 40, 481, 407, 736, 17903, 11, 329, 703, 6029, 706, 4082, 198, 42826, 1028, 1128, 633, 263, 11, 198, 10594, 407, 198, 2704, 454, 680, 1028, 262, 1027, 28860, 286, 198, 3237, 323};
+    static char* expected[] = {"<|endoftext|>", "Come", " Running", " Away", ",", "\n", "Great", "er", " conquer", "\n", "With", " the", " Imperial", " blood", "\n", "the", " heav", "iest", " host", " of", " the", " gods", "\n", "into", " this", " wond", "rous", " world", " beyond", ".", "\n", "I", " will", " not", " back", " thee", ",", " for", " how", " sweet", " after", " birth", "\n", "Netflix", " against", " rep", "ound", "er", ",", "\n", "will", " not", "\n", "fl", "our", "ish", " against", " the", " ear", "locks", " of", "\n", "All", "ay"};
+    int num = sizeof(tokens) / sizeof(tokens[0]);
+
+    int ok = 1;
+    for (int i = 0; i < num; ++i) {
+        if (strcmp(decode(tokens[i]), expected[i]) != 0) {
+            printf("MISMATCH AT INDEX %d: %s %s\n", i, decode(tokens[i]), expected[i]);
+            ok = 0;
+        }
+    }
+    if (ok) {
+        printf("Decoder OK\n");
+    } else {
+        printf("Decoder NOT OK\n");
     }
     return ok;
 }
@@ -47,6 +68,7 @@ int main(int argc, char *argv[]) {
     // setup the (global) cuBLASLt workspace
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
+    int decoder_ok = check_decoder();
     // build the GPT-2 model from a checkpoint
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
@@ -87,7 +109,7 @@ int main(int argc, char *argv[]) {
     fclose(state_file);
 
     // overall OK signal for the test
-    int allok = 1;
+    int allok = decoder_ok;
 
     // let's do 10 training iterations, following the pytorch code
     float losses[10];
