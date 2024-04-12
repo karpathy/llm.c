@@ -12,8 +12,15 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cuda.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+
+//#define ENABLE_PARAM_COMPRESSION
+#define ENABLE_ACTIVATION_COMPRESSION
+//#define MASK_ONE_BYTE_COMPRESSION
+//#define MASK_TWO_BYTES_COMPRESSION
+//#define MASK_THREE_BYTES_COMPRESSION
 
 // ----------------------------------------------------------------------------
 // CUDA utils & global variables
@@ -63,6 +70,105 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
+__device__ float mask_lsb_byte(float in) {
+#if defined(MASK_THREE_BYTES_COMPRESSION)
+    return __uint_as_float(__float_as_uint(in) & 0xFF000000);
+#elif defined(MASK_TWO_BYTES_COMPRESSION)
+    return __uint_as_float(__float_as_uint(in) & 0xFFFF0000);
+#elif defined(MASK_ONE_BYTE_COMPRESSION)
+    return __uint_as_float(__float_as_uint(in) & 0xFFFFFF00);
+#else
+    return in;
+#endif
+}
+
+cudaError_t setProp(CUmemAllocationProp *prop, bool UseCompressibleMemory)
+{
+    CUdevice currentDevice;
+    if (cuCtxGetDevice(&currentDevice) != CUDA_SUCCESS)
+        return cudaErrorMemoryAllocation;
+
+    memset(prop, 0, sizeof(CUmemAllocationProp));
+    prop->type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop->location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop->location.id = currentDevice;
+
+    if (UseCompressibleMemory)
+        prop->allocFlags.compressionType = CU_MEM_ALLOCATION_COMP_GENERIC;
+
+    return cudaSuccess;
+}
+
+cudaError_t allocateCompressible(void **adr, size_t size, bool UseCompressibleMemory)
+{
+    CUmemAllocationProp prop = {};
+    cudaError_t err = setProp(&prop, UseCompressibleMemory);
+    if (err != cudaSuccess)
+        return err;
+
+    size_t granularity = 0;
+    if (cuMemGetAllocationGranularity(&granularity, &prop,
+                                      CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS)
+        return cudaErrorMemoryAllocation;
+    size = ((size - 1) / granularity + 1) * granularity;
+
+    CUdeviceptr dptr;
+    if (cuMemAddressReserve(&dptr, size, 0, 0, 0) != CUDA_SUCCESS)
+        return cudaErrorMemoryAllocation;
+
+    CUmemGenericAllocationHandle allocationHandle;
+    if (cuMemCreate(&allocationHandle, size, &prop, 0) != CUDA_SUCCESS)
+        return cudaErrorMemoryAllocation;
+
+    // Check if cuMemCreate was able to allocate compressible memory.
+    if (UseCompressibleMemory) {
+        CUmemAllocationProp allocationProp = {};
+        cuMemGetAllocationPropertiesFromHandle(&allocationProp, allocationHandle);
+        if (allocationProp.allocFlags.compressionType != CU_MEM_ALLOCATION_COMP_GENERIC) {
+            printf("Could not allocate compressible memory... so waiving execution\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    if (cuMemMap(dptr, size, 0, allocationHandle, 0) != CUDA_SUCCESS)
+        return cudaErrorMemoryAllocation;
+
+    if (cuMemRelease(allocationHandle) != CUDA_SUCCESS)
+        return cudaErrorMemoryAllocation;
+
+    CUmemAccessDesc accessDescriptor;
+    accessDescriptor.location.id = prop.location.id;
+    accessDescriptor.location.type = prop.location.type;
+    accessDescriptor.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+
+    if (cuMemSetAccess(dptr, size, &accessDescriptor, 1) != CUDA_SUCCESS)
+        return cudaErrorMemoryAllocation;
+
+    *adr = (void *)dptr;
+    return cudaSuccess;
+}
+
+cudaError_t freeCompressible(void *ptr, size_t size, bool UseCompressibleMemory)
+{
+    CUmemAllocationProp prop = {};
+    cudaError_t err = setProp(&prop, UseCompressibleMemory);
+    if (err != cudaSuccess)
+        return err;
+
+    size_t granularity = 0;
+    if (cuMemGetAllocationGranularity(&granularity, &prop,
+                                      CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS)
+        return cudaErrorMemoryAllocation;
+    size = ((size - 1) / granularity + 1) * granularity;
+
+    if (ptr == NULL)
+        return cudaSuccess;
+    if (cuMemUnmap((CUdeviceptr)ptr, size) != CUDA_SUCCESS ||
+        cuMemAddressFree((CUdeviceptr)ptr, size) != CUDA_SUCCESS)
+        return cudaErrorInvalidValue;
+    return cudaSuccess;
+}
+
 // ----------------------------------------------------------------------------
 // all the kernels
 
@@ -101,10 +207,9 @@ __global__ void encoder_forward_kernel2(float* out,
         float* out_btc = out + b * T * C + t * C + c;
         float* wte_ix = wte + ix * C + c;
         float* wpe_tc = wpe + t * C + c;
-        *out_btc = *wte_ix + *wpe_tc;
+        *out_btc = mask_lsb_byte(*wte_ix + *wpe_tc);
     }
 }
-
 
 __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const float*  __restrict__ inp, const float*  __restrict__ weight,
@@ -128,7 +233,8 @@ __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __rest
     sum = cg::reduce(warp, sum, cg::plus<float>{});
     float m = sum / C;
     if(warp.thread_rank() == 0 && mean != nullptr) {
-        __stcs(mean + idx, m);
+        //uint mean_bits = ;
+        __stcs(mean + idx, mask_lsb_byte(m));
     }
 
     // rstd
@@ -140,7 +246,7 @@ __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __rest
     sum = cg::reduce(warp, sum, cg::plus<float>{});
     float s = rsqrtf(sum / C + 1e-5f);
     if(warp.thread_rank() == 0 && rstd != nullptr) {
-        __stcs(rstd + idx, s);
+        __stcs(rstd + idx, mask_lsb_byte(s));
     }
 
     // final normalization and scaling by weight/bias
@@ -150,7 +256,7 @@ __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __rest
         // indicating that this data will not be reused soon, and can be streamed through the caches
         // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
         float n = s * (__ldcs(x+c) - m);
-        __stcs(o+c, n * weight[c] + bias[c]);
+        __stcs(o+c, mask_lsb_byte(n * weight[c] + bias[c]));
     }
 }
 
@@ -179,9 +285,9 @@ __global__ void permute_kernel(float* q, float* k, float* v,
             +          (nh_ * d)
             +                d_;
 
-        q[idx] = inp[inp_idx];
-        k[idx] = inp[inp_idx + NH * d];
-        v[idx] = inp[inp_idx + 2 * (NH * d)];
+        q[idx] = mask_lsb_byte(inp[inp_idx]);
+        k[idx] = mask_lsb_byte(inp[inp_idx + NH * d]);
+        v[idx] = mask_lsb_byte(inp[inp_idx + 2 * (NH * d)]);
     }
 }
 
@@ -199,7 +305,7 @@ __global__ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, i
         int d_ = rest % d;
 
         int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-        out[other_idx] = inp[idx];
+        out[other_idx] = mask_lsb_byte(inp[idx]);
     }
 }
 
@@ -315,7 +421,7 @@ __global__ void softmax_forward_kernel5_scale(float* out, float* inp, float scal
                 value = __ldcs(&x[i]) * scale;
             }
             float output = expf(value - offset);
-            out[idx * C + i] = output;
+            out[idx * C + i] = mask_lsb_byte(output);
             sumval += output; // combined into the same loop unlike kernel3
         }
     } else {
@@ -350,7 +456,7 @@ __global__ void softmax_forward_kernel5_scale(float* out, float* inp, float scal
 
     // divide the whole row by the sum
     for (int i = tid; i < C; i += blockDim.x) {
-        out[idx * C + i] = out[idx * C + i] / sum;
+        out[idx * C + i] = mask_lsb_byte(out[idx * C + i] / sum);
     }
 }
 
@@ -476,7 +582,7 @@ __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, in
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
         // __ldcs to reduce cache persistence (not read again after this)
-        out[idx] = __ldcs(&inp1[idx]) + __ldcs(&inp2[idx]);
+        out[idx] = mask_lsb_byte(__ldcs(&inp1[idx]) + __ldcs(&inp2[idx]));
     }
 }
 
@@ -499,7 +605,7 @@ __global__ void crossentropy_forward_kernel1(float* losses,
         int t = i % T;
         float* probs_bt = probs + b * T * V + t * V;
         int ix = targets[b * T + t];
-        losses[b * T + t] = -logf(probs_bt[ix]);
+        losses[b * T + t] = mask_lsb_byte(-logf(probs_bt[ix]));
     }
 }
 
@@ -736,7 +842,12 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     // malloc all parameters all at once on the device
     float* params_memory;
     if (on_device) {
-        cudaCheck(cudaMalloc((void**)&params_memory, num_parameters * sizeof(float)));
+        if (ENABLE_PARAM_COMPRESSION) {
+            allocateCompressible((void**)&params_memory, num_parameters * sizeof(float), true);
+        } else {
+            cudaCheck(cudaMalloc((void**)&params_memory, num_parameters * sizeof(float)));
+        }
+        cudaCheckErrors();
     } else {
         params_memory = (float*)malloc(num_parameters * sizeof(float));
     }
@@ -791,7 +902,13 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
         num_activations += act_sizes[i];
     }
     float* acts_memory;
-    cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
+    
+    if (ENABLE_ACTIVATION_COMPRESSION) {
+        allocateCompressible((void**)&acts_memory, num_activations * sizeof(float), true);
+    } else {
+        cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
+    }
+
     float** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
         &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
