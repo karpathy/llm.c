@@ -21,6 +21,7 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 //#define MASK_ONE_BYTE_COMPRESSION
 //#define MASK_TWO_BYTES_COMPRESSION
 //#define MASK_THREE_BYTES_COMPRESSION
+//#define MASK_ALL_BYTES_COMPRESSION
 
 // ----------------------------------------------------------------------------
 // CUDA utils & global variables
@@ -71,7 +72,9 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
 __device__ float mask_lsb_byte(float in) {
-#if defined(MASK_THREE_BYTES_COMPRESSION)
+#if defined(MASK_ALL_BYTES_COMPRESSION)
+    return 0.0f;
+#elif defined(MASK_THREE_BYTES_COMPRESSION)
     return __uint_as_float(__float_as_uint(in) & 0xFF000000);
 #elif defined(MASK_TWO_BYTES_COMPRESSION)
     return __uint_as_float(__float_as_uint(in) & 0xFFFF0000);
@@ -842,12 +845,11 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     // malloc all parameters all at once on the device
     float* params_memory;
     if (on_device) {
-        if (ENABLE_PARAM_COMPRESSION) {
-            allocateCompressible((void**)&params_memory, num_parameters * sizeof(float), true);
-        } else {
-            cudaCheck(cudaMalloc((void**)&params_memory, num_parameters * sizeof(float)));
-        }
-        cudaCheckErrors();
+#if defined(ENABLE_PARAM_COMPRESSION)
+        allocateCompressible((void**)&params_memory, num_parameters * sizeof(float), true);
+#else
+        cudaCheck(cudaMalloc((void**)&params_memory, num_parameters * sizeof(float)));
+#endif
     } else {
         params_memory = (float*)malloc(num_parameters * sizeof(float));
     }
@@ -902,12 +904,12 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
         num_activations += act_sizes[i];
     }
     float* acts_memory;
-    
-    if (ENABLE_ACTIVATION_COMPRESSION) {
-        allocateCompressible((void**)&acts_memory, num_activations * sizeof(float), true);
-    } else {
-        cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
-    }
+
+#if defined(ENABLE_ACTIVATION_COMPRESSION)
+    allocateCompressible((void**)&acts_memory, num_activations * sizeof(float), true);
+#else
+    cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
+#endif
 
     float** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
