@@ -986,6 +986,7 @@ int main() {
 
     // train
     struct timespec start, end;
+    double total_elapsed_s = 0.0;
     for (int step = 0; step <= 40; step++) {
 
         // once in a while estimate the validation loss
@@ -1035,8 +1036,10 @@ int main() {
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        total_elapsed_s += time_elapsed_s;
         printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
     }
+    printf("total training time: %f s\n", total_elapsed_s);
 
     // free
     dataloader_free(&train_loader);
