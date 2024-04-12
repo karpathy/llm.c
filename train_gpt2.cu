@@ -861,12 +861,6 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
         *(ptrs[i]) = params_memory_iterator;
         params_memory_iterator += param_sizes[i];
     }
-
-    // Get size of nv_bfloat16
-    size_t nv_bfloat16_size = sizeof(nv_bfloat16);
-    // printf it
-    printf("nv_bfloat16 size: %zu\n", nv_bfloat16_size);
-
     return params_memory;
 }
 
