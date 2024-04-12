@@ -1,6 +1,12 @@
 #define TESTING
 #include "train_gpt2.cu"
 
+#ifdef ENABLE_TF32
+#define LOGIT_ERROR_THRESHOLD 1.0f // TF32 is slightly less accurate
+#else
+#define LOGIT_ERROR_THRESHOLD 1e-2
+#endif
+
 // poor man's tensor checker
 int check_tensor(float *a, float *b, int n, char* label) {
     int print_upto = 5;
@@ -89,7 +95,7 @@ int main(int argc, char *argv[]) {
                 if(i < 3) {
                     printf("%f %f\n", expected_logits[i], logits_cpu[i]);
                 }
-                if (fabsf(expected_logits[i] - logits_cpu[i]) >= 1e-2) {
+                if (fabsf(expected_logits[i] - logits_cpu[i]) >= LOGIT_ERROR_THRESHOLD) {
                     printf("MISMATCH AT INDEX %d: ", i);
                     printf("%f %f\n", expected_logits[i],logits_cpu[i]);
                     logits_ok = 0;
