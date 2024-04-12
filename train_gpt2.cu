@@ -16,12 +16,12 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
-//#define ENABLE_PARAM_COMPRESSION
 #define ENABLE_ACTIVATION_COMPRESSION
 //#define MASK_ONE_BYTE_COMPRESSION
 //#define MASK_TWO_BYTES_COMPRESSION
 //#define MASK_THREE_BYTES_COMPRESSION
 //#define MASK_ALL_BYTES_COMPRESSION
+size_t activation_size = 0; // We need to keep track of the activation size for freeing the memory *sigh*
 
 // ----------------------------------------------------------------------------
 // CUDA utils & global variables
@@ -845,11 +845,8 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     // malloc all parameters all at once on the device
     float* params_memory;
     if (on_device) {
-#if defined(ENABLE_PARAM_COMPRESSION)
-        allocateCompressible((void**)&params_memory, num_parameters * sizeof(float), true);
-#else
         cudaCheck(cudaMalloc((void**)&params_memory, num_parameters * sizeof(float)));
-#endif
+        cudaCheckErrors();
     } else {
         params_memory = (float*)malloc(num_parameters * sizeof(float));
     }
@@ -864,6 +861,12 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
         *(ptrs[i]) = params_memory_iterator;
         params_memory_iterator += param_sizes[i];
     }
+
+    // Get size of nv_bfloat16
+    size_t nv_bfloat16_size = sizeof(nv_bfloat16);
+    // printf it
+    printf("nv_bfloat16 size: %zu\n", nv_bfloat16_size);
+
     return params_memory;
 }
 
@@ -906,7 +909,8 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
     float* acts_memory;
 
 #if defined(ENABLE_ACTIVATION_COMPRESSION)
-    allocateCompressible((void**)&acts_memory, num_activations * sizeof(float), true);
+    activation_size = num_activations * sizeof(float);
+    allocateCompressible((void**)&acts_memory, activation_size, true);
 #else
     cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
 #endif
@@ -1237,10 +1241,15 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->grads_memory));
     cudaCheck(cudaFree(model->m_memory));
     cudaCheck(cudaFree(model->v_memory));
-    cudaCheck(cudaFree(model->acts_memory));
     cudaCheck(cudaFree(model->grads_acts_memory));
     cudaCheck(cudaFree(model->inputs));
     cudaCheck(cudaFree(model->targets));
+
+#if defined(ENABLE_ACTIVATION_COMPRESSION)
+    freeCompressible((void**)&model->acts_memory, activation_size, true);
+#else
+    cudaCheck(cudaFree(model->acts_memory));
+#endif
 
     // free the cublas handles and CUDA stream
     if (cublaslt_handle != NULL) {
@@ -1369,6 +1378,7 @@ int sample_mult(float* probabilities, int n, float coin) {
 // ----------------------------------------------------------------------------
 // main training loop
 int main() {
+    cudaCheck(cudaSetDevice(0));
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
