@@ -49,8 +49,8 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 }
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
 
-// cuBLAS workspace
-static size_t cublaslt_workspace_size = 4 * 1024 * 1024;
+// cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
+static size_t cublaslt_workspace_size = 32 * 1024 * 1024;
 static void* cublaslt_workspace = NULL;
 
 // ----------------------------------------------------------------------------
