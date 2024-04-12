@@ -31,7 +31,7 @@ this turns out to be ~20X faster than (1) nice
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
-// error checking
+// CUDA error checking
 void cudaCheck(cudaError_t error, const char *file, int line) {
   if (error != cudaSuccess) {
     printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
@@ -40,6 +40,19 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
   }
 };
 #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
+
+// cuBLAS error checking
+void cublasCheck(cublasStatus_t status, const char *file, int line)
+{
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        printf("[cuBLAS ERROR]: %d %s %d\n", status, file, line);
+        exit(EXIT_FAILURE);
+    }
+}
+#define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
+
+// cuBLAS handle
+static cublasHandle_t handle;
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -624,11 +637,9 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
 
     // batched matrix multiply with cuBLAS
-    cublasHandle_t handle;
-    cublasStatus_t stat = cublasCreate(&handle);
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    stat = cublasSgemmStridedBatched(handle,
+    cublasCheck(cublasSgemmStridedBatched(handle,
                             CUBLAS_OP_T, CUBLAS_OP_N,
                             T, T, HS,
                             &alpha,
@@ -636,14 +647,10 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
                             q, HS, T * HS,
                             &beta,
                             preatt, T, T * T,
-                            B * NH);
-    if (stat != CUBLAS_STATUS_SUCCESS) {
-        printf("cublasSgemm failed\n");
-        exit(1);
-    }
+                            B * NH));
 
     // multiply all elements of preatt elementwise by scale
-    float scale = 1.0 / sqrtf(HS);
+    float scale = 1.0f / sqrtf(HS);
     total_threads = B * NH * T * T;
     num_blocks = CEIL_DIV(total_threads, block_size);
     scale_kernel<<<num_blocks, block_size>>>(preatt, scale, B, NH, T);
@@ -656,7 +663,7 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    stat = cublasSgemmStridedBatched(handle,
+    cublasCheck(cublasSgemmStridedBatched(handle,
                             CUBLAS_OP_N, CUBLAS_OP_N,
                             HS, T, T,
                             &alpha,
@@ -664,19 +671,12 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
                             att, T, T * T,
                             &beta,
                             vaccum, HS, T * HS,
-                            B * NH);
-    if (stat != CUBLAS_STATUS_SUCCESS) {
-        printf("cublasSgemm failed\n");
-        exit(1);
-    }
+                            B * NH));
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
-
-    // cleanups
-    cublasDestroy(handle);
 }
 
 // kernel version dispatch
@@ -724,6 +724,7 @@ int main(int argc, char **argv) {
 
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
+    cublasCreate(&handle);
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * C * sizeof(float));
@@ -808,6 +809,7 @@ int main(int argc, char **argv) {
     cudaCheck(cudaFree(d_preatt));
     cudaCheck(cudaFree(d_att));
     cudaCheck(cudaFree(d_inp));
+    cublasDestroy(handle);
 
     return 0;
 }
