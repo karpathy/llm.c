@@ -24,6 +24,7 @@ this turns out to be ~20X faster than (1) nice
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <float.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
@@ -330,45 +331,41 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     // one row of inp, i.e. inp[idx, :] of shape (T,)
     const float* x = inp + idx * T;
 
-    // reduce to max
-    float maxval = -INFINITY;
+    // not INF, so we don't get NaNs accidentally when subtracting two values.
+    float maxval = -FLT_MAX;
+    float sumval = 0.0f;
+
     const float4* x_vec = reinterpret_cast<const float4*>(x);
 
     for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
         float4 v = x_vec[i];
+        float old_maxval = maxval;
         for(int k = 0; k < 4; ++k) {
             maxval = fmaxf(maxval, vec_at(v, k));
         }
-    }
-
-    if(4*pos_by_4 + warp.thread_rank() <= own_pos) {
-        maxval = fmaxf(maxval, x[4*pos_by_4 + warp.thread_rank()]);
-    }
-
-    float offset = cg::reduce(warp, maxval, cg::greater<float>{});
-
-    // compute exp and sum
-    float sumval = 0.0f;
-    for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
-        // subtract max for numerical stability
-        float4 v = x_vec[i];
+        sumval *= expf(inv_temperature * (old_maxval - maxval));
         for(int k = 0; k < 4; ++k) {
-            sumval += expf(inv_temperature * (vec_at(v, k) - offset));
+            sumval += expf(inv_temperature * (vec_at(v, k) - maxval));
         }
     }
 
     if(4*pos_by_4 + warp.thread_rank() <= own_pos) {
-        sumval += expf(inv_temperature * (x[4*pos_by_4 + warp.thread_rank()] - offset));
+        float old_maxval = maxval;
+        maxval = fmaxf(maxval, x[4*pos_by_4 + warp.thread_rank()]);
+        sumval *= expf(inv_temperature * (old_maxval - maxval));
+        sumval += expf(inv_temperature * (x[4*pos_by_4 + warp.thread_rank()] - maxval));
     }
 
-    float sum = cg::reduce(warp, sumval, cg::plus<float>{});
+    float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
+    sumval *= expf(inv_temperature * (maxval - global_maxval));
 
+    float sum = cg::reduce(warp, sumval, cg::plus<float>{});
     float norm = 1.f / sum;
 
     // divide the whole row by the sum
     for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
         // recalculation is faster than doing the round-trip through memory.
-        float ev = expf(inv_temperature * (__ldcs(x + i) - offset));
+        float ev = expf(inv_temperature * (__ldcs(x + i) - global_maxval));
         __stcs(out + idx * T + i, ev * norm);
     }
 }
