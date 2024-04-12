@@ -13,9 +13,6 @@ OMP_NUM_THREADS=32 ./matmul_forward 2
 
 version 3 calls cuBLASLt, should be even faster
 OMP_NUM_THREADS=32 ./matmul_forward 3
-
-version 4 calls cuBLASLt with TF32, should be even even faster
-OMP_NUM_THREADS=32 ./matmul_forward 4
 */
 
 #include <stdio.h>
@@ -52,6 +49,9 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 // cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
 static size_t cublaslt_workspace_size = 32 * 1024 * 1024;
 static void* cublaslt_workspace = NULL;
+static cublasComputeType_t cublas_compute_type;
+cublasHandle_t cublas_handle;
+cublasLtHandle_t cublaslt_handle;
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -137,8 +137,6 @@ void matmul_forward2(float* out,
                      float* inp, float* weight, float* bias,
                      int B, int T, int C, int OC,
                      const int sqrt_block_size) {
-    cublasHandle_t handle; // cuBLAS context
-    cublasStatus_t stat = cublasCreate(&handle); // initialize CUBLAS context
     // for reference API is:
     // cublasStatus_t cublasSgemm(cublasHandle_t handle,
     //                        cublasOperation_t transa, cublasOperation_t transb,
@@ -163,11 +161,7 @@ void matmul_forward2(float* out,
 
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    stat = cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC);
-    if (stat != CUBLAS_STATUS_SUCCESS) {
-        printf("cublasSgemm failed\n");
-        exit(1);
-    }
+    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC));
     // and now we still have to add the bias... (ew)
     if (bias != NULL) {
         int block_size = sqrt_block_size * sqrt_block_size;
@@ -175,7 +169,6 @@ void matmul_forward2(float* out,
         add_bias<<<grid_size, block_size>>>(out, bias, B, T, OC);
         cudaCheck(cudaGetLastError());
     }
-    cublasDestroy(handle);
 }
 
 // uses cublasLt to fuse the bias and gelu
@@ -183,8 +176,7 @@ void matmul_forward2(float* out,
 // https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtSgemm/sample_cublasLt_LtSgemm.cu
 void matmul_forward3(float* out,
                      float* inp, float* weight, float* bias,
-                     int B, int T, int C, int OC,
-                     int enable_tf32) {
+                     int B, int T, int C, int OC) {
     int has_bias = (bias != NULL);
     int has_gelu = 0;
 
@@ -193,24 +185,6 @@ void matmul_forward3(float* out,
         printf("Bias pointer is not aligned (cuBLASLt requirement)!\n");
         exit(EXIT_FAILURE);
     }
-
-    // setup cuBLAS and cuBLASLt handles
-    cublasHandle_t cublas_handle;
-    cublasLtHandle_t cublaslt_handle;
-    cublasCheck(cublasCreate(&cublas_handle));
-    cublasCheck(cublasLtCreate(&cublaslt_handle));
-
-    // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
-    cublasComputeType_t cublas_compute_type;
-    cublasMath_t cublas_math_mode;
-    if (enable_tf32) {
-        cublas_compute_type = CUBLAS_COMPUTE_32F_FAST_TF32;
-        cublas_math_mode = CUBLAS_TF32_TENSOR_OP_MATH;
-    } else {
-        cublas_compute_type = CUBLAS_COMPUTE_32F;
-        cublas_math_mode = CUBLAS_DEFAULT_MATH;
-    }
-    cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
 
     int returnedResults = 0;
     cublasLtMatmulDesc_t operationDesc;
@@ -290,10 +264,7 @@ void matmul_forward(int kernel_num,
             matmul_forward2(out, inp, weight, bias, B, T, C, OC, sqrt_block_size);
             break;
         case 3:
-            matmul_forward3(out, inp, weight, bias, B, T, C, OC, 0); // no tf32
-            break;
-        case 4:
-            matmul_forward3(out, inp, weight, bias, B, T, C, OC, 1); // with tf32
+            matmul_forward3(out, inp, weight, bias, B, T, C, OC);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -325,8 +296,20 @@ int main(int argc, char **argv) {
     // set up the device
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, deviceIdx);
+    printf("Device %d: %s\n", deviceIdx, deviceProp.name);
 
-    // setup (global) cuBLASLt workspace
+    // setup cuBLAS and cuBLASLt
+    cublasCheck(cublasCreate(&cublas_handle));
+    cublasCheck(cublasLtCreate(&cublaslt_handle));
+    // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
+    int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
+    printf("enable_tf32: %d\n", enable_tf32);
+    cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
+    cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
+    // setup the (global) cuBLASLt workspace
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     // create host memory of random numbers
@@ -410,6 +393,8 @@ int main(int argc, char **argv) {
     cudaCheck(cudaFree(d_inp));
     cudaCheck(cudaFree(d_weight));
     cudaCheck(cudaFree(d_bias));
-
+    cudaCheck(cudaFree(cublaslt_workspace));
+    cublasCheck(cublasDestroy(cublas_handle));
+    cublasCheck(cublasLtDestroy(cublaslt_handle));
     return 0;
 }

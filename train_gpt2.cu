@@ -44,9 +44,9 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 // cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
 static size_t cublaslt_workspace_size = 32 * 1024 * 1024;
 static void* cublaslt_workspace = NULL;
-
-// whether to use TF32 precision for matmuls (less accurate, much much faster)
-static int enable_tf32 = 0;
+static cublasComputeType_t cublas_compute_type;
+cublasHandle_t cublas_handle;
+cublasLtHandle_t cublaslt_handle;
 
 // ----------------------------------------------------------------------------
 // all the kernels
@@ -389,24 +389,6 @@ void matmul_forward_cublaslt(float* out,
         printf("Bias pointer is not aligned (cuBLASLt requirement)!\n");
         exit(EXIT_FAILURE);
     }
-
-    // setup cuBLAS and cuBLASLt handles
-    cublasHandle_t cublas_handle;
-    cublasLtHandle_t cublaslt_handle;
-    cublasCheck(cublasCreate(&cublas_handle));
-    cublasCheck(cublasLtCreate(&cublaslt_handle));
-
-    // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
-    cublasComputeType_t cublas_compute_type;
-    cublasMath_t cublas_math_mode;
-    if (enable_tf32) {
-        cublas_compute_type = CUBLAS_COMPUTE_32F_FAST_TF32;
-        cublas_math_mode = CUBLAS_TF32_TENSOR_OP_MATH;
-    } else {
-        cublas_compute_type = CUBLAS_COMPUTE_32F;
-        cublas_math_mode = CUBLAS_DEFAULT_MATH;
-    }
-    cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
 
     int returnedResults = 0;
     cublasLtMatmulDesc_t operationDesc;
@@ -1062,11 +1044,22 @@ int main() {
     // set up the device
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, deviceIdx);
+    printf("[System]\n");
+    printf("Device %d: %s\n", deviceIdx, deviceProp.name);
 
-    // setup (global) cuBLASLt workspace
-    cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
-    printf("[Run]\n");
+    // setup cuBLAS and cuBLASLt
+    cublasCheck(cublasCreate(&cublas_handle));
+    cublasCheck(cublasLtCreate(&cublaslt_handle));
+    // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
+    int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
     printf("enable_tf32: %d\n", enable_tf32);
+    cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
+    cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
+    // setup the (global) cuBLASLt workspace
+    cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
@@ -1157,6 +1150,10 @@ int main() {
     dataloader_free(&val_loader);
     gpt2_free(&model);
     free(cpu_probs);
+    cudaCheck(cudaFree(cublaslt_workspace));
+    cublasCheck(cublasDestroy(cublas_handle));
+    cublasCheck(cublasLtDestroy(cublaslt_handle));
+
     return 0;
 }
 #endif
