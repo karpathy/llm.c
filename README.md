@@ -174,7 +174,7 @@ The time drops down to 26ms/iteration. So we have a gap to close :)! At the curr
 Ways of organizing development:
 
 - Experiencing a concrete issue with the repo? Use [Issues](https://github.com/karpathy/llm.c/issues).
-- Have some code to contribute? Open a [PR](https://github.com/karpathy/llm.c/pulls)
+- Have some code to contribute? Open a [PR](https://github.com/karpathy/llm.c/pulls).
 - Chat about the repo, ask questions, etc.? Look at [Discussions](https://github.com/karpathy/llm.c/discussions).
 - Something faster? I created a new `#llmc` channel on my [Zero to Hero Discord channel](https://discord.gg/3zy8kqD9Cp).
 
