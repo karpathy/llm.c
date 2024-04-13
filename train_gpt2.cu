@@ -1054,6 +1054,10 @@ void gpt2_load_decoder(const char* filename, char arr[][GPT2_MAX_TOKEN_LEN]) {
         }
     }
 
+    if (j > 0) {
+        arr[i][j] = '\0';
+    }
+
     fclose(file);
 }
 
