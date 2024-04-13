@@ -493,9 +493,12 @@ int main(int argc, char **argv) {
     // first check the correctness of the kernel
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
+        printf("Checking block size %d.\n", block_size);
         softmax_forward(kernel_num, d_out, d_inp, B * T, T, block_size);
         validate_result(d_out, out, "out", B * T * T, 1e-4f);
     }
+
+    printf("All results match. Starting benchmarks.\n\n");
 
     // time the kernel at different block sizes
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {

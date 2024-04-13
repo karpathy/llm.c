@@ -339,15 +339,16 @@ int main(int argc, char **argv) {
     // check the correctness of the kernel at all block sizes
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
+        printf("Checking block size %d.\n", block_size);
 
         layernorm_forward(kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, B, T, C, block_size);
 
         validate_result(d_out, out, "out", B * T * C, 1e-5f);
         validate_result(d_mean, mean, "mean", B * T, 1e-5f);
         validate_result(d_rstd, rstd, "rstd", B * T, 1e-5f);
-
-        printf("Results match at block size %d\n\n", block_size);
     }
+
+    printf("All results match. Starting benchmarks.\n\n");
 
     // time the kernel at different block sizes
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
@@ -363,7 +364,7 @@ int main(int argc, char **argv) {
         long memory_ops = (2 * B * T * C) * 4; // *4 for float
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
 
-        printf("block_size %4d | time %f ms | bandwidth %f GB/s\n", block_size, elapsed_time / repeat_times, memory_bandwidth);
+        printf("block_size %4d | time %f ms | bandwidth %f GB/s\n", block_size, elapsed_time, memory_bandwidth);
     }
 
     // free memory

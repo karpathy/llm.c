@@ -309,12 +309,18 @@ int main(int argc, char **argv) {
 
     // first check the correctness of the kernel
     matmul_forward_cpu(out, inp, weight, bias, B, T, C, OC);
-    matmul_forward(kernel_num, d_out, d_inp, d_weight, d_bias, B, T, C, OC, 32);
-
-    validate_result(d_out, out, "out", B * T * OC, 1e-1f);
 
     // time the kernel at different block sizes
     int sqrt_block_sizes[] = {4, 8, 16, 32};
+
+    for (int j = 0; j < sizeof(sqrt_block_sizes) / sizeof(int); j++) {
+        int sqrt_block_size = sqrt_block_sizes[j];
+        printf("Checking block size %d x %d.\n", sqrt_block_size, sqrt_block_size);
+        matmul_forward(kernel_num, d_out, d_inp, d_weight, d_bias, B, T, C, OC, sqrt_block_size);
+        validate_result(d_out, out, "out", B * T * OC, 1e-1f);
+    }
+
+    printf("All results match. Starting benchmarks.\n\n");
 
     for (int j = 0; j < sizeof(sqrt_block_sizes) / sizeof(int); j++) {
         int sqrt_block_size = sqrt_block_sizes[j];

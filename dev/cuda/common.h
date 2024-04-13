@@ -13,14 +13,14 @@ T ceil_div(T dividend, T divisor) {
 // checking utils
 
 // CUDA error checking
-void cudaCheck(cudaError_t error, const char *file, int line) {
+void cuda_check(cudaError_t error, const char *file, int line) {
     if (error != cudaSuccess) {
         printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
                cudaGetErrorString(error));
         exit(EXIT_FAILURE);
     }
 };
-#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
+#define cudaCheck(err) (cuda_check(err, __FILE__, __LINE__))
 
 // cuBLAS error checking
 void cublasCheck(cublasStatus_t status, const char *file, int line)
@@ -64,7 +64,7 @@ float* make_zeros_float(int N) {
 // testing and benchmarking utils
 
 template<class T>
-void validate_result(const T* device_result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance=1e-4) {
+void validate_result(T* device_result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance=1e-4) {
     T* out_gpu = (T*)malloc(num_elements * sizeof(T));
     cudaCheck(cudaMemcpy(out_gpu, device_result, num_elements * sizeof(T), cudaMemcpyDeviceToHost));
     for (int i = 0; i < num_elements; i++) {
@@ -79,7 +79,10 @@ void validate_result(const T* device_result, const T* cpu_reference, const char*
             exit(EXIT_FAILURE);
         }
     }
-    printf("Results match for %s!\n", name);
+
+    // reset the result pointer, so we can chain multiple tests and don't miss trivial errors,
+    // like the kernel not writing to part of the result.
+    cudaMemset(device_result, 0, num_elements);
     free(out_gpu);
 }
 

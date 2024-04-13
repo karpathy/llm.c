@@ -113,11 +113,17 @@ int main(int argc, char **argv) {
 
     // first check the correctness of the kernel
     crossentropy_forward_cpu(out, probs, targets, B, T, V);
-    crossentropy_forward(kernel_num, d_out, d_probs, d_targets, B, T, V, 256);
-    validate_result(d_out, out, "out", B * T, 1e-5f);
-
     // time the kernel at different block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+
+    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+        int block_size = block_sizes[j];
+        printf("Checking block size %d.\n", block_size);
+        crossentropy_forward(kernel_num, d_out, d_probs, d_targets, B, T, V, block_size);
+        validate_result(d_out, out, "out", B * T, 1e-5f);
+    }
+
+    printf("All results match. Starting benchmarks.\n\n");
 
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
@@ -127,7 +133,7 @@ int main(int argc, char **argv) {
                                               kernel_num, d_out, d_probs, d_targets,
                                               B, T, V, block_size);
 
-        printf("block_size %4d | time %f ms\n", block_size, elapsed_time / repeat_times);
+        printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
     }
 
     // free memory

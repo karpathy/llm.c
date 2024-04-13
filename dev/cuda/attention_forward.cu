@@ -864,13 +864,21 @@ int main(int argc, char **argv) {
 
     // first check the correctness of the kernel
     attention_forward_cpu(out, preatt, att, inp, B, T, C, NH);
-    attention_forward(kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, 256);
-
-    // compare the output
-    validate_result(d_out, out, "out", B * T * C, 1e-4f);
 
     // time the kernel at different block sizes
     int block_sizes[] = {32, 64, 128, 256, 512};
+
+    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+        int block_size = block_sizes[j];
+        printf("Checking block size %d.\n", block_size);
+        attention_forward(kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+        validate_result(d_out, out, "out", B * T * C, 1e-4f);
+        validate_result(d_att, att, "att", B * T * C, 1e-4f);
+        // fused scaling does not produce the same result as CPU reference code
+        // validate_result(d_preatt, preatt, "preatt", B * T * C, 1e-4f);
+    }
+
+    printf("All results match. Starting benchmarks.\n\n");
 
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];

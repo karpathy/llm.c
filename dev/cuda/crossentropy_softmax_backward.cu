@@ -117,7 +117,6 @@ int main(int argc, char **argv) {
     cudaCheck(cudaMemcpy(d_probs, probs, B * T * V * sizeof(float), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(d_targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(d_dlosses, dlosses, B * T * sizeof(float), cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(d_dlogits, dlogits, B * T * V * sizeof(float), cudaMemcpyHostToDevice));
 
     // read kernel_num from command line
     int kernel_num = 1;
@@ -127,13 +126,19 @@ int main(int argc, char **argv) {
     printf("Using kernel %d\n", kernel_num);
 
     // first check the correctness of the kernel
-    // crossentropy_forward_cpu(out, probs, targets, B, T, V);
     crossentropy_softmax_backward_cpu(dlogits, dlosses, probs, targets, B, T, V);
-    crossentropy_softmax_backward(kernel_num, d_dlogits, d_dlosses, d_probs, d_targets, B, T, V, 256);
-    validate_result(d_dlogits, dlogits, "dlogits", B * T * V, 1e-5f);
 
     // time the kernel at different block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+
+    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+        int block_size = block_sizes[j];
+        printf("Checking block size %d.\n", block_size);
+        crossentropy_softmax_backward(kernel_num, d_dlogits, d_dlosses, d_probs, d_targets, B, T, V, block_size);
+        validate_result(d_dlogits, dlogits, "dlogits", B * T * V, 1e-5f);
+    }
+
+    printf("All results match. Starting benchmarks.\n\n");
 
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
