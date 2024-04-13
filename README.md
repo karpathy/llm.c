@@ -167,7 +167,7 @@ And see that the first iteration now takes 20 seconds (compilation time), but al
 python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4 --compile 1 --tensorcores 1
 ```
 
-The time drops down to 26ms/iteration. So at the current 28ms/iteration we are only about 7% slower.
+The time drops down to 26.17ms/iteration. So at the current 27.93ms/iteration we are only about 7% slower. This somewhat makes sense because most of the FLOPs are in the matmul, and we both call about the same kernels. The remainder of the difference is likely our self-attention implementation, and possibly the round trips for GeLU, and permute/unpermute.
 
 ## discussions
 
