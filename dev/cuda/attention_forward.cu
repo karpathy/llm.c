@@ -23,8 +23,12 @@ this turns out to be ~20X faster than (1) nice
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
+#include <float.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -314,6 +318,71 @@ __global__ void softmax_forward_kernel4(float* out, float* inp, int N, int C) {
         out[idx * C + i] = x[i] / sum;
     }
 }
+
+
+__device__ float& vec_at(float4& vec, int index) {
+    return reinterpret_cast<float*>(&vec)[index];
+}
+
+__device__ float vec_at(const float4& vec, int index) {
+    return reinterpret_cast<const float*>(&vec)[index];
+}
+
+__global__ void softmax_forward_kernel5(float* out, float inv_temperature, const float* inp, int N, int T) {
+    // shape: (N, T, T)
+    assert(T % 4  == 0);
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if(idx >= N * T) {
+        return;
+    }
+    int own_pos = idx % T;
+    int pos_by_4 = own_pos / 4;
+
+    // one row of inp, i.e. inp[idx, :] of shape (T,)
+    const float* x = inp + idx * T;
+
+    // not INF, so we don't get NaNs accidentally when subtracting two values.
+    float maxval = -FLT_MAX;
+    float sumval = 0.0f;
+
+    const float4* x_vec = reinterpret_cast<const float4*>(x);
+
+    for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
+        float4 v = x_vec[i];
+        float old_maxval = maxval;
+        for(int k = 0; k < 4; ++k) {
+            maxval = fmaxf(maxval, vec_at(v, k));
+        }
+        sumval *= expf(inv_temperature * (old_maxval - maxval));
+        for(int k = 0; k < 4; ++k) {
+            sumval += expf(inv_temperature * (vec_at(v, k) - maxval));
+        }
+    }
+
+    if(4*pos_by_4 + warp.thread_rank() <= own_pos) {
+        float old_maxval = maxval;
+        maxval = fmaxf(maxval, x[4*pos_by_4 + warp.thread_rank()]);
+        sumval *= expf(inv_temperature * (old_maxval - maxval));
+        sumval += expf(inv_temperature * (x[4*pos_by_4 + warp.thread_rank()] - maxval));
+    }
+
+    float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
+    sumval *= expf(inv_temperature * (maxval - global_maxval));
+
+    float sum = cg::reduce(warp, sumval, cg::plus<float>{});
+    float norm = 1.f / sum;
+
+    // divide the whole row by the sum
+    for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
+        // recalculation is faster than doing the round-trip through memory.
+        float ev = expf(inv_temperature * (__ldcs(x + i) - global_maxval));
+        __stcs(out + idx * T + i, ev * norm);
+    }
+}
+
 
 __global__ void attention_value_kernel1(float* out, float* att, float* inp,
                                        int B, int T, int C, int NH) {
@@ -679,6 +748,75 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
 }
 
+
+void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
+                        float* inp,
+                        int B, int T, int C, int NH,
+                        const int block_size) {
+    // inp is (B, T, 3C) QKV
+    // preatt, att are (B, NH, T, T)
+    // output is (B, T, C)
+    int HS = C / NH; // head size
+
+    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
+    float *q, *k, *v;
+    q = qkvr + 0 * B * T * C;
+    k = qkvr + 1 * B * T * C;
+    v = qkvr + 2 * B * T * C;
+    int total_threads = B * NH * T * HS;
+    int num_blocks = CEIL_DIV(total_threads, block_size);
+    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+
+    // batched matrix multiply with cuBLAS
+    cublasHandle_t handle;
+    cublasStatus_t stat = cublasCreate(&handle);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    stat = cublasSgemmStridedBatched(handle,
+                                     CUBLAS_OP_T, CUBLAS_OP_N,
+                                     T, T, HS,
+                                     &alpha,
+                                     k, HS, T * HS,
+                                     q, HS, T * HS,
+                                     &beta,
+                                     preatt, T, T * T,
+                                     B * NH);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        printf("cublasSgemm failed\n");
+        exit(1);
+    }
+
+    // multiply all elements of preatt elementwise by scale
+    float scale = 1.0 / sqrtf(HS);
+    int softmax_block_size = 256;
+    int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
+    softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
+
+    // new approach: first cuBLAS another batched matmul
+    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+    stat = cublasSgemmStridedBatched(handle,
+                                     CUBLAS_OP_N, CUBLAS_OP_N,
+                                     HS, T, T,
+                                     &alpha,
+                                     v, HS, T * HS,
+                                     att, T, T * T,
+                                     &beta,
+                                     vaccum, HS, T * HS,
+                                     B * NH);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        printf("cublasSgemm failed\n");
+        exit(1);
+    }
+
+    // now unpermute
+    // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+    num_blocks = CEIL_DIV(B * T * C, block_size);
+    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+
+    // cleanups
+    cublasDestroy(handle);
+}
+
 // kernel version dispatch
 void attention_forward(int kernel_num,
                        float* out, float* vaccum, float* qkvr, float* preatt, float* att,
@@ -694,6 +832,9 @@ void attention_forward(int kernel_num,
             break;
         case 3:
             attention_forward3(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+            break;
+        case 4:
+            attention_forward4(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
