@@ -24,14 +24,14 @@ OMP_NUM_THREADS=32 ./matmul_forward 3
 #include "common.h"
 
 // ----------------------------------------------------------------------------
-// CUDA utils
+// CUDA setup
 
 // cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
+static cublasHandle_t cublas_handle;
+static cublasLtHandle_t cublaslt_handle;
 static size_t cublaslt_workspace_size = 32 * 1024 * 1024;
 static void* cublaslt_workspace = NULL;
 static cublasComputeType_t cublas_compute_type;
-cublasHandle_t cublas_handle;
-cublasLtHandle_t cublaslt_handle;
 
 // ----------------------------------------------------------------------------
 // CPU code reference

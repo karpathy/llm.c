@@ -32,9 +32,6 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 }
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
 
-// cuBLAS handle
-static cublasHandle_t handle;
-
 // ----------------------------------------------------------------------------
 // random utils
 

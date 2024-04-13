@@ -36,6 +36,11 @@ uses a directly autoregressive softmax, and uses the online softmax algorithm.
 #include "common.h"
 
 // ----------------------------------------------------------------------------
+// CUDA setup
+
+static cublasHandle_t cublas_handle;
+
+// ----------------------------------------------------------------------------
 // CPU code reference
 
 void attention_forward_cpu(float* out, float* preatt, float* att,
@@ -687,7 +692,7 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     // batched matrix multiply with cuBLAS
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    cublasCheck(cublasSgemmStridedBatched(handle,
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                             CUBLAS_OP_T, CUBLAS_OP_N,
                             T, T, HS,
                             &alpha,
@@ -711,7 +716,7 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasSgemmStridedBatched(handle,
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                             CUBLAS_OP_N, CUBLAS_OP_N,
                             HS, T, T,
                             &alpha,
@@ -748,7 +753,7 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     // batched matrix multiply with cuBLAS
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    cublasCheck(cublasSgemmStridedBatched(handle,
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                                      CUBLAS_OP_T, CUBLAS_OP_N,
                                      T, T, HS,
                                      &alpha,
@@ -766,7 +771,7 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasSgemmStridedBatched(handle,
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                                      CUBLAS_OP_N, CUBLAS_OP_N,
                                      HS, T, T,
                                      &alpha,
@@ -818,7 +823,7 @@ int main(int argc, char **argv) {
 
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
-    cublasCreate(&handle);
+    cublasCreate(&cublas_handle);
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * C * sizeof(float));
@@ -895,7 +900,7 @@ int main(int argc, char **argv) {
     cudaCheck(cudaFree(d_preatt));
     cudaCheck(cudaFree(d_att));
     cudaCheck(cudaFree(d_inp));
-    cublasDestroy(handle);
+    cublasDestroy(cublas_handle);
 
     return 0;
 }
