@@ -16,7 +16,7 @@ def _txt_to_c_readable(txt: str | bytes) -> str:
         if 32 <= byte <= 126 and byte != ord('\\'):
             c_array_elements.append(f"{chr(byte)}")
         else:
-            # use `\xFF` style for other characters
+            # use `\xHH` style with hex value for other characters
             c_array_elements.append(f"\\x{byte:02X}")
     return ''.join(c_array_elements)
 
