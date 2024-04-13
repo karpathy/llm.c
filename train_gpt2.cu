@@ -412,10 +412,9 @@ void matmul_forward_cublas(float* out,
     const int sqrt_block_size = 32;
 
     cublasHandle_t handle; // cuBLAS context
-    cublasStatus_t stat = cublasCreate(&handle); // initialize CUBLAS context
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    cublasCheck(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC));
+    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC));
 
     // and now we still have to add the bias... (ew)
     if (bias != NULL) {
@@ -424,7 +423,6 @@ void matmul_forward_cublas(float* out,
         add_bias<<<grid_size, block_size>>>(out, bias, B, T, OC);
         cudaCheck(cudaGetLastError());
     }
-    cublasDestroy(handle);
 }
 
 // uses cuBLASLt to fuse the bias and gelu. does not work with OC = 50257 (last layer)
@@ -519,11 +517,10 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
 
     // batched matrix multiply with cuBLAS
-    cublasHandle_t handle;
-    cublasStatus_t stat = cublasCreate(&handle);
+    cublasStatus_t stat;
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    stat = cublasSgemmStridedBatched(handle,
+    stat = cublasSgemmStridedBatched(cublas_handle,
                                      CUBLAS_OP_T, CUBLAS_OP_N,
                                      T, T, HS,
                                      &alpha,
@@ -544,7 +541,7 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    stat = cublasSgemmStridedBatched(handle,
+    stat = cublasSgemmStridedBatched(cublas_handle,
                                      CUBLAS_OP_N, CUBLAS_OP_N,
                                      HS, T, T,
                                      &alpha,
@@ -562,9 +559,6 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
-
-    // cleanups
-    cublasDestroy(handle);
 }
 
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
