@@ -16,7 +16,6 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 #include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include "decode_gpt2.c"
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -1015,6 +1014,49 @@ void gpt2_backward(GPT2 *model) {
     // crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V);
 }
 
+// 50256 tokens + 1 for end-of-text token
+#define GPT2_NUM_TOKENS 50257
+// 128 + 1 for null terminator
+#define GPT2_MAX_TOKEN_LEN 129
+void gpt2_load_decoder(const char* filename, char arr[][GPT2_MAX_TOKEN_LEN]) {
+    FILE* file = fopen(filename, "r");
+    if (!file) {
+        perror("Failed to open file");
+        return;
+    }
+
+    int i = 0, j = 0;
+    int ch;
+    while ((ch = fgetc(file)) != EOF && i < GPT2_NUM_TOKENS) {
+        if (ch == '\\') {
+            char next = fgetc(file);
+            if (next == 'x') {
+                // if \x，read next 2 characters as a hex number
+                int value;
+                if (fscanf(file, "%02X", &value) == 1) {
+                    arr[i][j++] = (char)value;
+                } else {
+                    printf("Malformed input\n");
+                    fclose(file);
+                    return;
+                }
+            } else {
+                // if not \x，treat `\` as a normal character
+                arr[i][j++] = '\\';
+                ungetc(next, file); // put it back for next iteration
+            }
+        } else if (ch == '\n') {
+            arr[i][j] = '\0'; // Null-terminate the current row
+            i++;
+            j = 0;
+        } else {
+            arr[i][j++] = (char)ch;
+        }
+    }
+
+    fclose(file);
+}
+
 void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->params_memory));
     cudaCheck(cudaFree(model->grads_memory));
@@ -1187,6 +1229,10 @@ int main() {
     int gen_tokens[gen_max_length];
     float* cpu_probs = (float*)malloc(model.config.vocab_size * sizeof(float));
 
+    // decoder
+    char decoder[GPT2_NUM_TOKENS][GPT2_MAX_TOKEN_LEN];
+    gpt2_load_decoder("decode_gpt2.txt", decoder);
+
     // train
     struct timespec start, end;
     for (int step = 0; step <= 40; step++) {
@@ -1223,7 +1269,7 @@ int main() {
             }
             printf("generated: ");
             for (int t = 0; t < gen_max_length; t++) {
-                printf("%s", decode(gen_tokens[t]));
+                printf("%s", decoder[gen_tokens[t]]);
             }
             printf("\n");
         }
