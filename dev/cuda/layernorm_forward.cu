@@ -27,13 +27,13 @@ version 3 uses cooperative groups to parallelize over all of B,T,C
 
 // GPT-2 layernorm forward pass
 void layernorm_forward_cpu(float* out, float* mean, float* rstd,
-                       float* inp, float* weight, float* bias,
+                       const float* inp, const float* weight, const float* bias,
                        int B, int T, int C) {
     float eps = 1e-5f;
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // seek to the input position inp[b,t,:]
-            float* x = inp + b * T * C + t * C;
+            const float* x = inp + b * T * C + t * C;
             // calculate the mean
             float m = 0.0f;
             for (int i = 0; i < C; i++) {
@@ -68,14 +68,14 @@ void layernorm_forward_cpu(float* out, float* mean, float* rstd,
 
 // naive drag and drop implementation into kernel, parallelize over B,T, loop over C
 __global__ void layernorm_forward_kernel1(float* out, float* mean, float* rstd,
-                                 float* inp, float* weight, float* bias,
+                                 const float* inp, const float* weight, const float* bias,
                                  int N, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     float eps = 1e-5f;
 
     if (idx < N) {
         // seek to the input position inp[idx,:]
-        float* x = inp + idx * C;
+        const float* x = inp + idx * C;
         // calculate the mean
         float m = 0.0f;
         for (int i = 0; i < C; i++) {
@@ -104,11 +104,11 @@ __global__ void layernorm_forward_kernel1(float* out, float* mean, float* rstd,
     }
 }
 
-__global__ void mean_kernel(float* mean, float* inp, int N, int C, int block_size) {
+__global__ void mean_kernel(float* mean, const float* inp, int N, int C, int block_size) {
     extern __shared__ float shared[];
     int idx = blockIdx.x; // range [0, B*T)
     int tid = threadIdx.x; // range [0, block_size)
-    float* x = inp + idx * C;
+    const float* x = inp + idx * C;
     // thread coarsening
     float sum = 0.0f;
     for (int i = tid; i < C; i += block_size) {
@@ -129,11 +129,11 @@ __global__ void mean_kernel(float* mean, float* inp, int N, int C, int block_siz
     }
 }
 
-__global__ void rstd_kernel(float* rstd, float* inp, float* mean, int N, int C, int block_size) {
+__global__ void rstd_kernel(float* rstd, const float* inp, const float* mean, int N, int C, int block_size) {
     extern __shared__ float shared[];
     int idx = blockIdx.x; // range [0, B*T)
     int tid = threadIdx.x; // range [0, block_size)
-    float* x = inp + idx * C;
+    const float* x = inp + idx * C;
     float m = mean[idx];
     // thread coarsening
     float sum = 0.0f;
@@ -156,8 +156,8 @@ __global__ void rstd_kernel(float* rstd, float* inp, float* mean, int N, int C, 
     }
 }
 
-__global__ void normalization_kernel(float* out, float* inp, float* mean, float* rstd,
-                                     float* weight, float* bias, int B, int T, int C) {
+__global__ void normalization_kernel(float* out, const float* inp, float* mean, float* rstd,
+                                     const float* weight, const float* bias, int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     int bt = idx / C;
@@ -226,7 +226,7 @@ __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __rest
 // kernel launcher
 
 void layernorm_forward1(float* out, float* mean, float* rstd,
-                           float* inp, float* weight, float* bias,
+                           const float* inp, const float* weight, const float* bias,
                            int B, int T, int C,
                            const int block_size) {
     const int N = B * T;
@@ -236,7 +236,7 @@ void layernorm_forward1(float* out, float* mean, float* rstd,
 }
 
 void layernorm_forward2(float* out, float* mean, float* rstd,
-                       float* inp, float* weight, float* bias,
+                       const float* inp, const float* weight, const float* bias,
                        int B, int T, int C,
                        const int block_size) {
     int N = B * T;
@@ -266,7 +266,7 @@ void layernorm_forward3(float* out, float* mean, float* rstd,
 // kernel version dispatch
 void layernorm_forward(int kernel_num,
                     float* out, float* mean, float* rstd,
-                    float* inp, float* weight, float* bias,
+                    const float* inp, const float* weight, const float* bias,
                     int B, int T, int C,
                     const int block_size) {
     switch (kernel_num) {

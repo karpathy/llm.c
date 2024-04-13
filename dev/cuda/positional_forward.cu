@@ -21,14 +21,14 @@ version 2 is more optimized, parallelizes over all of B,T,C
 
 // GPT-2 positional encoder forward pass
 void encoder_forward_cpu(float* out,
-                   int* inp, float* wte, float* wpe,
+                   const int* inp, const float* wte, const float* wpe,
                    int B, int T, int C) {
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             float* out_bt = out + b * T * C + t * C;
             int ix = inp[b * T + t];
-            float* wte_ix = wte + ix * C;
-            float* wpe_t = wpe + t * C;
+            const float* wte_ix = wte + ix * C;
+            const float* wpe_t = wpe + t * C;
             for (int i = 0; i < C; i++) {
                 out_bt[i] = wte_ix[i] + wpe_t[i];
             }
@@ -41,7 +41,7 @@ void encoder_forward_cpu(float* out,
 
 // naive implementation into kernel, parallelize over B,T, loop over C
 __global__ void encoder_forward_kernel1(float* out,
-                               int* inp, float* wte, float* wpe,
+                               const int* inp, const float* wte, const float* wpe,
                                int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * T;
@@ -51,8 +51,8 @@ __global__ void encoder_forward_kernel1(float* out,
         int t = idx % T;
         float* out_bt = out + b * T * C + t * C;
         int ix = inp[b * T + t];
-        float* wte_ix = wte + ix * C;
-        float* wpe_t = wpe + t * C;
+        const float* wte_ix = wte + ix * C;
+        const float* wpe_t = wpe + t * C;
         for (int i = 0; i < C; i++) {
             out_bt[i] = wte_ix[i] + wpe_t[i];
         }
@@ -61,7 +61,7 @@ __global__ void encoder_forward_kernel1(float* out,
 
 // optimized implementation: parallelize over all of B,T,C
 __global__ void encoder_forward_kernel2(float* out,
-                               int* inp, float* wte, float* wpe,
+                               const int* inp, const float* wte, const float* wpe,
                                int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * T * C;
@@ -75,8 +75,8 @@ __global__ void encoder_forward_kernel2(float* out,
         int ix = inp[b * T + t];
 
         float* out_btc = out + b * T * C + t * C + c;
-        float* wte_ix = wte + ix * C + c;
-        float* wpe_tc = wpe + t * C + c;
+        const float* wte_ix = wte + ix * C + c;
+        const float* wpe_tc = wpe + t * C + c;
         *out_btc = *wte_ix + *wpe_tc;
     }
 }
@@ -85,7 +85,7 @@ __global__ void encoder_forward_kernel2(float* out,
 // kernel launcher
 
 void encoder_forward1(float* out,
-                     int* inp, float* wte, float* wpe,
+                     const int* inp, const float* wte, const float* wpe,
                      int B, int T, int C,
                      const int block_size) {
     const int N = B * T;
@@ -95,7 +95,7 @@ void encoder_forward1(float* out,
 }
 
 void encoder_forward2(float* out,
-                     int* inp, float* wte, float* wpe,
+                     const int* inp, const float* wte, const float* wpe,
                      int B, int T, int C,
                      const int block_size) {
     const int N = B * T * C;
@@ -107,7 +107,7 @@ void encoder_forward2(float* out,
 // kernel version dispatch
 void encoder_forward(int kernel_num,
                      float* out,
-                     int* inp, float* wte, float* wpe,
+                     const int* inp, const float* wte, const float* wpe,
                      int B, int T, int C,
                      const int block_size) {
     switch (kernel_num) {

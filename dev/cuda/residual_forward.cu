@@ -16,7 +16,7 @@ version 1 is naive port from CPU code to kernel
 // ----------------------------------------------------------------------------
 // CPU code reference lol
 
-void residual_forward_cpu(float* out, float* inp1, float* inp2, int N) {
+void residual_forward_cpu(float* out, const float* inp1, const float* inp2, int N) {
     for (int i = 0; i < N; i++) {
         out[i] = inp1[i] + inp2[i];
     }
@@ -26,7 +26,7 @@ void residual_forward_cpu(float* out, float* inp1, float* inp2, int N) {
 // GPU kernels
 
 // elementwise ops are nice and ez
-__global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, int N) {
+__global__ void residual_forward_kernel(float* out, const float* inp1, const float* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
         out[idx] = inp1[idx] + inp2[idx];
@@ -36,7 +36,7 @@ __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, in
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-void residual_forward1(float* out, float* inp1, float* inp2, int N, const int block_size) {
+void residual_forward1(float* out, const float* inp1, const float* inp2, int N, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
     residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
     cudaCheck(cudaGetLastError());
@@ -45,8 +45,8 @@ void residual_forward1(float* out, float* inp1, float* inp2, int N, const int bl
 // kernel version dispatch
 void residual_forward(int kernel_num,
                   float* out,
-                  float* inp1,
-                  float* inp2,
+                  const float* inp1,
+                  const float* inp2,
                   int N,
                   int block_size) {
     switch (kernel_num) {

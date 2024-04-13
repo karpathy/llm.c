@@ -26,7 +26,7 @@ If encountering "error: identifier "M_PI" is undefined", add the following lines
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 
-void gelu_forward_cpu(float* out, float* inp, int N) {
+void gelu_forward_cpu(float* out, const float* inp, int N) {
     for (int i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
@@ -50,7 +50,7 @@ __global__ void gelu_kernel(float* out, const float* inp, int N) {
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-void gelu_forward1(float* out, float* inp, int N, const int block_size) {
+void gelu_forward1(float* out, const float* inp, int N, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
     gelu_kernel<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
@@ -59,7 +59,7 @@ void gelu_forward1(float* out, float* inp, int N, const int block_size) {
 // kernel version dispatch
 void gelu_forward(int kernel_num,
                   float* out,
-                  float* inp,
+                  const float* inp,
                   int B, int T, int C,
                   int block_size) {
     switch (kernel_num) {

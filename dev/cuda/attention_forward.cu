@@ -39,7 +39,7 @@ uses a directly autoregressive softmax, and uses the online softmax algorithm.
 // CPU code reference
 
 void attention_forward_cpu(float* out, float* preatt, float* att,
-                       float* inp,
+                       const float* inp,
                        int B, int T, int C, int NH) {
     // input is (B, T, 3C) Q,K,V
     // preatt, att are (B, NH, T, T)
@@ -51,14 +51,14 @@ void attention_forward_cpu(float* out, float* preatt, float* att,
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
-                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
+                const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
                 float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
                 float* att_bth = att + b*NH*T*T + h*T*T + t*T;
 
                 // pass 1: calculate query dot key and maxval
                 float maxval = -10000.0f; // TODO something better
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                    const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
 
                     // (query_t) dot (key_t2)
                     float val = 0.0f;
@@ -101,7 +101,7 @@ void attention_forward_cpu(float* out, float* preatt, float* att,
                 float* out_bth = out + b * T * C + t * C + h * hs;
                 for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                    const float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
                     float att_btht2 = att_bth[t2];
                     for (int i = 0; i < hs; i++) {
                         out_bth[i] += att_btht2 * value_t2[i];
@@ -115,7 +115,7 @@ void attention_forward_cpu(float* out, float* preatt, float* att,
 // ----------------------------------------------------------------------------
 // GPU kernels
 
-__global__ void attention_query_key_kernel1(float* preatt, float* inp,
+__global__ void attention_query_key_kernel1(float* preatt, const float* inp,
                                            int B, int T, int C, int NH) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_threads = B * NH * T * T;
@@ -133,8 +133,8 @@ __global__ void attention_query_key_kernel1(float* preatt, float* inp,
 
         int C3 = C*3;
         int hs = C / NH; // head size
-        float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-        float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+        const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
+        const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
 
         // (query_t) dot (key_t2)
         float val = 0.0f;
@@ -147,7 +147,7 @@ __global__ void attention_query_key_kernel1(float* preatt, float* inp,
     }
 }
 
-__global__ void attention_softmax_kernel1(float* att, float* preatt,
+__global__ void attention_softmax_kernel1(float* att, const float* preatt,
                                          int B, int T, int NH) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_threads = B * T * NH;
@@ -157,7 +157,7 @@ __global__ void attention_softmax_kernel1(float* att, float* preatt,
         int t = (idx / NH) % T;
         int b = idx / (NH * T);
 
-        float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
+        const float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
         float* att_bth = att + b*NH*T*T + h*T*T + t*T;
 
         // find maxval
@@ -206,7 +206,7 @@ __device__ float warpReduceSum(float val) {
     return val;
 }
 
-__global__ void softmax_forward_kernel4(float* out, float* inp, int N, int C) {
+__global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int C) {
     // out is (N, C) just like inp. Each row of inp will get softmaxed.
     // same as kernel3, but can handle any block size (multiple of 32)
     // each row of C elements is handled by block_size threads
@@ -229,7 +229,7 @@ __global__ void softmax_forward_kernel4(float* out, float* inp, int N, int C) {
     float* sumvals = &shared[warpsPerBlock];
 
     // one row of inp, i.e. inp[idx, :] of shape (C,)
-    float* x = inp + idx * C;
+    const float* x = inp + idx * C;
 
     // first, thread coarsening by directly accessing global memory in series
     float maxval = -INFINITY;
@@ -363,7 +363,7 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
 }
 
 
-__global__ void attention_value_kernel1(float* out, float* att, float* inp,
+__global__ void attention_value_kernel1(float* out, const float* att, const float* inp,
                                        int B, int T, int C, int NH) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_threads = B * T * NH;
@@ -377,11 +377,11 @@ __global__ void attention_value_kernel1(float* out, float* att, float* inp,
         int hs = C / NH; // head size
 
         float* out_bth = out + b * T * C + t * C + h * hs;
-        float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+        const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
 
         for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
         for (int t2 = 0; t2 <= t; t2++) {
-            float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+           const  float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
             float att_btht2 = att_bth[t2];
             for (int i = 0; i < hs; i++) {
                 out_bth[i] += att_btht2 * value_t2[i];
@@ -534,7 +534,7 @@ __global__ void permute_kernel(float* q, float* k, float* v,
     }
 }
 
-__global__ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, int d) {
+__global__ void unpermute_kernel(const float* inp, float *out, int B, int N, int NH, int d) {
    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -573,7 +573,7 @@ __global__ void scale_kernel(float* inp, float scale, int B, int NH, int T) {
 // kernel launcher
 
 void attention_forward1(float* out, float* preatt, float* att,
-                       float* inp,
+                       const float* inp,
                        int B, int T, int C, int NH,
                        const int block_size) {
     // attention calculation
@@ -589,7 +589,7 @@ void attention_forward1(float* out, float* preatt, float* att,
 
 
 void attention_forward2(float* out,
-                       float* inp,
+                       const float* inp,
                        int B, int T, int C, int NH,
                        const int block_size) {
     // TODO there should be no mallocs inside any of these functions!
@@ -667,7 +667,7 @@ void attention_forward2(float* out,
 }
 
 void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
-                       float* inp,
+                       const float* inp,
                        int B, int T, int C, int NH,
                        const int block_size) {
     // inp is (B, T, 3C) QKV
@@ -729,7 +729,7 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
 
 
 void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
-                        float* inp,
+                        const float* inp,
                         int B, int T, int C, int NH,
                         const int block_size) {
     // inp is (B, T, 3C) QKV
@@ -799,7 +799,7 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
 // kernel version dispatch
 void attention_forward(int kernel_num,
                        float* out, float* vaccum, float* qkvr, float* preatt, float* att,
-                       float* inp,
+                       const float* inp,
                        int B, int T, int C, int NH,
                        const int block_size) {
     switch (kernel_num) {

@@ -17,13 +17,13 @@ version 1 is a straight-forward port from CPU code to kernel, parallel over B,T
 // CPU code reference
 
 void crossentropy_softmax_backward_cpu(float* dlogits,
-                           float* dlosses, float* probs, int* targets,
+                           const float* dlosses, const float* probs, const int* targets,
                            int B, int T, int V) {
     // backwards through both softmax and crossentropy
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             float* dlogits_bt = dlogits + b * T * V + t * V;
-            float* probs_bt = probs + b * T * V + t * V;
+            const float* probs_bt = probs + b * T * V + t * V;
             float dloss = dlosses[b * T + t];
             int ix = targets[b * T + t];
             for (int i = 0; i < V; i++) {
@@ -40,7 +40,7 @@ void crossentropy_softmax_backward_cpu(float* dlogits,
 
 // naive kernel that just parallelizes over B,T,V
 __global__ void crossentropy_softmax_backward_kernel1(float* dlogits,
-                           float* dlosses, float* probs, int* targets,
+                           const float* dlosses, const float* probs, const int* targets,
                            int B, int T, int V) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < B * T * V) {
@@ -48,7 +48,7 @@ __global__ void crossentropy_softmax_backward_kernel1(float* dlogits,
         int t = (i / V) % T;
         int v = i % V;
         float* dlogits_bt = dlogits + b * T * V + t * V;
-        float* probs_bt = probs + b * T * V + t * V;
+        const float* probs_bt = probs + b * T * V + t * V;
         float dloss = dlosses[b * T + t];
         int ix = targets[b * T + t];
         float p = probs_bt[v];
@@ -61,7 +61,7 @@ __global__ void crossentropy_softmax_backward_kernel1(float* dlogits,
 // kernel launcher
 
 void crossentropy_softmax_backward1(float* dlogits,
-                           float* dlosses, float* probs, int* targets,
+                           const float* dlosses, const float* probs, const int* targets,
                            int B, int T, int V,
                            const int block_size) {
     const int N = B * T * V;
@@ -73,7 +73,7 @@ void crossentropy_softmax_backward1(float* dlogits,
 // kernel version dispatch
 void crossentropy_softmax_backward(int kernel_num,
                            float* dlogits,
-                           float* dlosses, float* probs, int* targets,
+                           const float* dlosses, const float* probs, const int* targets,
                            int B, int T, int V,
                            const int block_size) {
     switch (kernel_num) {

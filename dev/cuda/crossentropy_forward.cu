@@ -17,7 +17,7 @@ version 1 is a straight-forward port from CPU code to kernel, parallel over B,T
 // CPU code reference
 
 void crossentropy_forward_cpu(float* losses,
-                            float* probs, int* targets,
+                            const float* probs, const int* targets,
                             int B, int T, int V) {
     // output: losses is (B,T) of the individual losses at each position
     // input: probs are (B,T,V) of the probabilities
@@ -25,7 +25,7 @@ void crossentropy_forward_cpu(float* losses,
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // loss = -log(probs[target])
-            float* probs_bt = probs + b * T * V + t * V;
+            const float* probs_bt = probs + b * T * V + t * V;
             int ix = targets[b * T + t];
             losses[b * T + t] = -logf(probs_bt[ix]);
         }
@@ -36,13 +36,13 @@ void crossentropy_forward_cpu(float* losses,
 // GPU kernels
 
 __global__ void crossentropy_forward_kernel1(float* losses,
-                            float* probs, int* targets,
+                            const float* probs, const int* targets,
                             int B, int T, int V) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < B * T) {
         int b = i / T;
         int t = i % T;
-        float* probs_bt = probs + b * T * V + t * V;
+        const float* probs_bt = probs + b * T * V + t * V;
         int ix = targets[b * T + t];
         losses[b * T + t] = -logf(probs_bt[ix]);
     }
@@ -52,7 +52,7 @@ __global__ void crossentropy_forward_kernel1(float* losses,
 // kernel launcher
 
 void crossentropy_forward1(float* losses,
-                            float* probs, int* targets,
+                            const float* probs, const int* targets,
                             int B, int T, int V,
                             const int block_size) {
     const int N = B * T;
@@ -64,7 +64,7 @@ void crossentropy_forward1(float* losses,
 // kernel version dispatch
 void crossentropy_forward(int kernel_num,
                           float* losses,
-                          float* probs, int* targets,
+                          const float* probs, const int* targets,
                           int B, int T, int V,
                           const int block_size) {
     switch (kernel_num) {
