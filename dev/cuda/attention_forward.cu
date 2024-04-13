@@ -19,6 +19,10 @@ cuBLAS is used both to calculate the QK^T and the final weighted sum
 the softmax is calculated using a custom, efficient kernel as well
 this turns out to be ~20X faster than (1) nice
 ./attention_forward 3
+
+version 4 is a further optimized kernel that fuses the scale operation,
+uses a directly autoregressive softmax, and uses the online softmax algorithm.
+./attention_forward 4
 */
 
 #include <stdio.h>
@@ -329,7 +333,10 @@ __device__ float vec_at(const float4& vec, int index) {
 }
 
 __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const float* inp, int N, int T) {
-    // shape: (N, T, T)
+    // inp, out shape: (N, T, T), where N = B * NH
+    // fuses the multiplication by scale inside attention
+    // directly autoregressive, so we only compute the lower triangular part
+    // uses the online softmax algorithm
     assert(T % 4  == 0);
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
@@ -349,7 +356,6 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     float sumval = 0.0f;
 
     const float4* x_vec = reinterpret_cast<const float4*>(x);
-
     for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
         float4 v = x_vec[i];
         float old_maxval = maxval;
