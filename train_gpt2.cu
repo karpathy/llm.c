@@ -691,6 +691,7 @@ typedef struct {
     int* inputs; // the input tokens for the current forward pass
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
+    float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
 } GPT2;
 
 
@@ -823,6 +824,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         // also create memory for caching inputs and targets
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
+        cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
     } else {
         // validate B,T is no larger than what was previously allocated
         // in principle, we could re-allocate a larger chunk of memory, for now we just error out
@@ -908,13 +910,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         // for convenience also evaluate the mean loss
         // move the (B,T) losses to CPU
         // TODO get rid of inline mallocs
-        float* cpu_losses = (float*)malloc(B * T * sizeof(float));
-        cudaCheck(cudaMemcpy(cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
         float mean_loss = 0.0f;
-        for (int i=0; i<B*T; i++) { mean_loss += cpu_losses[i]; }
+        for (int i=0; i<B*T; i++) { mean_loss += model->cpu_losses[i]; }
         mean_loss /= B*T;
         model->mean_loss = mean_loss;
-        free(cpu_losses);
 
     } else {
         // if we don't have targets, we don't have a loss
@@ -931,6 +931,7 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->grads_acts_memory));
     cudaCheck(cudaFree(model->inputs));
     cudaCheck(cudaFree(model->targets));
+    cudaFreeHost(model->cpu_losses);
 }
 
 #ifndef TESTING
@@ -978,7 +979,9 @@ void dataloader_init(DataLoader *loader, char* filename, int B, int T) {
     loader->current_position = 0; // start at the beginning
 
     // allocate space for B*T + 1 integers to store the inputs and targets
-    loader->batch = (int*) malloc((B * T + 1) * sizeof(int));
+    // Using CUDA CPU pinned memory for faster PCI Express transfers to GPU
+    // See: https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/
+    cudaMallocHost((void**)&loader->batch, (B * T + 1) * sizeof(int));
     loader->inputs = loader->batch;
     loader->targets = loader->batch + 1; // targets are shifted by one
     loader->num_batches = loader->file_size / (B * T * sizeof(int));
@@ -1004,7 +1007,7 @@ void dataloader_next_batch(DataLoader *loader) {
 
 void dataloader_free(DataLoader *loader) {
     fclose(loader->tokens_file);
-    free(loader->batch);
+    cudaFreeHost(loader->batch);
 }
 
 
