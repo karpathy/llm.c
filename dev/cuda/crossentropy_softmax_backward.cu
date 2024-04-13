@@ -93,7 +93,6 @@ int main(int argc, char **argv) {
 
     int B = 8;
     int T = 1024;
-    int C = 768;
     int V = 50257;
 
     int deviceIdx = 0;
