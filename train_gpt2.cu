@@ -173,9 +173,9 @@ __global__ void permute_kernel(float* q, float* k, float* v,
             +          (nh_ * d)
             +                d_;
 
-        q[idx] = inp[inp_idx];
-        k[idx] = inp[inp_idx + NH * d];
-        v[idx] = inp[inp_idx + 2 * (NH * d)];
+        q[idx] = __ldcs(&inp[inp_idx]);
+        k[idx] = __ldcs(&inp[inp_idx + NH * d]);
+        v[idx] = __ldcs(&inp[inp_idx + 2 * (NH * d)]);
     }
 }
 
@@ -193,7 +193,7 @@ __global__ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, i
         int d_ = rest % d;
 
         int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-        out[other_idx] = inp[idx];
+        out[other_idx] = __ldcs(&inp[idx]);
     }
 }
 
@@ -355,7 +355,7 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
 __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
-        out[idx] = inp1[idx] + inp2[idx];
+        out[idx] = __ldcs(&inp1[idx]) + __ldcs(&inp2[idx]);
     }
 }
 
