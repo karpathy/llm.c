@@ -927,7 +927,7 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
 
-        int repeat_times = 10;
+        int repeat_times = 100;
         cudaEvent_t start, stop;
         cudaCheck(cudaEventCreate(&start));
         cudaCheck(cudaEventCreate(&stop));
