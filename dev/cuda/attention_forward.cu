@@ -727,7 +727,6 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
 }
 
-
 void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
                         const float* inp,
                         int B, int T, int C, int NH,
@@ -747,11 +746,9 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
 
     // batched matrix multiply with cuBLAS
-    cublasHandle_t handle;
-    cublasStatus_t stat = cublasCreate(&handle);
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    stat = cublasSgemmStridedBatched(handle,
+    cublasCheck(cublasSgemmStridedBatched(handle,
                                      CUBLAS_OP_T, CUBLAS_OP_N,
                                      T, T, HS,
                                      &alpha,
@@ -759,11 +756,7 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
                                      q, HS, T * HS,
                                      &beta,
                                      preatt, T, T * T,
-                                     B * NH);
-    if (stat != CUBLAS_STATUS_SUCCESS) {
-        printf("cublasSgemm failed\n");
-        exit(1);
-    }
+                                     B * NH));
 
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
@@ -773,7 +766,7 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    stat = cublasSgemmStridedBatched(handle,
+    cublasCheck(cublasSgemmStridedBatched(handle,
                                      CUBLAS_OP_N, CUBLAS_OP_N,
                                      HS, T, T,
                                      &alpha,
@@ -781,19 +774,12 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
                                      att, T, T * T,
                                      &beta,
                                      vaccum, HS, T * HS,
-                                     B * NH);
-    if (stat != CUBLAS_STATUS_SUCCESS) {
-        printf("cublasSgemm failed\n");
-        exit(1);
-    }
+                                     B * NH));
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = ceil_div(B * T * C, block_size);
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
-
-    // cleanups
-    cublasDestroy(handle);
 }
 
 // kernel version dispatch
@@ -861,26 +847,32 @@ int main(int argc, char **argv) {
         kernel_num = atoi(argv[1]);
     }
     printf("Using kernel %d\n", kernel_num);
+    int block_sizes[] = {32, 64, 128, 256, 512};
 
     // first check the correctness of the kernel
     attention_forward_cpu(out, preatt, att, inp, B, T, C, NH);
-
-    // time the kernel at different block sizes
-    int block_sizes[] = {32, 64, 128, 256, 512};
-
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
         attention_forward(kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+        // all kernels should produce the correct output out
         validate_result(d_out, out, "out", B * T * C, 1e-4f);
-        // TODO kernel 2 currently fails these.
-        // validate_result(d_att, att, "att", B * T * C, 1e-4f);
-        // TODO fused scaling does not produce the same result as CPU reference code
-        // validate_result(d_preatt, preatt, "preatt", B * T * C, 1e-4f);
+        // but as for preatt and att, things get a bit more complicated:
+        if (kernel_num != 2) {
+            // kernel 2 (knowingly) fails att/preatt because it uses a different algorithm
+            // that estimates the softmax online and never materializes preatt/att
+            validate_result(d_att, att, "att", B * T * C, 1e-4f);
+        }
+        if (kernel_num != 2 && kernel_num != 4) {
+            // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
+            // into the softmax, so preatt is off by 1.0f / sqrt(HS)
+            // but att and out (checked below) should match.
+            validate_result(d_preatt, preatt, "preatt", B * T * C, 1e-4f);
+        }
     }
-
     printf("All results match. Starting benchmarks.\n\n");
 
+    // benchmark speed of the kernel
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         int repeat_times = 100;
