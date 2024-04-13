@@ -477,7 +477,7 @@ void matmul_forward_cublaslt(float* out,
         weightLayout, inputLayout, outputLayout, outputLayout,
         preference, 1, &heuristic, &returnedResults));
     if (returnedResults == 0) {
-        printf("No cuBLASLt algorithm: B: %d, T: %d, C: %d, OC: %d, bias: %d, gelu: %d\n", B, T, C, OC, has_bias);
+        printf("No cuBLASLt algorithm: B: %d, T: %d, C: %d, OC: %d, bias: %d\n", B, T, C, OC, has_bias);
         exit(EXIT_FAILURE);
     }
 
@@ -745,7 +745,7 @@ typedef struct {
 } GPT2;
 
 
-void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
+void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in model from a checkpoint file
     FILE *model_file = fopen(checkpoint_path, "rb");
@@ -994,15 +994,19 @@ void gpt2_backward(GPT2 *model) {
     // convenience shortcuts
     int B = model->batch_size;
     int T = model->seq_len;
+    /*
     int V = model->config.vocab_size;
     int L = model->config.num_layers;
     int NH = model->config.num_heads;
     int C = model->config.channels;
+    */
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
+    /*
     ParameterTensors params = model->params; // for brevity
     ParameterTensors grads = model->grads;
     ActivationTensors acts = model->acts;
+    */
     ActivationTensors grads_acts = model->grads_acts;
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
@@ -1049,7 +1053,7 @@ typedef struct {
     int num_batches;
 } DataLoader;
 
-void dataloader_init(DataLoader *loader, char* filename, int B, int T) {
+void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     loader->B = B;
     loader->T = T;
 
@@ -1161,12 +1165,12 @@ int main() {
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
-    char* tiny_stories_train = "data/TinyStories_train.bin";
-    char* tiny_stories_val = "data/TinyStories_val.bin";
-    char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
-    char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
-    char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
-    char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
+    const char* tiny_stories_train = "data/TinyStories_train.bin";
+    const char* tiny_stories_val = "data/TinyStories_val.bin";
+    const char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
+    const char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
+    const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
+    const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
     int B = 4;
     int T = 1024;
     DataLoader train_loader;
