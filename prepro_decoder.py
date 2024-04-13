@@ -5,7 +5,7 @@ from pathlib import Path
 from tiktoken_ext.openai_public import ENCODING_CONSTRUCTORS
 
 
-root = Path(__file__).parent.parent.parent
+data_dir = Path(__file__).parent / 'data'
 
 
 def _txt_to_c_readable(txt: str | bytes) -> str:
@@ -13,7 +13,7 @@ def _txt_to_c_readable(txt: str | bytes) -> str:
     c_array_elements = []
     for byte in bytes_repr:
         # printable ASCII except `\`(92)
-        if 32 <= byte <= 126 and byte != ord('\\'):
+        if chr(byte).isprintable() and byte != ord('\\'):
             c_array_elements.append(f"{chr(byte)}")
         else:
             # use `\xHH` style with hex value for other characters
@@ -24,11 +24,14 @@ def _txt_to_c_readable(txt: str | bytes) -> str:
 def gen(name: str) -> None:
     """
     Generate the decoding tokens for the given encoding constructor defined in https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py
+    `python decoder_gen.py gpt2` will generate `data/decode_gpt2.txt`, which can be loaded as a `char [52507][129]` array in C as the decoder.
+      * printable characters are readable as is except for `\`
+      * all other characters are represented as `\xHH` where `HH` is the hex value of the character
     """
     if name not in ENCODING_CONSTRUCTORS:
         raise ValueError(f"Unknown encoding constructor name: {name}. Available names: {list(ENCODING_CONSTRUCTORS.keys())}")
 
-    gen_file = f"decode_{name}.txt"
+    gen_file = f"{data_dir}/decode_{name}.txt"
     print(f"Generating {gen_file} ...")
 
     encoder = ENCODING_CONSTRUCTORS[name]()
@@ -39,7 +42,7 @@ def gen(name: str) -> None:
     decoding = {v: _txt_to_c_readable(k) for k, v in all_tokens.items()}
     all_tokens_str = '\n'.join([v for _, v in decoding.items()])
 
-    with open(root / gen_file, 'w') as f:
+    with open(gen_file, 'w') as f:
         f.write(all_tokens_str)
 
     print("Done!")

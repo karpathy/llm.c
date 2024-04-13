@@ -27,7 +27,7 @@ int check_tensor(float *a, float *b, int n, char* label) {
 
 int check_decoder() {
     char decoder[GPT2_NUM_TOKENS][GPT2_MAX_TOKEN_LEN];
-    gpt2_load_decoder("decode_gpt2.txt", decoder);
+    gpt2_load_decoder("data/decode_gpt2.txt", decoder);
 
     static int tokens[] = {50256, 16773, 18162, 21986, 11, 198, 13681, 263, 23875, 198, 3152, 262, 11773, 2910, 198, 1169, 6002, 6386, 2583, 286, 262, 11858, 198, 20424, 428, 3135, 7596, 995, 3675, 13, 198, 40, 481, 407, 736, 17903, 11, 329, 703, 6029, 706, 4082, 198, 42826, 1028, 1128, 633, 263, 11, 198, 10594, 407, 198, 2704, 454, 680, 1028, 262, 1027, 28860, 286, 198, 3237, 323};
     static char* expected[] = {"<|endoftext|>", "Come", " Running", " Away", ",", "\n", "Great", "er", " conquer", "\n", "With", " the", " Imperial", " blood", "\n", "the", " heav", "iest", " host", " of", " the", " gods", "\n", "into", " this", " wond", "rous", " world", " beyond", ".", "\n", "I", " will", " not", " back", " thee", ",", " for", " how", " sweet", " after", " birth", "\n", "Netflix", " against", " rep", "ound", "er", ",", "\n", "will", " not", "\n", "fl", "our", "ish", " against", " the", " ear", "locks", " of", "\n", "All", "ay"};

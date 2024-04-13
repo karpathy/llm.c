@@ -1125,7 +1125,7 @@ int main() {
 
     // decoder
     char decoder[GPT2_NUM_TOKENS][GPT2_MAX_TOKEN_LEN];
-    gpt2_load_decoder("decode_gpt2.txt", decoder);
+    gpt2_load_decoder("data/decode_gpt2.txt", decoder);
 
     // train
     struct timespec start, end;
