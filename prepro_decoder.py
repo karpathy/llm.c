@@ -24,7 +24,8 @@ def _txt_to_c_readable(txt: str | bytes) -> str:
 def gen(name: str) -> None:
     """
     Generate the decoding tokens for the given encoding constructor defined in https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py
-    `python decoder_gen.py gpt2` will generate `data/decode_gpt2.txt`, which can be loaded as a `char [52507][129]` array in C as the decoder.
+
+    `python prepro_decoder.py` will generate `data/decode_gpt2.txt`, which can be loaded as a `char [52507][129]` array in C as the decoder.
       * printable characters are readable as is except for \
       * all other characters are represented as `\\xHH` where `HH` is the hex value of the character
     """
