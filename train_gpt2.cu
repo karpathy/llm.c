@@ -994,19 +994,15 @@ void gpt2_backward(GPT2 *model) {
     // convenience shortcuts
     int B = model->batch_size;
     int T = model->seq_len;
-    /*
-    int V = model->config.vocab_size;
-    int L = model->config.num_layers;
-    int NH = model->config.num_heads;
-    int C = model->config.channels;
-    */
+    // int V = model->config.vocab_size;
+    // int L = model->config.num_layers;
+    // int NH = model->config.num_heads;
+    // int C = model->config.channels;
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
-    /*
-    ParameterTensors params = model->params; // for brevity
-    ParameterTensors grads = model->grads;
-    ActivationTensors acts = model->acts;
-    */
+    // ParameterTensors params = model->params; // for brevity
+    // ParameterTensors grads = model->grads;
+    // ActivationTensors acts = model->acts;
     ActivationTensors grads_acts = model->grads_acts;
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
