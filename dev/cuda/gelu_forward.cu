@@ -4,16 +4,13 @@ Kernels for gelu forward pass.
 Compile example:
 nvcc -O3 --use_fast_math gelu_forward.cu -o gelu_forward
 
-version 1 is naive port from CPU code to kernel
-./gelu_forward 1
-*/
-
-/*
 If encountering "error: identifier "M_PI" is undefined", add the following lines to the top of the file:
 
 #define _USE_MATH_DEFINES
 #include <math.h>  OR  #include <cmath>
 
+version 1 is naive port from CPU code to kernel
+./gelu_forward 1
 */
 
 #include <stdio.h>
