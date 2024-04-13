@@ -410,8 +410,6 @@ void matmul_forward_cublas(float* out,
                     float* inp, float* weight, float* bias,
                     int B, int T, int C, int OC) {
     const int sqrt_block_size = 32;
-
-    cublasHandle_t handle; // cuBLAS context
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC));
