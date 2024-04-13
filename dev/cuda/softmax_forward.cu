@@ -16,11 +16,19 @@ version 3 uses intra-warp reductions for maxval and sumval, must use block_size=
 version 4 uses both intra-warp reductions and shared memory for inter-warp reductions
 so it can tolerate any block_size % 32 == 0. this is hopefully the most efficient version
 ./softmax_forward 4
+
+version 5 is naive port from CPU code (softmax_online) to kernel: parallelizes over B,T, loops over C
+./softmax_forward 5
+
+version 6 is softmax_online that parallelizes over all of B,T,C
+./softmax_forward 6
 */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -60,6 +68,33 @@ void softmax_forward_cpu(float* out, float* inp, int N, int C) {
         }
         for (int j = 0; j < C; j++) {
             out_row[j] /= sum;
+        }
+    }
+}
+
+
+// online version of softmax on CPU from the paper "Online normalizer calculation for softmax"
+void softmax_forward_online_cpu(float* out, float* inp, int N, int C) {
+    // inp is (N, C)
+    // out is (N, C), each row of inp will get softmaxed
+    for (int i = 0; i < N; i++) {
+        float* inp_row = inp + i * C;
+        float* out_row = out + i * C;
+
+        float maxval = -INFINITY;
+        float sum = 0.0f;
+		for (int j = 0; j < C; j++) {
+			float maxval_prev = maxval;
+			if (inp_row[j] > maxval) {
+				maxval = inp_row[j];
+				sum = sum * expf(maxval_prev - maxval) + expf(inp_row[j] - maxval);
+			} else {
+				sum += expf(inp_row[j] - maxval);
+			}
+		}
+
+        for (int j = 0; j < C; j++) {
+            out_row[j] = expf(inp_row[j] - maxval) / sum;
         }
     }
 }
@@ -289,6 +324,86 @@ __global__ void softmax_forward_kernel4(float* out, float* inp, int N, int C) {
     }
 }
 
+__global__ void softmax_forward_online_kernel1(float* out, float* inp, int N, int C) {
+    // inp is (N, C)
+    // out is (N, C), each row of inp will get softmaxed
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        float* inp_row = inp + i * C;
+        float* out_row = out + i * C;
+
+        float maxval = -INFINITY;
+        float sum = 0.0f;
+        for (int j = 0; j < C; j++) {
+            float maxval_prev = maxval;
+			if (inp_row[j] > maxval) {
+				maxval = inp_row[j];
+				sum = sum * expf(maxval_prev - maxval) + expf(inp_row[j] - maxval);
+			}
+			else {
+				sum += expf(inp_row[j] - maxval);
+			}
+		}
+
+        for (int j = 0; j < C; j++) {
+            out_row[j] = expf(inp_row[j] - maxval) / sum;
+        }
+    }
+}
+
+// struct for the reduction operation, guarantees 8-byte alignment
+struct __align__(8) SumMax
+{
+    float maxval;
+    float sum;
+};
+
+// forceinline helps avoid function call overhead
+__device__ __forceinline__ SumMax reduce_sum_max_op(SumMax a, SumMax b) {
+    bool a_bigger = (a.maxval > b.maxval);
+    SumMax bigger_m = a_bigger ? a : b;
+    SumMax smaller_m = a_bigger ? b : a;
+    SumMax res;
+    res.maxval = bigger_m.maxval;
+    res.sum = bigger_m.sum + smaller_m.sum * expf(smaller_m.maxval - bigger_m.maxval);
+    return res;
+}
+
+__global__ void softmax_forward_online_kernel2(float* out, float* inp, int N, int C) {
+	namespace cg = cooperative_groups;
+	cg::thread_block block = cg::this_thread_block();
+	cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+	int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+	if (idx >= N) {
+		return;
+	}
+
+	// one row of inp, i.e. inp[idx, :] of shape (C,)
+	float* x = inp + idx * C;
+
+    // base case for the reduction
+    SumMax sm_partial;
+	sm_partial.maxval = -INFINITY;
+	sm_partial.sum = 0.0f;
+
+	// first, thread coarsening by directly accessing global memory in series
+	for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+		sm_partial = reduce_sum_max_op(sm_partial, { x[i], 1.0f });
+	}
+
+    // second, the reduction
+	SumMax sm_total = cg::reduce(warp, sm_partial, reduce_sum_max_op);
+
+	// divide the whole row by the sum
+	for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+        // the below is equivalent to to
+        // out[idx * C + i] = expf(x[i] - sm_total.maxval) / sm_total.sum;
+        // but uses special instruction that bypasses the cache
+        __stcs(out + idx * C + i, expf(x[i] - sm_total.maxval) / sm_total.sum);
+	}
+}
+
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -317,6 +432,18 @@ void softmax_forward4(float* out, float* inp, int N, int C, int block_size) {
     softmax_forward_kernel4<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
 }
 
+void softmax_forward_online1(float* out, float* inp, int N, int C, int block_size) {
+    const int grid_size = CEIL_DIV(N, block_size);
+    softmax_forward_online_kernel1 << <grid_size, block_size >> > (out, inp, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
+void softmax_forward_online2(float* out, float* inp, int N, int C, int block_size) {
+    const int grid_size = CEIL_DIV(N * 32, block_size);
+    softmax_forward_online_kernel2 << <grid_size, block_size >> > (out, inp, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void softmax_forward(int kernel_num, float* out, float* inp, int N, int C, const int block_size) {
     switch (kernel_num) {
@@ -331,6 +458,12 @@ void softmax_forward(int kernel_num, float* out, float* inp, int N, int C, const
             break;
         case 4:
             softmax_forward4(out, inp, N, C, block_size);
+            break;
+        case 5:
+            softmax_forward_online1(out, inp, N, C, block_size);
+            break;
+        case 6:
+            softmax_forward_online2(out, inp, N, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
