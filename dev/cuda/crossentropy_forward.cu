@@ -11,21 +11,7 @@ version 1 is a straight-forward port from CPU code to kernel, parallel over B,T
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
-
-// ----------------------------------------------------------------------------
-// CUDA utils
-
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-
-// error checking
-void cudaCheck(cudaError_t error, const char *file, int line) {
-  if (error != cudaSuccess) {
-    printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
-           cudaGetErrorString(error));
-    exit(EXIT_FAILURE);
-  }
-};
-#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
+#include "common.h"
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -70,17 +56,17 @@ void crossentropy_forward1(float* losses,
                             int B, int T, int V,
                             const int block_size) {
     const int N = B * T;
-    const int grid_size = CEIL_DIV(N, block_size);
+    const int grid_size = ceil_div(N, block_size);
     crossentropy_forward_kernel1<<<grid_size, block_size>>>(losses, probs, targets, B, T, V);
     cudaCheck(cudaGetLastError());
 }
 
 // kernel version dispatch
 void crossentropy_forward(int kernel_num,
-                            float* losses,
-                            float* probs, int* targets,
-                            int B, int T, int V,
-                            const int block_size) {
+                          float* losses,
+                          float* probs, int* targets,
+                          int B, int T, int V,
+                          const int block_size) {
     switch (kernel_num) {
         case 1:
             crossentropy_forward1(losses, probs, targets, B, T, V, block_size);
@@ -89,25 +75,6 @@ void crossentropy_forward(int kernel_num,
             printf("Invalid kernel number\n");
             exit(1);
     }
-}
-
-// ----------------------------------------------------------------------------
-// random utils
-
-float* make_random_float(int N) {
-    float* arr = (float*)malloc(N * sizeof(float));
-    for (int i = 0; i < N; i++) {
-        arr[i] = ((float)rand() / RAND_MAX); // [0,1)
-    }
-    return arr;
-}
-
-int* make_random_int(int N, int V) {
-    int* arr = (int*)malloc(N * sizeof(int));
-    for (int i = 0; i < N; i++) {
-        arr[i] = rand() % V;
-    }
-    return arr;
 }
 
 // ----------------------------------------------------------------------------
@@ -147,20 +114,7 @@ int main(int argc, char **argv) {
     // first check the correctness of the kernel
     crossentropy_forward_cpu(out, probs, targets, B, T, V);
     crossentropy_forward(kernel_num, d_out, d_probs, d_targets, B, T, V, 256);
-    float* out_gpu = (float*)malloc(B * T * sizeof(float));
-    cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * sizeof(float), cudaMemcpyDeviceToHost));
-    for (int i = 0; i < B * T; i++) {
-        // print the first few comparisons
-        if (i < 10) {
-            printf("%f %f\n", out[i], out_gpu[i]);
-        }
-        // ensure correctness for all elements
-        if (fabs(out[i] - out_gpu[i]) > 1e-5) {
-            printf("Mismatch at %d: %f vs %f\n", i, out[i], out_gpu[i]);
-            exit(1);
-        }
-    }
-    printf("Results match at block_size=256!\n");
+    validate_result(d_out, out, "out", B * T, 1e-5f);
 
     // time the kernel at different block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
@@ -169,18 +123,9 @@ int main(int argc, char **argv) {
         int block_size = block_sizes[j];
 
         int repeat_times = 1000;
-        cudaEvent_t start, stop;
-        cudaCheck(cudaEventCreate(&start));
-        cudaCheck(cudaEventCreate(&stop));
-        cudaCheck(cudaEventRecord(start, 0));
-        for (int i = 0; i < repeat_times; i++) {
-            crossentropy_forward(kernel_num, d_out, d_probs, d_targets, B, T, V, block_size);
-        }
-        cudaCheck(cudaEventRecord(stop, 0));
-        cudaCheck(cudaEventSynchronize(start));
-        cudaCheck(cudaEventSynchronize(stop));
-        float elapsed_time;
-        cudaCheck(cudaEventElapsedTime(&elapsed_time, start, stop));
+        float elapsed_time = benchmark_kernel(repeat_times, crossentropy_forward,
+                                              kernel_num, d_out, d_probs, d_targets,
+                                              B, T, V, block_size);
 
         printf("block_size %4d | time %f ms\n", block_size, elapsed_time / repeat_times);
     }
@@ -189,7 +134,6 @@ int main(int argc, char **argv) {
     free(out);
     free(probs);
     free(targets);
-    free(out_gpu);
     cudaCheck(cudaFree(d_out));
     cudaCheck(cudaFree(d_probs));
     cudaCheck(cudaFree(d_targets));

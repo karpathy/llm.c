@@ -20,21 +20,7 @@ version 3 uses cooperative groups to parallelize over all of B,T,C
 #include <assert.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-
-// ----------------------------------------------------------------------------
-// CUDA utils
-
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-
-// error checking
-void cudaCheck(cudaError_t error, const char *file, int line) {
-  if (error != cudaSuccess) {
-    printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
-           cudaGetErrorString(error));
-    exit(EXIT_FAILURE);
-  }
-};
-#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
+#include "common.h"
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -244,7 +230,7 @@ void layernorm_forward1(float* out, float* mean, float* rstd,
                            int B, int T, int C,
                            const int block_size) {
     const int N = B * T;
-    const int grid_size = CEIL_DIV(N, block_size);
+    const int grid_size = ceil_div(N, block_size);
     layernorm_forward_kernel1<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
@@ -261,7 +247,7 @@ void layernorm_forward2(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
     // in the normalization, everything just gets flattened out
     const int block_size2 = 256;
-    const int grid_size = CEIL_DIV(B * T * C, block_size2);
+    const int grid_size = ceil_div(B * T * C, block_size2);
     normalization_kernel<<<grid_size, block_size2>>>(out, inp, mean, rstd, weight, bias, B, T, C);
     cudaCheck(cudaGetLastError());
 }
@@ -272,7 +258,7 @@ void layernorm_forward3(float* out, float* mean, float* rstd,
                        const int block_size) {
     assert(block_size % 32 == 0);
     const int N = B * T;
-    const int grid_size = CEIL_DIV(N * 32, block_size);
+    const int grid_size = ceil_div(N * 32, block_size);
     layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
@@ -297,17 +283,6 @@ void layernorm_forward(int kernel_num,
             printf("Invalid kernel number\n");
             exit(1);
     }
-}
-
-// ----------------------------------------------------------------------------
-// random utils
-
-float* make_random_float(int N) {
-    float* arr = (float*)malloc(N * sizeof(float));
-    for (int i = 0; i < N; i++) {
-        arr[i] = ((float)rand() / RAND_MAX) * 2.0 - 1.0;
-    }
-    return arr;
 }
 
 // ----------------------------------------------------------------------------
@@ -359,38 +334,19 @@ int main(int argc, char **argv) {
     float* mean_gpu = (float*)malloc(B * T * sizeof(float));
     float* rstd_gpu = (float*)malloc(B * T * sizeof(float));
 
+    layernorm_forward_cpu(out, mean, rstd, inp, weight, bias, B, T, C);
+
     // check the correctness of the kernel at all block sizes
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
-        layernorm_forward_cpu(out, mean, rstd, inp, weight, bias, B, T, C);
-        layernorm_forward(kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, B, T, C, 256);
-        cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * C * sizeof(float), cudaMemcpyDeviceToHost));
-        cudaCheck(cudaMemcpy(mean_gpu, d_mean, B * T * sizeof(float), cudaMemcpyDeviceToHost));
-        cudaCheck(cudaMemcpy(rstd_gpu, d_rstd, B * T * sizeof(float), cudaMemcpyDeviceToHost));
+        int block_size = block_sizes[j];
 
-        for (int i = 0; i < B * T * C; i++) {
-            // print the first few comparisons
-            if (i < 5) {
-                printf("%f %f\n", out[i], out_gpu[i]);
-            }
-            // ensure correctness for all elements
-            if (fabs(out[i] - out_gpu[i]) > 1e-5) {
-                printf("Mismatch at %d: %f vs %f\n", i, out[i], out_gpu[i]);
-                exit(1);
-            }
-        }
-        for (int i = 0; i < B * T; i++) {
-            if (fabs(mean[i] - mean_gpu[i]) > 1e-5) {
-                printf("Mismatch at mean %d: %f vs %f\n", i, mean[i], mean_gpu[i]);
-                exit(1);
-            }
-        }
-        for (int i = 0; i < B * T; i++) {
-            if (fabs(rstd[i] - rstd_gpu[i]) > 1e-5) {
-                printf("Mismatch at rstd %d: %f vs %f\n", i, rstd[i], rstd_gpu[i]);
-                exit(1);
-            }
-        }
-        printf("Results match at block size %d\n", block_sizes[j]);
+        layernorm_forward(kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, B, T, C, block_size);
+
+        validate_result(d_out, out, "out", B * T * C, 1e-5f);
+        validate_result(d_mean, mean, "mean", B * T, 1e-5f);
+        validate_result(d_rstd, rstd, "rstd", B * T, 1e-5f);
+
+        printf("Results match at block size %d\n\n", block_size);
     }
 
     // time the kernel at different block sizes
@@ -398,23 +354,14 @@ int main(int argc, char **argv) {
         int block_size = block_sizes[j];
 
         int repeat_times = 1000;
-        cudaEvent_t start, stop;
-        cudaCheck(cudaEventCreate(&start));
-        cudaCheck(cudaEventCreate(&stop));
-        cudaCheck(cudaEventRecord(start, 0));
-        for (int i = 0; i < repeat_times; i++) {
-            layernorm_forward(kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, B, T, C, block_size);
-        }
-        cudaCheck(cudaEventRecord(stop, 0));
-        cudaCheck(cudaEventSynchronize(start));
-        cudaCheck(cudaEventSynchronize(stop));
-        float elapsed_time;
-        cudaCheck(cudaEventElapsedTime(&elapsed_time, start, stop));
+        float elapsed_time = benchmark_kernel(repeat_times, layernorm_forward,
+                                              kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight, d_bias,
+                                              B, T, C, block_size);
 
         // napkin math: estimate the memory bandwidth achieved
         // e.g. A100 40GB PCIe is advertised at 1,555GB/s
         long memory_ops = (2 * B * T * C) * 4; // *4 for float
-        float memory_bandwidth = memory_ops / (elapsed_time / repeat_times) / 1e6;
+        float memory_bandwidth = memory_ops / elapsed_time / 1e6;
 
         printf("block_size %4d | time %f ms | bandwidth %f GB/s\n", block_size, elapsed_time / repeat_times, memory_bandwidth);
     }
@@ -426,7 +373,6 @@ int main(int argc, char **argv) {
     free(inp);
     free(weight);
     free(bias);
-    free(out_gpu);
     cudaCheck(cudaFree(d_out));
     cudaCheck(cudaFree(d_mean));
     cudaCheck(cudaFree(d_rstd));

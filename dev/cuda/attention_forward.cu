@@ -33,34 +33,7 @@ uses a directly autoregressive softmax, and uses the online softmax algorithm.
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-
-// ----------------------------------------------------------------------------
-// CUDA utils
-
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-
-// CUDA error checking
-void cudaCheck(cudaError_t error, const char *file, int line) {
-  if (error != cudaSuccess) {
-    printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
-           cudaGetErrorString(error));
-    exit(EXIT_FAILURE);
-  }
-};
-#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
-
-// cuBLAS error checking
-void cublasCheck(cublasStatus_t status, const char *file, int line)
-{
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        printf("[cuBLAS ERROR]: %d %s %d\n", status, file, line);
-        exit(EXIT_FAILURE);
-    }
-}
-#define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
-
-// cuBLAS handle
-static cublasHandle_t handle;
+#include "common.h"
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -605,11 +578,11 @@ void attention_forward1(float* out, float* preatt, float* att,
                        const int block_size) {
     // attention calculation
     int total_threads = B * NH * T * T;
-    int num_blocks = CEIL_DIV(total_threads, block_size);
+    int num_blocks = ceil_div(total_threads, block_size);
     attention_query_key_kernel1<<<num_blocks, block_size>>>(preatt, inp, B, T, C, NH);
     // softmax and value accumulation
     total_threads = B * T * NH;
-    num_blocks = CEIL_DIV(total_threads, block_size);
+    num_blocks = ceil_div(total_threads, block_size);
     attention_softmax_kernel1<<<num_blocks, block_size>>>(att, preatt, B, T, NH);
     attention_value_kernel1<<<num_blocks, block_size>>>(out, att, inp, B, T, C, NH);
 }
@@ -671,7 +644,7 @@ void attention_forward2(float* out,
     cudaCheck(cudaMalloc(&k, B * T * C * sizeof(float)));
     cudaCheck(cudaMalloc(&v, B * T * C * sizeof(float)));
     int total_threads = B * N * nh * d;
-    int num_blocks = CEIL_DIV(total_threads, block_size);
+    int num_blocks = ceil_div(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, N, nh, d);
 
     // now actually call the flash attention kernel
@@ -708,7 +681,7 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     k = qkvr + 1 * B * T * C;
     v = qkvr + 2 * B * T * C;
     int total_threads = B * NH * T * HS;
-    int num_blocks = CEIL_DIV(total_threads, block_size);
+    int num_blocks = ceil_div(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
 
     // batched matrix multiply with cuBLAS
@@ -727,7 +700,7 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0f / sqrtf(HS);
     total_threads = B * NH * T * T;
-    num_blocks = CEIL_DIV(total_threads, block_size);
+    num_blocks = ceil_div(total_threads, block_size);
     scale_kernel<<<num_blocks, block_size>>>(preatt, scale, B, NH, T);
 
     // softmax. preatt is (B, NH, T, T) but we view it as (B * NH * T, T) and use the softmax kernel
@@ -750,7 +723,7 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-    num_blocks = CEIL_DIV(B * T * C, block_size);
+    num_blocks = ceil_div(B * T * C, block_size);
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
 }
 
@@ -770,7 +743,7 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     k = qkvr + 1 * B * T * C;
     v = qkvr + 2 * B * T * C;
     int total_threads = B * NH * T * HS;
-    int num_blocks = CEIL_DIV(total_threads, block_size);
+    int num_blocks = ceil_div(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
 
     // batched matrix multiply with cuBLAS
@@ -795,7 +768,7 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
     int softmax_block_size = 256;
-    int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
+    int grid_size = ceil_div(B * NH * T * 32, softmax_block_size);
     softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
 
     // new approach: first cuBLAS another batched matmul
@@ -816,7 +789,7 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-    num_blocks = CEIL_DIV(B * T * C, block_size);
+    num_blocks = ceil_div(B * T * C, block_size);
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
 
     // cleanups
@@ -847,18 +820,6 @@ void attention_forward(int kernel_num,
             exit(1);
     }
 }
-
-// ----------------------------------------------------------------------------
-// random utils
-
-float* make_random_float(int N) {
-    float* arr = (float*)malloc(N * sizeof(float));
-    for (int i = 0; i < N; i++) {
-        arr[i] = ((float)rand() / RAND_MAX) * 2.0 - 1.0;
-    }
-    return arr;
-}
-
 // ----------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
@@ -906,40 +867,18 @@ int main(int argc, char **argv) {
     attention_forward(kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, 256);
 
     // compare the output
-    float* out_gpu = (float*)malloc(B * T * C * sizeof(float));
-    cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * C * sizeof(float), cudaMemcpyDeviceToHost));
-    for (int i = 0; i < B * T * C; i++) {
-        // print the first few comparisons
-        if (i < 5) {
-            printf("%f %f\n", out[i], out_gpu[i]);
-        }
-        // ensure correctness for all elements
-        if (fabs(out[i] - out_gpu[i]) > 1e-4) {
-            printf("Mismatch at %d: %f vs %f\n", i, out[i], out_gpu[i]);
-            exit(1);
-        }
-    }
-    printf("Results match!\n");
+    validate_result(d_out, out, "out", B * T * C, 1e-4f);
 
     // time the kernel at different block sizes
     int block_sizes[] = {32, 64, 128, 256, 512};
 
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
-
         int repeat_times = 100;
-        cudaEvent_t start, stop;
-        cudaCheck(cudaEventCreate(&start));
-        cudaCheck(cudaEventCreate(&stop));
-        cudaCheck(cudaEventRecord(start, 0));
-        for (int i = 0; i < repeat_times; i++) {
-            attention_forward(kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
-        }
-        cudaCheck(cudaEventRecord(stop, 0));
-        cudaCheck(cudaEventSynchronize(start));
-        cudaCheck(cudaEventSynchronize(stop));
-        float elapsed_time;
-        cudaCheck(cudaEventElapsedTime(&elapsed_time, start, stop));
+
+        float elapsed_time = benchmark_kernel(repeat_times, attention_forward,
+                                              kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp,
+                                              B, T, C, NH, block_size);
 
         printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
     }
@@ -949,7 +888,6 @@ int main(int argc, char **argv) {
     free(preatt);
     free(att);
     free(inp);
-    free(out_gpu);
     cudaCheck(cudaFree(d_out));
     cudaCheck(cudaFree(d_vaccum));
     cudaCheck(cudaFree(d_qkvr));

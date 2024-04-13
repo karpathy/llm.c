@@ -14,21 +14,7 @@ version 2 is more optimized, parallelizes over all of B,T,C
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
-
-// ----------------------------------------------------------------------------
-// CUDA utils
-
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-
-// error checking
-void cudaCheck(cudaError_t error, const char *file, int line) {
-  if (error != cudaSuccess) {
-    printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
-           cudaGetErrorString(error));
-    exit(EXIT_FAILURE);
-  }
-};
-#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
+#include "common.h"
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -103,7 +89,7 @@ void encoder_forward1(float* out,
                      int B, int T, int C,
                      const int block_size) {
     const int N = B * T;
-    const int grid_size = CEIL_DIV(N, block_size);
+    const int grid_size = ceil_div(N, block_size);
     encoder_forward_kernel1<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
     cudaCheck(cudaGetLastError());
 }
@@ -113,7 +99,7 @@ void encoder_forward2(float* out,
                      int B, int T, int C,
                      const int block_size) {
     const int N = B * T * C;
-    const int grid_size = CEIL_DIV(N, block_size);
+    const int grid_size = ceil_div(N, block_size);
     encoder_forward_kernel2<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
     cudaCheck(cudaGetLastError());
 }
@@ -135,25 +121,6 @@ void encoder_forward(int kernel_num,
             printf("Invalid kernel number\n");
             exit(1);
     }
-}
-
-// ----------------------------------------------------------------------------
-// random utils
-
-float* make_random_float(int N) {
-    float* arr = (float*)malloc(N * sizeof(float));
-    for (int i = 0; i < N; i++) {
-        arr[i] = ((float)rand() / RAND_MAX) * 2.0 - 1.0;
-    }
-    return arr;
-}
-
-int* make_random_int(int N, int V) {
-    int* arr = (int*)malloc(N * sizeof(int));
-    for (int i = 0; i < N; i++) {
-        arr[i] = rand() % V;
-    }
-    return arr;
 }
 
 // ----------------------------------------------------------------------------
@@ -198,20 +165,7 @@ int main(int argc, char **argv) {
     // first check the correctness of the kernel
     encoder_forward_cpu(out, inp, wte, wpe, B, T, C);
     encoder_forward(kernel_num, d_out, d_inp, d_wte, d_wpe, B, T, C, 256);
-    float* out_gpu = (float*)malloc(B * T * C * sizeof(float));
-    cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * C * sizeof(float), cudaMemcpyDeviceToHost));
-    for (int i = 0; i < B * T * C; i++) {
-        // print the first few comparisons
-        if (i < 5) {
-            printf("%f %f\n", out[i], out_gpu[i]);
-        }
-        // ensure correctness for all elements
-        if (fabs(out[i] - out_gpu[i]) > 1e-5) {
-            printf("Mismatch at %d: %f vs %f\n", i, out[i], out_gpu[i]);
-            exit(1);
-        }
-    }
-    printf("Results match!\n");
+    validate_result(d_out, out, "out", B * T * C, 1e-5f);
 
     // time the kernel at different block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
@@ -220,26 +174,17 @@ int main(int argc, char **argv) {
         int block_size = block_sizes[j];
 
         int repeat_times = 1000;
-        cudaEvent_t start, stop;
-        cudaCheck(cudaEventCreate(&start));
-        cudaCheck(cudaEventCreate(&stop));
-        cudaCheck(cudaEventRecord(start, 0));
-        for (int i = 0; i < repeat_times; i++) {
-            encoder_forward(kernel_num, d_out, d_inp, d_wte, d_wpe, B, T, C, block_size);
-        }
-        cudaCheck(cudaEventRecord(stop, 0));
-        cudaCheck(cudaEventSynchronize(start));
-        cudaCheck(cudaEventSynchronize(stop));
-        float elapsed_time;
-        cudaCheck(cudaEventElapsedTime(&elapsed_time, start, stop));
+        float elapsed_time = benchmark_kernel(repeat_times, encoder_forward,
+                                              kernel_num, d_out, d_inp, d_wte, d_wpe, B, T, C, block_size
+                                              );
 
         // napkin math: estimate the memory bandwidth achieved
         // for each (B,T,C) output element, we do 3 reads and 1 write, 4 bytes each
         // and e.g. A100 40GB PCIe is advertised at 1,555GB/s
         long memory_ops = B * T * C * 4 * 4;
-        float memory_bandwidth = memory_ops / (elapsed_time / repeat_times) / 1e6;
+        float memory_bandwidth = memory_ops / elapsed_time / 1e6;
 
-        printf("block_size %4d | time %f ms | bandwidth %f GB/s\n", block_size, elapsed_time / repeat_times, memory_bandwidth);
+        printf("block_size %4d | time %f ms | bandwidth %f GB/s\n", block_size, elapsed_time, memory_bandwidth);
     }
 
     // free memory

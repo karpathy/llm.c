@@ -21,30 +21,10 @@ OMP_NUM_THREADS=32 ./matmul_forward 3
 #include <cuda_runtime.h>
 #include <cublasLt.h>
 #include <omp.h>
+#include "common.h"
 
 // ----------------------------------------------------------------------------
 // CUDA utils
-
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-
-// CUDA error checking
-void cudaCheck(cudaError_t error, const char *file, int line) {
-  if (error != cudaSuccess) {
-    printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line, cudaGetErrorString(error));
-    exit(EXIT_FAILURE);
-  }
-};
-#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
-
-// cuBLAS error checking
-void cublasCheck(cublasStatus_t status, const char *file, int line)
-{
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        printf("[cuBLAS ERROR]: %d %s %d\n", status, file, line);
-        exit(EXIT_FAILURE);
-    }
-}
-#define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
 
 // cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
 static size_t cublaslt_workspace_size = 32 * 1024 * 1024;
@@ -126,7 +106,7 @@ void matmul_forward1(float* out,
                      const int sqrt_block_size) {
     // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    dim3 gridDim(CEIL_DIV(B * T, sqrt_block_size), CEIL_DIV(OC, sqrt_block_size));
+    dim3 gridDim(ceil_div(B * T, sqrt_block_size), ceil_div(OC, sqrt_block_size));
     dim3 blockDim(sqrt_block_size, sqrt_block_size);
     matmul_forward_kernel1<<<gridDim, blockDim>>>(out, inp, weight, bias, B*T, C, OC);
     cudaCheck(cudaGetLastError());
@@ -165,7 +145,7 @@ void matmul_forward2(float* out,
     // and now we still have to add the bias... (ew)
     if (bias != NULL) {
         int block_size = sqrt_block_size * sqrt_block_size;
-        int grid_size = CEIL_DIV(OC * B * T, block_size);
+        int grid_size = ceil_div(OC * B * T, block_size);
         add_bias<<<grid_size, block_size>>>(out, bias, B, T, OC);
         cudaCheck(cudaGetLastError());
     }
@@ -273,17 +253,6 @@ void matmul_forward(int kernel_num,
 }
 
 // ----------------------------------------------------------------------------
-// random utils
-
-float* make_random_float(int N) {
-    float* arr = (float*)malloc(N * sizeof(float));
-    for (int i = 0; i < N; i++) {
-        arr[i] = ((float)rand() / RAND_MAX) * 2.0 - 1.0;
-    }
-    return arr;
-}
-
-// ----------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
     srand(0);
@@ -342,20 +311,7 @@ int main(int argc, char **argv) {
     matmul_forward_cpu(out, inp, weight, bias, B, T, C, OC);
     matmul_forward(kernel_num, d_out, d_inp, d_weight, d_bias, B, T, C, OC, 32);
 
-    float* out_gpu = (float*)malloc(B * T * OC * sizeof(float));
-    cudaCheck(cudaMemcpy(out_gpu, d_out, B * T * OC * sizeof(float), cudaMemcpyDeviceToHost));
-    for (int i = 0; i < B * T * OC; i++) {
-        // print the first few comparisons
-        if (i < 5) {
-            printf("%f %f\n", out[i], out_gpu[i]);
-        }
-        // ensure correctness for all elements
-        if (fabs(out[i] - out_gpu[i]) > 1e-1) {
-            printf("Mismatch at %d: %f vs %f\n", i, out[i], out_gpu[i]);
-            exit(1);
-        }
-    }
-    printf("Results match at block_size=1024!\n");
+    validate_result(d_out, out, "out", B * T * OC, 1e-1f);
 
     // time the kernel at different block sizes
     int sqrt_block_sizes[] = {4, 8, 16, 32};
@@ -364,22 +320,13 @@ int main(int argc, char **argv) {
         int sqrt_block_size = sqrt_block_sizes[j];
 
         int repeat_times = 100;
-        cudaEvent_t start, stop;
-        cudaCheck(cudaEventCreate(&start));
-        cudaCheck(cudaEventCreate(&stop));
-        cudaCheck(cudaEventRecord(start, 0));
-        for (int i = 0; i < repeat_times; i++) {
-            matmul_forward(kernel_num, d_out, d_inp, d_weight, d_bias, B, T, C, OC, sqrt_block_size);
-        }
-        cudaCheck(cudaEventRecord(stop, 0));
-        cudaCheck(cudaEventSynchronize(start));
-        cudaCheck(cudaEventSynchronize(stop));
-        float elapsed_time;
-        cudaCheck(cudaEventElapsedTime(&elapsed_time, start, stop));
+        float elapsed_time = benchmark_kernel(repeat_times, matmul_forward,
+                                              kernel_num, d_out, d_inp, d_weight, d_bias,
+                                              B, T, C, OC, sqrt_block_size);
 
         // napkin math: estimate the flops achieved
         // e.g. A100 40GB PCIe is advertised at 19.5 TFLOPS fp32
-        float tflops = (float)B * T * C * OC * 2 * repeat_times / elapsed_time * 1e3f / 1e12f;
+        float tflops = (float)B * T * C * OC * 2 / elapsed_time * 1e3f / 1e12f;
         printf("sqrt_block_size %4d | time %f ms | tflops %f\n", sqrt_block_size, elapsed_time, tflops);
     }
 
@@ -388,7 +335,6 @@ int main(int argc, char **argv) {
     free(inp);
     free(weight);
     free(bias);
-    free(out_gpu);
     cudaCheck(cudaFree(d_out));
     cudaCheck(cudaFree(d_inp));
     cudaCheck(cudaFree(d_weight));
