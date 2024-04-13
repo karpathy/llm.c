@@ -10,6 +10,14 @@ Currently, I am working on:
 
 For the repo, I'd like to maintain both clean, simple reference implementations alongside a also lot more optimized versions that can come close to PyTorch, but in a tiny fraction of the code and dependencies.
 
+## pre-requisites
+
+You'll need a sane python environment. Deploy python using your OS-provided package manager. On Windows, you should probably use Choclatey. Install the Python packages once you have a shell with python available.
+
+```bash
+bash install-python-packages.sh
+```
+
 ## quick start
 
 Download and tokenize a dataset. The [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset is the fastest to download and tokenize:

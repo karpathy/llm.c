@@ -1,0 +1,8 @@
+# Once you've installed python and pip, you'll need to also download these packages.
+# You can use install-python-packages.sh to do that, or just run `pip install <package>` for each one you're missing
+requests
+tqdm
+tiktoken
+numpy
+torch
+transformers
