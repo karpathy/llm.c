@@ -909,7 +909,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
         // for convenience also evaluate the mean loss
         // move the (B,T) losses to CPU
-        // TODO get rid of inline mallocs
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
         float mean_loss = 0.0f;
         for (int i=0; i<B*T; i++) { mean_loss += model->cpu_losses[i]; }
