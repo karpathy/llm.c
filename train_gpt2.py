@@ -375,6 +375,7 @@ if __name__ == "__main__":
     data_iter = iter(get_batch())
     x, y = next(data_iter) # we'll overfit this batch below
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    timings = []
     for i in range(args.num_iterations):
         t0 = time.time()
         logits, loss = model(x, y)
@@ -391,7 +392,11 @@ if __name__ == "__main__":
         elif device == "cuda":
             torch.cuda.synchronize()
         t1 = time.time()
+        if i > args.num_iterations - 20:
+            timings.append(t1-t0)
         print(f"iteration {i}, loss: {loss.item()}, time: {(t1-t0)*1000:.3f}ms")
+    if len(timings) > 0:
+        print(f"final 20 iters avg: {np.mean(timings)*1000:.3f}ms")
 
     # before we end, let's also do one round of inference
     # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
