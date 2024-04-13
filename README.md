@@ -142,10 +142,10 @@ This will run GPT-2 (124M) in one file of pure CUDA (see [train_gpt2.cu](train_g
 
 ```
 val loss 4.517179
-step 0: train loss 4.367630 (took 27.778707 ms)
-step 1: train loss 4.406341 (took 27.790644 ms)
-step 2: train loss 4.484755 (took 28.130608 ms)
-step 3: train loss 4.345182 (took 27.990422 ms)
+step 0: train loss 4.367631 (took 25.868564 ms)
+step 1: train loss 4.406341 (took 26.112257 ms)
+step 2: train loss 4.484756 (took 26.124789 ms)
+step 3: train loss 4.345182 (took 26.149837 ms)
 ...
 ```
 
@@ -167,7 +167,7 @@ And see that the first iteration now takes 20 seconds (compilation time), but al
 python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4 --compile 1 --tensorcores 1
 ```
 
-The time drops down to 26.17ms/iteration. So at the current 27.93ms/iteration we are only about 7% slower. This somewhat makes sense because most of the FLOPs are in the matmul, and we both call about the same kernels. The remainder of the difference is likely our self-attention implementation, and possibly the round trips for GeLU, and permute/unpermute.
+The time drops down to 26.2ms/iteration. So at the current 26.2ms/iteration we, amusingly and right now, have an identical running time. This somewhat makes sense because most of the FLOPs are in the matmul, and we both call about the same kernels. The remainder of the difference is likely our self-attention implementation, and possibly the round trips for GeLU, and permute/unpermute.
 
 ## discussions
 
