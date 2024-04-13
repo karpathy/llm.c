@@ -73,8 +73,7 @@ void softmax_forward_cpu(float* out, float* inp, int N, int C) {
 }
 
 
-// Implement the online version of softmax on CPU from the paper:
-// Online normalizer calculation for softmax
+// online version of softmax on CPU from the paper "Online normalizer calculation for softmax"
 void softmax_forward_online_cpu(float* out, float* inp, int N, int C) {
     // inp is (N, C)
     // out is (N, C), each row of inp will get softmaxed
@@ -89,8 +88,7 @@ void softmax_forward_online_cpu(float* out, float* inp, int N, int C) {
 			if (inp_row[j] > maxval) {
 				maxval = inp_row[j];
 				sum = sum * expf(maxval_prev - maxval) + expf(inp_row[j] - maxval);
-			}
-			else {
+			} else {
 				sum += expf(inp_row[j] - maxval);
 			}
 		}
@@ -353,14 +351,15 @@ __global__ void softmax_forward_online_kernel1(float* out, float* inp, int N, in
     }
 }
 
+// struct for the reduction operation, guarantees 8-byte alignment
 struct __align__(8) SumMax
 {
     float maxval;
     float sum;
 };
 
-__device__ __forceinline__ SumMax reduce_sum_max_op(SumMax a, SumMax b)
-{
+// forceinline helps avoid function call overhead
+__device__ __forceinline__ SumMax reduce_sum_max_op(SumMax a, SumMax b) {
     bool a_bigger = (a.maxval > b.maxval);
     SumMax bigger_m = a_bigger ? a : b;
     SumMax smaller_m = a_bigger ? b : a;
@@ -378,23 +377,29 @@ __global__ void softmax_forward_online_kernel2(float* out, float* inp, int N, in
 	if (idx >= N) {
 		return;
 	}
-	SumMax sm_partial;
-	sm_partial.maxval = -INFINITY;
-	sm_partial.sum = 0.0f;
 
 	// one row of inp, i.e. inp[idx, :] of shape (C,)
 	float* x = inp + idx * C;
+
+    // base case for the reduction
+    SumMax sm_partial;
+	sm_partial.maxval = -INFINITY;
+	sm_partial.sum = 0.0f;
 
 	// first, thread coarsening by directly accessing global memory in series
 	for (int i = warp.thread_rank(); i < C; i += warp.size()) {
 		sm_partial = reduce_sum_max_op(sm_partial, { x[i], 1.0f });
 	}
 
+    // second, the reduction
 	SumMax sm_total = cg::reduce(warp, sm_partial, reduce_sum_max_op);
 
 	// divide the whole row by the sum
 	for (int i = warp.thread_rank(); i < C; i += warp.size()) {
-		out[idx * C + i] = expf(x[i] - sm_total.maxval) / sm_total.sum;
+        // the below is equivalent to to
+        // out[idx * C + i] = expf(x[i] - sm_total.maxval) / sm_total.sum;
+        // but uses special instruction that bypasses the cache
+        __stcs(out + idx * C + i, expf(x[i] - sm_total.maxval) / sm_total.sum);
 	}
 }
 
