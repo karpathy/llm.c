@@ -91,7 +91,7 @@ int main(int argc, char **argv) {
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * sizeof(float));
-    float* probs = make_random_float(B * T * V);
+    float* probs = make_random_float_01(B * T * V);
     int* targets = make_random_int(B * T, V);
 
     // move to GPU
