@@ -1173,7 +1173,7 @@ void gen_tiktoken_script(int step, int* gen_tokens, int gen_max_length)
 
         fprintf(f, "%s", tiktoken_py_1);
         for (int t = 1; t < gen_max_length; t++) {
-            fprintf(f, "%d ", gen_tokens[t]);
+            fprintf(f, "%s%d", (t>1 ? " " : ""), gen_tokens[t]);
         }
         fprintf(f, "%s", tiktoken_py_2);
         fclose(f);
@@ -1237,7 +1237,7 @@ int main() {
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
     const int gen_max_length = 64;
-    int gen_tokens[gen_max_length];
+    int gen_tokens[gen_max_length] = { 0, };
     float* cpu_probs = (float*)malloc(model.config.vocab_size * sizeof(float));
 
     // train
