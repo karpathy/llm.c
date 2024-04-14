@@ -133,7 +133,7 @@ int main(int argc, char **argv) {
                                               kernel_num, d_out, d_probs, d_targets,
                                               B, T, V, block_size);
 
-        printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
+        printf("block_size %4d | time %.4f ms | per token %.2f ns\n", block_size, elapsed_time, elapsed_time * 1'000'000 / (B*T));
     }
 
     // free memory

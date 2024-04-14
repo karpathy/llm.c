@@ -637,7 +637,7 @@ int main(int argc, char **argv) {
                                               kernel_num, d_out, d_inp, B * T, T, block_size
                                               );
 
-        printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
+        printf("block_size %4d | time %.4f ms | per token %.2f µs\n", block_size, elapsed_time, elapsed_time * 1'000 / (B*T));
     }
 
     // free memory
