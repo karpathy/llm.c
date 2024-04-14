@@ -51,10 +51,12 @@ int main(int argc, char *argv[]) {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
-    int C = model.config.channels;
     int V = model.config.vocab_size;
+    /*
+    int C = model.config.channels;
     int maxT = model.config.max_seq_len;
     int L = model.config.num_layers;
+    */
 
     // load additional information that we will use for debugging and error checking
     FILE *state_file = fopen("gpt2_124M_debug_state.bin", "rb");
@@ -90,7 +92,6 @@ int main(int argc, char *argv[]) {
     int allok = 1;
 
     // let's do 10 training iterations, following the pytorch code
-    float losses[10];
     for (int step = 0; step < 10; step++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
