@@ -852,6 +852,14 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     int NH = model->config.num_heads;
     int C = model->config.channels;
 
+    // validate inputs, all indices must be in the range [0, V)
+    for(int i = 0; i < B * T; i++) {
+        assert(0 <= inputs[i] && inputs[i] < V);
+        if (targets != NULL) {
+            assert(0 <= targets[i] && targets[i] < V);
+        }
+    }
+
     // allocate space for all the activations if needed (done here, lazily)
     if(model->acts_memory == NULL) {
         // record the current B,T as well
@@ -902,11 +910,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
             printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
             exit(1);
         }
-    }
-
-    // validate inputs
-    for(int i = 0; i < B * T; ++i) {
-        assert(inputs[i] < V);
     }
 
     // copy inputs/targets to the model
@@ -1229,6 +1232,7 @@ int main() {
 
         // once in a while do model inference to print generated text
         if (step > 0 && step % 20 == 0) {
+
             // the GPT-2 EOT token kicks off the generation
             for(int i = 0; i < gen_max_length; ++i) {
                 gen_tokens[i] = GPT2_EOT;
