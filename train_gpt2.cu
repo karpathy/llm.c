@@ -91,7 +91,7 @@ __global__ void encoder_forward_kernel2(float* out,
 }
 
 
-__global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+__global__ void __launch_bounds__(1024, 2) layernorm_forward_kernel3(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const float*  __restrict__ inp, const float*  __restrict__ weight,
                                     const float* __restrict__ bias, int N, int C) {
     namespace cg = cooperative_groups;
