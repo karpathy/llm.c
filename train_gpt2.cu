@@ -904,6 +904,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         }
     }
 
+    // validate inputs
+    for(int i = 0; i < B * T; ++i) {
+        assert(inputs[i] < V);
+    }
+
     // copy inputs/targets to the model
     cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
     if (targets != NULL) {
@@ -1224,7 +1229,11 @@ int main() {
 
         // once in a while do model inference to print generated text
         if (step > 0 && step % 20 == 0) {
-            gen_tokens[0] = GPT2_EOT; // the GPT-2 EOT token kicks off the generation
+            // the GPT-2 EOT token kicks off the generation
+            for(int i = 0; i < gen_max_length; ++i) {
+                gen_tokens[i] = GPT2_EOT;
+            }
+
             for (int t = 1; t < gen_max_length; t++) {
                 // note that inference is wasteful here because
                 // for each t, we re-compute all activations between 0 and t
