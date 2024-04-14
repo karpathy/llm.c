@@ -54,29 +54,32 @@ def download():
         print(f"{data_filename} already exists, skipping download...")
 
 def tokenize():
-    eot = enc._special_tokens['<|endoftext|>'] # end of text token
+    eot = enc._special_tokens['<|endoftext|>'] 
     data_filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare.txt")
-    text = open(data_filename, 'r').read()
-    # let's treat every person's statement in the dialog as a separate document
-    text = "<|endoftext|>" + text
-    text = text.replace('\n\n', '\n\n<|endoftext|>')
-    # encode the text
+    
+    # Read text from the file
+    with open(data_filename, 'r') as file:
+        text = file.read()
+
+    # Tokenize the text
     tokens = encode(text)
     tokens_np = np.array(tokens, dtype=np.int32)
-    # let's take the first 32,768 tokens as the validation split (~10%)
+    
+    # Split the tokens into validation and training sets
     val_tokens_np = tokens_np[:32768]
     train_tokens_np = tokens_np[32768:]
-    # save to file
+
+    # Save validation and training sets to files
     val_filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare_val.bin")
     train_filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare_train.bin")
+    
     with open(val_filename, "wb") as f:
         f.write(val_tokens_np.tobytes())
+        
     with open(train_filename, "wb") as f:
         f.write(train_tokens_np.tobytes())
-    # prints
+    
+    # Print information about the saved tokens
     print(f"Saved {len(val_tokens_np)} tokens to {val_filename}")
     print(f"Saved {len(train_tokens_np)} tokens to {train_filename}")
 
-if __name__ == "__main__":
-    download()
-    tokenize()
