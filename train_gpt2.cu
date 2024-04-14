@@ -903,12 +903,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
     } else {
-        // validate B,T is no larger than what was previously allocated
-        // in principle, we could re-allocate a larger chunk of memory, for now we just error out
-        if (B > model->batch_size || T > model->seq_len) {
-            printf("Error: batch size or sequence length is inadequately large\n");
+        // validate B,T is consistent with how we've allocated the memory before
+        // in principle we could get more clever here in the future, for now this is safest
+        if (B != model->batch_size || T != model->seq_len) {
             printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
-            exit(1);
+            exit(EXIT_FAILURE);
         }
     }
 
@@ -1209,8 +1208,8 @@ int main() {
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    const int gen_max_length = 64;
-    int gen_tokens[gen_max_length];
+    int* gen_tokens = (int*)malloc(B * T * sizeof(int));
+    const int genT = 64; // number of steps of inference we will do
     float* cpu_probs = (float*)malloc(model.config.vocab_size * sizeof(float));
 
     // train
@@ -1232,28 +1231,30 @@ int main() {
 
         // once in a while do model inference to print generated text
         if (step > 0 && step % 20 == 0) {
-
-            // the GPT-2 EOT token kicks off the generation
-            for(int i = 0; i < gen_max_length; ++i) {
+            // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
+            for(int i = 0; i < B * T; ++i) {
                 gen_tokens[i] = GPT2_EOT;
             }
-
-            for (int t = 1; t < gen_max_length; t++) {
-                // note that inference is wasteful here because
-                // for each t, we re-compute all activations between 0 and t
-                // leaving this alone because you want separate code for inference anyway
-                // the inference here is just for sanity checking purposes
-                int t4 = (t + 3) & ~3; // clever way to round up to multiple of 4
-                gpt2_forward(&model, gen_tokens, NULL, 1, t4);
+            // now sample from the model autoregressively
+            for (int t = 1; t < genT; t++) {
+                // note that inference is very wasteful here because for each token
+                // we re-calculate the forward pass for all of (B,T) positions from scratch
+                // but the inference here is just for sanity checking anyway
+                // and we can maybe optimize a bit more later, with careful tests
+                gpt2_forward(&model, gen_tokens, NULL, B, T);
+                // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
+                // we're in principle running B "inference streams" in parallel here
+                // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
+                // get the V-dimensional vector probs[0, t-1, :]
                 float* probs = model.acts.probs + (t-1) * model.config.vocab_size;
-                float coin = random_f32(&rng_state);
                 // move probs back to CPU and sample
                 cudaCheck(cudaMemcpy(cpu_probs, probs, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+                float coin = random_f32(&rng_state);
                 int next_token = sample_mult(cpu_probs, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
             }
             printf("generated: ");
-            for (int t = 0; t < gen_max_length; t++) {
+            for (int t = 0; t < genT; t++) {
                 printf("%d ", gen_tokens[t]);
             }
             printf("\n");
@@ -1277,6 +1278,7 @@ int main() {
     dataloader_free(&val_loader);
     gpt2_free(&model);
     free(cpu_probs);
+    free(gen_tokens);
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
