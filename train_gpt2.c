@@ -580,7 +580,7 @@ typedef struct {
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
 } GPT2;
 
-void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
+void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in model from a checkpoint file
     FILE *model_file = fopen(checkpoint_path, "rb");
@@ -965,7 +965,7 @@ typedef struct {
     int num_batches;
 } DataLoader;
 
-void dataloader_init(DataLoader *loader, char* filename, int B, int T) {
+void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     loader->B = B;
     loader->T = T;
 
@@ -1055,12 +1055,12 @@ int main() {
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
-    char* tiny_stories_train = "data/TinyStories_train.bin";
-    char* tiny_stories_val = "data/TinyStories_val.bin";
-    char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
-    char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
-    char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
-    char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
+    const char* tiny_stories_train = "data/TinyStories_train.bin";
+    const char* tiny_stories_val = "data/TinyStories_val.bin";
+    const char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
+    const char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
+    const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
+    const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
     int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
     int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader;
