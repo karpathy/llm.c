@@ -1201,8 +1201,8 @@ int main() {
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    const int gen_max_length = 64;
-    int gen_tokens[gen_max_length];
+    const int genT = 64;
+    int* gen_tokens = (int*)calloc(B * genT, sizeof(int)); // init with all zero token
     float* cpu_probs = (float*)malloc(model.config.vocab_size * sizeof(float));
 
     // train
@@ -1225,13 +1225,12 @@ int main() {
         // once in a while do model inference to print generated text
         if (step > 0 && step % 20 == 0) {
             gen_tokens[0] = GPT2_EOT; // the GPT-2 EOT token kicks off the generation
-            for (int t = 1; t < gen_max_length; t++) {
-                // note that inference is wasteful here because
-                // for each t, we re-compute all activations between 0 and t
-                // leaving this alone because you want separate code for inference anyway
-                // the inference here is just for sanity checking purposes
-                int t4 = (t + 3) & ~3; // clever way to round up to multiple of 4
-                gpt2_forward(&model, gen_tokens, NULL, 1, t4);
+            for (int t = 1; t < genT; t++) {
+                // note that inference is very wasteful here because for each token
+                // we re-calculate the forward pass for all of (B,T) from scratch
+                // but the inference here is just for sanity checking anyway
+                // and we're only actually using b=0 (i.e. the first row) of all B rows
+                gpt2_forward(&model, gen_tokens, NULL, B, T);
                 float* probs = model.acts.probs + (t-1) * model.config.vocab_size;
                 float coin = random_f32(&rng_state);
                 // move probs back to CPU and sample
@@ -1239,8 +1238,8 @@ int main() {
                 int next_token = sample_mult(cpu_probs, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
             }
-            printf("generated: ");
-            for (int t = 0; t < gen_max_length; t++) {
+            printf("generated:\n");
+            for (int t = 0; t < genT; t++) {
                 printf("%d ", gen_tokens[t]);
             }
             printf("\n");
@@ -1264,6 +1263,7 @@ int main() {
     dataloader_free(&val_loader);
     gpt2_free(&model);
     free(cpu_probs);
+    free(gen_tokens);
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
