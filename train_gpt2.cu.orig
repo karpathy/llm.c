@@ -904,6 +904,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         }
     }
 
+    // validate inputs
+    for(int i = 0; i < B * T; ++i) {
+        assert(inputs[i] < V);
+    }
+
     // copy inputs/targets to the model
     cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
     if (targets != NULL) {
@@ -1156,33 +1161,34 @@ int sample_mult(float* probabilities, int n, float coin) {
 
 void gen_tiktoken_script(int step, int* gen_tokens, int gen_max_length)
 {
-    char fn_tiktoken_py[32];
-    const char
-        *tiktoken_py_1 =
-                "import tiktoken\n"
-                "import tiktoken\n"
-                "enc = tiktoken.get_encoding(\"gpt2\")\n"
-                "ptok = lambda x: print(enc.decode(list(map(int, x.strip().split()))))\n"
-                "ptok(\"",
-        *tiktoken_py_2 = "\")\n";
+	const char 
+		*tiktoken_py_1 = 
+				"import tiktoken\n"
+				"import tiktoken\n"
+				"enc = tiktoken.get_encoding(\"gpt2\")\n"
+				"ptok = lambda x: print(enc.decode(list(map(int, x.strip().split()))))\n"
+				"ptok(\"",
+		*tiktoken_py_2 = 
+				"\")\n";
+	char fn_tiktoken_py[32];
 
-    snprintf(fn_tiktoken_py, sizeof fn_tiktoken_py, "tiktoken_step_%d.py", step);
-    FILE *f = fopen(fn_tiktoken_py, "w");
-    if (f) {
-        char tiktoken_cmd[40];
+	snprintf(fn_tiktoken_py, sizeof fn_tiktoken_py, "tiktoken_step_%d.py", step);
+	FILE *f = fopen(fn_tiktoken_py, "w");
+	if (f) {
+		char tiktoken_cmd[40];
 
-        fprintf(f, "%s", tiktoken_py_1);
-        for (int t = 1; t < gen_max_length; t++) {
-            fprintf(f, "%d ", gen_tokens[t]);
-        }
-        fprintf(f, "%s", tiktoken_py_2);
-        fclose(f);
+		fprintf(f, "%s", tiktoken_py_1);
+		for (int t = 1; t < gen_max_length; t++) {
+			fprintf(f, "%d ", gen_tokens[t]);
+		}
+		fprintf(f, "%s", tiktoken_py_2);
+		fclose(f);
 
-        snprintf(tiktoken_cmd, sizeof tiktoken_cmd, "python %s", fn_tiktoken_py);
-        printf("(run '%s' to see the output as words)\n", tiktoken_cmd);
-        // uncmment the line below to actually run that now
-        // system(tiktoken_cmd);
-    }
+		snprintf(tiktoken_cmd, sizeof tiktoken_cmd, "python %s", fn_tiktoken_py);
+		printf("(run '%s' to see the output as words)\n", tiktoken_cmd);
+		// uncmment the line below to actually run that now
+		// system(tiktoken_cmd);
+	}	
 }
 
 
@@ -1237,7 +1243,7 @@ int main() {
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
     const int gen_max_length = 64;
-    int gen_tokens[gen_max_length];
+    int gen_tokens[gen_max_length]= { 0 };
     float* cpu_probs = (float*)malloc(model.config.vocab_size * sizeof(float));
 
     // train
@@ -1259,7 +1265,11 @@ int main() {
 
         // once in a while do model inference to print generated text
         if (step > 0 && step % 20 == 0) {
-            gen_tokens[0] = GPT2_EOT; // the GPT-2 EOT token kicks off the generation
+            // the GPT-2 EOT token kicks off the generation
+            for(int i = 0; i < gen_max_length; ++i) {
+                gen_tokens[i] = GPT2_EOT;
+            }
+
             for (int t = 1; t < gen_max_length; t++) {
                 // note that inference is wasteful here because
                 // for each t, we re-compute all activations between 0 and t
@@ -1280,8 +1290,8 @@ int main() {
             }
             printf("\n");
 
-            // hacky output of tokens as words
-            gen_tiktoken_script(step, gen_tokens, gen_max_length);
+			// hacky output of tokens as words 
+			gen_tiktoken_script(step, gen_tokens, gen_max_length);
         }
 
         // do a training step
