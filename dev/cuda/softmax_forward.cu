@@ -110,13 +110,13 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
                 maxval = inp_row[j];
             }
         }
-        float sum = 0.0f;
+        double sum = 0.0;
         for (int j = 0; j < C; j++) {
             out_row[j] = expf(inp_row[j] - maxval);
             sum += out_row[j];
         }
         for (int j = 0; j < C; j++) {
-            out_row[j] /= sum;
+            out_row[j] /= (float)sum;
         }
     }
 }
@@ -656,7 +656,7 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
 
-        int repeat_times = 1000;
+        int repeat_times = 100;
         float elapsed_time = benchmark_kernel(repeat_times, softmax_forward,
                                               kernel_num, d_out, d_inp, B * T, V, block_size
                                               );
