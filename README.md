@@ -162,7 +162,24 @@ The time drops down to 26.2ms/iteration. So at the current 26.2ms/iteration we, 
 !python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4 --compile 1 --tensorcores 1 --profiler 1
 ```
 
-The profiler prints the most expensive operations sorted by their cuda execution time.
+The profiler prints the most expensive operations sorted by their cuda execution time. eg::
+
+```
+-------------------------------------------------------  ------------  
+                                                   Name    Self CUDA %  
+-------------------------------------------------------  ------------  
+                                          ProfilerStep*         0.00%  
+                                  Torch-Compiled Region         0.00%  
+                                       CompiledFunction         0.00%  
+                                               aten::mm        29.32%  
+void cutlass::Kernel<cutlass_80_tensorop_s1688gemm_1...        19.28%  
+                                              aten::bmm        19.15%  
+                                   triton__0d1d2d3de4de        16.21%  
+            triton_per_fused__softmax_masked_fill_mul_6        15.23%  
+void cutlass::Kernel<cutlass_80_tensorop_s1688gemm_2...        11.32%  
+                       triton_red_fused__log_softmax_15        10.80%  
+-------------------------------------------------------  ------------  
+```
 
 ## discussions
 
