@@ -1,3 +1,9 @@
+# This script uses Runhouse and SkyPilot to launch, set up, and run the GPT-2 training
+# script in the cloud. For installation instructions, see:
+# https://www.run.house/docs/tutorials/quick-start-cloud
+# After bringing up this box, you can ssh into it directly with `$ ssh rh-cuda-gpu`, or
+# bring it down with `$ sky down rh-cuda-gpu`.
+
 import runhouse as rh
 
 
@@ -11,7 +17,7 @@ def train_cloud():
                      "sudo apt-get update",
                      "sudo apt install clang -y --fix-missing"
                  ],
-                 working_dir="./")  # rsync over the current git root
+                 working_dir="./")  # rsync over the current git root and install requirements.txt
     # Note this is cached, so it will not run the installation commands again unless they change.
     env.to(cluster)
     cluster.run(["cd llm.c; make train_gpt2",
