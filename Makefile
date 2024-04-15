@@ -1,5 +1,5 @@
 CC ?= clang
-CFLAGS = -Ofast -fno-finite-math-only -Wno-unused-result -march-native
+CFLAGS = -Ofast -fno-finite-math-only -Wno-unused-result -march=native
 LDFLAGS =
 LDLIBS = -lm
 INCLUDES =
