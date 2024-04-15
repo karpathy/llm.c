@@ -144,8 +144,9 @@ void matmul_forward2(float* out,
     cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC));
     // and now we still have to add the bias... (ew)
     if (bias != NULL) {
+        int thread_reuse_factor = 1;
         int block_size = sqrt_block_size * sqrt_block_size;
-        int grid_size = ceil_div(OC * B * T, block_size);
+        int grid_size = ceil_div(OC * B * T, block_size * thread_reuse_factor);
         add_bias<<<grid_size, block_size>>>(out, bias, B, T, OC);
         cudaCheck(cudaGetLastError());
     }
