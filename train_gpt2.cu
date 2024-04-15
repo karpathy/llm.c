@@ -1346,6 +1346,7 @@ int main() {
                     // fall back to printing the token id
                     printf("%d ", next_token);
                 }
+                fflush(stdout);
             }
             printf("\n---\n");
         }
