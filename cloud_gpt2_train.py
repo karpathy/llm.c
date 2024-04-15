@@ -12,8 +12,8 @@ def train_cloud():
     cluster = rh.cluster(name="rh-cuda-gpu", instance_type="A10G:1").up_if_not()
     env = rh.env(name="llm_c_train",
                  setup_cmds=[
-                     "python llm.c/prepro_tinyshakespeare.py",
-                     "python llm.c/train_gpt2.py",
+                     "python -u llm.c/prepro_tinyshakespeare.py",
+                     "python -u llm.c/train_gpt2.py",
                      "sudo apt-get update",
                      "sudo apt install clang -y --fix-missing"
                  ],
