@@ -44,7 +44,7 @@ __global__ void crossentropy_forward_kernel1(float* losses,
         int t = i % T;
         const float* probs_bt = probs + b * T * V + t * V;
         int ix = targets[b * T + t];
-        losses[b * T + t] = -logf(probs_bt[ix]);
+        losses[b * T + t] = -__logf(probs_bt[ix]);
     }
 }
 
