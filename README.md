@@ -8,7 +8,7 @@ Currently, I am working on:
 - speed up the CPU version with SIMD instructions, AVX2 on x86 / NEON on ARM (e.g. Apple Silicon).
 - more modern architectures, e.g. Llama2, Gemma, etc.
 
-For the repo, I'd like to maintain both clean, simple reference implementations alongside a also lot more optimized versions that can come close to PyTorch, but in a tiny fraction of the code and dependencies.
+I'd like this repo to only maintain C and CUDA code. Ports of this repo to other programming languages are very welcome, but should be done in separate repos, and I am very happy to link to them below in the "notable forks" section, just like I did in [llama2.c notable forks](https://github.com/karpathy/llama2.c/tree/master?tab=readme-ov-file#notable-forks).
 
 ## quick start
 
@@ -155,6 +155,10 @@ python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024
 ```
 
 The time drops down to 26.2ms/iteration. So at the current 26.2ms/iteration we, amusingly and right now, have an identical running time. This somewhat makes sense because most of the FLOPs are in the matmul, and we both call about the same kernels. The remainder of the difference is likely our self-attention implementation, and possibly the round trips for GeLU, and permute/unpermute.
+
+## notable forks
+
+will go here, similar to [llama2.c notable forks](https://github.com/karpathy/llama2.c/tree/master?tab=readme-ov-file#notable-forks)
 
 ## discussions
 
