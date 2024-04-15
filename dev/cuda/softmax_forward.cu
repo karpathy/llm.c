@@ -143,8 +143,8 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
             shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
         }
     }
-    float offset = shared[0];
     __syncthreads();
+    float offset = shared[0];
     // compute expf and write the result to global memory
     for (int i = tid; i < C; i += block_size) {
         out[idx * C + i] = expf(x[i] - offset);
@@ -327,7 +327,7 @@ __global__ void softmax_forward_online_kernel1(float* out, const float* inp, int
         float* out_row = out + i * C;
 
         float maxval = -INFINITY;
-        float sum = 0.0f;
+        double sum = 0.0f;
         for (int j = 0; j < C; j++) {
             float maxval_prev = maxval;
 			if (inp_row[j] > maxval) {
