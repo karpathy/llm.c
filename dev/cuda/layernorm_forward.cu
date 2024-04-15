@@ -364,7 +364,7 @@ int main(int argc, char **argv) {
         long memory_ops = (2 * B * T * C) * 4; // *4 for float
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
 
-        printf("block_size %4d | time %f ms | bandwidth %f GB/s\n", block_size, elapsed_time, memory_bandwidth);
+        printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
     }
 
     // free memory

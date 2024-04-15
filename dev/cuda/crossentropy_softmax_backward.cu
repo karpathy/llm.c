@@ -147,7 +147,7 @@ int main(int argc, char **argv) {
                                               kernel_num, d_dlogits, d_dlosses, d_probs, d_targets,
                                               B, T, V, block_size);
 
-        printf("block_size %4d | time %f ms\n", block_size, elapsed_time / repeat_times);
+        printf("block_size %4d | time %.4f ms | per token %.2f µs\n", block_size, elapsed_time, elapsed_time * 1'000 / (B*T));
     }
 
     // free memory
