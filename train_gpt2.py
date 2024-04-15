@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.profiler import profile, record_function, ProfilerActivity
 
 class NewGELU(nn.Module):
     """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
@@ -307,6 +308,26 @@ def write_tokenizer(enc, filename):
             file.write(b)  # Write the actual bytes
     print(f"wrote {filename}")
 
+def configure_profiler():
+    """Configures the PyTorch profiler with predefined settings."""
+    return profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        with_stack=True,
+        schedule=torch.profiler.schedule(
+            skip_first=1, wait=1, warmup=1, active=1, repeat=1
+        ),
+        on_trace_ready=trace_handler
+    )
+
+def trace_handler(profiler_):
+    """Handles profiler traces by exporting summary and detailed stack traces."""
+    print(profiler_.key_averages(group_by_stack_n=5).table(sort_by="cuda_time_total", row_limit=10))
+    profiler_.export_chrome_trace(f"chrometrace-{profiler_.step_num}.json")
+    # TODO the stack trace is empty for some unknown reason
+    # profiler_.export_stacks(f"flamegraph_stacks_{profiler_.step_num}.txt", "self_cuda_time_total")
+
+
 if __name__ == "__main__":
     import time
     import argparse
@@ -324,6 +345,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
     parser.add_argument("--batch_size", type=int, default=4, help="batch size")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
+    parser.add_argument("--profiler", type=int, default=0, help="enable torch.profiler")
     args = parser.parse_args()
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
@@ -393,28 +415,39 @@ if __name__ == "__main__":
     data_iter = iter(get_batch())
     x, y = next(data_iter) # we'll overfit this batch below
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    timings = []
-    for i in range(args.num_iterations):
-        t0 = time.time()
-        logits, loss = model(x, y)
-        if not args.inference_only:
-            optimizer.zero_grad()
-            loss.backward()
-            # on the first iteration only, save the state dict to file for later reference
-            if i == 0 and args.write_tensors:
-                write_model(model, "gpt2_124M.bin")
-                write_state(model, x, y, logits, loss, "gpt2_124M_debug_state.bin")
-            optimizer.step()
-        if device == "mps":
-            torch.mps.synchronize()
-        elif device == "cuda":
-            torch.cuda.synchronize()
-        t1 = time.time()
-        if i > args.num_iterations - 20:
-            timings.append(t1-t0)
-        print(f"iteration {i}, loss: {loss.item()}, time: {(t1-t0)*1000:.3f}ms")
-    if len(timings) > 0:
-        print(f"final 20 iters avg: {np.mean(timings)*1000:.3f}ms")
+
+    def training_loop(profiler_=None):
+        timings = []
+        for i in range(args.num_iterations):
+            t0 = time.time()
+            logits, loss = model(x, y)
+            if not args.inference_only:
+                optimizer.zero_grad()
+                loss.backward()
+                if i == 0 and args.write_tensors:
+                    write_model(model, "gpt2_124M.bin")
+                    write_state(model, x, y, logits, loss, "gpt2_124M_debug_state.bin")
+                optimizer.step()
+            if device == "mps":
+                torch.mps.synchronize()
+            elif device == "cuda":
+                torch.cuda.synchronize()
+            t1 = time.time()
+            if i >= args.num_iterations - 20:
+                timings.append(t1-t0)
+            print(f"iteration {i}, loss: {loss.item()}, time: {(t1-t0)*1000:.3f}ms")
+            if profiler_:
+                profiler_.step()
+        if timings:
+            print(f"Final 20 iterations avg time: {np.mean(timings)*1000:.3f}ms")
+    
+    if args.profiler:
+        if args.num_iterations < 4:
+            raise ValueError("--num_iterations should be 4 or higher for profiling")
+        with configure_profiler() as profiler:
+            training_loop(profiler)
+    else:
+        training_loop()
 
     # before we end, let's also do one round of inference
     # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
