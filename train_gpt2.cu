@@ -212,7 +212,7 @@ __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __rest
     }
 }
 
-__global__ void add_bias(float* out, float* bias, int B, int T, int OC) {
+__global__ void add_bias(float* out, const float* bias, int B, int T, int OC) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
     for (int i = idx; i < B*T*OC; i += stride) {
@@ -365,7 +365,7 @@ __global__ void crossentropy_forward_kernel1(float* losses,
     }
 }
 
-__global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int C) {
+__global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int C, int ldd) {
     // out is (N, C) just like inp. Each row of inp will get softmaxed.
     // same as kernel4, but optimised for very large Cs with advanced unrolling
 
@@ -395,8 +395,8 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
         return;
     }
 
-    const float* x = inp + idx * C; // input
-    float* y = out + idx * C; // output
+    const float* x = inp + idx * ldd; // input
+    float* y = out + idx * ldd; // output
 
     // first, thread coarsening by directly accessing global memory in series
     float maxval = -INFINITY;
@@ -603,12 +603,16 @@ void layernorm_forward(float* out, float* mean, float* rstd,
 
 // uses cuBLAS
 void matmul_forward_cublas(float* out,
-                    float* inp, float* weight, float* bias,
-                    int B, int T, int C, int OC) {
+                    const float* inp, const float* weight, const float* bias,
+                    int B, int T, int C, int OC, int ldc=-1) {
+    // assume no padding
+    if(ldc == -1) {
+        ldc = OC;
+    }
     const int sqrt_block_size = 32;
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC));
+    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, ldc));
 
     // and now we still have to add the bias... (ew)
     if (bias != NULL) {
@@ -764,11 +768,11 @@ void gelu_forward(float* out, const float* inp, int N) {
     cudaCheck(cudaGetLastError());
 }
 
-void softmax_forward(float* out, float* inp, int N, int C) {
+void softmax_forward(float* out, const float* inp, int N, int C, int P) {
     int grid_size = N;
     const int block_size = 512;
     size_t shared_mem_size = 2 * block_size / 32 * sizeof(float);
-    softmax_forward_kernel7<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
+    softmax_forward_kernel7<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C, P);
     cudaCheck(cudaGetLastError());
 }
 
@@ -959,6 +963,7 @@ typedef struct {
     ActivationTensors grads_acts;
     float* grads_acts_memory;
     // other run state configuration
+    int padded_vocab; // size of vocab after padding, influences activation buffer layout
     int batch_size; // the batch size (B) of current forward pass
     int seq_len; // the sequence length (T) of current forward pass
     int* inputs; // the input tokens for the current forward pass
@@ -978,9 +983,10 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     if (model_header[1] != 1) { printf("Bad version in model file"); exit(EXIT_FAILURE); }
 
     // read in hyperparameters
-    int maxT, V, L, NH, C;
+    int maxT, V, Vp, L, NH, C;
     model->config.max_seq_len = maxT = model_header[2];
     model->config.vocab_size = V = model_header[3];
+    model->padded_vocab = Vp = (V + 127) & ~127;
     model->config.num_layers = L = model_header[4];
     model->config.num_heads = NH = model_header[5];
     model->config.channels = C = model_header[6];
@@ -1052,6 +1058,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     // convenience parameters
     int V = model->config.vocab_size;
+    int Vp = model->padded_vocab;
     int L = model->config.num_layers;
     int NH = model->config.num_heads;
     int C = model->config.channels;
@@ -1090,8 +1097,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         model->act_sizes[17] = B * T * C; // lnf
         model->act_sizes[18] = B * T; // lnf_mean
         model->act_sizes[19] = B * T; // lnf_rstd
-        model->act_sizes[20] = B * T * V; // logits
-        model->act_sizes[21] = B * T * V; // probs
+        model->act_sizes[20] = B * T * Vp; // logits
+        model->act_sizes[21] = B * T * Vp; // probs
         model->act_sizes[22] = B * T; // losses
         model->act_sizes[23] = L * B * T * 3*C; // qkvr
         model->act_sizes[24] = L * B * T * C; // v_accum
@@ -1180,12 +1187,12 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_cublas(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
-    softmax_forward(acts.probs, acts.logits, B*T, V);
+    matmul_forward_cublas(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V, Vp);
+    softmax_forward(acts.probs, acts.logits, B*T, V, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
-        crossentropy_forward(acts.losses, acts.probs, model->targets, B, T, V);
+        crossentropy_forward(acts.losses, acts.probs, model->targets, B, T, Vp);
 
         // for convenience also evaluate the mean loss
         // move the (B,T) losses to CPU
