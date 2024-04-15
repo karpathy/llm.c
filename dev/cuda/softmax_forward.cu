@@ -29,6 +29,7 @@ version 7 is softmax optimized for very large C.
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -50,13 +51,17 @@ void softmax_forward_cpu(float* out, const float* inp, int N, int C) {
                 maxval = inp_row[j];
             }
         }
-        float sum = 0.0f;
+        // Note: since we want to ensure that the CUDA-kernels are accurate,
+        // we do this accumulation in higher precision, so we can be assured
+        // that our ground-truth is of high quality.
+        double sum = 0.0;
         for (int j = 0; j < C; j++) {
             out_row[j] = expf(inp_row[j] - maxval);
             sum += out_row[j];
         }
+        float norm = 1.f / (float)sum;
         for (int j = 0; j < C; j++) {
-            out_row[j] /= sum;
+            out_row[j] *= norm;
         }
     }
 }
@@ -105,13 +110,13 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
                 maxval = inp_row[j];
             }
         }
-        float sum = 0.0f;
+        double sum = 0.0;
         for (int j = 0; j < C; j++) {
             out_row[j] = expf(inp_row[j] - maxval);
             sum += out_row[j];
         }
         for (int j = 0; j < C; j++) {
-            out_row[j] /= sum;
+            out_row[j] /= (float)sum;
         }
     }
 }
@@ -138,8 +143,8 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
             shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
         }
     }
-    float offset = shared[0];
     __syncthreads();
+    float offset = shared[0];
     // compute expf and write the result to global memory
     for (int i = tid; i < C; i += block_size) {
         out[idx * C + i] = expf(x[i] - offset);
@@ -322,7 +327,7 @@ __global__ void softmax_forward_online_kernel1(float* out, const float* inp, int
         float* out_row = out + i * C;
 
         float maxval = -INFINITY;
-        float sum = 0.0f;
+        double sum = 0.0f;
         for (int j = 0; j < C; j++) {
             float maxval_prev = maxval;
 			if (inp_row[j] > maxval) {
@@ -592,20 +597,31 @@ int main(int argc, char **argv) {
 
     int B = 8;
     int T = 1024;
+    int V = 50257;
 
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
 
     // create host memory of random numbers
-    float* out = (float*)malloc(B * T * T * sizeof(float));
-    float* inp = make_random_float(B * T * T);
+    float* out = (float*)malloc(B * T * V * sizeof(float));
+    float* inp = make_random_float(B * T * V);
+
+    // make the input less uniformly random: Otherwise, all probabilities will be basically zero,
+    // and the tests are not actually meaningful.
+    const int* outliers = make_random_int(B * T * 3, V);
+    for(int k = 0; k < 3; ++k) {
+        for(int j = 0; j < B * T; ++j) {
+            inp[j * V +  outliers[j*3 + k]] *= 20;
+        }
+    }
+
 
     // move to GPU
     float* d_out;
     float* d_inp;
-    cudaCheck(cudaMalloc(&d_out, B * T * T * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_inp, B * T * T * sizeof(float)));
-    cudaCheck(cudaMemcpy(d_inp, inp, B * T * T * sizeof(float), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMalloc(&d_out, B * T * V * sizeof(float)));
+    cudaCheck(cudaMalloc(&d_inp, B * T * V * sizeof(float)));
+    cudaCheck(cudaMemcpy(d_inp, inp, B * T * V * sizeof(float), cudaMemcpyHostToDevice));
 
     // read kernel_num from command line
     int kernel_num = 1;
@@ -616,14 +632,22 @@ int main(int argc, char **argv) {
 
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
 
-    softmax_forward_cpu(out, inp, B * T, T);
+    softmax_forward_cpu(out, inp, B * T, V);
+    {
+        float max_el = -INFINITY;
+        for(int i = 0; i <  B * T * V; ++i) {
+            max_el = max(max_el, out[i]);
+        }
+        assert(max_el > 1e-4);
+        printf("Largest output is: %f\n", max_el);
+    }
 
     // first check the correctness of the kernel
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
-        softmax_forward(kernel_num, d_out, d_inp, B * T, T, block_size);
-        validate_result(d_out, out, "out", B * T * T, 1e-4f);
+        softmax_forward(kernel_num, d_out, d_inp, B * T, V, block_size);
+        validate_result(d_out, out, "out", B * T * V, 1e-4f);
     }
 
     printf("All results match. Starting benchmarks.\n\n");
@@ -632,12 +656,12 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
 
-        int repeat_times = 1000;
+        int repeat_times = 100;
         float elapsed_time = benchmark_kernel(repeat_times, softmax_forward,
-                                              kernel_num, d_out, d_inp, B * T, T, block_size
+                                              kernel_num, d_out, d_inp, B * T, V, block_size
                                               );
 
-        printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
+        printf("block_size %4d | time %.4f ms | per token %.2f µs\n", block_size, elapsed_time, elapsed_time * 1'000 / (B*T));
     }
 
     // free memory

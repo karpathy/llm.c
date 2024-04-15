@@ -4,6 +4,7 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <math.h>
 #include <time.h>
 #include <assert.h>
@@ -903,12 +904,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
     } else {
-        // validate B,T is no larger than what was previously allocated
-        // in principle, we could re-allocate a larger chunk of memory, for now we just error out
-        if (B > model->batch_size || T > model->seq_len) {
-            printf("Error: batch size or sequence length is inadequately large\n");
+        // validate B,T is consistent with how we've allocated the memory before
+        // in principle we could get more clever here in the future, for now this is safest
+        if (B != model->batch_size || T != model->seq_len) {
             printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
-            exit(1);
+            exit(EXIT_FAILURE);
         }
     }
 
@@ -1160,6 +1160,86 @@ int sample_mult(float* probabilities, int n, float coin) {
 }
 
 // ----------------------------------------------------------------------------
+// Tokenizer (only supports decoding)
+
+typedef struct {
+    uint32_t vocab_size;
+    char **token_table;
+    int init_ok;
+} Tokenizer;
+
+void safe_printf(const char *piece) {
+    // the tokens are raw bytes, and we we only want to print the printable ones
+    // many bytes can be various control codes, backspace, etc.
+    if (piece == NULL) { return; }
+    if (piece[0] == '\0') { return; }
+    // handle individual byte tokens
+    // every token is asserted to be at least one byte so doing piece[1] is ok
+    if (piece[1] == '\0') {
+        unsigned char byte_val = piece[0];
+        if (!(isprint(byte_val) || isspace(byte_val))) {
+            return; // weird byte, don't print it
+        }
+    }
+    printf("%s", piece);
+}
+
+void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
+    FILE *file = fopen(filename, "rb");
+    if (file == NULL) {
+        // try to be more helpful as we just added this feature, erase later
+        printf("---\n");
+        printf("WARNING: Failed to open the tokenizer file %s\n", filename);
+        printf("The Tokenizer is a new feature added April 14 2024.\n");
+        printf("Re-run `python train_gpt2.py` to write it\n");
+        printf("---\n");
+        tokenizer->init_ok = 0;
+        return;
+    }
+    // read in the header
+    uint32_t header[256];
+    fread(header, sizeof(uint32_t), 256, file);
+    assert(header[0] == 20240328);
+    assert(header[1] == 1);
+    tokenizer->vocab_size = header[2];
+    // read in all the tokens
+    unsigned char length;
+    tokenizer->token_table = (char **)malloc(tokenizer->vocab_size * sizeof(char *));
+    for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
+        fread(&length, sizeof(unsigned char), 1, file);
+        assert(length > 0); // every token should be at least one character
+        char *token_bytes = (char *)malloc(length + 1);
+        fread(token_bytes, sizeof(char), length, file);
+        token_bytes[length] = '\0';  // Add null terminator for printing
+        tokenizer->token_table[i] = token_bytes;
+    }
+    // cleanups
+    fclose(file);
+    tokenizer->init_ok = 1;
+}
+
+const char *tokenizer_decode(Tokenizer *tokenizer, uint32_t token_id) {
+    if (tokenizer->init_ok == 0) {
+        return NULL;
+    }
+    if (token_id < tokenizer->vocab_size) {
+        return tokenizer->token_table[token_id];
+    } else {
+        printf("invalid token id %d!\n", token_id);
+        return NULL;
+    }
+}
+
+void tokenizer_free(Tokenizer *tokenizer) {
+    if (tokenizer->init_ok) {
+        for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
+            free(tokenizer->token_table[i]);
+        }
+        free(tokenizer->token_table);
+    }
+}
+
+// ----------------------------------------------------------------------------
 // main training loop
 int main() {
 
@@ -1207,10 +1287,14 @@ int main() {
     printf("sequence length: %d\n", T);
     printf("val_num_batches: %d\n", val_num_batches);
 
+    // build the Tokenizer
+    Tokenizer tokenizer;
+    tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    const int gen_max_length = 64;
-    int gen_tokens[gen_max_length];
+    int* gen_tokens = (int*)malloc(B * T * sizeof(int));
+    const int genT = 64; // number of steps of inference we will do
     float* cpu_probs = (float*)malloc(model.config.vocab_size * sizeof(float));
 
     // train
@@ -1232,31 +1316,39 @@ int main() {
 
         // once in a while do model inference to print generated text
         if (step > 0 && step % 20 == 0) {
-
-            // the GPT-2 EOT token kicks off the generation
-            for(int i = 0; i < gen_max_length; ++i) {
+            // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
+            for(int i = 0; i < B * T; ++i) {
                 gen_tokens[i] = GPT2_EOT;
             }
-
-            for (int t = 1; t < gen_max_length; t++) {
-                // note that inference is wasteful here because
-                // for each t, we re-compute all activations between 0 and t
-                // leaving this alone because you want separate code for inference anyway
-                // the inference here is just for sanity checking purposes
-                int t4 = (t + 3) & ~3; // clever way to round up to multiple of 4
-                gpt2_forward(&model, gen_tokens, NULL, 1, t4);
+            // now sample from the model autoregressively
+            printf("generating:\n---\n");
+            for (int t = 1; t < genT; t++) {
+                // note that inference is very wasteful here because for each token
+                // we re-calculate the forward pass for all of (B,T) positions from scratch
+                // but the inference here is just for sanity checking anyway
+                // and we can maybe optimize a bit more later, with careful tests
+                gpt2_forward(&model, gen_tokens, NULL, B, T);
+                // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
+                // we're in principle running B "inference streams" in parallel here
+                // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
+                // get the V-dimensional vector probs[0, t-1, :]
                 float* probs = model.acts.probs + (t-1) * model.config.vocab_size;
-                float coin = random_f32(&rng_state);
                 // move probs back to CPU and sample
                 cudaCheck(cudaMemcpy(cpu_probs, probs, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+                float coin = random_f32(&rng_state);
                 int next_token = sample_mult(cpu_probs, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
+                // print the generated token, either using the Tokenizer or a fallback
+                if (tokenizer.init_ok) {
+                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
+                    safe_printf(token_str);
+                } else {
+                    // fall back to printing the token id
+                    printf("%d ", next_token);
+                }
+                fflush(stdout);
             }
-            printf("generated: ");
-            for (int t = 0; t < gen_max_length; t++) {
-                printf("%d ", gen_tokens[t]);
-            }
-            printf("\n");
+            printf("\n---\n");
         }
 
         // do a training step
@@ -1275,8 +1367,10 @@ int main() {
     // free
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
+    tokenizer_free(&tokenizer);
     gpt2_free(&model);
     free(cpu_probs);
+    free(gen_tokens);
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));

@@ -333,7 +333,7 @@ int main(int argc, char **argv) {
         // napkin math: estimate the flops achieved
         // e.g. A100 40GB PCIe is advertised at 19.5 TFLOPS fp32
         float tflops = (float)B * T * C * OC * 2 / elapsed_time * 1e3f / 1e12f;
-        printf("sqrt_block_size %4d | time %f ms | tflops %f\n", sqrt_block_size, elapsed_time, tflops);
+        printf("sqrt_block_size %4d | time %.4f ms | tflops %.2f\n", sqrt_block_size, elapsed_time, tflops);
     }
 
     // free memory
