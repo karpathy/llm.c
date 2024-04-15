@@ -156,6 +156,14 @@ python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024
 
 The time drops down to 26.2ms/iteration. So at the current 26.2ms/iteration we, amusingly and right now, have an identical running time. This somewhat makes sense because most of the FLOPs are in the matmul, and we both call about the same kernels. The remainder of the difference is likely our self-attention implementation, and possibly the round trips for GeLU, and permute/unpermute.
 
+## profiling pytorch implementaiton
+
+```bash
+!python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4 --compile 1 --tensorcores 1 --profiler 1
+```
+
+The profiler prints the most expensive operations sorted by their cuda execution time.
+
 ## discussions
 
 Ways of organizing development:
