@@ -43,9 +43,9 @@ You can have a look inside the `Makefile` and its comments. It will try to autod
 
 ```
 # try this first
-CFLAGS = -Ofast -fno-fast-math -Wno-unused-result
+CFLAGS="-Ofast -fno-fast-math -Wno-unused-result -march=native" make train_gpt2
 # try this second
-CFLAGS = -O3 -Wno-unused-result
+CFLAGS="-O3 -Wno-unused-result -march=native" make train_gpt2
 ```
 
 Once `train_gpt2` is compiled, you can run it:
