@@ -77,17 +77,20 @@ step 39: train loss 3.970751 (took 1323.779000 ms)
 val loss 4.107781
 generating:
 ---
-Come palm thy back, yet, thou
-Colonius: or in good Faith
-Of thine faith shall we see thee. Presbyterian:
-I will not have treason
-With thy carriage under command; Aggravated,
-Farewell:
-You are the cheap; the harbinger, in your
+Come Running Away,
+Greater conquer
+With the Imperial blood
+the heaviest host of the gods
+into this wondrous world beyond.
+I will not back thee, for how sweet after birth
+Netflix against repounder,
+will not
+flourish against the earlocks of
+Allay
 ---
 ```
 
-I noticed that slightly different platforms (e.g. MacOS / Linux) will (sadly) give very slightly different results, so potentially don't expect an exact match to the above. Also note that if you are seeing token ids instead of text in the generation, it might be because your code is out of date, as Tokenizer decoding was added April 14, 2024. `git pull` the updates, and then re-run `python train_gpt2.py`, which will now also save the tokenizer, which C can read and then use to print text instead of token ids.
+I like how Netflix comes up, it's clear that the shadow of the training past is still lurking in the model. I did not attempt to tune the finetuning hyperparameters so it's quite likely this can be improved quite a bit. I also noticed that slightly different platforms (e.g. MacOS / Linux) will (sadly) give very slightly different results, so perhaps don't expect to get the exact numbers or generation above. Also note that if you are seeing token ids instead of text in the generation, it might be because your code is out of date, as Tokenizer decoding was added April 14, 2024. `git pull` the updates, and then re-run `python train_gpt2.py`, which will now also save the tokenizer, which C can read and then use to print text instead of token ids.
 
 ## test
 
