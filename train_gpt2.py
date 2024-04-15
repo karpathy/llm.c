@@ -445,9 +445,9 @@ if __name__ == "__main__":
         if args.num_iterations < 4:
             raise ValueError("--num_iterations should be 4 or higher for profiling")
         with configure_profiler() as profiler:
-            training_loop(model, x, y, optimizer, args, profiler)
+            training_loop(profiler)
     else:
-        training_loop(model, x, y, optimizer, args, None)
+        training_loop()
 
     # before we end, let's also do one round of inference
     # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
