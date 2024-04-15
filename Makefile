@@ -3,6 +3,8 @@ CFLAGS = -O3 -Ofast -Wno-unused-result
 LDFLAGS =
 LDLIBS = -lm
 INCLUDES =
+CLCFLAGS = -Idev/opencl
+CLLDFLAGS =
 
 # Check if OpenMP is available
 # This is done by attempting to compile an empty file with OpenMP flags
@@ -11,6 +13,7 @@ INCLUDES =
 # e.g. on Ubuntu: sudo apt-get install libomp-dev
 # later, run the program by prepending the number of threads, e.g.: OMP_NUM_THREADS=8 ./gpt2
 ifeq ($(shell uname), Darwin)
+  CLLDFLAGS = -framework OpenCL
   # Check if the libomp directory exists
   ifeq ($(shell [ -d /opt/homebrew/opt/libomp/lib ] && echo "exists"), exists)
     # macOS with Homebrew and directory exists
@@ -29,6 +32,7 @@ ifeq ($(shell uname), Darwin)
     $(warning OOPS Compiling without OpenMP support)
   endif
 else
+  CLLDFLAGS = -lOpenCL
   ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
     # Ubuntu or other Linux distributions
     CFLAGS += -fopenmp -DOMP
@@ -58,6 +62,12 @@ train_gpt2cu: train_gpt2.cu
 test_gpt2cu: test_gpt2.cu
 	nvcc -O3 --use_fast_math $< -lcublas -lcublasLt -o $@
 
+train_gpt2cl: train_gpt2cl.c
+	$(CC) $(CFLAGS) $(CLCFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) $(CLLDFLAGS) -o $@
+
+test_gpt2cl: test_gpt2cl.c
+	$(CC) $(CFLAGS) $(CLCFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) $(CLLDFLAGS) -o $@
+
 clean:
-	rm -f train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu
+	rm -f train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2cl test_gpt2cl
 
