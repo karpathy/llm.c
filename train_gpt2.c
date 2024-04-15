@@ -16,11 +16,6 @@ There will be other versions of this code that specialize it and make it fast.
 #include <math.h>
 #include <time.h>
 #include <string.h>
-#if defined _WIN32
-#include "win.h"
-#else
-#include <unistd.h>
-#endif
 #ifdef OMP
 #include <omp.h>
 #endif
