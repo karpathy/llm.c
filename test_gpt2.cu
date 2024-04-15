@@ -1,5 +1,6 @@
 #define TESTING
 #include "train_gpt2.cu"
+#define MODEL_HEADER 256
 
 // poor man's tensor checker
 int check_tensor(float *a, float *b, int n, char* label) {
@@ -51,16 +52,17 @@ int main(int argc, char *argv[]) {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
-    int C = model.config.channels;
     int V = model.config.vocab_size;
-    int maxT = model.config.max_seq_len;
-    int L = model.config.num_layers;
 
     // load additional information that we will use for debugging and error checking
     FILE *state_file = fopen("gpt2_124M_debug_state.bin", "rb");
     if (state_file == NULL) { printf("Error opening state file\n"); exit(1); }
     int state_header[256];
-    fread(state_header, sizeof(int), 256, state_file);
+    size_t retval = fread(state_header, sizeof(int), MODEL_HEADER, state_file);
+    if (retval !=  MODEL_HEADER) {
+        fprintf(stderr, "Failed to read model header: expected %d items, got %zu.\n", MODEL_HEADER, retval);
+        exit(1);
+    }
     if (state_header[0] != 20240327) { printf("Bad magic state file"); exit(1); }
     if (state_header[1] != 1) { printf("Bad version in state file"); exit(1); }
     int B = state_header[2]; // batch size, e.g. 4
@@ -79,18 +81,36 @@ int main(int argc, char *argv[]) {
     float* expected_loss = (float*) malloc(1 * sizeof(float));
 
     // read reference information from Python
-    fread(x, sizeof(int), B*T, state_file);
-    fread(y, sizeof(int), B*T, state_file);
-    fread(expected_logits, sizeof(float), B*T*V, state_file);
-    fread(expected_loss, sizeof(float), 1, state_file);
-    fread(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
+    retval = fread(x, sizeof(int), B*T, state_file);
+    if (retval !=  B*T) {
+        fprintf(stderr, "Failed to read model header: expected %d items, got %zu.\n", B*T, retval);
+        exit(1);
+    }
+    retval = fread(y, sizeof(int), B*T, state_file);
+    if (retval !=  B*T) {
+        fprintf(stderr, "Failed to read model header: expected %d items, got %zu.\n", B*T, retval);
+        exit(1);
+    }
+    retval = fread(expected_logits, sizeof(float), B*T*V, state_file);
+    if (retval !=  B*T*V) {
+        fprintf(stderr, "Failed to read model header: expected %d items, got %zu.\n", B*T*V, retval);
+        exit(1);
+    }
+    retval = fread(expected_loss, sizeof(float), 1, state_file);
+    if (retval !=  1) {
+        fprintf(stderr, "Failed to read model header: expected %d items, got %zu.\n", 1, retval);
+        exit(1);
+    }
+    retval = fread(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
+    if (retval !=  model.num_parameters) {
+        fprintf(stderr, "Failed to read model header: expected %d items, got %zu.\n", model.num_parameters, retval);
+    }
     fclose(state_file);
 
     // overall OK signal for the test
     int allok = 1;
 
     // let's do 10 training iterations, following the pytorch code
-    float losses[10];
     for (int step = 0; step < 10; step++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);

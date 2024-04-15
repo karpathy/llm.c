@@ -766,12 +766,17 @@ typedef struct {
 
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
-
+    #define MODEL_HEADER 256
     // read in model from a checkpoint file
     FILE *model_file = fopen(checkpoint_path, "rb");
     if (model_file == NULL) { printf("Error opening model file\n"); exit(1); }
-    int model_header[256];
-    fread(model_header, sizeof(int), 256, model_file);
+    int model_header[MODEL_HEADER];
+    size_t retval = fread(model_header, sizeof(int), MODEL_HEADER, model_file);
+    if (retval != 256) {
+        fprintf(stderr, "Failed to read model header: expected %d items, got %zu.\n", MODEL_HEADER, retval);
+        exit(1);
+    }
+
     if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(1); }
     if (model_header[1] != 1) { printf("Bad version in model file"); exit(1); }
 
@@ -820,7 +825,11 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in all the parameters from file and copy them to device
     float* params_memory_cpu = (float*)malloc(num_parameters * sizeof(float));
-    fread(params_memory_cpu, sizeof(float), num_parameters, model_file);
+    retval = fread(params_memory_cpu, sizeof(float), num_parameters, model_file);
+    if (retval != num_parameters) {
+        fprintf(stderr, "Failed to read model header: expected %zu items, got %zu.\n", num_parameters, retval);
+        exit(1);
+    }
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     free(params_memory_cpu);
     fclose(model_file);
@@ -1119,7 +1128,11 @@ void dataloader_next_batch(DataLoader *loader) {
     }
     // read the B*T+1 integers from the file into batch
     fseek(loader->tokens_file, loader->current_position, SEEK_SET);
-    fread(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
+    size_t retval = fread(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
+    if (retval !=  B*T+1) {
+        fprintf(stderr, "Failed to read model header: expected %d items, got %zu.\n",  B*T+1, retval);
+        exit(EXIT_FAILURE);
+    }
     // advance the current position by B*T integers
     loader->current_position += B*T * sizeof(int);
 }
@@ -1198,7 +1211,11 @@ void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
     }
     // read in the header
     uint32_t header[256];
-    fread(header, sizeof(uint32_t), 256, file);
+    size_t retval = fread(header, sizeof(uint32_t), 256, file);
+    if (retval !=  256) {
+        fprintf(stderr, "Failed to read tokenizer header: expected %d items, got %zu.\n",  256, retval);
+        exit(1);
+    }
     assert(header[0] == 20240328);
     assert(header[1] == 1);
     tokenizer->vocab_size = header[2];
@@ -1206,10 +1223,18 @@ void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
     unsigned char length;
     tokenizer->token_table = (char **)malloc(tokenizer->vocab_size * sizeof(char *));
     for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
-        fread(&length, sizeof(unsigned char), 1, file);
+        retval = fread(&length, sizeof(unsigned char), 1, file);
+        if (retval !=  1) {
+            fprintf(stderr, "Failed to read tokenizer file: expected %d items, got %zu.\n",  1, retval);
+            exit(1);
+        }
         assert(length > 0); // every token should be at least one character
         char *token_bytes = (char *)malloc(length + 1);
-        fread(token_bytes, sizeof(char), length, file);
+        retval = fread(token_bytes, sizeof(char), length, file);
+        if (retval !=  length) {
+            fprintf(stderr, "Failed to read tokenizer file: expected %d items, got %zu.\n",  length, retval);
+            exit(1);
+        }
         token_bytes[length] = '\0';  // Add null terminator for printing
         tokenizer->token_table[i] = token_bytes;
     }
