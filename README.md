@@ -33,7 +33,7 @@ In principle we'd be ready to train the model right here. However the baseline C
 python train_gpt2.py
 ```
 
-You'll recognize this code from nanoGPT as a simple GPT-2 reference implementation in PyTorch. This script will download the GPT-2 (124M) model, overfit a single batch of data for 10 iterations, run a few steps of generation, and most importantly it will save two files: 1) the `gpt2_124M.bin` file that contains the raw model weights for loading in C, and `gpt2_124M_debug_state.bin`, which also contains more debug state: the inputs, targets, logits and loss. This is very useful for debugging C code, for unit testing, and making sure we're exactly matching the PyTorch reference implementation. For now all we care about are the model weights in `gpt2_124M.bin`. We can now initialize with them and train in raw C. First compile the code:
+You'll recognize this code from nanoGPT as a simple GPT-2 reference implementation in PyTorch. This script will download the GPT-2 (124M) model, overfit a single batch of data for 10 iterations, run a few steps of generation, and most importantly it will save three files: 1) the `gpt2_124M.bin` file that contains the raw model weights for loading in C, 2) the `gpt2_124M_debug_state.bin`, which also contains more debug state: the inputs, targets, logits and loss (useful for debugging and unit testing), and finally 3) the `gpt2_tokenizer.bin` which stores the vocabulary for the GPT-2 tokenizer, translating token ids to byte sequences of UTF-8 encoded string pieces. We can now initialize with these model weights and continue training in raw C. First compile the code:
 
 ```bash
 make train_gpt2
@@ -75,35 +75,19 @@ step 3: train loss 4.600470 (took 1290.761000 ms)
 ... (trunctated) ...
 step 39: train loss 3.970751 (took 1323.779000 ms)
 val loss 4.107781
-generated: 50256 16773 18162 21986 11 198 13681 263 23875 198 3152 262 11773 2910 198 1169 6002 6386 2583 286 262 11858 198 20424 428 3135 7596 995 3675 13 198 40 481 407 736 17903 11 329 703 6029 706 4082 198 42826 1028 1128 633 263 11 198 10594 407 198 2704 454 680 1028 262 1027 28860 286 198 3237 323
-step 40: train loss 4.377757 (took 1366.368000 ms)
+generating:
+---
+Come palm thy back, yet, thou
+Colonius: or in good Faith
+Of thine faith shall we see thee. Presbyterian:
+I will not have treason
+With thy carriage under command; Aggravated,
+Farewell:
+You are the cheap; the harbinger, in your
+---
 ```
 
-The generation just gives you the token ids for now, which we have to decode back to text. We can implement this in C quite easily also, because decoding is very straight-forward, it's just string chunk lookups and prints. For now we can use tiktoken:
-
-```python
-import tiktoken
-enc = tiktoken.get_encoding("gpt2")
-ptok = lambda x: print(enc.decode(list(map(int, x.strip().split()))))
-ptok("50256 16773 18162 21986 11 198 13681 263 23875 198 3152 262 11773 2910 198 1169 6002 6386 2583 286 262 11858 198 20424 428 3135 7596 995 3675 13 198 40 481 407 736 17903 11 329 703 6029 706 4082 198 42826 1028 1128 633 263 11 198 10594 407 198 2704 454 680 1028 262 1027 28860 286 198 3237 323")
-```
-
-which prints:
-
-```
-<|endoftext|>Come Running Away,
-Greater conquer
-With the Imperial blood
-the heaviest host of the gods
-into this wondrous world beyond.
-I will not back thee, for how sweet after birth
-Netflix against repounder,
-will not
-flourish against the earlocks of
-Allay
-```
-
-I like how Netflix comes up, it's clear that the shadow of the training past is still lurking in the model. I did not attempt to tune the finetuning hyperparameters so it's quite likely this can be improved quite a bit, most likely especially if one was to train a bit longer.
+I noticed that slightly different platforms (e.g. MacOS / Linux) will (sadly) give very slightly different results, so potentially don't expect an exact match to the above. Also note that if you are seeing token ids instead of text in the generation, it might be because your code is out of date, as Tokenizer decoding was added April 14, 2024. `git pull` the updates, and then re-run `python train_gpt2.py`, which will now also save the tokenizer, which C can read and then use to print text instead of token ids.
 
 ## test
 
