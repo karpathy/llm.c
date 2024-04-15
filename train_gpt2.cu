@@ -740,7 +740,7 @@ typedef struct {
     ParameterTensors params;
     size_t param_sizes[NUM_PARAMETER_TENSORS];
     float* params_memory;
-    int num_parameters;
+    size_t num_parameters;
     // gradients of the weights
     ParameterTensors grads;
     float* grads_memory;
@@ -751,7 +751,7 @@ typedef struct {
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
     float* acts_memory;
-    int num_activations;
+    size_t num_activations;
     // gradients of the activations
     ActivationTensors grads_acts;
     float* grads_acts_memory;
@@ -833,6 +833,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->grads_acts_memory = NULL;
     model->inputs = NULL;
     model->targets = NULL;
+    model->cpu_losses = NULL;
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss

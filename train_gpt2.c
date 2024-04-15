@@ -560,7 +560,7 @@ typedef struct {
     ParameterTensors params;
     size_t param_sizes[NUM_PARAMETER_TENSORS];
     float* params_memory;
-    int num_parameters;
+    size_t num_parameters;
     // gradients of the weights
     ParameterTensors grads;
     float* grads_memory;
@@ -571,7 +571,7 @@ typedef struct {
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
     float* acts_memory;
-    int num_activations;
+    size_t num_activations;
     // gradients of the activations
     ActivationTensors grads_acts;
     float* grads_acts_memory;
