@@ -11,6 +11,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import os
 import math
+import struct
 from dataclasses import dataclass
 
 import numpy as np
@@ -290,6 +291,21 @@ def write_state(model, x, y, logits, loss, filename):
         write_tensors(grads, model.config.n_layer, file)
     print(f"wrote {filename}")
 
+def write_tokenizer(enc, filename):
+    n = enc.max_token_value + 1
+    header = torch.zeros(256, dtype=torch.int32)
+    header[0] = 20240328 # magic
+    header[1] = 1 # tokenizer version = 1
+    header[2] = n # number of tokens
+    with open(filename, "wb") as file:
+        file.write(header.numpy().tobytes())
+        for i in range(n):
+            b = enc.decode_bytes([i])
+            length = len(b)
+            assert length < 256, f"Token length exceeds 255: {length}"
+            file.write(struct.pack("<B", length))  # Write the length as a 1-byte unsigned integer
+            file.write(b)  # Write the actual bytes
+    print(f"wrote {filename}")
 
 if __name__ == "__main__":
     import time
@@ -329,6 +345,8 @@ if __name__ == "__main__":
     enc = tiktoken.get_encoding("gpt2")
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
+
+    write_tokenizer(enc, "gpt2_tokenizer.bin")
 
     if args.tensorcores:
         torch.set_float32_matmul_precision('high')
