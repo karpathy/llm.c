@@ -7,12 +7,11 @@ This version is the clean, minimal, reference. As such:
 - it _does_ use a few OpenMP pragmas because this is a large speedup at very low cost
 There will be other versions of this code that specialize it and make it fast.
 */
-
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdint.h>
-#include <assert.h>
 #include <math.h>
 #include <time.h>
 #include <string.h>
@@ -485,6 +484,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     }
     // malloc all parameters all at once
     float* params_memory = (float*)malloc(num_parameters * sizeof(float));
+    assert(params_memory != NULL);
     // assign all the tensors
     float** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
@@ -532,6 +532,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
         num_activations += act_sizes[i];
     }
     float* acts_memory = (float*)malloc(num_activations * sizeof(float));
+    assert(acts_memory != NULL);
     float** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
         &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
@@ -713,6 +714,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         // also create memory for caching inputs and targets
         model->inputs = (int*)malloc(B * T * sizeof(int));
         model->targets = (int*)malloc(B * T * sizeof(int)); // might be unused if we never have targets but it's small
+        assert(model->inputs != NULL && model->targets != NULL);
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -1001,6 +1003,7 @@ void dataloader_init(DataLoader *loader, char* filename, int B, int T) {
     loader->inputs = loader->batch;
     loader->targets = loader->batch + 1; // targets are shifted by one
     loader->num_batches = loader->file_size / (B * T * sizeof(int));
+    assert(loader->batch != NULL);
 }
 
 void dataloader_reset(DataLoader *loader) {
@@ -1102,10 +1105,12 @@ void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
     // read in all the tokens
     unsigned char length;
     tokenizer->token_table = (char **)malloc(tokenizer->vocab_size * sizeof(char *));
+    assert(tokenizer->token_table != NULL);
     for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
         fread(&length, sizeof(unsigned char), 1, file);
         assert(length > 0); // every token should be at least one character
         char *token_bytes = (char *)malloc(length + 1);
+        assert(token_bytes != NULL);
         fread(token_bytes, sizeof(char), length, file);
         token_bytes[length] = '\0';  // Add null terminator for printing
         tokenizer->token_table[i] = token_bytes;
@@ -1169,6 +1174,7 @@ int main() {
     unsigned long long rng_state = 1337;
     int* gen_tokens = (int*)malloc(B * T * sizeof(int));
     const int genT = 64; // number of steps of inference we will do
+    assert(gen_tokens != NULL);
 
     // train
     struct timespec start, end;

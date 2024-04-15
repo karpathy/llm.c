@@ -1,5 +1,6 @@
 #define TESTING
 #include "train_gpt2.c"
+#include <assert.h>
 
 // poor man's tensor checker
 int check_tensor(float *a, float *b, int n, char* label) {
@@ -56,6 +57,7 @@ int main(int argc, char *argv[]) {
     int* y = (int*) malloc(B * T * sizeof(int));
     float* expected_logits = (float*) malloc(B * T * V * sizeof(float));
     float* expected_loss = (float*) malloc(1 * sizeof(float));
+    assert(x != NULL && y != NULL && expected_logits != NULL && expected_loss != NULL);
 
     // read reference information from Python
     fread(x, sizeof(int), B*T, state_file);

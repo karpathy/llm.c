@@ -11,7 +11,6 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 #include <float.h>
 #include <string.h>
 #include <unistd.h>
-#include <assert.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cublasLt.h>
