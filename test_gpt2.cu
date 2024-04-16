@@ -2,7 +2,7 @@
 #include "train_gpt2.cu"
 
 // poor man's tensor checker
-int check_tensor(float *a, float *b, int n, char* label) {
+int check_tensor(float *a, float *b, int n, const char* label) {
     int print_upto = 5;
     int ok = 1;
     printf("%s\n", label);
@@ -44,7 +44,6 @@ int main(int argc, char *argv[]) {
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
-    // setup the (global) cuBLASLt workspace
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     // build the GPT-2 model from a checkpoint
@@ -57,14 +56,14 @@ int main(int argc, char *argv[]) {
     int L = model.config.num_layers;
 
     // load additional information that we will use for debugging and error checking
-    FILE *state_file = fopen("gpt2_124M_debug_state.bin", "rb");
-    if (state_file == NULL) { printf("Error opening state file\n"); exit(1); }
+    FILE *state_file = fopenCheck("gpt2_124M_debug_state.bin", "rb");
     int state_header[256];
-    fread(state_header, sizeof(int), 256, state_file);
+    freadCheck(state_header, sizeof(int), 256, state_file);
     if (state_header[0] != 20240327) { printf("Bad magic state file"); exit(1); }
     if (state_header[1] != 1) { printf("Bad version in state file"); exit(1); }
     int B = state_header[2]; // batch size, e.g. 4
     int T = state_header[3]; // time / sequence length (e.g. 64, up to maxT)
+    assert(0 <= T && T <= maxT);
     printf("[State]\n");
     printf("batch_size: %d\n", B);
     printf("seq_len: %d\n", T);
@@ -75,18 +74,18 @@ int main(int argc, char *argv[]) {
     float* calculated_grads_memory = malloc_and_point_parameters(&calculated_grads, model.param_sizes, 0);
 
     // inputs and expected outputs, only used for error checking
-    int* x = (int*) malloc(B * T * sizeof(int));
-    int* y = (int*) malloc(B * T * sizeof(int));
-    float* expected_logits = (float*) malloc(B * T * V * sizeof(float));
-    float* expected_loss = (float*) malloc(1 * sizeof(float));
+    int* x = (int*)mallocCheck(B * T * sizeof(int));
+    int* y = (int*)mallocCheck(B * T * sizeof(int));
+    float* expected_logits = (float*) mallocCheck(B * T * V * sizeof(float));
+    float* expected_loss = (float*) mallocCheck(1 * sizeof(float));
 
     // read reference information from Python
-    fread(x, sizeof(int), B*T, state_file);
-    fread(y, sizeof(int), B*T, state_file);
-    fread(expected_logits, sizeof(float), B*T*V, state_file);
-    fread(expected_loss, sizeof(float), 1, state_file);
-    fread(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
-    fclose(state_file);
+    freadCheck(x, sizeof(int), B*T, state_file);
+    freadCheck(y, sizeof(int), B*T, state_file);
+    freadCheck(expected_logits, sizeof(float), B*T*V, state_file);
+    freadCheck(expected_loss, sizeof(float), 1, state_file);
+    freadCheck(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
+    fcloseCheck(state_file);
 
     // overall OK signal for the test
     int allok = 1;
@@ -107,7 +106,7 @@ int main(int argc, char *argv[]) {
 
             // at this point, target should be equal to expected_logits, let's compare
             // copy logits to CPU so we can compare them
-            float* logits_cpu = (float*) malloc(B * T * V * sizeof(float));
+            float* logits_cpu = (float*)mallocCheck(B * T * V * sizeof(float));
             cudaMemcpy(logits_cpu, model.acts.logits, B * T * V * sizeof(float), cudaMemcpyDeviceToHost);
             int logits_ok = 1;
             for (int i=0; i<B*T*V; i++) {
