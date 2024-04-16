@@ -139,6 +139,12 @@ int main(int argc, char *argv[]) {
             check_tensor(calculated_grads.lnfb, expected_grads.lnfb, C, "lnfb");
             cudaMemcpy(calculated_grads.lnfw, model.grads.lnfw, C * sizeof(float), cudaMemcpyDeviceToHost);
             check_tensor(calculated_grads.lnfw, expected_grads.lnfw, C, "lnfw");
+            // look at only the last layer for now
+            int l = L-1;
+            cudaMemcpy(calculated_grads.fcprojw + l * C * 4*C, model.grads.fcprojw + l * C * 4*C, C * 4*C * sizeof(float), cudaMemcpyDeviceToHost);
+            check_tensor(calculated_grads.fcprojw + l * C * 4*C, expected_grads.fcprojw + l * C * 4*C, C * 4*C, "fcprojw");
+            cudaMemcpy(calculated_grads.fcprojb + l * C, model.grads.fcprojb + l * C, C * sizeof(float), cudaMemcpyDeviceToHost);
+            check_tensor(calculated_grads.fcprojb + l * C, expected_grads.fcprojb + l * C, C, "fcprojb");
         }
     }
 

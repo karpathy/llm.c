@@ -342,6 +342,14 @@ __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, in
     }
 }
 
+__global__ void residual_backward_kernel(float* dinp1, float* dinp2, float* dout, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        dinp1[idx] += __ldcs(&dout[idx]);
+        dinp2[idx] += __ldcs(&dout[idx]);
+    }
+}
+
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 __global__ void gelu_kernel(float* out, const float* inp, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -756,6 +764,12 @@ void residual_forward(float* out, float* inp1, float* inp2, int N) {
     cudaCheck(cudaGetLastError());
 }
 
+void residual_backward(float* dinp1, float* dinp2, float* dout, int N) {
+    const int block_size = 256;
+    const int grid_size = CEIL_DIV(N, block_size);
+    residual_backward_kernel<<<grid_size, block_size>>>(dinp1, dinp2, dout, N);
+    cudaCheck(cudaGetLastError());
+}
 
 void gelu_forward(float* out, const float* inp, int N) {
     const int block_size = 128;
@@ -793,7 +807,7 @@ void crossentropy_softmax_backward(float* dlogits,
 }
 
 void matmul_backward(float* dinp, float* dweight, float* dbias,
-                     float* dout, float* inp, float* weight, float* ones,
+                     float* dout, float* inp, float* weight,
                      int B, int T, int C, int OC) {
     float alpha = 1.0f;
     float beta = 1.0f; // note we must use beta = 1.0 so that we do a +=, as we should, because gradients add
@@ -1226,7 +1240,7 @@ void gpt2_backward(GPT2 *model) {
     int T = model->seq_len;
     int V = model->config.vocab_size;
     int L = model->config.num_layers;
-    // int NH = model->config.num_heads;
+    int NH = model->config.num_heads;
     int C = model->config.channels;
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
@@ -1243,11 +1257,80 @@ void gpt2_backward(GPT2 *model) {
     cudaCheck(cudaGetLastError());
     crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V);
     // backward the classifier matmul
-    matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
+    matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, V);
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // and its gradient
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+
+    // now backward all the layers
+    for (int l = L-1; l >= 0; l--) {
+        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
+        dresidual = l == 0 ? grads_acts.encoded : grads_acts.residual3 + (l-1) * B * T * C;
+
+        // get the pointers of the weights for this layer
+        float* l_ln1w = params.ln1w + l * C;
+        float* l_qkvw = params.qkvw + l * 3*C * C;
+        float* l_attprojw = params.attprojw + l * C * C;
+        float* l_ln2w = params.ln2w + l * C;
+        float* l_fcw = params.fcw + l * 4*C * C;
+        float* l_fcprojw = params.fcprojw + l * C * 4*C;
+        // get the pointers of the gradients of the weights for this layer
+        float* dl_ln1w = grads.ln1w + l * C;
+        float* dl_ln1b = grads.ln1b + l * C;
+        float* dl_qkvw = grads.qkvw + l * 3*C * C;
+        float* dl_qkvb = grads.qkvb + l * 3*C;
+        float* dl_attprojw = grads.attprojw + l * C * C;
+        float* dl_attprojb = grads.attprojb + l * C;
+        float* dl_ln2w = grads.ln2w + l * C;
+        float* dl_ln2b = grads.ln2b + l * C;
+        float* dl_fcw = grads.fcw + l * 4*C * C;
+        float* dl_fcb = grads.fcb + l * 4*C;
+        float* dl_fcprojw = grads.fcprojw + l * C * 4*C;
+        float* dl_fcprojb = grads.fcprojb + l * C;
+        // get the pointers of the activations for this layer
+        float* l_ln1 = acts.ln1 + l * B * T * C;
+        float* l_ln1_mean = acts.ln1_mean + l * B * T;
+        float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
+        float* l_qkv = acts.qkv + l * B * T * 3*C;
+        float* l_atty = acts.atty + l * B * T * C;
+        float* l_att = acts.att + l * B * NH * T * T;
+        float* l_residual2 = acts.residual2 + l * B * T * C;
+        float* l_ln2 = acts.ln2 + l * B * T * C;
+        float* l_ln2_mean = acts.ln2_mean + l * B * T;
+        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
+        float* l_fch = acts.fch + l * B * T * 4*C;
+        float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
+        // get the pointers of the gradients of the activations for this layer
+        float* dl_ln1 = grads_acts.ln1 + l * B * T * C;
+        float* dl_qkv = grads_acts.qkv + l * B * T * 3*C;
+        float* dl_atty = grads_acts.atty + l * B * T * C;
+        float* dl_preatt = grads_acts.preatt + l * B * NH * T * T;
+        float* dl_att = grads_acts.att + l * B * NH * T * T;
+        float* dl_attproj = grads_acts.attproj + l * B * T * C;
+        float* dl_residual2 = grads_acts.residual2 + l * B * T * C;
+        float* dl_ln2 = grads_acts.ln2 + l * B * T * C;
+        float* dl_fch = grads_acts.fch + l * B * T * 4*C;
+        float* dl_fch_gelu = grads_acts.fch_gelu + l * B * T * 4*C;
+        float* dl_fcproj = grads_acts.fcproj + l * B * T * C;
+        float* dl_residual3 = grads_acts.residual3 + l * B * T * C;
+
+        // backprop this layer
+        residual_backward(dl_residual2, dl_fcproj, dl_residual3, B*T*C);
+        matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
+
+        break; // break until we get all the other blocks in place, so we're only backwarding the last layer
+
+        // gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
+        // matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
+        // layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
+        // residual_backward(dresidual, dl_attproj, dl_residual2, B*T*C);
+        // matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C);
+        // attention_backward(dl_qkv, dl_preatt, dl_att, dl_atty, l_qkv, l_att, B, T, C, NH);
+        // matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
+        // layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+    }
+    // encoder_backward(grads.wte, grads.wpe, grads_acts.encoded, model->inputs, B, T, C);
 }
 
 void gpt2_free(GPT2 *model) {
