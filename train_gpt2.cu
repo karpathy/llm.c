@@ -52,6 +52,60 @@ cublasHandle_t cublas_handle;
 cublasLtHandle_t cublaslt_handle;
 
 // ----------------------------------------------------------------------------
+// fread convenience utils, with nice handling of error checking using macros
+// simple replace fopen, fread, fclose with fopenCheck, freadCheck, fcloseCheck
+
+FILE *fopen_check(const char *path, const char *mode, const char *file, int line) {
+    FILE *fp = fopen(path, mode);
+    if (fp == NULL) {
+        fprintf(stderr, "Error: Failed to open file '%s' at %s:%d\n", path, file, line);
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        fprintf(stderr, "  Path: %s\n", path);
+        fprintf(stderr, "  Mode: %s\n", mode);
+        exit(1);
+    }
+    return fp;
+}
+
+#define fopenCheck(path, mode) fopen_check(path, mode, __FILE__, __LINE__)
+
+void fread_check(void *ptr, size_t size, size_t nmemb, FILE *stream, const char *file, int line) {
+    size_t result = fread(ptr, size, nmemb, stream);
+    if (result != nmemb) {
+        if (feof(stream)) {
+            fprintf(stderr, "Error: Unexpected end of file at %s:%d\n", file, line);
+        } else if (ferror(stream)) {
+            fprintf(stderr, "Error: File read error at %s:%d\n", file, line);
+        } else {
+            fprintf(stderr, "Error: Partial read at %s:%d. Expected %zu elements, read %zu\n",
+                    file, line, nmemb, result);
+        }
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        fprintf(stderr, "  Expected elements: %zu\n", nmemb);
+        fprintf(stderr, "  Read elements: %zu\n", result);
+        exit(1);
+    }
+}
+
+#define freadCheck(ptr, size, nmemb, stream) fread_check(ptr, size, nmemb, stream, __FILE__, __LINE__)
+
+void fclose_check(FILE *fp, const char *file, int line) {
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "Error: Failed to close file at %s:%d\n", file, line);
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        exit(1);
+    }
+}
+
+#define fcloseCheck(fp) fclose_check(fp, __FILE__, __LINE__)
+
+// ----------------------------------------------------------------------------
 // all the kernels
 
 // warp-level reduction for finding the maximum value
@@ -902,10 +956,9 @@ typedef struct {
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in model from a checkpoint file
-    FILE *model_file = fopen(checkpoint_path, "rb");
-    if (model_file == NULL) { printf("Error opening model file\n"); exit(1); }
+    FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
-    fread(model_header, sizeof(int), 256, model_file);
+    freadCheck(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(1); }
     if (model_header[1] != 1) { printf("Bad version in model file"); exit(1); }
 
@@ -954,10 +1007,10 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in all the parameters from file and copy them to device
     float* params_memory_cpu = (float*)malloc(num_parameters * sizeof(float));
-    fread(params_memory_cpu, sizeof(float), num_parameters, model_file);
+    freadCheck(params_memory_cpu, sizeof(float), num_parameters, model_file);
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     free(params_memory_cpu);
-    fclose(model_file);
+    fcloseCheck(model_file);
 
     // other inits
     model->acts_memory = NULL;
@@ -1221,11 +1274,7 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     loader->T = T;
 
     // open the input file for reading
-    loader->tokens_file = fopen(filename, "rb");
-    if (loader->tokens_file == NULL) {
-        printf("Error opening tokens file\n");
-        exit(1);
-    }
+    loader->tokens_file = fopenCheck(filename, "rb");
 
     // determine the file size
     fseek(loader->tokens_file, 0, SEEK_END);
@@ -1259,13 +1308,13 @@ void dataloader_next_batch(DataLoader *loader) {
     }
     // read the B*T+1 integers from the file into batch
     fseek(loader->tokens_file, loader->current_position, SEEK_SET);
-    fread(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
+    freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
     // advance the current position by B*T integers
     loader->current_position += B*T * sizeof(int);
 }
 
 void dataloader_free(DataLoader *loader) {
-    fclose(loader->tokens_file);
+    fcloseCheck(loader->tokens_file);
     cudaFreeHost(loader->batch);
 }
 
@@ -1338,7 +1387,7 @@ void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
     }
     // read in the header
     uint32_t header[256];
-    fread(header, sizeof(uint32_t), 256, file);
+    freadCheck(header, sizeof(uint32_t), 256, file);
     assert(header[0] == 20240328);
     assert(header[1] == 1);
     tokenizer->vocab_size = header[2];
@@ -1346,15 +1395,15 @@ void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
     unsigned char length;
     tokenizer->token_table = (char **)malloc(tokenizer->vocab_size * sizeof(char *));
     for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
-        fread(&length, sizeof(unsigned char), 1, file);
+        freadCheck(&length, sizeof(unsigned char), 1, file);
         assert(length > 0); // every token should be at least one character
         char *token_bytes = (char *)malloc(length + 1);
-        fread(token_bytes, sizeof(char), length, file);
+        freadCheck(token_bytes, sizeof(char), length, file);
         token_bytes[length] = '\0';  // Add null terminator for printing
         tokenizer->token_table[i] = token_bytes;
     }
     // cleanups
-    fclose(file);
+    fcloseCheck(file);
     tokenizer->init_ok = 1;
 }
 
