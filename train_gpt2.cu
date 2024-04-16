@@ -351,12 +351,26 @@ __global__ void residual_backward_kernel(float* dinp1, float* dinp2, float* dout
 }
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__global__ void gelu_kernel(float* out, const float* inp, int N) {
+__global__ void gelu_forward_kernel(float* out, const float* inp, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) {
         float xi = inp[i];
         float cube = 0.044715f * xi * xi * xi;
         out[i] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
+    }
+}
+
+__global__ void gelu_backward_kernel(float* dinp, const float* inp, const float* dout, const int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        float x = inp[i];
+        float cube = 0.044715f * x * x * x;
+        float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
+        float tanh_out = tanhf(tanh_arg);
+        float coshf_out = coshf(tanh_arg);
+        float sech_out = 1.0f / (coshf_out * coshf_out);
+        float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
+        dinp[i] += local_grad * dout[i];
     }
 }
 
@@ -774,7 +788,14 @@ void residual_backward(float* dinp1, float* dinp2, float* dout, int N) {
 void gelu_forward(float* out, const float* inp, int N) {
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N, block_size);
-    gelu_kernel<<<grid_size, block_size>>>(out, inp, N);
+    gelu_forward_kernel<<<grid_size, block_size>>>(out, inp, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void gelu_backward(float* dinp, const float* inp, const float* dout, const int N) {
+    const int block_size = 128;
+    const int grid_size = CEIL_DIV(N, block_size);
+    gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1318,11 +1339,11 @@ void gpt2_backward(GPT2 *model) {
         // backprop this layer
         residual_backward(dl_residual2, dl_fcproj, dl_residual3, B*T*C);
         matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
+        gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
+        matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
 
         break; // break until we get all the other blocks in place, so we're only backwarding the last layer
 
-        // gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
-        // matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
         // layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
         // residual_backward(dresidual, dl_attproj, dl_residual2, B*T*C);
         // matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C);
