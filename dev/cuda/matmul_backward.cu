@@ -47,18 +47,20 @@ void matmul_backward_cpu(float* dinp, float* dweight, float* dbias,
     // backward into weight/bias, parallelize over output channels OC
     #pragma omp parallel for
     for (int o = 0; o < OC; o++) {
+        double sum = 0.0f;
         for (int b = 0; b < B; b++) {
             for (int t = 0; t < T; t++) {
                 float* dout_bt = dout + b * T * OC + t * OC;
                 float* inp_bt = inp + b * T * C + t * C;
                 float* dwrow = dweight + o*C;
                 float d = dout_bt[o];
-                if (dbias != NULL) { dbias[o] += d; }
+                if (dbias != NULL) { sum += d; }
                 for (int i = 0; i < C; i++) {
                     dwrow[i] += inp_bt[i] * d;
                 }
             }
         }
+        if (dbias != NULL){dbias[o] = sum;}
     }
 }
 
