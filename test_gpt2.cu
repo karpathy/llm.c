@@ -69,8 +69,10 @@ int main(int argc, char *argv[]) {
     printf("batch_size: %d\n", B);
     printf("seq_len: %d\n", T);
 
-    ParameterTensors expected_grads;
+    ParameterTensors expected_grads; // will be read from file (from PyTorch)
+    ParameterTensors calculated_grads; // will be calculated by us
     float* expected_grads_memory = malloc_and_point_parameters(&expected_grads, model.param_sizes, 0);
+    float* calculated_grads_memory = malloc_and_point_parameters(&calculated_grads, model.param_sizes, 0);
 
     // inputs and expected outputs, only used for error checking
     int* x = (int*) malloc(B * T * sizeof(int));
@@ -95,6 +97,8 @@ int main(int argc, char *argv[]) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
         gpt2_forward(&model, x, y, B, T);
+        gpt2_zero_grad(&model);
+        gpt2_backward(&model);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
@@ -129,6 +133,12 @@ int main(int argc, char *argv[]) {
             } else {
                 printf("LOSS OK: %f %f\n", model.mean_loss, *expected_loss);
             }
+
+            // and now compare the gradients on the parameters
+            cudaMemcpy(calculated_grads.lnfb, model.grads.lnfb, C * sizeof(float), cudaMemcpyDeviceToHost);
+            check_tensor(calculated_grads.lnfb, expected_grads.lnfb, C, "lnfb");
+            cudaMemcpy(calculated_grads.lnfw, model.grads.lnfw, C * sizeof(float), cudaMemcpyDeviceToHost);
+            check_tensor(calculated_grads.lnfw, expected_grads.lnfw, C, "lnfw");
         }
     }
 
@@ -140,6 +150,7 @@ int main(int argc, char *argv[]) {
     free(expected_logits);
     free(expected_loss);
     free(expected_grads_memory);
+    free(calculated_grads_memory);
     gpt2_free(&model);
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
