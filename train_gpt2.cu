@@ -410,6 +410,102 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
     }
 }
 
+__global__ void crossentropy_softmax_backward_kernel1(float* dlogits,
+                           const float* dlosses, const float* probs, const int* targets,
+                           int B, int T, int V) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < B * T * V) {
+        int b = i / (T * V);
+        int t = (i / V) % T;
+        int v = i % V;
+        float* dlogits_bt = dlogits + b * T * V + t * V;
+        const float* probs_bt = probs + b * T * V + t * V;
+        float dloss = dlosses[b * T + t];
+        int ix = targets[b * T + t];
+        float p = probs_bt[v];
+        float indicator = v == ix ? 1.0f : 0.0f;
+        dlogits_bt[v] += (p - indicator) * dloss;
+    }
+}
+
+__global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* dout, int B, int T, int OC) {
+    extern __shared__ float shared[];
+    int o = blockIdx.x; // range [0, OC)
+    int tid = threadIdx.x; // range [0, block_size)
+    int block_size = blockDim.x;
+    const float* x = dout + o;
+    // thread coarsening
+    double sum = 0.0f;
+    for (int i = tid; i < B * T; i += block_size) {
+        sum += x[i * OC];
+    }
+    shared[tid] = (float) sum;
+    __syncthreads();
+    // reductions
+    for (int stride = block_size / 2; stride >= 1; stride /= 2) {
+        __syncthreads();
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+    }
+    // write the final result (at thread 0) to global memory
+    if (tid == 0) {
+        dbias[o] = shared[0];
+    }
+}
+
+// super naive layernorm backward kernel that just parallelizes over B,T and loops over C
+__global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* dbias,
+                        float* dout, float* inp, float* weight, float* mean, float* rstd,
+                        int B, int T, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B*T) return;
+    int b = idx / T;
+    int t = idx % T;
+
+    float* dout_bt = dout + b * T * C + t * C;
+    float* inp_bt = inp + b * T * C + t * C;
+    float* dinp_bt = dinp + b * T * C + t * C;
+    float mean_bt = mean[b * T + t];
+    float rstd_bt = rstd[b * T + t];
+
+    // first: two reduce operations
+    float dnorm_mean = 0.0f;
+    float dnorm_norm_mean = 0.0f;
+    for (int i = 0; i < C; i++) {
+        float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+        float dnorm_i = weight[i] * dout_bt[i];
+        dnorm_mean += dnorm_i;
+        dnorm_norm_mean += dnorm_i * norm_bti;
+    }
+    dnorm_mean = dnorm_mean / C;
+    dnorm_norm_mean = dnorm_norm_mean / C;
+
+    // now iterate again and accumulate all the gradients
+    for (int i = 0; i < C; i++) {
+        float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+        float dnorm_i = weight[i] * dout_bt[i];
+        // gradient contribution to bias
+        atomicAdd(&dbias[i], dout_bt[i]);
+        // gradient contribution to weight
+        atomicAdd(&dweight[i], norm_bti * dout_bt[i]);
+        // gradient contribution to input
+        float dval = 0.0f;
+        dval += dnorm_i; // term 1
+        dval -= dnorm_mean; // term 2
+        dval -= norm_bti * dnorm_norm_mean; // term 3
+        dval *= rstd_bt; // final scale
+        dinp_bt[i] += dval;
+    }
+}
+
+__global__ void setConstant(float* vec, float constant, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        vec[idx] = constant;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -617,6 +713,44 @@ void crossentropy_forward(float* losses,
     const int grid_size = CEIL_DIV(N, block_size);
     crossentropy_forward_kernel1<<<grid_size, block_size>>>(losses, probs, targets, B, T, V);
     cudaCheck(cudaGetLastError());
+}
+
+void crossentropy_softmax_backward(float* dlogits,
+                           const float* dlosses, const float* probs, const int* targets,
+                           int B, int T, int V) {
+    const int block_size = 256;
+    const int N = B * T * V;
+    const int grid_size = CEIL_DIV(N, block_size);
+    crossentropy_softmax_backward_kernel1<<<grid_size, block_size>>>(dlogits, dlosses, probs, targets, B, T, V);
+    cudaCheck(cudaGetLastError());
+}
+
+void matmul_backward(float* dinp, float* dweight, float* dbias,
+                     float* dout, float* inp, float* weight, float* ones,
+                     int B, int T, int C, int OC) {
+    float alpha = 1.0f;
+    float beta = 1.0f; // note we must use beta = 1.0 so that we do a +=, as we should, because gradients add
+    // backward to input
+    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &alpha, weight, C, dout, OC, &beta, dinp, C));
+    // backward to weight
+    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &alpha, inp, C, dout, OC, &beta, dweight, C));
+    // backward to bias, if given
+    if (dbias != NULL) {
+        const int block_size=512;
+        dim3 block_dim(block_size);
+        dim3 grid_dim(OC);
+        size_t shared_mem_size = block_size * sizeof(float);
+        matmul_backward_bias_kernel_faster<<<grid_dim, block_dim, shared_mem_size>>>(dbias, dout, B, T, OC);
+    }
+}
+
+void layernorm_backward(float* dinp, float* dweight, float* dbias,
+                        float* dout, float* inp, float* weight, float* mean, float* rstd,
+                        int B, int T, int C) {
+    const int block_size = 64;
+    const int N = B * T;
+    const int grid_size = CEIL_DIV(N, block_size);
+    layernorm_backward_kernel1<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
 }
 
 // ----------------------------------------------------------------------------
@@ -1022,24 +1156,29 @@ void gpt2_backward(GPT2 *model) {
     // convenience shortcuts
     int B = model->batch_size;
     int T = model->seq_len;
-    // int V = model->config.vocab_size;
-    // int L = model->config.num_layers;
+    int V = model->config.vocab_size;
+    int L = model->config.num_layers;
     // int NH = model->config.num_heads;
-    // int C = model->config.channels;
+    int C = model->config.channels;
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
-    // ParameterTensors params = model->params; // for brevity
-    // ParameterTensors grads = model->grads;
-    // ActivationTensors acts = model->acts;
+    ParameterTensors params = model->params; // for brevity
+    ParameterTensors grads = model->grads;
+    ActivationTensors acts = model->acts;
     ActivationTensors grads_acts = model->grads_acts;
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // technically this is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     float dloss_mean = 1.0f / (B*T);
-    cudaCheck(cudaMemset(grads_acts.losses, dloss_mean, B*T * sizeof(float)));
-
-    // crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V);
+    setConstant<<<CEIL_DIV(B*T, 256), 256>>>(grads_acts.losses, dloss_mean, B*T); // silly; to refactor later
+    crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V);
+    // backward the classifier matmul
+    matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
+    // backward the final layernorm
+    float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
+    float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // and its gradient
+    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
 }
 
 void gpt2_free(GPT2 *model) {
