@@ -80,10 +80,11 @@ __global__ void matmul_backward_bias_kernel_naive(float* dbias, const float* dou
 }
 
 // use shared memory and coarsening + reductions
-__global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* dout, int B, int T, int OC, int block_size) {
+__global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* dout, int B, int T, int OC) {
     extern __shared__ float shared[];
     int o = blockIdx.x; // range [0, OC)
     int tid = threadIdx.x; // range [0, block_size)
+    int block_size = blockDim.x;
     const float* x = dout + o;
     // thread coarsening
     double sum = 0.0f;
@@ -156,11 +157,10 @@ void matmul_backward1(float* dinp, float* dweight, float* dbias,
 
         // bit faster
         const int block_size=512;
-        int grid_size = OC;
         dim3 block_dim(block_size);
-        dim3 grid_dim(grid_size);
+        dim3 grid_dim(OC);
         size_t shared_mem_size = block_size * sizeof(float);
-        matmul_backward_bias_kernel_faster<<<grid_dim, block_dim, shared_mem_size>>>(dbias, dout, B, T, OC, block_size);
+        matmul_backward_bias_kernel_faster<<<grid_dim, block_dim, shared_mem_size>>>(dbias, dout, B, T, OC);
     }
 }
 
