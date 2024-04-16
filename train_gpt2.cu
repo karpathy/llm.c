@@ -998,7 +998,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     printf("channels: %d\n", C);
 
     // allocate space for all the parameters and read them in
-    model->param_sizes[0] = V * C; // wte
+    model->param_sizes[0] = Vp * C; // wte
     model->param_sizes[1] = maxT * C; // wpe
     model->param_sizes[2] = L * C; // ln1w
     model->param_sizes[3] = L * C; // ln1b
@@ -1028,8 +1028,17 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in all the parameters from file and copy them to device
     float* params_memory_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
-    freadCheck(params_memory_cpu, sizeof(float), num_parameters, model_file);
-    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+    size_t file_parameters = num_parameters - (Vp - V) * C;
+    freadCheck(params_memory_cpu, sizeof(float), file_parameters, model_file);
+
+    // copy the embedding parameters
+    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, V * C * sizeof(float),
+                         cudaMemcpyHostToDevice));
+    // copy the rest, leaving some padding
+    cudaCheck(cudaMemcpy(model->params_memory + Vp * C,
+                         params_memory_cpu + V * C, (num_parameters - Vp * C) * sizeof(float),
+                         cudaMemcpyHostToDevice));
+
     free(params_memory_cpu);
     fcloseCheck(model_file);
 
@@ -1187,7 +1196,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_cublas(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V, Vp);
+    matmul_forward_cublas(acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp, Vp);
     softmax_forward(acts.probs, acts.logits, B*T, V, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
