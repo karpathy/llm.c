@@ -485,8 +485,8 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
 __global__ void crossentropy_softmax_backward_kernel1(float* dlogits,
                            const float* dlosses, const float* probs, const int* targets,
                            int B, int T, int V) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < B * T * V) {
+    size_t i = (size_t)(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < (size_t)(B) * T * V) {
         int b = i / (T * V);
         int t = (i / V) % T;
         int v = i % V;

@@ -635,7 +635,7 @@ int main(int argc, char **argv) {
     softmax_forward_cpu(out, inp, B * T, V);
     {
         float max_el = -INFINITY;
-        for(int i = 0; i <  B * T * V; ++i) {
+        for(size_t i = 0; i <  (size_t)(B) * T * V; ++i) {
             max_el = max(max_el, out[i]);
         }
         assert(max_el > 1e-4);

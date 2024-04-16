@@ -42,8 +42,8 @@ void crossentropy_softmax_backward_cpu(float* dlogits,
 __global__ void crossentropy_softmax_backward_kernel1(float* dlogits,
                            const float* dlosses, const float* probs, const int* targets,
                            int B, int T, int V) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < B * T * V) {
+    size_t i = (size_t)(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < (size_t)(B) * T * V) {
         int b = i / (T * V);
         int t = (i / V) % T;
         int v = i % V;
@@ -64,8 +64,8 @@ void crossentropy_softmax_backward1(float* dlogits,
                            const float* dlosses, const float* probs, const int* targets,
                            int B, int T, int V,
                            const int block_size) {
-    const int N = B * T * V;
-    const int grid_size = ceil_div(N, block_size);
+    const size_t N = (size_t)(B) * T * V;
+    const int grid_size = ceil_div(N, (size_t) block_size);
     crossentropy_softmax_backward_kernel1<<<grid_size, block_size>>>(dlogits, dlosses, probs, targets, B, T, V);
     cudaCheck(cudaGetLastError());
 }
