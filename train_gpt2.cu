@@ -64,7 +64,7 @@ FILE *fopen_check(const char *path, const char *mode, const char *file, int line
         fprintf(stderr, "  Line: %d\n", line);
         fprintf(stderr, "  Path: %s\n", path);
         fprintf(stderr, "  Mode: %s\n", mode);
-        exit(1);
+        exit(EXIT_FAILURE);
     }
     return fp;
 }
@@ -87,7 +87,7 @@ void fread_check(void *ptr, size_t size, size_t nmemb, FILE *stream, const char 
         fprintf(stderr, "  Line: %d\n", line);
         fprintf(stderr, "  Expected elements: %zu\n", nmemb);
         fprintf(stderr, "  Read elements: %zu\n", result);
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 }
 
@@ -99,7 +99,7 @@ void fclose_check(FILE *fp, const char *file, int line) {
         fprintf(stderr, "Error details:\n");
         fprintf(stderr, "  File: %s\n", file);
         fprintf(stderr, "  Line: %d\n", line);
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 }
 
@@ -116,7 +116,7 @@ void *malloc_check(size_t size, const char *file, int line) {
         fprintf(stderr, "  File: %s\n", file);
         fprintf(stderr, "  Line: %d\n", line);
         fprintf(stderr, "  Size: %zu bytes\n", size);
-        exit(1);
+        exit(EXIT_FAILURE);
     }
     return ptr;
 }
@@ -725,7 +725,7 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
                                      B * NH);
     if (stat != CUBLAS_STATUS_SUCCESS) {
         printf("cublasSgemm failed\n");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
     // multiply all elements of preatt elementwise by scale
@@ -746,7 +746,7 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
                                      B * NH);
     if (stat != CUBLAS_STATUS_SUCCESS) {
         printf("cublasSgemm failed\n");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
     // now unpermute
@@ -977,8 +977,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
     freadCheck(model_header, sizeof(int), 256, model_file);
-    if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(1); }
-    if (model_header[1] != 1) { printf("Bad version in model file"); exit(1); }
+    if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(EXIT_FAILURE); }
+    if (model_header[1] != 1) { printf("Bad version in model file"); exit(EXIT_FAILURE); }
 
     // read in hyperparameters
     int maxT, V, L, NH, C;
@@ -1050,7 +1050,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     // ensure the model was initialized or error out
     if (model->params_memory == NULL) {
         printf("Error: model was not initialized properly.\n");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
     // convenience parameters
@@ -1214,7 +1214,7 @@ void gpt2_backward(GPT2 *model) {
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
         printf("Error: must forward with targets before backward\n");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
@@ -1300,7 +1300,7 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     fseek(loader->tokens_file, 0, SEEK_SET);
     if (loader->file_size < (B * T + 1) * sizeof(int)) {
         printf("Error: file size is too small for the batch size and sequence length\n");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
     loader->current_position = 0; // start at the beginning
 
