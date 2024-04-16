@@ -53,4 +53,5 @@ if __name__ == "__main__":
     n_params = model.get_num_params(False)
     print("number of parameters: %.2fM" % (n_params/1e6,))
 
-    write_model(model, "gpt2_124M.bin") # it's actually a 10M model...
+    # save the new model to be trained from scratch using train_gpt2.cu
+    write_model(model, "gpt2_124M.bin")
