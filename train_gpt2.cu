@@ -709,12 +709,12 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+    cudaCheck(cudaGetLastError());
 
     // batched matrix multiply with cuBLAS
-    cublasStatus_t stat;
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    stat = cublasSgemmStridedBatched(cublas_handle,
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                                      CUBLAS_OP_T, CUBLAS_OP_N,
                                      T, T, HS,
                                      &alpha,
@@ -722,20 +722,17 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
                                      q, HS, T * HS,
                                      &beta,
                                      preatt, T, T * T,
-                                     B * NH);
-    if (stat != CUBLAS_STATUS_SUCCESS) {
-        printf("cublasSgemm failed\n");
-        exit(EXIT_FAILURE);
-    }
+                                     B * NH));
 
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
     int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
     softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
+    cudaCheck(cudaGetLastError());
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    stat = cublasSgemmStridedBatched(cublas_handle,
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                                      CUBLAS_OP_N, CUBLAS_OP_N,
                                      HS, T, T,
                                      &alpha,
@@ -743,16 +740,13 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
                                      att, T, T * T,
                                      &beta,
                                      vaccum, HS, T * HS,
-                                     B * NH);
-    if (stat != CUBLAS_STATUS_SUCCESS) {
-        printf("cublasSgemm failed\n");
-        exit(EXIT_FAILURE);
-    }
+                                     B * NH));
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+    cudaCheck(cudaGetLastError());
 }
 
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
@@ -775,6 +769,7 @@ void softmax_forward(float* out, float* inp, int N, int C) {
     const int block_size = 512;
     size_t shared_mem_size = 2 * block_size / 32 * sizeof(float);
     softmax_forward_kernel7<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
+    cudaCheck(cudaGetLastError());
 }
 
 void crossentropy_forward(float* losses,
@@ -813,6 +808,7 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
         dim3 grid_dim(OC);
         size_t shared_mem_size = block_size * sizeof(float);
         matmul_backward_bias_kernel_faster<<<grid_dim, block_dim, shared_mem_size>>>(dbias, dout, B, T, OC);
+        cudaCheck(cudaGetLastError());
     }
 }
 
@@ -823,6 +819,7 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
     const int N = B * T;
     const int grid_size = CEIL_DIV(N, block_size);
     layernorm_backward_kernel1<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+    cudaCheck(cudaGetLastError());
 }
 
 // ----------------------------------------------------------------------------
@@ -1243,6 +1240,7 @@ void gpt2_backward(GPT2 *model) {
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     float dloss_mean = 1.0f / (B*T);
     setConstant<<<CEIL_DIV(B*T, 256), 256>>>(grads_acts.losses, dloss_mean, B*T); // silly; to refactor later
+    cudaCheck(cudaGetLastError());
     crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V);
     // backward the classifier matmul
     matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
