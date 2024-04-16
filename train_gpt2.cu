@@ -106,6 +106,24 @@ void fclose_check(FILE *fp, const char *file, int line) {
 #define fcloseCheck(fp) fclose_check(fp, __FILE__, __LINE__)
 
 // ----------------------------------------------------------------------------
+// malloc error-handling wrapper util
+
+void *malloc_check(size_t size, const char *file, int line) {
+    void *ptr = malloc(size);
+    if (ptr == NULL) {
+        fprintf(stderr, "Error: Memory allocation failed at %s:%d\n", file, line);
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        fprintf(stderr, "  Size: %zu bytes\n", size);
+        exit(1);
+    }
+    return ptr;
+}
+
+#define mallocCheck(size) malloc_check(size, __FILE__, __LINE__)
+
+// ----------------------------------------------------------------------------
 // all the kernels
 
 // warp-level reduction for finding the maximum value
@@ -845,7 +863,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     if (on_device) {
         cudaCheck(cudaMalloc((void**)&params_memory, num_parameters * sizeof(float)));
     } else {
-        params_memory = (float*)malloc(num_parameters * sizeof(float));
+        params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
     }
     // assign all the tensors their place in the array
     float** ptrs[] = {
@@ -1006,7 +1024,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
 
     // read in all the parameters from file and copy them to device
-    float* params_memory_cpu = (float*)malloc(num_parameters * sizeof(float));
+    float* params_memory_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
     freadCheck(params_memory_cpu, sizeof(float), num_parameters, model_file);
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     free(params_memory_cpu);
@@ -1393,11 +1411,11 @@ void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
     tokenizer->vocab_size = header[2];
     // read in all the tokens
     unsigned char length;
-    tokenizer->token_table = (char **)malloc(tokenizer->vocab_size * sizeof(char *));
+    tokenizer->token_table = (char **)mallocCheck(tokenizer->vocab_size * sizeof(char *));
     for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
         freadCheck(&length, sizeof(unsigned char), 1, file);
         assert(length > 0); // every token should be at least one character
-        char *token_bytes = (char *)malloc(length + 1);
+        char *token_bytes = (char *)mallocCheck(length + 1);
         freadCheck(token_bytes, sizeof(char), length, file);
         token_bytes[length] = '\0';  // Add null terminator for printing
         tokenizer->token_table[i] = token_bytes;
@@ -1482,9 +1500,9 @@ int main() {
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    int* gen_tokens = (int*)malloc(B * T * sizeof(int));
+    int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     const int genT = 64; // number of steps of inference we will do
-    float* cpu_probs = (float*)malloc(model.config.vocab_size * sizeof(float));
+    float* cpu_probs = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
     // train
     struct timespec start, end;
