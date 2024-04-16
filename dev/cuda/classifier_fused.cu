@@ -31,7 +31,7 @@ void softmax_forward_cpu(float* out, const float* inp, int N, int C) {
                 maxval = inp_row[j];
             }
         }
-        float sum = 0.0f;
+        double sum = 0.0;
         for (int j = 0; j < C; j++) {
             out_row[j] = expf(inp_row[j] - maxval);
             sum += out_row[j];
@@ -72,7 +72,7 @@ void crossentropy_softmax_backward_cpu(float* dlogits,
             for (int i = 0; i < V; i++) {
                 float p = probs_bt[i];
                 float indicator = i == ix ? 1.0f : 0.0f;
-                dlogits_bt[i] += (p - indicator) * dloss;
+                dlogits_bt[i] = (p - indicator) * dloss;
             }
         }
     }
@@ -87,9 +87,9 @@ struct SoftmaxParams {
 };
 namespace cg = cooperative_groups;
 __device__ SoftmaxParams prepare_softmax(cg::thread_block_tile<32>& warp,
-                                         int idx, const float* inp, int V) {
+                                         int idx, const float* inp, int V, int P) {
     // one row of inp, i.e. inp[idx, :] of shape (V,)
-    const float* x = inp + idx * V;
+    const float* x = inp + idx * P;
 
     float maxval = -INFINITY;
     float sumval = 0.0f;
@@ -114,7 +114,7 @@ __device__ SoftmaxParams prepare_softmax(cg::thread_block_tile<32>& warp,
 
 __global__ void fused_classifier_kernel(float* dlogits, float* losses,
                              const float* logits, const float* dlosses, const int* targets,
-                             int B, int T, int V) {
+                             int B, int T, int V, int P) {
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
@@ -127,25 +127,25 @@ __global__ void fused_classifier_kernel(float* dlogits, float* losses,
     int b = idx / T;
     int t = idx % T;
 
-    auto sp = prepare_softmax(warp, idx, logits, V);
+    auto sp = prepare_softmax(warp, idx, logits, V, P);
 
     // calculate the probability needed for the loss and update.
     // single-threaded
     if(warp.thread_rank() == 0) {
         int ix = targets[b * T + t];
-        float prob = expf(logits[idx * V + ix] - sp.Offset) * sp.Scale;
+        float prob = expf(logits[idx * P + ix] - sp.Offset) * sp.Scale;
         losses[b * T + t] = -logf(prob);
     }
 
     // calculate all the gradients
     for (int i = warp.thread_rank(); i < V; i += warp.size()) {
-        float prob = expf(logits[i] - sp.Offset) * sp.Scale;
-        float* dlogits_bt = dlogits + b * T * V + t * V;
+        float prob = expf(logits[idx * P + i] - sp.Offset) * sp.Scale;
+        float* dlogits_bt = dlogits + b * T * P + t * P;
         float dloss = dlosses[b * T + t];
         int ix = targets[b * T + t];
         float p = prob;
         float indicator = i == ix ? 1.0f : 0.0f;
-        dlogits_bt[i] += (p - indicator) * dloss;
+        dlogits_bt[i] = (p - indicator) * dloss;
     }
 
 }
@@ -155,19 +155,19 @@ __global__ void fused_classifier_kernel(float* dlogits, float* losses,
 
 void fused_classifier1(float* dlogits, float* losses,
                       const float* logits, const float* dlosses, const int* targets,
-                      int B, int T, int V, int block_size) {
+                      int B, int T, int V, int P, int block_size) {
     const int N = B * T;
     const int grid_size = N;
-    fused_classifier_kernel<<<grid_size, block_size>>>(dlogits, losses, logits, dlosses, targets, B, T, V);
+    fused_classifier_kernel<<<grid_size, block_size>>>(dlogits, losses, logits, dlosses, targets, B, T, V, P);
     cudaCheck(cudaGetLastError());
 }
 
 void fused_classifier(int kernel_num, float* dlogits, float* losses,
                       const float* logits, const float* dlosses, const int* targets,
-                      int B, int T, int V, int block_size) {
+                      int B, int T, int V, int P, int block_size) {
     switch (kernel_num) {
         case 1:
-            fused_classifier1(dlogits, losses, logits, dlosses, targets, B, T, V, block_size);
+            fused_classifier1(dlogits, losses, logits, dlosses, targets, B, T, V, P, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -183,31 +183,47 @@ int main(int argc, char **argv) {
     int B = 8;
     int T = 1024;
     int V = 50257;
+    // padded size
+    int P = (V + 63) & ~63;
 
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
 
     // create host memory of random numbers
-    const float* logits = make_random_float_01(B * T * V);
+    float* logits = make_random_float_01(B * T * V);
     float* probs = (float*)malloc(B * T * V * sizeof(float));
     float* dlogits = (float*)malloc(B * T * V * sizeof(float));
     float* losses = (float*)malloc(B * T * sizeof(float));
     const float* dlosses = make_random_float(B * T);
     const int* targets = make_random_int(B * T, V);
 
+    // make the input less uniformly random: Otherwise, all probabilities will be basically zero,
+    // and the tests are not actually meaningful.
+    const int* outliers = make_random_int(B * T * 3, V);
+    for(int k = 0; k < 3; ++k) {
+        for(int j = 0; j < B * T; ++j) {
+            logits[j * V +  outliers[j*3 + k]] *= 20;
+        }
+    }
+
     // move to GPU
     float* d_logits;
     float* d_dlogits;
+    float* d_dlogits_no_pad;
     float* d_losses;
     float* d_dlosses;
     int* d_targets;
-    cudaCheck(cudaMalloc(&d_logits, B * T * V * sizeof(float)));
+
+    cudaCheck(cudaMalloc(&d_dlogits, B * T * P * sizeof(float)));
+    cudaCheck(cudaMalloc(&d_logits, B * T * P * sizeof(float)));
+    cudaCheck(cudaMalloc(&d_dlogits_no_pad, B * T * V * sizeof(float)));
     cudaCheck(cudaMalloc(&d_targets, B * T * sizeof(int)));
     cudaCheck(cudaMalloc(&d_losses, B * T * sizeof(float)));
     cudaCheck(cudaMalloc(&d_dlosses, B * T * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_dlogits, B * T * V * sizeof(float)));
 
-    cudaCheck(cudaMemcpy(d_logits, logits, B * T * V * sizeof(float), cudaMemcpyHostToDevice));
+    // move to GPU
+    cudaCheck(cudaMemset(d_logits, 0xff, B * T * P * sizeof(float)));
+    cudaCheck(cudaMemcpy2D(d_logits, P * sizeof(float), logits, V * sizeof(float), V * sizeof(float), B * T, cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(d_dlosses, dlosses, B * T * sizeof(float), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(d_targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
 
@@ -229,9 +245,11 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
-        fused_classifier(kernel_num, d_dlogits, d_losses, d_logits, d_dlosses, d_targets, B, T, V, block_size);
+        fused_classifier(kernel_num, d_dlogits, d_losses, d_logits, d_dlosses, d_targets, B, T, V, P, block_size);
         validate_result(d_losses, losses, "losses", B * T, 1e-4f);
-        validate_result(d_dlogits, dlogits, "dlogits", B * T * V, 1e-4f);
+        // undo the padding before we can check for correctness
+        cudaCheck(cudaMemcpy2D(d_dlogits_no_pad, V * sizeof(float), d_dlogits, P * sizeof(float), V * sizeof(float), B * T, cudaMemcpyDeviceToDevice));
+        validate_result(d_dlogits_no_pad, dlogits, "dlogits", B * T * V, 1e-4f);
     }
 
     printf("All results match. Starting benchmarks.\n\n");
@@ -242,7 +260,7 @@ int main(int argc, char **argv) {
         int repeat_times = 1000;
         float elapsed_time = benchmark_kernel(repeat_times, fused_classifier,
                                               kernel_num, d_dlogits, d_losses, d_logits, d_dlosses, d_targets,
-                                              B, T, V, block_size);
+                                              B, T, V, P, block_size);
 
         printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
     }
