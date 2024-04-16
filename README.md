@@ -43,9 +43,9 @@ You can have a look inside the `Makefile` and its comments. It will try to autod
 
 ```
 # try this first
-CFLAGS = -Ofast -fno-fast-math -Wno-unused-result
+CFLAGS="-Ofast -fno-fast-math -Wno-unused-result -march=native" make train_gpt2
 # try this second
-CFLAGS = -O3 -Wno-unused-result
+CFLAGS="-O3 -Wno-unused-result -march=native" make train_gpt2
 ```
 
 Once `train_gpt2` is compiled, you can run it:
@@ -155,6 +155,18 @@ python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024
 ```
 
 The time drops down to 26.2ms/iteration. So at the current 26.2ms/iteration we, amusingly and right now, have an identical running time. This somewhat makes sense because most of the FLOPs are in the matmul, and we both call about the same kernels. The remainder of the difference is likely our self-attention implementation, and possibly the round trips for GeLU, and permute/unpermute.
+
+## repo philosophy
+
+A few more words on what I want this repo to be:
+
+First, I want `llm.c` to be a place for education. E.g. our `dev/cuda` folder is a place for a library of kernels for all the layers that are manually hand-written, starting from very simple kernels all the way to more complex / faster kernels. If you have a new kernel with various different tradeoffs, please feel free to contribute it here.
+
+That said, I also want `llm.c` to have teeth. I want this repo to be very fast, and even practically useful to train some actual networks. E.g. the goal I have in mind right now is that we should be able to reproduce the full/big GPT-2 (1.6B) training run in reasonable time. This requires that we incorporate whatever fastest kernels there are, from cuBLAS, cuBLASLt, CUTLASS, cuDNN, whatever exists. I also think this serves an educational purpose as an upper bound, and a unit of measurement, e.g. you could say that your manually written kernels are 80% of cuBLAS speed, etc. Then you can choose to do a super fast run, or you can choose to "drag and drop" whatever manual kernels you wish to use, and run with those.
+
+However, as a constraint, I want to keep the mainline `llm.c` in the root folder simple and readable. If there is a PR that e.g. improves performance by 2% but it "costs" 500 lines of complex C code, and maybe an exotic 3rd party dependency, I may reject the PR because the complexity is not worth it. In that sense I'd be ok to only be at e.g. 90% of PyTorch speed, if it means we can remain at ~2,000 readable lines of code with minimal exotic dependencies. As a concrete example - adding cuBLAS for matmuls is a no-brainer: it makes the mainline code much faster, it is a single line of interpretable code, and it is a very common dependency.
+
+Lastly, I will be a lot more sensitive to introduced complexity in the root folder of the project, which contains the main / default files of the project. In comparison, the `dev/` folder is a bit more of a scratch space for us to develop a library of kernels or classes and share useful or related or educational code, and some of this code could be ok to be (locally) complex.
 
 ## notable forks
 
