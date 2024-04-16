@@ -1342,11 +1342,11 @@ void gpt2_backward(GPT2 *model) {
         gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
         matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
         layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
+        residual_backward(dresidual, dl_attproj, dl_residual2, B*T*C);
+        matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C);
 
         break; // break until we get all the other blocks in place, so we're only backwarding the last layer
 
-        // residual_backward(dresidual, dl_attproj, dl_residual2, B*T*C);
-        // matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C);
         // attention_backward(dl_qkv, dl_preatt, dl_att, dl_atty, l_qkv, l_att, B, T, C, NH);
         // matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
         // layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);

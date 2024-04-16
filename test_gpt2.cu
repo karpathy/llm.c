@@ -145,6 +145,8 @@ int main(int argc, char *argv[]) {
             cudaMemcpy(calculated_grads.fcb + l * 4*C, model.grads.fcb + l * 4*C, 4*C * sizeof(float), cudaMemcpyDeviceToHost);
             cudaMemcpy(calculated_grads.ln2w + l * C, model.grads.ln2w + l * C, C * sizeof(float), cudaMemcpyDeviceToHost);
             cudaMemcpy(calculated_grads.ln2b + l * C, model.grads.ln2b + l * C, C * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(calculated_grads.attprojw + l * C * C, model.grads.attprojw + l * C * C, C * C * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(calculated_grads.attprojb + l * C, model.grads.attprojb + l * C, C * sizeof(float), cudaMemcpyDeviceToHost);
 
             check_tensor(calculated_grads.lnfb, expected_grads.lnfb, C, "lnfb");
             check_tensor(calculated_grads.lnfw, expected_grads.lnfw, C, "lnfw");
@@ -154,6 +156,8 @@ int main(int argc, char *argv[]) {
             check_tensor(calculated_grads.fcb + l * 4*C, expected_grads.fcb + l * 4*C, 4*C, "fcb");
             check_tensor(calculated_grads.ln2w + l * C, expected_grads.ln2w + l * C, C, "ln2w");
             check_tensor(calculated_grads.ln2b + l * C, expected_grads.ln2b + l * C, C, "ln2b");
+            check_tensor(calculated_grads.attprojw + l * C * C, expected_grads.attprojw + l * C * C, C * C, "attprojw");
+            check_tensor(calculated_grads.attprojb + l * C, expected_grads.attprojb + l * C, C, "attprojb");
         }
     }
 
