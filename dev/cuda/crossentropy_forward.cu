@@ -59,9 +59,7 @@ __global__ void crossentropy_forward_kernel2(float* losses,
         const int bt = b * T + t;
         const float* probs_bt = probs_pad + bt * V_pad;
         int ix = targets[bt];
-        if (ix < V) { // Make sure we don't read past the end of the original V-sized block
-            losses[bt] = -logf(probs_bt[ix]);
-        }
+        losses[bt] = -logf(probs_bt[ix]);
     }
 }
 // ----------------------------------------------------------------------------
