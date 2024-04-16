@@ -22,10 +22,11 @@ void crossentropy_softmax_backward_cpu(float* dlogits,
     // backwards through both softmax and crossentropy
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            float* dlogits_bt = dlogits + b * T * V + t * V;
-            const float* probs_bt = probs + b * T * V + t * V;
-            float dloss = dlosses[b * T + t];
-            int ix = targets[b * T + t];
+            int bt = b * T + t;
+            float* dlogits_bt = dlogits + bt * V;
+            const float* probs_bt = probs + bt * V;
+            float dloss = dlosses[bt];
+            int ix = targets[bt];
             for (int i = 0; i < V; i++) {
                 float p = probs_bt[i];
                 float indicator = i == ix ? 1.0f : 0.0f;
@@ -47,10 +48,11 @@ __global__ void crossentropy_softmax_backward_kernel1(float* dlogits,
         int b = i / (T * V);
         int t = (i / V) % T;
         int v = i % V;
-        float* dlogits_bt = dlogits + b * T * V + t * V;
-        const float* probs_bt = probs + b * T * V + t * V;
-        float dloss = dlosses[b * T + t];
-        int ix = targets[b * T + t];
+        int bt = b * T + t;
+        float* dlogits_bt = dlogits + bt * V;
+        const float* probs_bt = probs + bt * V;
+        float dloss = dlosses[bt];
+        int ix = targets[bt];
         float p = probs_bt[v];
         float indicator = v == ix ? 1.0f : 0.0f;
         dlogits_bt[v] += (p - indicator) * dloss;

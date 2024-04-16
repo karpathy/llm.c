@@ -257,6 +257,7 @@ int main(int argc, char **argv) {
     validate_result(d_dweight, dweight, "dweight", C, 1e-3f);
     printf("dbias:\n");
     validate_result(d_dbias, dbias, "dbias", C, 1e-3f);
+    printf("All results match.\n\n");
 
     // now time the kernel
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
