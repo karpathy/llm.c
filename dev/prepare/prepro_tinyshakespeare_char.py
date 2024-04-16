@@ -8,9 +8,16 @@
 
     .\gpt2_tokenizer.bin
 
-3. Create a new tiny GPT model from scratch and save it.
+3. Create a new GPT-2 10M model from scratch and save it
 
-    .\gpt2_124M.bin
+    .\gpt2_124M.bin # This is actually a 10M model saved as with '124M' in the filename so that we don't modify 
+                    # the train_gpt2.c/cu files. If/when the train_gpt2 can accept input params 
+                    # you can save to what ever file name you like.
+
+    e.g. Run this script from the root folder
+
+    $python dev/prepare/prepro_tinyshakespeare_char.py
+
 """
 
 from ast import Import
@@ -20,6 +27,9 @@ from tqdm import tqdm
 import struct
 import torch
 import numpy as np
+
+import sys
+sys.path.append('.')
 
 from prepro_tinyshakespeare import DATA_CACHE_DIR, download
 from train_gpt2 import GPT, GPTConfig, write_model
@@ -119,17 +129,17 @@ if __name__ == "__main__":
     config_args = dict(n_layer=6, n_head=6, n_embd=384) # tiny-gpt
     config_args['vocab_size'] = len(enc)
     config_args['block_size'] = 256
-    learning_rate = 1e-3 # small steps
+    learning_rate = 1e-3 # start with a large lr
     max_iters = 5000
     lr_decay_iters = max_iters
-    min_lr = 1e-6
+    min_lr = 1e-4 # don't go below this lr. see train_gpt2.c
     warmup_iters = 10
     weight_decay = 0
     beta1 = 0.9
     beta2 = 0.999
-    decay_lr = True # don't use the lr decay as it is not implemented yet in the C counter part.
+    decay_lr = True
 
-    B = 32
+    B = 16
     T = 256
     assert 1 <= T <= config_args['block_size']
 
@@ -237,7 +247,7 @@ if __name__ == "__main__":
         x, y = next(data_iter)
         logits, loss = model(x, y)
         if not args.inference_only:
-            # save the raw model initialized from scratch so it can be train using the C counter part
+            # save the raw model initialized from scratch so it can be trained using the C counter part from scratch
             if iter_num == 0 and args.write_tensors:
                 write_model(model, "gpt2_124M.bin")
             optimizer.zero_grad()
@@ -248,12 +258,15 @@ if __name__ == "__main__":
         elif device == "cuda":
             torch.cuda.synchronize()
         t1 = time.time()
-        print(f"iteration {iter_num}, lr: {lr} loss: {loss.item()}, time: {(t1-t0)*1000:.3f}ms")
+        print(f"iteration {iter_num}, lr: {lr:e} loss: {loss.item()}, time: {(t1-t0)*1000:.3f}ms")
     if len(timings) > 0:
         print(f"final {args.num_iterations} iters avg: {np.mean(timings)*1000:.3f}ms")
 
-    # after a few round of training
+    # let's see what we get now after pre-training
     generate()
 
-    # save the trained model...
-    write_model(model, "gpt2_124M.bin")
+    # save the pre-trained model...
+    if not args.inference_only:
+        write_model(model, "gpt2_124M.bin")
+        
+    # now continue to fine tune with train-gpt2.c with a smaller lr    
