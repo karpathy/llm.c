@@ -65,6 +65,14 @@ float* make_zeros_float(int N) {
     return arr;
 }
 
+float* make_ones_float(int N) {
+    float* arr = (float*)malloc(N * sizeof(float));
+    for (int i = 0; i < N; i++) {
+        arr[i] = 1.0f;
+    }
+    return arr;
+}
+
 // ----------------------------------------------------------------------------
 // testing and benchmarking utils
 
