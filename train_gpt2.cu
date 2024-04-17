@@ -403,7 +403,7 @@ __global__ void residual_backward_kernel(float* dinp1, float* dinp2, const float
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
         dinp1[idx] += __ldcs(&dout[idx]);
-        dinp2[idx] += __ldcs(&dout[idx]);
+        dinp2[idx] = __ldcs(&dout[idx]);
     }
 }
 
@@ -1004,6 +1004,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     int HS = C / NH; // head size
     const float alpha = 1.0f;
     const float beta = 1.0f; // note beta = 1.0f so that we accumulate gradients (+=)
+    const float zero = 0.0f; // note beta = 1.0f so that we accumulate gradients (+=)
     // unpack convenience pointers into q, k, v
     const float *q, *k, *v;
     q = qkvr + 0 * B * T * C;
@@ -1025,7 +1026,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
                             &alpha,
                             v, HS, T * HS,
                             dvaccum, HS, T * HS,
-                            &beta,
+                            &zero,
                             datt, T, T * T,
                             B * NH);
 
@@ -1036,7 +1037,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
             &alpha,
             dvaccum, HS, T * HS,
             att, T, T * T,
-            &beta,
+            &zero,
             dv, HS, T * HS,
             B * NH);
 
@@ -1050,7 +1051,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
                             &alpha,
                             k, HS, T * HS,
                             dpreatt, T, T * T,
-                            &beta,
+                            &zero,
                             dq, HS, T * HS,
                             B * NH);
     // backward into k
@@ -1060,7 +1061,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
                             &alpha,
                             q, HS, T * HS,
                             dpreatt, T, T * T,
-                            &beta,
+                            &zero,
                             dk, HS, T * HS,
                             B * NH);
 
@@ -1473,43 +1474,27 @@ void gpt2_backward(GPT2 *model) {
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
+        // allocate buffers for weight gradients
+        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes, 1);
+
+        // determine buffer size for activation gradients
+        // _mostly_ allocate as if we had just a single layer,
+        // because we're going to reuse memory
         size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
         GPT2Config cfg = model->config;
+        cfg.num_layers = 1;
         fill_in_activation_sizes(bw_act_sizes, model->batch_size, model->seq_len, cfg);
-        int B = model->batch_size;
-        int T = model->seq_len;
-        int NH = model->config.num_heads;
-        int C = model->config.channels;
 
-        // shrink buffers where possible.
-        // for the ones that are currently commented, we need to be a bit more clever
-        bw_act_sizes[1] = B * T * C; // ln1
+        // however, some buffers are not needed at all
         bw_act_sizes[2] = 0; // ln1_mean
         bw_act_sizes[3] = 0; // ln1_rstd
-        bw_act_sizes[4] = B * T * 3*C; // qkv
-        bw_act_sizes[5] = B * T * C; // atty
-        bw_act_sizes[6] = B * NH * T * T; // preatt
-//        bw_act_sizes[7] = L * B * NH * T * T; // att
-//        bw_act_sizes[8] = L * B * T * C; // attproj
-        bw_act_sizes[10] = B * T * C; // ln2
         bw_act_sizes[11] = 0; // ln2_mean
         bw_act_sizes[12] = 0; // ln2_rstd
-        bw_act_sizes[13] = B * T * 4*C; // fch
-        bw_act_sizes[14] = B * T * 4*C; // fch_gelu
-//        bw_act_sizes[15] = L * B * T * C; // fcproj
-//        bw_act_sizes[16] = L * B * T * C; // residual3
-//        bw_act_sizes[17] = B * T * C; // lnf
         bw_act_sizes[18] = 0; // lnf_mean
         bw_act_sizes[19] = 0; // lnf_rstd
-//        bw_act_sizes[20] = B * T * V; // logits
         bw_act_sizes[21] = 0; // probs
-//        bw_act_sizes[22] = B * T; // losses
-//        bw_act_sizes[23] = L * B * T * 3*C; // qkvr
-        bw_act_sizes[24] = B * T * C; // v_accum
-        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes, 1);
         // residual3 is tricky. For now, just allocate per layer
-        //bw_act_sizes[9] = model->config.num_layers * model->batch_size * model->seq_len * model->config.channels;
-        //bw_act_sizes[16] = model->config.num_layers * model->batch_size * model->seq_len * model->config.channels;
+        bw_act_sizes[16] = model->config.num_layers * model->batch_size * model->seq_len * model->config.channels;
         model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, bw_act_sizes);
         model->num_grad_acts = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
@@ -1590,20 +1575,21 @@ void gpt2_backward(GPT2 *model) {
         // get the pointers of the gradients of the activations for this layer
         float* dl_ln1 = grads_acts.ln1;
         float* dl_qkv = grads_acts.qkv;
-        float* dl_qkvr = grads_acts.qkvr + l * B * T * 3*C;
+        float* dl_qkvr = grads_acts.qkvr;
         float* dl_atty = grads_acts.atty;
         float* dl_preatt = grads_acts.preatt;
-        float* dl_att = grads_acts.att + l * B * NH * T * T;
+        float* dl_att = grads_acts.att;
         float* dl_v_accum = grads_acts.v_accum;
-        float* dl_attproj = grads_acts.attproj + l * B * T * C;
-        float* dl_residual2 = grads_acts.residual2 + l * B * T * C;
+        float* dl_attproj = grads_acts.attproj;
+        float* dl_residual2 = grads_acts.residual2;
         float* dl_ln2 = grads_acts.ln2;
         float* dl_fch = grads_acts.fch;
         float* dl_fch_gelu = grads_acts.fch_gelu;
-        float* dl_fcproj = grads_acts.fcproj + l * B * T * C;
+        float* dl_fcproj = grads_acts.fcproj;
         float* dl_residual3 = grads_acts.residual3 + l * B * T * C;
 
         // backprop this layer
+        cudaCheck(cudaMemset(dl_residual2, 0, B * T * C  * sizeof(float)));
         residual_backward(dl_residual2, dl_fcproj, dl_residual3, B*T*C);
         matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
         gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
