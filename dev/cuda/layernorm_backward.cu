@@ -170,7 +170,7 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
     int t = idx % T;
 
     const float* dout_bt = dout + b * T * C + t * C;
-    const  float* inp_bt = inp + b * T * C + t * C;
+    const float* inp_bt = inp + b * T * C + t * C;
     float* dinp_bt = dinp + b * T * C + t * C;
     const float mean_bt = mean[b * T + t];
     const float rstd_bt = rstd[b * T + t];
