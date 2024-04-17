@@ -134,39 +134,42 @@ int main(int argc, char *argv[]) {
             }
 
             // and now compare the gradients on the parameters
-            cudaMemcpy(calculated_grads.lnfw, model.grads.lnfw, C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.lnfb, model.grads.lnfb, C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.fcprojw, model.grads.fcprojw, L * C * 4*C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.fcprojb, model.grads.fcprojb, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.fcw, model.grads.fcw, L * 4*C * C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.fcb, model.grads.fcb, L * 4*C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.ln2w, model.grads.ln2w, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.ln2b, model.grads.ln2b, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.attprojw, model.grads.attprojw, L * C * C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.attprojb, model.grads.attprojb, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.qkvw, model.grads.qkvw, L * 3*C * C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.qkvb, model.grads.qkvb, L * 3*C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.ln1w, model.grads.ln1w, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.ln1b, model.grads.ln1b, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.wte, model.grads.wte, V * C * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(calculated_grads.wpe, model.grads.wpe, maxT * C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.lnfw, model.grads.lnfw, C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.lnfb, model.grads.lnfb, C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.fcprojw, model.grads.fcprojw, L * C * 4*C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.fcprojb, model.grads.fcprojb, L * C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.fcw, model.grads.fcw, L * 4*C * C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.fcb, model.grads.fcb, L * 4*C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.ln2w, model.grads.ln2w, L * C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.ln2b, model.grads.ln2b, L * C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.attprojw, model.grads.attprojw, L * C * C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.attprojb, model.grads.attprojb, L * C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.qkvw, model.grads.qkvw, L * 3*C * C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.qkvb, model.grads.qkvb, L * 3*C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.ln1w, model.grads.ln1w, L * C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.ln1b, model.grads.ln1b, L * C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.wte, model.grads.wte, V * C * sizeof(float), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(calculated_grads.wpe, model.grads.wpe, maxT * C * sizeof(float), cudaMemcpyDeviceToHost);
+            // check_tensor(calculated_grads.lnfb, expected_grads.lnfb, C, "lnfb");
+            // check_tensor(calculated_grads.lnfw, expected_grads.lnfw, C, "lnfw");
+            // check_tensor(calculated_grads.fcprojw, expected_grads.fcprojw, L * C * 4*C, "fcprojw");
+            // check_tensor(calculated_grads.fcprojb, expected_grads.fcprojb, L * C, "fcprojb");
+            // check_tensor(calculated_grads.fcw, expected_grads.fcw, L * 4*C * C, "fcw");
+            // check_tensor(calculated_grads.fcb, expected_grads.fcb, L * 4*C, "fcb");
+            // check_tensor(calculated_grads.ln2w, expected_grads.ln2w, L * C, "ln2w");
+            // check_tensor(calculated_grads.ln2b, expected_grads.ln2b, L * C, "ln2b");
+            // check_tensor(calculated_grads.attprojw, expected_grads.attprojw, L * C * C, "attprojw");
+            // check_tensor(calculated_grads.attprojb, expected_grads.attprojb, L * C, "attprojb");
+            // check_tensor(calculated_grads.qkvw, expected_grads.qkvw, L * 3*C * C, "qkvw");
+            // check_tensor(calculated_grads.qkvb, expected_grads.qkvb, L * 3*C, "qkvb");
+            // check_tensor(calculated_grads.ln1w, expected_grads.ln1w, L * C, "ln1w");
+            // check_tensor(calculated_grads.ln1b, expected_grads.ln1b, L * C, "ln1b");
+            // check_tensor(calculated_grads.wte, expected_grads.wte, V * C, "wte");
+            // check_tensor(calculated_grads.wpe, expected_grads.wpe, maxT * C, "wpe");
 
-            check_tensor(calculated_grads.lnfb, expected_grads.lnfb, C, "lnfb");
-            check_tensor(calculated_grads.lnfw, expected_grads.lnfw, C, "lnfw");
-            check_tensor(calculated_grads.fcprojw, expected_grads.fcprojw, L * C * 4*C, "fcprojw");
-            check_tensor(calculated_grads.fcprojb, expected_grads.fcprojb, L * C, "fcprojb");
-            check_tensor(calculated_grads.fcw, expected_grads.fcw, L * 4*C * C, "fcw");
-            check_tensor(calculated_grads.fcb, expected_grads.fcb, L * 4*C, "fcb");
-            check_tensor(calculated_grads.ln2w, expected_grads.ln2w, L * C, "ln2w");
-            check_tensor(calculated_grads.ln2b, expected_grads.ln2b, L * C, "ln2b");
-            check_tensor(calculated_grads.attprojw, expected_grads.attprojw, L * C * C, "attprojw");
-            check_tensor(calculated_grads.attprojb, expected_grads.attprojb, L * C, "attprojb");
-            check_tensor(calculated_grads.qkvw, expected_grads.qkvw, L * 3*C * C, "qkvw");
-            check_tensor(calculated_grads.qkvb, expected_grads.qkvb, L * 3*C, "qkvb");
-            check_tensor(calculated_grads.ln1w, expected_grads.ln1w, L * C, "ln1w");
-            check_tensor(calculated_grads.ln1b, expected_grads.ln1b, L * C, "ln1b");
-            check_tensor(calculated_grads.wte, expected_grads.wte, V * C, "wte");
-            check_tensor(calculated_grads.wpe, expected_grads.wpe, maxT * C, "wpe");
+            // compare the gradients ona the parameters all at once
+            cudaMemcpy(calculated_grads_memory, model.grads_memory, model.num_parameters * sizeof(float), cudaMemcpyDeviceToHost);
+            check_tensor(calculated_grads_memory, expected_grads_memory, model.num_parameters, "grads");
         }
     }
 
