@@ -1204,6 +1204,7 @@ typedef struct {
     size_t num_activations;
     // gradients of the activations
     ActivationTensors grads_acts;
+    size_t num_grad_acts;
     float* grads_acts_memory;
     // other run state configuration
     int batch_size; // the batch size (B) of current forward pass
@@ -1458,7 +1459,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 }
 
 void gpt2_zero_grad(GPT2 *model) {
-    if (model->grads_acts_memory != NULL) { cudaCheck(cudaMemset(model->grads_acts_memory, 0, model->num_activations * sizeof(float))); }
+    if (model->grads_acts_memory != NULL) { cudaCheck(cudaMemset(model->grads_acts_memory, 0, model->num_grad_acts * sizeof(float))); }
     if (model->grads_memory != NULL) { cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(float))); }
 }
 
@@ -1472,8 +1473,48 @@ void gpt2_backward(GPT2 *model) {
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
+        size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
+        GPT2Config cfg = model->config;
+        fill_in_activation_sizes(bw_act_sizes, model->batch_size, model->seq_len, cfg);
+        int B = model->batch_size;
+        int T = model->seq_len;
+        int NH = model->config.num_heads;
+        int C = model->config.channels;
+
+        // shrink buffers where possible.
+        // for the ones that are currently commented, we need to be a bit more clever
+        bw_act_sizes[1] = B * T * C; // ln1
+        bw_act_sizes[2] = 0; // ln1_mean
+        bw_act_sizes[3] = 0; // ln1_rstd
+        bw_act_sizes[4] = B * T * 3*C; // qkv
+        bw_act_sizes[5] = B * T * C; // atty
+        bw_act_sizes[6] = B * NH * T * T; // preatt
+//        bw_act_sizes[7] = L * B * NH * T * T; // att
+//        bw_act_sizes[8] = L * B * T * C; // attproj
+        bw_act_sizes[10] = B * T * C; // ln2
+        bw_act_sizes[11] = 0; // ln2_mean
+        bw_act_sizes[12] = 0; // ln2_rstd
+        bw_act_sizes[13] = B * T * 4*C; // fch
+        bw_act_sizes[14] = B * T * 4*C; // fch_gelu
+//        bw_act_sizes[15] = L * B * T * C; // fcproj
+//        bw_act_sizes[16] = L * B * T * C; // residual3
+//        bw_act_sizes[17] = B * T * C; // lnf
+        bw_act_sizes[18] = 0; // lnf_mean
+        bw_act_sizes[19] = 0; // lnf_rstd
+//        bw_act_sizes[20] = B * T * V; // logits
+        bw_act_sizes[21] = 0; // probs
+//        bw_act_sizes[22] = B * T; // losses
+//        bw_act_sizes[23] = L * B * T * 3*C; // qkvr
+        bw_act_sizes[24] = B * T * C; // v_accum
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes, 1);
-        model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, model->act_sizes);
+        // residual3 is tricky. For now, just allocate per layer
+        //bw_act_sizes[9] = model->config.num_layers * model->batch_size * model->seq_len * model->config.channels;
+        //bw_act_sizes[16] = model->config.num_layers * model->batch_size * model->seq_len * model->config.channels;
+        model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, bw_act_sizes);
+        model->num_grad_acts = 0;
+        for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+            model->num_grad_acts += bw_act_sizes[i];
+        }
         gpt2_zero_grad(model);
     }
 
@@ -1547,18 +1588,18 @@ void gpt2_backward(GPT2 *model) {
         float* l_fch = acts.fch + l * B * T * 4*C;
         float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
         // get the pointers of the gradients of the activations for this layer
-        float* dl_ln1 = grads_acts.ln1 + l * B * T * C;
-        float* dl_qkv = grads_acts.qkv + l * B * T * 3*C;
+        float* dl_ln1 = grads_acts.ln1;
+        float* dl_qkv = grads_acts.qkv;
         float* dl_qkvr = grads_acts.qkvr + l * B * T * 3*C;
-        float* dl_atty = grads_acts.atty + l * B * T * C;
-        float* dl_preatt = grads_acts.preatt + l * B * NH * T * T;
+        float* dl_atty = grads_acts.atty;
+        float* dl_preatt = grads_acts.preatt;
         float* dl_att = grads_acts.att + l * B * NH * T * T;
-        float* dl_v_accum = grads_acts.v_accum + l * B * T * C;
+        float* dl_v_accum = grads_acts.v_accum;
         float* dl_attproj = grads_acts.attproj + l * B * T * C;
         float* dl_residual2 = grads_acts.residual2 + l * B * T * C;
-        float* dl_ln2 = grads_acts.ln2 + l * B * T * C;
-        float* dl_fch = grads_acts.fch + l * B * T * 4*C;
-        float* dl_fch_gelu = grads_acts.fch_gelu + l * B * T * 4*C;
+        float* dl_ln2 = grads_acts.ln2;
+        float* dl_fch = grads_acts.fch;
+        float* dl_fch_gelu = grads_acts.fch_gelu;
         float* dl_fcproj = grads_acts.fcproj + l * B * T * C;
         float* dl_residual3 = grads_acts.residual3 + l * B * T * C;
 
