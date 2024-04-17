@@ -252,6 +252,25 @@ __global__ void permute_kernel(float* q, float* k, float* v,
     }
 }
 
+__global__ void permute_kernel_backward(float* dinp,
+                                        const float* dq, const float* dk, const float* dv,
+                                        int B, int N, int NH, int d) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < B * NH * N * d) {
+        int b = idx / (NH * N * d);
+        int rest = idx % (NH * N * d);
+        int nh_ = rest / (N * d);
+        rest = rest % (N * d);
+        int n = rest / d;
+        int d_ = rest % d;
+
+        int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
+        dinp[inp_idx] += dq[idx];
+        dinp[inp_idx + NH * d] += dk[idx];
+        dinp[inp_idx + 2 * (NH * d)] += dv[idx];
+    }
+}
+
 __global__ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, int d) {
    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -267,6 +286,21 @@ __global__ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, i
 
         int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
         out[other_idx] = __ldcs(&inp[idx]);
+    }
+}
+
+__global__ void unpermute_kernel_backward(float* dinp, const float *dout, int B, int N, int NH, int d) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < B * NH * N * d) {
+        int b = idx / (NH * N * d);
+        int rest = idx % (NH * N * d);
+        int nh_ = rest / (N * d);
+        rest = rest % (N * d);
+        int n = rest / d;
+        int d_ = rest % d;
+
+        int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
+        dinp[idx] += dout[other_idx];
     }
 }
 
@@ -600,6 +634,30 @@ __global__ void setConstant(float* vec, float constant, int N) {
     }
 }
 
+// naive kernel to backward through an autoregressive softmax, just to get correctness
+__global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
+                                                     int B, int T, int C, int NH) {
+    int t3 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t3 < T) {
+        int hs = C / NH; // head size
+        float scale = 1.0f / sqrtf(hs);
+        for (int b = 0; b < B; b++) {
+            for (int h = 0; h < NH; h++) {
+                for (int t = t3; t < T; t++) {
+                    for (int t2 = 0; t2 <= t; t2++) {
+                        const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+                        const float* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
+                        float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
+                        float indicator = t2 == t3 ? 1.0f : 0.0f;
+                        float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
+                        dpreatt_bth[t3] += scale * local_derivative * datt_bth[t2];
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -855,6 +913,82 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
     const int grid_size = CEIL_DIV(N, block_size);
     layernorm_backward_kernel1<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
+}
+
+// the sequence of transformations in this compound op is:
+// inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
+void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, float* dvaccum,
+                        const float* dout,
+                        const float* inp, const float* qkvr, const float* preatt, const float* att, const float* vaccum,
+                        int B, int T, int C, int NH) {
+    const int block_size = 256;
+
+    int HS = C / NH; // head size
+    const float alpha = 1.0f;
+    const float beta = 1.0f; // note beta = 1.0f so that we accumulate gradients (+=)
+    // unpack convenience pointers into q, k, v
+    const float *q, *k, *v;
+    q = qkvr + 0 * B * T * C;
+    k = qkvr + 1 * B * T * C;
+    v = qkvr + 2 * B * T * C;
+    float *dq, *dk, *dv;
+    dq = dqkvr + 0 * B * T * C;
+    dk = dqkvr + 1 * B * T * C;
+    dv = dqkvr + 2 * B * T * C;
+
+    // backward through the unpermute operation
+    int num_blocks = CEIL_DIV(B * T * C, block_size);
+    unpermute_kernel_backward<<<num_blocks, block_size>>>(dvaccum, dout, B, T, NH, HS);
+
+    // backward into datt
+    cublasSgemmStridedBatched(cublas_handle,
+                            CUBLAS_OP_T, CUBLAS_OP_N,
+                            T, T, HS,
+                            &alpha,
+                            v, HS, T * HS,
+                            dvaccum, HS, T * HS,
+                            &beta,
+                            datt, T, T * T,
+                            B * NH);
+
+    // backward into dv
+    cublasSgemmStridedBatched(cublas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            HS, T, T,
+            &alpha,
+            dvaccum, HS, T * HS,
+            att, T, T * T,
+            &beta,
+            dv, HS, T * HS,
+            B * NH);
+
+    // backward into preatt
+    softmax_autoregressive_backward_kernel<<<num_blocks, block_size>>>(dpreatt, datt, att, B, T, C, NH);
+
+    // backward into q
+    cublasSgemmStridedBatched(cublas_handle,
+                            CUBLAS_OP_N, CUBLAS_OP_N,
+                            HS, T, T,
+                            &alpha,
+                            k, HS, T * HS,
+                            dpreatt, T, T * T,
+                            &beta,
+                            dq, HS, T * HS,
+                            B * NH);
+    // backward into k
+    cublasSgemmStridedBatched(cublas_handle,
+                            CUBLAS_OP_N, CUBLAS_OP_T,
+                            HS, T, T,
+                            &alpha,
+                            q, HS, T * HS,
+                            dpreatt, T, T * T,
+                            &beta,
+                            dk, HS, T * HS,
+                            B * NH);
+
+    // backward into inp
+    num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
+    permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
 }
 
 // ----------------------------------------------------------------------------
@@ -1314,8 +1448,11 @@ void gpt2_backward(GPT2 *model) {
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         float* l_qkv = acts.qkv + l * B * T * 3*C;
+        float* l_qkvr = acts.qkvr + l * B * T * 3*C;
         float* l_atty = acts.atty + l * B * T * C;
+        float* l_preatt = acts.preatt + l * B * NH * T * T;
         float* l_att = acts.att + l * B * NH * T * T;
+        float* l_v_accum = acts.v_accum + l * B * T * C;
         float* l_residual2 = acts.residual2 + l * B * T * C;
         float* l_ln2 = acts.ln2 + l * B * T * C;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
@@ -1325,9 +1462,11 @@ void gpt2_backward(GPT2 *model) {
         // get the pointers of the gradients of the activations for this layer
         float* dl_ln1 = grads_acts.ln1 + l * B * T * C;
         float* dl_qkv = grads_acts.qkv + l * B * T * 3*C;
+        float* dl_qkvr = grads_acts.qkvr + l * B * T * 3*C;
         float* dl_atty = grads_acts.atty + l * B * T * C;
         float* dl_preatt = grads_acts.preatt + l * B * NH * T * T;
         float* dl_att = grads_acts.att + l * B * NH * T * T;
+        float* dl_v_accum = grads_acts.v_accum + l * B * T * C;
         float* dl_attproj = grads_acts.attproj + l * B * T * C;
         float* dl_residual2 = grads_acts.residual2 + l * B * T * C;
         float* dl_ln2 = grads_acts.ln2 + l * B * T * C;
@@ -1344,12 +1483,11 @@ void gpt2_backward(GPT2 *model) {
         layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
         residual_backward(dresidual, dl_attproj, dl_residual2, B*T*C);
         matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C);
+        attention_backward(dl_qkv, dl_qkvr, dl_preatt, dl_att, dl_v_accum, dl_atty, l_qkv, l_qkvr, l_preatt, l_att, l_v_accum, B, T, C, NH);
+        matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
+        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
 
         break; // break until we get all the other blocks in place, so we're only backwarding the last layer
-
-        // attention_backward(dl_qkv, dl_preatt, dl_att, dl_atty, l_qkv, l_att, B, T, C, NH);
-        // matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
-        // layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
     // encoder_backward(grads.wte, grads.wpe, grads_acts.encoded, model->inputs, B, T, C);
 }
