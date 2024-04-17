@@ -10,8 +10,12 @@ nvcc adamw.cu -o adamw
 
 ./adamw
 
-TODO:
+TODO(general):
 amsgrad=True
+
+TODO(perf):
+dtype
+thread coarsening/ILP
 */
 
 #include <stdio.h>
@@ -49,6 +53,14 @@ void adamw_cpu(float* params_memory, float* grads_memory, float* m_memory, float
 // ----------------------------------------------------------------------------
 // GPU kernels
 
+// utility functions
+
+// Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
+// Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
+__device__ inline float lerp(float start, float end, float weight) {
+    return fma(weight, end, fma(-weight, start, start));
+}
+
 // naive fused kernel
 __global__ void adamw_kernel1(float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
@@ -63,16 +75,47 @@ __global__ void adamw_kernel1(float* params_memory, float* grads_memory, float* 
    params_memory[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * params_memory[i]);
 }
 
+// Slightly more optimized AdamW kernel by:
+// * loading data that is accessed more than once into registers,
+// * using optimized linear interpolation for the moment updates.
+__global__ void adamw_kernel2(float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+   int i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= num_parameters) return;  // guard
+   float grad = grads_memory[i];
+   float m = m_memory[i];
+   float v = v_memory[i];
+   // update the first moment (momentum)
+   m = lerp(grad, m, beta1);
+   m_memory[i] = m;
+   // update the second moment (RMSprop)
+   v = lerp(grad * grad, v, beta2);
+   v_memory[i] = v;
+   m /= beta1_correction;  // m_hat
+   v /= beta2_correction;  // v_hat
+   params_memory[i] -= learning_rate * (m / (sqrtf(v) + eps) + weight_decay * params_memory[i]);
+}
+
 
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-// version 1: naive dispatch to naive fused kernel
+// version 1: naive dispatch to naive kernel
 void adamw_dispatch1(float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                      float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
     unsigned int block_size = 512; 
     unsigned int num_blocks = ceil_div(num_parameters, (long) block_size);
     adamw_kernel1<<<num_blocks, block_size>>>(params_memory, grads_memory, m_memory, v_memory, num_parameters,
+                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+    cudaCheck(cudaGetLastError());
+}
+
+// version 2: naive dispatch to slightly optimized kernel
+void adamw_dispatch2(float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+                     float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+    unsigned int block_size = 512; 
+    unsigned int num_blocks = ceil_div(num_parameters, (long) block_size);
+    adamw_kernel2<<<num_blocks, block_size>>>(params_memory, grads_memory, m_memory, v_memory, num_parameters,
                                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
     cudaCheck(cudaGetLastError());
 }
@@ -88,8 +131,10 @@ void adamw(int kernel_num,
             adamw_dispatch1(params_memory, grads_memory, m_memory, v_memory, num_parameters,
                             learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
             break;
-//        case 2:
-// TODO: add optimized kernel
+        case 2:
+            adamw_dispatch2(params_memory, grads_memory, m_memory, v_memory, num_parameters,
+                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+            break;
         default:
             printf("Invalid kernel number\n");
             exit(1);
