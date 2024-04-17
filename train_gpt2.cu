@@ -681,6 +681,30 @@ __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const flo
     }
 }
 
+// Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
+// Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
+__device__ inline float lerp(float start, float end, float weight) {
+    return fma(weight, end, fma(-weight, start, start));
+}
+
+__global__ void adamw_kernel2(float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+   int i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= num_parameters) return;  // guard
+   float grad = grads_memory[i];
+   float m = m_memory[i];
+   float v = v_memory[i];
+   // update the first moment (momentum)
+   m = lerp(grad, m, beta1);
+   m_memory[i] = m;
+   // update the second moment (RMSprop)
+   v = lerp(grad * grad, v, beta2);
+   v_memory[i] = v;
+   m /= beta1_correction;  // m_hat
+   v /= beta2_correction;  // v_hat
+   params_memory[i] -= learning_rate * (m / (sqrtf(v) + eps) + weight_decay * params_memory[i]);
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -1521,6 +1545,27 @@ void gpt2_backward(GPT2 *model) {
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
     encoder_backward(grads.wte, grads.wpe, grads_acts.encoded, model->inputs, B, T, C);
+}
+
+void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
+    // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
+
+    // lazily allocate the memory for m_memory and v_memory
+    if (model->m_memory == NULL) {
+        cudaCheck(cudaMalloc((void**)&model->m_memory, model->num_parameters * sizeof(float)));
+        cudaCheck(cudaMalloc((void**)&model->v_memory, model->num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->m_memory, 0, model->num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->v_memory, 0, model->num_parameters * sizeof(float)));
+    }
+
+    int block_size = 512;
+    int num_blocks = CEIL_DIV(model->num_parameters, block_size);
+    float beta1_correction = 1.0f - powf(beta1, t);
+    float beta2_correction = 1.0f - powf(beta2, t);
+    adamw_kernel2<<<num_blocks, block_size>>>(model->params_memory, model->grads_memory, model->m_memory, model->v_memory,
+                                              model->num_parameters,
+                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+    cudaCheck(cudaGetLastError());
 }
 
 void gpt2_free(GPT2 *model) {

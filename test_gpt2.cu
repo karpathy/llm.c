@@ -50,10 +50,10 @@ int main(int argc, char *argv[]) {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
-    int C = model.config.channels;
+    // int C = model.config.channels;
     int V = model.config.vocab_size;
     int maxT = model.config.max_seq_len;
-    int L = model.config.num_layers;
+    // int L = model.config.num_layers;
 
     // load additional information that we will use for debugging and error checking
     FILE *state_file = fopenCheck("gpt2_124M_debug_state.bin", "rb");
@@ -171,8 +171,39 @@ int main(int argc, char *argv[]) {
             cudaMemcpy(calculated_grads_memory, model.grads_memory, model.num_parameters * sizeof(float), cudaMemcpyDeviceToHost);
             check_tensor(calculated_grads_memory, expected_grads_memory, model.num_parameters, "grads");
         }
+
+        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1);
+
+        // print the timing information at the end
+        printf("step %d: loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
+        losses[step] = model.mean_loss;
     }
 
+    // expected losses are as follows, from Python
+    float expected_losses[10] = {
+        5.270007133483887,
+        4.059706687927246,
+        3.3751230239868164,
+        2.8007826805114746,
+        2.315382242202759,
+        1.8490285873413086,
+        1.3946564197540283,
+        0.9991465210914612,
+        0.6240804195404053,
+        0.37651097774505615
+    };
+
+    // compare
+    for (int i = 0; i < 10; i++) {
+        if (fabsf(losses[i] - expected_losses[i]) >= 1e-2) {
+            printf("LOSS MISMATCH AT STEP %d: %f %f\n", i, losses[i], expected_losses[i]);
+            allok = 0;
+        } else {
+            printf("loss ok at step %d: %f %f\n", i, losses[i], expected_losses[i]);
+        }
+    }
+
+    // final approval
     printf("overall okay: %d\n", allok);
 
     // free everything
