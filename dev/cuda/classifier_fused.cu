@@ -86,7 +86,7 @@ struct SoftmaxParams {
     float Offset;
 };
 namespace cg = cooperative_groups;
-__device__ SoftmaxParams prepare_softmax(cg::thread_block_tile<32>& warp,
+__device__ SoftmaxParams prepare_softmax(const cg::thread_block_tile<32>& warp,
                                          int idx, const float* inp, int V, int P) {
     // one row of inp, i.e. inp[idx, :] of shape (V,)
     const float* x = inp + idx * P;
@@ -116,8 +116,8 @@ __global__ void fused_classifier_kernel(float* dlogits, float* losses,
                              const float* logits, const float* dlosses, const int* targets,
                              int B, int T, int V, int P) {
     namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    const cg::thread_block block = cg::this_thread_block();
+    const cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
     if (idx >= B * T) {
         return;
