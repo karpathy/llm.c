@@ -669,31 +669,37 @@ __global__ void setConstant(float* vec, float constant, int N) {
 
 // naive kernel to backward through an autoregressive softmax, just to get correctness
 __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
-                                                     int B, int T, int C, int NH) {
-    int t3 = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t3 >= T) {
-        return;
-    }
+                                                       int B, int T, int C, int NH) {
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int t3 = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+
+    int idx = blockIdx.y * T * T;
+    if (t3 >= T) { return; }
 
     int hs = C / NH; // head size
     float scale = 1.0f / sqrtf(hs);
-    int idx = blockIdx.y * T * T;
-
     for (int t = t3; t < T; t++) {
         float result = 0.0;
         const float* att_bth = att + idx + t*T;
         const float* datt_bth = datt + idx + t*T;
         float* dpreatt_bth = dpreatt + idx + t*T;
+        const float att_at_t3 = att_bth[t3];
 
-        for (int t2 = 0; t2 <= t; t2++) {
+        for (int t2 = warp.thread_rank(); t2 <= t; t2 += warp.size()) {
             float indicator = t2 == t3 ? 1.0f : 0.0f;
-            float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
-            result += scale * local_derivative * datt_bth[t2];
+            float local_derivative = att_bth[t2] * (indicator - att_at_t3);
+            result += local_derivative * datt_bth[t2];
         }
 
-        dpreatt_bth[t3] += result;
+        result = cg::reduce(warp, result, cg::plus<float>());
+        if(warp.thread_rank() == 0) {
+            dpreatt_bth[t3] += scale * result;
+        }
     }
 }
+
 
 // Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
 // Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
@@ -1035,7 +1041,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
             B * NH);
 
     // backward into preatt
-    softmax_autoregressive_backward_kernel<<<dim3(num_blocks, B*NH), block_size>>>(dpreatt, datt, att, B, T, C, NH);
+    softmax_autoregressive_backward_kernel<<<dim3(CEIL_DIV(B * T * C, block_size/32), B*NH), block_size>>>(dpreatt, datt, att, B, T, C, NH);
 
     // backward into q
     cublasSgemmStridedBatched(cublas_handle,
