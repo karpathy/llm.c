@@ -20,7 +20,7 @@ version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops ov
 // CPU code reference
 
 void layernorm_forward_cpu(float* out, float* mean, float* rstd,
-                       float* inp, float* weight, float* bias,
+                       float* inp, const float* weight, const float* bias,
                        int B, int T, int C) {
     // reference: https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
     // both inp and out are (B,T,C) of the activations
@@ -62,12 +62,12 @@ void layernorm_forward_cpu(float* out, float* mean, float* rstd,
 }
 
 void layernorm_backward_cpu(float* dinp, float* dweight, float* dbias,
-                        float* dout, float* inp, float* weight, float* mean, float* rstd,
+                        float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                         int B, int T, int C) {
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             float* dout_bt = dout + b * T * C + t * C;
-            float* inp_bt = inp + b * T * C + t * C;
+            const float* inp_bt = inp + b * T * C + t * C;
             float* dinp_bt = dinp + b * T * C + t * C;
             float mean_bt = mean[b * T + t];
             float rstd_bt = rstd[b * T + t];
@@ -109,7 +109,7 @@ void layernorm_backward_cpu(float* dinp, float* dweight, float* dbias,
 
 // super naive kernel that just parallelizes over B,T and loops over C
 __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* dbias,
-                        float* dout, float* inp, float* weight, float* mean, float* rstd,
+                        float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                         int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B*T) return;
@@ -117,9 +117,9 @@ __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* d
     int t = idx % T;
 
     float* dout_bt = dout + b * T * C + t * C;
-    float* inp_bt = inp + b * T * C + t * C;
+    const float* inp_bt = inp + b * T * C + t * C;
     float* dinp_bt = dinp + b * T * C + t * C;
-    float mean_bt = mean[b * T + t];
+    const float mean_bt = mean[b * T + t];
     float rstd_bt = rstd[b * T + t];
 
     // first: two reduce operations
@@ -152,6 +152,63 @@ __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* d
     }
 }
 
+
+// super naive kernel that just parallelizes over B,T and loops over C
+__global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* dbias,
+                                           float* dout, float* inp, const float* weight, const float* mean, const float* rstd,
+                                           int B, int T, int C) {
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    int N = B * T;
+    if(idx >= N) {
+        return;
+    }
+
+    int b = idx / T;
+    int t = idx % T;
+
+    float* dout_bt = dout + b * T * C + t * C;
+    float* inp_bt = inp + b * T * C + t * C;
+    float* dinp_bt = dinp + b * T * C + t * C;
+    float mean_bt = mean[b * T + t];
+    float rstd_bt = rstd[b * T + t];
+
+    // first: two reduce operations
+    float dnorm_mean = 0.0f;
+    float dnorm_norm_mean = 0.0f;
+    for (int i = warp.thread_rank(); i < C; i  += warp.size()) {
+        float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+        float dnorm_i = weight[i] * dout_bt[i];
+        dnorm_mean += dnorm_i;
+        dnorm_norm_mean += dnorm_i * norm_bti;
+    }
+
+    dnorm_mean = cg::reduce(warp, dnorm_mean, cg::plus<float>{});
+    dnorm_norm_mean = cg::reduce(warp, dnorm_norm_mean, cg::plus<float>{});
+
+    dnorm_mean = dnorm_mean / C;
+    dnorm_norm_mean = dnorm_norm_mean / C;
+
+    // now iterate again and accumulate all the gradients
+    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+        float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+        float dnorm_i = weight[i] * dout_bt[i];
+        // gradient contribution to bias
+        atomicAdd(&dbias[i], dout_bt[i]);
+        // gradient contribution to weight
+        atomicAdd(&dweight[i], norm_bti * dout_bt[i]);
+        // gradient contribution to input
+        float dval = 0.0f;
+        dval += dnorm_i; // term 1
+        dval -= dnorm_mean; // term 2
+        dval -= norm_bti * dnorm_norm_mean; // term 3
+        dval *= rstd_bt; // final scale
+        dinp_bt[i] += dval;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -163,6 +220,14 @@ void layernorm_backward1(float* dinp, float* dweight, float* dbias,
     layernorm_backward_kernel1<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
 }
 
+void layernorm_backward2(float* dinp, float* dweight, float* dbias,
+                        float* dout, float* inp, float* weight, float* mean, float* rstd,
+                        int B, int T, int C, const int block_size) {
+    const int N = B * T;
+    const int grid_size = ceil_div(32*N, block_size);
+    layernorm_backward_kernel2<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+}
+
 // kernel version dispatch
 void layernorm_backward(int kernel_num,
                         float* dinp, float* dweight, float* dbias,
@@ -172,6 +237,9 @@ void layernorm_backward(int kernel_num,
     switch (kernel_num) {
         case 1:
             layernorm_backward1(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            break;
+        case 2:
+            layernorm_backward2(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
     default:
             printf("Invalid kernel number\n");
