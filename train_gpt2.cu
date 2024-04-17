@@ -661,23 +661,27 @@ __global__ void setConstant(float* vec, float constant, int N) {
 __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
                                                      int B, int T, int C, int NH) {
     int t3 = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t3 < T) {
-        int hs = C / NH; // head size
-        float scale = 1.0f / sqrtf(hs);
-        for (int b = 0; b < B; b++) {
-            for (int h = 0; h < NH; h++) {
-                for (int t = t3; t < T; t++) {
-                    for (int t2 = 0; t2 <= t; t2++) {
-                        const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
-                        const float* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
-                        float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
-                        float indicator = t2 == t3 ? 1.0f : 0.0f;
-                        float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
-                        dpreatt_bth[t3] += scale * local_derivative * datt_bth[t2];
-                    }
-                }
-            }
+    if (t3 >= T) {
+        return;
+    }
+
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    int idx = blockIdx.y * T * T;
+
+    for (int t = t3; t < T; t++) {
+        float result = 0.0;
+        const float* att_bth = att + idx + t*T;
+        const float* datt_bth = datt + idx + t*T;
+        float* dpreatt_bth = dpreatt + idx + t*T;
+
+        for (int t2 = 0; t2 <= t; t2++) {
+            float indicator = t2 == t3 ? 1.0f : 0.0f;
+            float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
+            result += scale * local_derivative * datt_bth[t2];
         }
+
+        dpreatt_bth[t3] += result;
     }
 }
 
@@ -1020,7 +1024,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
             B * NH);
 
     // backward into preatt
-    softmax_autoregressive_backward_kernel<<<num_blocks, block_size>>>(dpreatt, datt, att, B, T, C, NH);
+    softmax_autoregressive_backward_kernel<<<dim3(num_blocks, B*NH), block_size>>>(dpreatt, datt, att, B, T, C, NH);
 
     // backward into q
     cublasSgemmStridedBatched(cublas_handle,
