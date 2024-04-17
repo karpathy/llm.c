@@ -605,12 +605,18 @@ __global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* do
     }
 }
 
-// super naive layernorm backward kernel that just parallelizes over B,T and loops over C
-__global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* dbias,
-                        float* dout, float* inp, float* weight, float* mean, float* rstd,
+__global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* dbias,
+                        float* dout, float* inp, const float* weight, const float* mean, const float* rstd,
                         int B, int T, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B*T) return;
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    int N = B * T;
+    if(idx >= N) {
+        return;
+    }
+
     int b = idx / T;
     int t = idx % T;
 
@@ -623,17 +629,21 @@ __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* d
     // first: two reduce operations
     float dnorm_mean = 0.0f;
     float dnorm_norm_mean = 0.0f;
-    for (int i = 0; i < C; i++) {
+    for (int i = warp.thread_rank(); i < C; i  += warp.size()) {
         float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
         float dnorm_i = weight[i] * dout_bt[i];
         dnorm_mean += dnorm_i;
         dnorm_norm_mean += dnorm_i * norm_bti;
     }
+
+    dnorm_mean = cg::reduce(warp, dnorm_mean, cg::plus<float>{});
+    dnorm_norm_mean = cg::reduce(warp, dnorm_norm_mean, cg::plus<float>{});
+
     dnorm_mean = dnorm_mean / C;
     dnorm_norm_mean = dnorm_norm_mean / C;
 
     // now iterate again and accumulate all the gradients
-    for (int i = 0; i < C; i++) {
+    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
         float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
         float dnorm_i = weight[i] * dout_bt[i];
         // gradient contribution to bias
@@ -969,10 +979,11 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
 void layernorm_backward(float* dinp, float* dweight, float* dbias,
                         float* dout, float* inp, float* weight, float* mean, float* rstd,
                         int B, int T, int C) {
-    const int block_size = 64;
+    const int block_size = 256;
     const int N = B * T;
-    const int grid_size = CEIL_DIV(N, block_size);
-    layernorm_backward_kernel1<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+    // one warp per token, so we need to divide by 32 here.
+    const int grid_size = CEIL_DIV(N, block_size / 32);
+    layernorm_backward_kernel<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1143,6 +1154,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
         num_activations += act_sizes[i];
     }
     float* acts_memory;
+    printf("Allocating %d MB for activation buffer\n", int(num_activations * sizeof(float) / 1024 / 1024));
     cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
     float** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
