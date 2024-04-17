@@ -587,8 +587,8 @@ int main(int argc, char **argv) {
     srand(0); // reproducibility
 
     // hyperparameters
-    int B = 4; //8;
-    int T = 64; //1024;
+    int B = 8;
+    int T = 1024;
     int C = 768;
     int NH = 12;
 
@@ -721,7 +721,20 @@ int main(int argc, char **argv) {
     printf("Number of gradients that are exactly zero: %d (%.2f%% of total)\n", num_zero_grad, 100*(float)num_zero_grad / (B * T * 3 * C));
 
     // final verdict
-    printf("All results match!\n\n");
+    printf("All results match. Starting benchmarks.\n\n");
+
+    // benchmark speed of the kernel
+    int block_sizes[] = {32, 64, 128, 256, 512};
+    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+        int block_size = block_sizes[j];
+        int repeat_times = 10;
+        float elapsed_time = benchmark_kernel(repeat_times, attention_backward,
+                                              kernel_num, d_dinp, d_dqkvr, d_dpreatt, d_datt, d_dvaccum,
+                                              d_dout, d_inp, d_qkvr, d_preatt, d_att, d_vaccum,
+                                              B, T, C, NH, block_size);
+
+        printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
+    }
 
     // free memory
     free(inp);
