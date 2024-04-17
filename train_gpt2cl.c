@@ -12,7 +12,7 @@ This version uses OpenCL
 #include <time.h>
 #include <string.h>
 #include <unistd.h>
-#include "dev/opencl/common.h"
+#include "dev/opencl/routines.h"
 
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
