@@ -163,6 +163,29 @@ __global__ void encoder_forward_kernel2(float* out,
     }
 }
 
+// really bad naive kernel with atomicAdd
+__global__ void encoder_backward_kernel(float* dwte, float* dwpe,
+                                        const float* dout, const int* inp,
+                                        int B, int T, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int N = B * T * C;
+
+    if (idx < N) {
+        int bt = idx / C;
+        int b = bt / T;
+        int t = bt % T;
+        int c = idx % C;
+
+        int ix = inp[b * T + t];
+
+        const float* dout_btc = dout + b * T * C + t * C + c;
+        float* dwte_ix = dwte + ix * C + c;
+        float* dwpe_tc = dwpe + t * C + c;
+
+        atomicAdd(dwte_ix, *dout_btc);
+        atomicAdd(dwpe_tc, *dout_btc);
+    }
+}
 
 __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const float*  __restrict__ inp, const float*  __restrict__ weight,
@@ -668,6 +691,16 @@ void encoder_forward(float* out,
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
     encoder_forward_kernel2<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
+    cudaCheck(cudaGetLastError());
+}
+
+void encoder_backward(float* dwte, float* dwpe,
+                    const float* dout, const int* inp,
+                    int B, int T, int C) {
+    const int N = B * T * C;
+    const int block_size = 256;
+    const int grid_size = CEIL_DIV(N, block_size);
+    encoder_backward_kernel<<<grid_size, block_size>>>(dwte, dwpe, dout, inp, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1486,10 +1519,8 @@ void gpt2_backward(GPT2 *model) {
         attention_backward(dl_qkv, dl_qkvr, dl_preatt, dl_att, dl_v_accum, dl_atty, l_qkv, l_qkvr, l_preatt, l_att, l_v_accum, B, T, C, NH);
         matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
-
-        break; // break until we get all the other blocks in place, so we're only backwarding the last layer
     }
-    // encoder_backward(grads.wte, grads.wpe, grads_acts.encoded, model->inputs, B, T, C);
+    encoder_backward(grads.wte, grads.wpe, grads_acts.encoded, model->inputs, B, T, C);
 }
 
 void gpt2_free(GPT2 *model) {
