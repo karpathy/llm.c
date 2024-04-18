@@ -200,19 +200,26 @@ __device__ SoftmaxParams prepare_softmax_blockwide(cg::thread_block_tile<32>& wa
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
 
-    // reduce maxval
-    shared_maxval[warp_id] = cg::reduce(warp, thread_maxval, cg::greater<float>{});
+    // reduce maxval within each warp
+    float warp_maxval = cg::reduce(warp, thread_maxval, cg::greater<float>{});
+    // thread 0 in each warp writes to shared memory
+    if (lane_id == 0) { shared_maxval[warp_id] = warp_maxval; }
     __syncthreads();
-    float warp_maxval = (lane_id < num_warps) ? shared_maxval[lane_id] : -FLT_MAX;
+    // each thread now loads the maxval across previous warps
+    // if the thread is "out of range" of data, use -FLT_MAX as the maxval
+    warp_maxval = (lane_id < num_warps) ? shared_maxval[lane_id] : -FLT_MAX;
+    // now reduce the maxval among the warp threads
     float block_maxval = cg::reduce(warp, warp_maxval, cg::greater<float>{});
-    // use maxval to scale sumval to avoid numerical instability / overflow
+    // each thread uses maxval to scale sumval to avoid numerical instability / overflow
     thread_sumval *= expf(thread_maxval - block_maxval);
-    // reduce sumval
-    shared_sumval[warp_id] = cg::reduce(warp, thread_sumval, cg::plus<float>{});
+    // (warp-level) reduce sumval, thread 0 in each warp saves result in shared memory
+    float warp_sumval = cg::reduce(warp, thread_sumval, cg::plus<float>{});
+    if (lane_id == 0) { shared_sumval[warp_id] = warp_sumval; }
     __syncthreads();
-    float warp_sumval = (lane_id < num_warps) ? shared_sumval[lane_id] : 0.f;
+    // same strategy, now reduce sumval across warps
+    warp_sumval = (lane_id < num_warps) ? shared_sumval[lane_id] : 0.0f;
     float block_sumval = cg::reduce(warp, warp_sumval, cg::plus<float>{});
-
+    // return the softmax parameters
     return SoftmaxParams{1.f / block_sumval, block_maxval};
 }
 
@@ -245,17 +252,18 @@ __global__ void fused_classifier_kernel2(float* dlogits, float* losses, float* p
         // this is the 2nd read of logits after the one in prepare_softmax2
         // this data will never be needed again, so we reduce cache persistence
         float4 v4 = __ldcs(&logits_vec4[i]);
+
         #pragma unroll
         for(int k = 0; k < 4; ++k) {
             int element = i*4 + k;
             float prob = expf(vec_at(v4, k) - sp.Offset) * sp.Scale;
-            prob = (element < V) ? prob : 0.f; // bounds checking against real V
+            prob = (element < V) ? prob : 0.0f; // bounds checking against real V
 
             // this kernel is DRAM limited so cost of inner branch is ~zero
-            if (probs) {
+            if (probs != NULL) {
                 probs[idx * P + element] = prob;
             }
-            if (dlogits) {
+            if (dlogits != NULL) {
                 float indicator = element == ix ? 1.0f : 0.0f;
                 dlogits[idx * P + element] = (prob - indicator) * dloss;
             }
