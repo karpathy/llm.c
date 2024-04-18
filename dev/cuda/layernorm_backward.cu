@@ -20,7 +20,7 @@ version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops ov
 // CPU code reference
 
 void layernorm_forward_cpu(float* out, float* mean, float* rstd,
-                       float* inp, const float* weight, const float* bias,
+                       const float* inp, const float* weight, const float* bias,
                        int B, int T, int C) {
     // reference: https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
     // both inp and out are (B,T,C) of the activations
@@ -31,7 +31,7 @@ void layernorm_forward_cpu(float* out, float* mean, float* rstd,
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // seek to the input position inp[b,t,:]
-            float* x = inp + b * T * C + t * C;
+            const float* x = inp + b * T * C + t * C;
             // calculate the mean
             float m = 0.0f;
             for (int i = 0; i < C; i++) {
@@ -62,15 +62,15 @@ void layernorm_forward_cpu(float* out, float* mean, float* rstd,
 }
 
 void layernorm_backward_cpu(float* dinp, float* dweight, float* dbias,
-                        float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
+                        const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                         int B, int T, int C) {
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            float* dout_bt = dout + b * T * C + t * C;
+            const float* dout_bt = dout + b * T * C + t * C;
             const float* inp_bt = inp + b * T * C + t * C;
             float* dinp_bt = dinp + b * T * C + t * C;
-            float mean_bt = mean[b * T + t];
-            float rstd_bt = rstd[b * T + t];
+            const float mean_bt = mean[b * T + t];
+            const float rstd_bt = rstd[b * T + t];
 
             // first: two reduce operations
             float dnorm_mean = 0.0f;
@@ -109,18 +109,18 @@ void layernorm_backward_cpu(float* dinp, float* dweight, float* dbias,
 
 // super naive kernel that just parallelizes over B,T and loops over C
 __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* dbias,
-                        float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
+                        const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                         int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B*T) return;
     int b = idx / T;
     int t = idx % T;
 
-    float* dout_bt = dout + b * T * C + t * C;
+    const float* dout_bt = dout + b * T * C + t * C;
     const float* inp_bt = inp + b * T * C + t * C;
     float* dinp_bt = dinp + b * T * C + t * C;
-    const float mean_bt = mean[b * T + t];
-    float rstd_bt = rstd[b * T + t];
+    const const float mean_bt = mean[b * T + t];
+    const float rstd_bt = rstd[b * T + t];
 
     // first: two reduce operations
     float dnorm_mean = 0.0f;
@@ -155,7 +155,7 @@ __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* d
 
 // super naive kernel that just parallelizes over B,T and loops over C
 __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* dbias,
-                                           float* dout, float* inp, const float* weight, const float* mean, const float* rstd,
+                                           const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                                            int B, int T, int C) {
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
@@ -169,11 +169,11 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
     int b = idx / T;
     int t = idx % T;
 
-    float* dout_bt = dout + b * T * C + t * C;
-    float* inp_bt = inp + b * T * C + t * C;
+    const float* dout_bt = dout + b * T * C + t * C;
+    const float* inp_bt = inp + b * T * C + t * C;
     float* dinp_bt = dinp + b * T * C + t * C;
-    float mean_bt = mean[b * T + t];
-    float rstd_bt = rstd[b * T + t];
+    const float mean_bt = mean[b * T + t];
+    const float rstd_bt = rstd[b * T + t];
 
     // first: two reduce operations
     float dnorm_mean = 0.0f;
@@ -213,7 +213,7 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
 // kernel launchers
 
 void layernorm_backward1(float* dinp, float* dweight, float* dbias,
-                        float* dout, float* inp, float* weight, float* mean, float* rstd,
+                        const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                         int B, int T, int C, const int block_size) {
     const int N = B * T;
     const int grid_size = ceil_div(N, block_size);
@@ -221,7 +221,7 @@ void layernorm_backward1(float* dinp, float* dweight, float* dbias,
 }
 
 void layernorm_backward2(float* dinp, float* dweight, float* dbias,
-                        float* dout, float* inp, float* weight, float* mean, float* rstd,
+                        const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                         int B, int T, int C, const int block_size) {
     const int N = B * T;
     const int grid_size = ceil_div(32*N, block_size);
@@ -231,7 +231,7 @@ void layernorm_backward2(float* dinp, float* dweight, float* dbias,
 // kernel version dispatch
 void layernorm_backward(int kernel_num,
                         float* dinp, float* dweight, float* dbias,
-                        float* dout, float* inp, float* weight, float* mean, float* rstd,
+                        const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                         int B, int T, int C,
                         const int block_size) {
     switch (kernel_num) {
