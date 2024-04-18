@@ -131,25 +131,27 @@ make train_gpt2cu
 This will load the tiny_shakespeare dataset validation and training splits. At the default settings of B=4, T=1024, there are 8 validation batches and 74 training batches. The script is currently configured to do a single epoch of finetuning with learning rate 1e-4, and along the way it evaluates the validation performance and generates samples, e.g.:
 
 ```
-step 1/74: train loss 4.367631 (424.545089 ms)
-step 2/74: train loss 4.031261 (418.123055 ms)
-step 3/74: train loss 4.034113 (418.248729 ms)
-step 4/74: train loss 3.859862 (419.620396 ms)
+step 1/74: train loss 4.367631 (198.891516 ms)
+step 2/74: train loss 4.031111 (190.001214 ms)
+step 3/74: train loss 4.034153 (192.847519 ms)
+step 4/74: train loss 3.859954 (196.304713 ms)
 ...
-step 72/74: train loss 3.085115 (430.124835 ms)
-step 73/74: train loss 3.667760 (428.690927 ms)
-step 74/74: train loss 3.467514 (428.090348 ms)
-val loss 3.516422
+step 72/74: train loss 3.085107 (198.018706 ms)
+step 73/74: train loss 3.667800 (198.899291 ms)
+step 74/74: train loss 3.467458 (195.024231 ms)
+val loss 3.516406
 generating:
 ---
 ?Where will you go?
 I take you wherefore I can, myself, and must.
-I sat down at a full's seven, and here was my mate;
-And being gone to find some gentleman to his place
-Zilled me with his eagle; and thus to find my light
+I cast off my beak, that I may look him up on the point;
+For on his rock shall he be opencast.
+
+<|endoftext|>My little nephew:
+Keep on with me, my
 ```
 
-So as currently configured, we come down to validation loss of 3.51 and can generate okay samples. This runs on my A100 in about ~30 seconds. Even so, this training loop in PyTorch is about 80ms/iteration, so we are currently ~5X slower. The kernels are being actively optimized and worked on and we aspire to reach the same vicinity soon^TM.
+So as currently configured, we come down to validation loss of 3.51 and can generate okay samples. This runs on my A100 in about ~15 seconds. Even so, this training loop in PyTorch is about 80ms/iteration, so at 200ms/iter we are currently ~2.5X slower. The kernels are being actively optimized and worked on and we aspire to reach the same vicinity soon^TM.
 
 **Timing**. Finally we can time the code and compare the speed to PyTorch. Because the backward pass CUDA kernels are still very new and being optimized, I'd recommend turning off the backward + update in `train_gpt2.cu`:
 
