@@ -866,13 +866,13 @@ int main(int argc, char **argv) {
         if (kernel_num != 2) {
             // kernel 2 (knowingly) fails att/preatt because it uses a different algorithm
             // that estimates the softmax online and never materializes preatt/att
-            validate_result(d_att, att, "att", B * T * C, 1e-4f);
+            validate_result(d_att, att, "att", B * NH * T * T, 1e-4f);
         }
         if (kernel_num != 2 && kernel_num != 4) {
             // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
             // into the softmax, so preatt is off by 1.0f / sqrt(HS)
             // but att and out (checked below) should match.
-            validate_result(d_preatt, preatt, "preatt", B * T * C, 1e-4f);
+            validate_result(d_preatt, preatt, "preatt", B * NH * T * T, 1e-4f);
         }
     }
     printf("All results match. Starting benchmarks.\n\n");
