@@ -2,7 +2,7 @@
 
 LLM training in simple, pure C/CUDA. There is no need for 245MB of PyTorch or 107MB of cPython. For example, training GPT-2 (CPU, fp32) is ~1,000 lines of clean code in a single file. It compiles and runs instantly, and exactly matches the PyTorch reference implementation. I chose GPT-2 as the first working example because it is the grand-daddy of LLMs, the first time the modern stack was put together.
 
-Currently, I am working on:
+Currently, we are working on:
 
 - optimize the CUDA implementation to compete with PyTorch
 - lower the precision from fp32 to mixed precision training
@@ -110,25 +110,63 @@ I attached a very small tutorial here, in [doc/layernorm/layernorm.md](doc/layer
 
 ## cuda
 
-CUDA port is WIP, I'm keeping the growing collection of kernels in the `dev` folder, e.g. see [dev/cuda/README.md](dev/cuda/README.md).
+As of April 17, 2024 the full training loop is now implemented in pure CUDA in one file, but has not been optimized yet. The way we organize code is that we have a growing collection of kernels of increasing complexity in the `dev/cuda` folder, see [dev/cuda/README.md](dev/cuda/README.md). We then copy paste the best kernels into the main training loop in the single training file `train_gpt2cu.cu`.
 
-As of April 17, 2024 the full training loop is now implemented in pure CUDA in one file, but has not been optimized yet. However, we are able to do 10 iterations of training and verify that our file exactly matches and preproduces the numbers from PyTorch:
+**Correctness**. First, we can do 10 iterations of training and verify that our code exactly matches and preproduces the numbers from PyTorch:
 
 ```bash
 make test_gpt2cu
 ./test_gpt2cu
 ```
 
-This prints `overall okay: 1`.
+This prints `overall okay: 1`. So the forward activations, backward gradients, and the individual loss values for 10 iterations all match exactly.
 
-Next, we can time the forward pass alone (the backward pass is too WIP) with:
+**Training**. To train GPT-2 in a single file of CUDA, run the train script:
 
 ```bash
 make train_gpt2cu
 ./train_gpt2cu
 ```
 
-This will run GPT-2 (124M) in one file of pure CUDA (see [train_gpt2.cu](train_gpt2.cu)), using batch size 4 and sequence length 1024. This will print a bunch of hyperparameters and then the "training":
+This will load the tiny_shakespeare dataset validation and training splits. At the default settings of B=4, T=1024, there are 8 validation batches and 74 training batches. The script is currently configured to do a single epoch of finetuning with learning rate 1e-4, and along the way it evaluates the validation performance and generates samples, e.g.:
+
+```
+step 1/74: train loss 4.367631 (424.545089 ms)
+step 2/74: train loss 4.031261 (418.123055 ms)
+step 3/74: train loss 4.034113 (418.248729 ms)
+step 4/74: train loss 3.859862 (419.620396 ms)
+...
+step 72/74: train loss 3.085115 (430.124835 ms)
+step 73/74: train loss 3.667760 (428.690927 ms)
+step 74/74: train loss 3.467514 (428.090348 ms)
+val loss 3.516422
+generating:
+---
+?Where will you go?
+I take you wherefore I can, myself, and must.
+I sat down at a full's seven, and here was my mate;
+And being gone to find some gentleman to his place
+Zilled me with his eagle; and thus to find my light
+```
+
+So as currently configured, we come down to validation loss of 3.51 and can generate okay samples. This runs on my A100 in about ~30 seconds.
+
+**Timing**. Finally we can time the code and compare the speed to PyTorch. Because the backward pass CUDA kernels are still very new and being optimized, I'd recommend turning off the backward + update in `train_gpt2.cu`:
+
+```
+// gpt2_zero_grad(&model);
+// gpt2_backward(&model);
+// gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
+```
+
+And then re-compile and run just the forward pass in a loop:
+
+```bash
+make train_gpt2cu
+./train_gpt2cu
+```
+
+This will print a bunch of hyperparameters and then you'll see the loop:
 
 ```
 val loss 4.517179
