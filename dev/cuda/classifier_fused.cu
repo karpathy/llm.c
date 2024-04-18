@@ -214,7 +214,7 @@ __global__ void fused_classifier_kernel2(float* dlogits, float* losses, float* p
     int ix = targets[idx];
     
     // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
-    auto sp = prepare_softmax_blockwide(warp, idx, logits, V);
+    auto sp = prepare_softmax_blockwide(warp, idx, logits, V, P);
 
     // calculate the probability needed for the loss and update (single-threaded)
     if(threadIdx.x == 0) {
