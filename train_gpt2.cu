@@ -1,5 +1,14 @@
 /*
 GPT-2 Transformer Neural Net trained in raw CUDA
+Non-trivial notes to be aware of:
+
+We are being clever in the backward pass to conserve memory.
+In particular, all parameters use a += in the backward pass, so we
+can later do gradient accumulation. But all activations have = instead of +=
+because these are faster (just read, no write). This is okay for all activations
+except for those in the residual stream, where the gradients have to add. We make
+sure that those parts work out ok and that we do a += as necessary. E.g.,
+the layernorms are connected to the residuals so we += in layernorm backward.
 */
 
 #include <stdio.h>
@@ -396,14 +405,6 @@ __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, in
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
         out[idx] = __ldcs(&inp1[idx]) + __ldcs(&inp2[idx]);
-    }
-}
-
-__global__ void residual_backward_kernel(float* dinp1, float* dinp2, const float* dout, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        dinp1[idx] += __ldcs(&dout[idx]);
-        dinp2[idx] = __ldcs(&dout[idx]);
     }
 }
 
@@ -913,13 +914,6 @@ void residual_forward(float* out, float* inp1, float* inp2, int N) {
     cudaCheck(cudaGetLastError());
 }
 
-void residual_backward(float* dinp1, float* dinp2, float* dout, int N) {
-    const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
-    residual_backward_kernel<<<grid_size, block_size>>>(dinp1, dinp2, dout, N);
-    cudaCheck(cudaGetLastError());
-}
-
 void gelu_forward(float* out, const float* inp, int N) {
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N, block_size);
@@ -967,11 +961,11 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
                      int B, int T, int C, int OC) {
     float one = 1.0f;
     float zero = 0.0f;
-    // backward to input
+    // backward to input, uses = in the backward pass (set the gradient)
     cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &one, weight, C, dout, OC, &zero, dinp, C));
-    // backward to weight
+    // backward to weight, uses += in the backward pass (accumulate the gradient)
     cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &one, inp, C, dout, OC, &one, dweight, C));
-    // backward to bias, if given
+    // backward to bias, if given, does a +=
     if (dbias != NULL) {
         const int block_size=512;
         dim3 block_dim(block_size);
@@ -1002,8 +996,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     const int block_size = 256;
 
     int HS = C / NH; // head size
-    const float alpha = 1.0f;
-    const float beta = 1.0f; // note beta = 1.0f so that we accumulate gradients (+=)
+    const float one = 1.0f;
     const float zero = 0.0f; // note beta = 1.0f so that we accumulate gradients (+=)
     // unpack convenience pointers into q, k, v
     const float *q, *k, *v;
@@ -1023,7 +1016,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     cublasSgemmStridedBatched(cublas_handle,
                             CUBLAS_OP_T, CUBLAS_OP_N,
                             T, T, HS,
-                            &alpha,
+                            &one,
                             v, HS, T * HS,
                             dvaccum, HS, T * HS,
                             &zero,
@@ -1034,7 +1027,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     cublasSgemmStridedBatched(cublas_handle,
             CUBLAS_OP_N, CUBLAS_OP_T,
             HS, T, T,
-            &alpha,
+            &one,
             dvaccum, HS, T * HS,
             att, T, T * T,
             &zero,
@@ -1048,7 +1041,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     cublasSgemmStridedBatched(cublas_handle,
                             CUBLAS_OP_N, CUBLAS_OP_N,
                             HS, T, T,
-                            &alpha,
+                            &one,
                             k, HS, T * HS,
                             dpreatt, T, T * T,
                             &zero,
@@ -1058,7 +1051,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     cublasSgemmStridedBatched(cublas_handle,
                             CUBLAS_OP_N, CUBLAS_OP_T,
                             HS, T, T,
-                            &alpha,
+                            &one,
                             q, HS, T * HS,
                             dpreatt, T, T * T,
                             &zero,
@@ -1477,23 +1470,24 @@ void gpt2_backward(GPT2 *model) {
         // allocate buffers for weight gradients
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes, 1);
 
-        // determine buffer size for activation gradients
-        // _mostly_ allocate as if we had just a single layer,
-        // because we're going to reuse memory
+        // we're going to be clever for the activations backward pass. we don't need to exactly
+        // mirror the forward pass acrtivations and we will save memory.
         size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
         GPT2Config cfg = model->config;
-        cfg.num_layers = 1;
+        cfg.num_layers = 1; // copy the configuration but override number of layers to 1
         fill_in_activation_sizes(bw_act_sizes, model->batch_size, model->seq_len, cfg);
-
-        // however, some buffers are not needed at all
+        // on top of that, some buffers are not needed at all, set their sizes to zero
+        bw_act_sizes[0] = 0; // encoded
         bw_act_sizes[2] = 0; // ln1_mean
         bw_act_sizes[3] = 0; // ln1_rstd
+        bw_act_sizes[8] = 0; // attproj
+        bw_act_sizes[9] = 0; // residual2
         bw_act_sizes[11] = 0; // ln2_mean
         bw_act_sizes[12] = 0; // ln2_rstd
         bw_act_sizes[18] = 0; // lnf_mean
         bw_act_sizes[19] = 0; // lnf_rstd
         bw_act_sizes[21] = 0; // probs
-
+        // count up and allocate the space
         model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, bw_act_sizes);
         model->num_grad_acts = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
@@ -1527,13 +1521,12 @@ void gpt2_backward(GPT2 *model) {
     matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, V);
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    float* dresidual = grads_acts.residual3; // and its gradient
+    float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
 
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
-        dresidual = l == 0 ? grads_acts.encoded : grads_acts.residual3;
 
         // get the pointers of the weights for this layer
         float* l_ln1w = params.ln1w + l * C;
@@ -1572,6 +1565,8 @@ void gpt2_backward(GPT2 *model) {
         float* l_fch = acts.fch + l * B * T * 4*C;
         float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
         // get the pointers of the gradients of the activations for this layer
+        // notice that there is no l *, because we just have a single copy, and keep
+        // re-using this memory in every Transformer block as we calculate backward pass
         float* dl_ln1 = grads_acts.ln1;
         float* dl_qkv = grads_acts.qkv;
         float* dl_qkvr = grads_acts.qkvr;
@@ -1579,29 +1574,23 @@ void gpt2_backward(GPT2 *model) {
         float* dl_preatt = grads_acts.preatt;
         float* dl_att = grads_acts.att;
         float* dl_v_accum = grads_acts.v_accum;
-        float* dl_attproj = grads_acts.attproj;
-        float* dl_residual2 = grads_acts.residual2;
         float* dl_ln2 = grads_acts.ln2;
         float* dl_fch = grads_acts.fch;
         float* dl_fch_gelu = grads_acts.fch_gelu;
-        float* dl_fcproj = grads_acts.fcproj;
-        float* dl_residual3 = grads_acts.residual3;
 
         // backprop this layer
-        cudaCheck(cudaMemset(dl_residual2, 0, B * T * C  * sizeof(float)));
-        residual_backward(dl_residual2, dl_fcproj, dl_residual3, B*T*C);
-        cudaCheck(cudaMemset(dl_residual3, 0, B * T * C  * sizeof(float)));
-        matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
+        matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
         gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
         matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
-        layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
-        residual_backward(dresidual, dl_attproj, dl_residual2, B*T*C);
-        matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C);
+        // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
+        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
+        matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
         attention_backward(dl_qkv, dl_qkvr, dl_preatt, dl_att, dl_v_accum, dl_atty, l_qkv, l_qkvr, l_preatt, l_att, l_v_accum, B, T, C, NH);
         matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
+        // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
-    encoder_backward(grads.wte, grads.wpe, grads_acts.encoded, model->inputs, B, T, C);
+    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
 }
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
