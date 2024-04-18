@@ -112,7 +112,6 @@ int main(int argc, char **argv) {
     cudaCheck(cudaMalloc(&d_probs, B * T * V * sizeof(float)));
     cudaCheck(cudaMalloc(&d_targets, B * T * sizeof(int)));
     cudaCheck(cudaMalloc(&d_dlosses, B * T * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_dlogits, B * T * V * sizeof(float)));
     cudaCheck(cudaMemcpy(d_probs, probs, B * T * V * sizeof(float), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(d_targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(d_dlosses, dlosses, B * T * sizeof(float), cudaMemcpyHostToDevice));
@@ -132,6 +131,7 @@ int main(int argc, char **argv) {
 
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
+        cudaCheck(cudaMalloc(&d_dlogits, B * T * V * sizeof(float)));
         printf("Checking block size %d.\n", block_size);
         crossentropy_softmax_backward(kernel_num, d_dlogits, d_dlosses, d_probs, d_targets, B, T, V, block_size);
         validate_result(d_dlogits, dlogits, "dlogits", B * T * V, 1e-5f);
