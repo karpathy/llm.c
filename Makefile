@@ -45,18 +45,18 @@ endif
 # default target is all
 all: train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu
 
-train_gpt2: train_gpt2.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
+train_gpt2: train_gpt2.c train_common.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-test_gpt2: test_gpt2.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
+test_gpt2: test_gpt2.c train_common.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 # possibly may want to disable warnings? e.g. append -Xcompiler -Wno-unused-result
-train_gpt2cu: train_gpt2.cu
-	nvcc -O3 --use_fast_math $< -lcublas -lcublasLt -o $@
+train_gpt2cu: train_gpt2.cu train_common.cu
+	nvcc -O3 --use_fast_math $^ -lcublas -lcublasLt -o $@
 
-test_gpt2cu: test_gpt2.cu
-	nvcc -O3 --use_fast_math $< -lcublas -lcublasLt -o $@
+test_gpt2cu: test_gpt2.cu train_common.cu
+	nvcc -O3 --use_fast_math $^ -lcublas -lcublasLt -o $@
 
 clean:
 	rm -f train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu
