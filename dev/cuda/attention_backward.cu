@@ -6,6 +6,18 @@ nvcc -O3 --use_fast_math attention_backward.cu -o attention_backward -lcublas
 
 version 1 is a naive first version
 OMP_NUM_THREADS=32 ./attention_backward 1
+
+version 2 much ensures better load-balancing by having independent threads for each batch and attention head
+OMP_NUM_THREADS=32 ./attention_backward 2
+
+version 3 uses a full warp to calculate each result (instead of a thread), which enables coalesced memory access
+OMP_NUM_THREADS=32 ./attention_backward 3
+
+version 4 improves data reuse in registers by doing 8 values of t3 in one warp.
+OMP_NUM_THREADS=32 ./attention_backward 4
+
+version 5 reduces the amount of non-fp32 instructions needed by avoiding ifs
+OMP_NUM_THREADS=32 ./attention_backward 5
 */
 
 #include <stdio.h>
@@ -339,7 +351,7 @@ __global__ void softmax_autoregressive_backward_kernel1(float* dpreatt, const fl
                         float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
                         accum +=  scale * local_derivative * datt_bth[t2];
                     }
-                    dpreatt_bth[t3] += accum;
+                    dpreatt_bth[t3] = accum;
                 }
             }
         }
@@ -367,7 +379,7 @@ __global__ void softmax_autoregressive_backward_kernel2(float* dpreatt, const fl
             result += scale * local_derivative * datt_bth[t2];
         }
 
-        dpreatt_bth[t3] += result;
+        dpreatt_bth[t3] = result;
     }
 }
 
@@ -399,7 +411,151 @@ __global__ void softmax_autoregressive_backward_kernel3(float* dpreatt, const fl
 
         result = cg::reduce(warp, result, cg::plus<float>());
         if(warp.thread_rank() == 0) {
-            dpreatt_bth[t3] += scale * result;
+            dpreatt_bth[t3] = scale * result;
+        }
+    }
+}
+__global__ void softmax_autoregressive_backward_kernel4(float* __restrict__ dpreatt, const float* __restrict__ datt,
+                                                        const float* __restrict__ att,
+                                                        int B, int T, int C, int NH) {
+    constexpr int UNROLL = 8;
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int t3 = UNROLL * (blockIdx.x * warp.meta_group_size() + warp.meta_group_rank());
+
+    int idx = blockIdx.y * T * T;
+    if (t3 >= T) { return; }
+
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+
+    // the innermost loop combines different values of t2 with different values of t.
+    // by handling [t3, t3 + UNROLL) in one thread, we get much better memory reuse:
+    // any t3/t-dependent value can be loaded once before the t2 loop.
+    // within the t2 loop, we can combine each loaded value with each of the UNROLL
+    // pre-loaded values, thus cutting memory ready by a factor of ~UNROLL.
+
+    // one iteration of this loop has to handle the cases
+    // this may lead to some invalid indices; therefore, we have several
+    // early-outs in the iteration over k below.
+    for (int t = t3; t < T; t++) {
+        float result[UNROLL] = {};
+        const float* att_bth = att + idx + t * T;
+        const float* datt_bth = datt + idx + t * T;
+        float* dpreatt_bth = dpreatt + idx + t * T;
+
+        float att_at_t3[UNROLL];
+        for(int k = 0; k < UNROLL; ++k) {
+            if (t < t3 + k) continue;
+            att_at_t3[k] = att_bth[t3 + k];
+        }
+
+        for (int t2 = warp.thread_rank(); t2 <= t; t2 += warp.size()) {
+            float att_t2 = att_bth[t2];
+            float datt_t2 = datt_bth[t2];
+            for(int k = 0; k < UNROLL; ++k) {
+                if (t < t3 + k) continue;
+                float indicator = t2 == (t3 + k) ? 1.0f : 0.0f;
+                float local_derivative = att_t2 * (indicator - att_at_t3[k]);
+                result[k] += local_derivative * datt_t2;
+            }
+        }
+
+        for(int k = 0; k < UNROLL; ++k) {
+            result[k] = cg::reduce(warp, result[k], cg::plus<float>());
+        }
+        if (warp.thread_rank() < UNROLL) {
+            dpreatt_bth[t3 + warp.thread_rank()] = scale * result[warp.thread_rank()];
+        }
+    }
+}
+
+__global__ void softmax_autoregressive_backward_kernel5(float* __restrict__ dpreatt, const float* __restrict__ datt,
+                                                        const float* __restrict__ att,
+                                                        int B, int T, int C, int NH) {
+    constexpr int UNROLL = 8;
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int t3 = UNROLL * (blockIdx.x * warp.meta_group_size() + warp.meta_group_rank());
+
+    int idx = blockIdx.y * T * T;
+    if (t3 >= T) { return; }
+
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    for (int t = t3; t < T; t++) {
+        float result[UNROLL] = {};
+        const float* att_bth = att + idx + t * T;
+        const float* datt_bth = datt + idx + t * T;
+        float* dpreatt_bth = dpreatt + idx + t * T;
+
+        float att_at_t3[UNROLL];
+        for(int k = 0; k < UNROLL; ++k) {
+            // if t < t3+k, we're out of bounds.
+            // in that case, we don't care what we read, because later on,
+            // we won't write the corresponding result. So just clip to
+            // make sure this is a valid (in-bounds) memory access.
+            att_at_t3[k] = att_bth[min(t, t3 + k)];
+        }
+
+        // the code below is actually just a for loop; except,
+        // we have to do something special in one iteration in
+        // the middle, and an if turned out to have significant
+        // performance impact.
+        // so we split the loop in three parts. Ugly, but effective.
+
+        // the beginning/end loop does the same thing, so we write the code
+        // just once in a lambda. In this step, we're guaranteed that
+        // indicator == 0
+        auto loop_step = [&](int t2){
+            float p = att_bth[t2] * datt_bth[t2];
+            for (int k = 0; k < UNROLL; ++k) {
+                result[k] -= p * att_at_t3[k];
+            }
+        };
+
+        // Now the actual loop.
+        {
+            // declare the loop iterator. Needs to be kept across the
+            // three different parts, so it's not a local variable in
+            // the for loop.
+            int t2 = warp.thread_rank();
+
+            // first part, as long as t2 < t3, indicator == 0
+            for (; t2 < t3; t2 += warp.size()) {
+                loop_step(t2);
+            }
+
+            // because k <= warp.size() (==32), the event that t3+k == t2
+            // has to happen at this particular step.
+            static_assert(UNROLL <= 32, "UNROLL is too large, this won't produce correct results.");
+            if (t2 <= t) {
+                float att_t2 = att_bth[t2];
+                float datt_t2 = datt_bth[t2];
+                float p = att_t2 * datt_t2;
+                for (int k = 0; k < UNROLL; ++k) {
+                    float indicator = t2 == (t3 + k) ? 1.0f : 0.0f;
+                    result[k] += p * (indicator - att_at_t3[k]);
+                }
+                t2 += warp.size();
+            }
+
+            // rest of the loop, indicator == 0 again
+            for (; t2 <= t; t2 += warp.size()) {
+                loop_step(t2);
+            }
+        }
+
+        for(int k = 0; k < UNROLL; ++k) {
+            result[k] = cg::reduce(warp, result[k], cg::plus<float>());
+        }
+
+        // when storing, we need to check that this is actually a valid result.
+        // here, warp.thread_rank() corresponds to `k` in the previous loops.
+        if (warp.thread_rank() < UNROLL && t >= t3 + warp.thread_rank()) {
+            dpreatt_bth[t3 + warp.thread_rank()] = scale * result[warp.thread_rank()];
         }
     }
 }
@@ -478,6 +634,16 @@ void launch_softmax_3(float* dpreatt, float* datt, const float* att, int B, int 
     softmax_autoregressive_backward_kernel3<<<dim3(num_blocks, B*NH), block_size>>>(dpreatt, datt, att, B, T, C, NH);
 }
 
+void launch_softmax_4(float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+    int num_blocks = ceil_div(32/8*T, block_size);
+    softmax_autoregressive_backward_kernel4<<<dim3(num_blocks, B*NH), block_size>>>(dpreatt, datt, att, B, T, C, NH);
+}
+
+void launch_softmax_5(float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+    int num_blocks = ceil_div(32/8*T, block_size);
+    softmax_autoregressive_backward_kernel5<<<dim3(num_blocks, B*NH), block_size>>>(dpreatt, datt, att, B, T, C, NH);
+}
+
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
 template<class SoftmaxKernel>
@@ -528,6 +694,7 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
 
     // backward into preatt
     softmax_autoregressive_backward(dpreatt, datt, att, B, T, C, NH, block_size);
+    cudaCheck(cudaGetLastError());
 
     // backward into q
     cublasSgemmStridedBatched(cublas_handle,
@@ -574,6 +741,14 @@ void attention_backward(int kernel_num,
         case 3:
             attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
                                 launch_softmax_3, block_size);
+            break;
+        case 4:
+            attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
+                                launch_softmax_4, block_size);
+            break;
+        case 5:
+            attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
+                                launch_softmax_5, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -724,7 +899,7 @@ int main(int argc, char **argv) {
     printf("All results match. Starting benchmarks.\n\n");
 
     // benchmark speed of the kernel
-    int block_sizes[] = {32, 64, 128, 256, 512};
+    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         int repeat_times = 10;
