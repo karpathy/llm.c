@@ -1261,7 +1261,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // create memory for model parameters on the device
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
-    printf("allocated %d MB for model parameters\n", (int)round(num_parameters * sizeof(float) / 1e6));
+    printf("allocated %d MiB for model parameters\n", (int)round(num_parameters * sizeof(float) / (1024 * 1024)));
 
     // read in all the parameters from file and copy them to device
     float* params_memory_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
@@ -1353,7 +1353,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         }
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
-        printf("allocated %d MB for activations\n", (int)round(num_activations * sizeof(float) / 1e6));
+        printf("allocated %d MiB for activations\n", (int)round(num_activations * sizeof(float) / (1024 * 1024)));
         // also create memory for caching inputs and targets
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
@@ -1470,7 +1470,7 @@ void gpt2_backward(GPT2 *model) {
     if (model->grads_memory == NULL) {
         // allocate buffers for weight gradients
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes, 1);
-        printf("allocated %d MB for parameter gradients\n", (int)round(model->num_parameters * sizeof(float) / 1e6));
+        printf("allocated %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(float) / (1024 * 1024)));
         // we're going to be clever for the activations backward pass. we don't need to exactly
         // mirror the forward pass acrtivations and we will save memory.
         size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
@@ -1494,7 +1494,7 @@ void gpt2_backward(GPT2 *model) {
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             model->num_grad_acts += bw_act_sizes[i];
         }
-        printf("allocated %d MB for activation gradients\n", (int)round(model->num_grad_acts * sizeof(float) / 1e6));
+        printf("allocated %d MiB for activation gradients\n", (int)round(model->num_grad_acts * sizeof(float) / (1024 * 1024)));
         // init gradients of parameters and activations to zero
         gpt2_zero_grad(model);
     }
@@ -1605,8 +1605,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         cudaCheck(cudaMalloc((void**)&model->v_memory, model->num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->m_memory, 0, model->num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->v_memory, 0, model->num_parameters * sizeof(float)));
-        printf("allocated %d MB for AdamW optimizer state m\n", (int)round(model->num_parameters * sizeof(float) / 1e6));
-        printf("allocated %d MB for AdamW optimizer state v\n", (int)round(model->num_parameters * sizeof(float) / 1e6));
+        printf("allocated %d MiB for AdamW optimizer state m\n", (int)round(model->num_parameters * sizeof(float) / (1024 * 1024)));
+        printf("allocated %d MiB for AdamW optimizer state v\n", (int)round(model->num_parameters * sizeof(float) / (1024 * 1024)));
     }
 
     int block_size = 512;
