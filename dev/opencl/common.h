@@ -27,8 +27,7 @@ typedef struct {
     cl_mem matmul_out;
     cl_mem matmul_weight;
     cl_mem matmul_bias;
-    size_t size_global;
-    size_t size_local;
+    size_t max_wg_size;
 } GPT2_CL;
 
 // set env CL_PLATFORM_IDX to select a platform
@@ -141,7 +140,7 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
         exit(1);
     }
 
-    err = clGetKernelWorkGroupInfo(gcl->matmul_forward, gcl->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(gcl->size_local), &gcl->size_local, NULL);
+    err = clGetKernelWorkGroupInfo(gcl->matmul_forward, gcl->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(gcl->max_wg_size), &gcl->max_wg_size, NULL);
     if (err != CL_SUCCESS)
     {
         printf("error: Failed to retrieve kernel work group info! %d\n", err);

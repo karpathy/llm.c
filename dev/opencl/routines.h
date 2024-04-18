@@ -25,11 +25,12 @@ void cl_matmul_forward(GPT2_CL *gcl, float* out,
         exit(1);
     }
 
-    gcl->size_global = B * T * OC;
-    err = clEnqueueNDRangeKernel(gcl->queue, gcl->matmul_forward, 1, NULL, &gcl->size_global, &gcl->size_local, 0, NULL, NULL);
+    size_t size_global[2] = {B * T, gcl->max_wg_size};
+    size_t size_local[2] = {gcl->max_wg_size, 1};
+    err = clEnqueueNDRangeKernel(gcl->queue, gcl->matmul_forward, 2, NULL, size_global, size_local, 0, NULL, NULL);
     if (err != CL_SUCCESS)
     {
-        printf("error: failed to execute kernel!\n");
+        printf("error: failed to execute kernel! %d\n", err);
         exit(1);
     }
     clFinish(gcl->queue);
