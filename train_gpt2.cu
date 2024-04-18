@@ -1,5 +1,14 @@
 /*
 GPT-2 Transformer Neural Net trained in raw CUDA
+Non-trivial notes to be aware of:
+
+We are being clever in the backward pass to conserve memory.
+In particular, all parameters use a += in the backward pass, so we
+can later do gradient accumulation. But all activations have = instead of +=
+because these are faster (just read, no write). This is okay for all activations
+except for those in the residual stream, where the gradients have to add. We make
+sure that those parts work out ok and that we do a += as necessary. E.g.,
+the layernorms are connected to the residuals so we += in layernorm backward.
 */
 
 #include <stdio.h>
@@ -288,9 +297,9 @@ __global__ void permute_kernel_backward(float* dinp,
         int d_ = rest % d;
 
         int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-        dinp[inp_idx] += dq[idx];
-        dinp[inp_idx + NH * d] += dk[idx];
-        dinp[inp_idx + 2 * (NH * d)] += dv[idx];
+        dinp[inp_idx] = dq[idx];
+        dinp[inp_idx + NH * d] = dk[idx];
+        dinp[inp_idx + 2 * (NH * d)] = dv[idx];
     }
 }
 
@@ -323,7 +332,7 @@ __global__ void unpermute_kernel_backward(float* dinp, const float *dout, int B,
         int d_ = rest % d;
 
         int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-        dinp[idx] += dout[other_idx];
+        dinp[idx] = dout[other_idx];
     }
 }
 
@@ -399,14 +408,6 @@ __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, in
     }
 }
 
-__global__ void residual_backward_kernel(float* dinp1, float* dinp2, float* dout, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        dinp1[idx] += __ldcs(&dout[idx]);
-        dinp2[idx] += __ldcs(&dout[idx]);
-    }
-}
-
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 __global__ void gelu_forward_kernel(float* out, const float* inp, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -427,7 +428,7 @@ __global__ void gelu_backward_kernel(float* dinp, const float* inp, const float*
         float coshf_out = coshf(tanh_arg);
         float sech_out = 1.0f / (coshf_out * coshf_out);
         float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
-        dinp[i] += local_grad * dout[i];
+        dinp[i] = local_grad * dout[i];
     }
 }
 
@@ -575,7 +576,7 @@ __global__ void crossentropy_softmax_backward_kernel1(float* dlogits,
         int ix = targets[b * T + t];
         float p = probs_bt[v];
         float indicator = v == ix ? 1.0f : 0.0f;
-        dlogits_bt[v] += (p - indicator) * dloss;
+        dlogits_bt[v] = (p - indicator) * dloss;
     }
 }
 
@@ -601,12 +602,12 @@ __global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* do
     }
     // write the final result (at thread 0) to global memory
     if (tid == 0) {
-        dbias[o] = shared[0];
+        dbias[o] += shared[0];
     }
 }
 
 __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* dbias,
-                        float* dout, float* inp, const float* weight, const float* mean, const float* rstd,
+                        const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                         int B, int T, int C) {
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
@@ -620,8 +621,8 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
     int b = idx / T;
     int t = idx % T;
 
-    float* dout_bt = dout + b * T * C + t * C;
-    float* inp_bt = inp + b * T * C + t * C;
+    const float* dout_bt = dout + b * T * C + t * C;
+    const float* inp_bt = inp + b * T * C + t * C;
     float* dinp_bt = dinp + b * T * C + t * C;
     float mean_bt = mean[b * T + t];
     float rstd_bt = rstd[b * T + t];
@@ -695,7 +696,7 @@ __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const flo
 
         result = cg::reduce(warp, result, cg::plus<float>());
         if(warp.thread_rank() == 0) {
-            dpreatt_bth[t3] += scale * result;
+            dpreatt_bth[t3] = scale * result;
         }
     }
 }
@@ -913,13 +914,6 @@ void residual_forward(float* out, float* inp1, float* inp2, int N) {
     cudaCheck(cudaGetLastError());
 }
 
-void residual_backward(float* dinp1, float* dinp2, float* dout, int N) {
-    const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
-    residual_backward_kernel<<<grid_size, block_size>>>(dinp1, dinp2, dout, N);
-    cudaCheck(cudaGetLastError());
-}
-
 void gelu_forward(float* out, const float* inp, int N) {
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N, block_size);
@@ -965,13 +959,13 @@ void crossentropy_softmax_backward(float* dlogits,
 void matmul_backward(float* dinp, float* dweight, float* dbias,
                      float* dout, float* inp, float* weight,
                      int B, int T, int C, int OC) {
-    float alpha = 1.0f;
-    float beta = 1.0f; // note we must use beta = 1.0 so that we do a +=, as we should, because gradients add
-    // backward to input
-    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &alpha, weight, C, dout, OC, &beta, dinp, C));
-    // backward to weight
-    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &alpha, inp, C, dout, OC, &beta, dweight, C));
-    // backward to bias, if given
+    float one = 1.0f;
+    float zero = 0.0f;
+    // backward to input, uses = in the backward pass (set the gradient)
+    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &one, weight, C, dout, OC, &zero, dinp, C));
+    // backward to weight, uses += in the backward pass (accumulate the gradient)
+    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &one, inp, C, dout, OC, &one, dweight, C));
+    // backward to bias, if given, does a +=
     if (dbias != NULL) {
         const int block_size=512;
         dim3 block_dim(block_size);
@@ -983,7 +977,7 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
 }
 
 void layernorm_backward(float* dinp, float* dweight, float* dbias,
-                        float* dout, float* inp, float* weight, float* mean, float* rstd,
+                        const float* dout, const float* inp, const  float* weight, const float* mean, const float* rstd,
                         int B, int T, int C) {
     const int block_size = 256;
     const int N = B * T;
@@ -1002,8 +996,8 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     const int block_size = 256;
 
     int HS = C / NH; // head size
-    const float alpha = 1.0f;
-    const float beta = 1.0f; // note beta = 1.0f so that we accumulate gradients (+=)
+    const float one = 1.0f;
+    const float zero = 0.0f; // note beta = 1.0f so that we accumulate gradients (+=)
     // unpack convenience pointers into q, k, v
     const float *q, *k, *v;
     q = qkvr + 0 * B * T * C;
@@ -1022,10 +1016,10 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     cublasSgemmStridedBatched(cublas_handle,
                             CUBLAS_OP_T, CUBLAS_OP_N,
                             T, T, HS,
-                            &alpha,
+                            &one,
                             v, HS, T * HS,
                             dvaccum, HS, T * HS,
-                            &beta,
+                            &zero,
                             datt, T, T * T,
                             B * NH);
 
@@ -1033,10 +1027,10 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     cublasSgemmStridedBatched(cublas_handle,
             CUBLAS_OP_N, CUBLAS_OP_T,
             HS, T, T,
-            &alpha,
+            &one,
             dvaccum, HS, T * HS,
             att, T, T * T,
-            &beta,
+            &zero,
             dv, HS, T * HS,
             B * NH);
 
@@ -1047,20 +1041,20 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     cublasSgemmStridedBatched(cublas_handle,
                             CUBLAS_OP_N, CUBLAS_OP_N,
                             HS, T, T,
-                            &alpha,
+                            &one,
                             k, HS, T * HS,
                             dpreatt, T, T * T,
-                            &beta,
+                            &zero,
                             dq, HS, T * HS,
                             B * NH);
     // backward into k
     cublasSgemmStridedBatched(cublas_handle,
                             CUBLAS_OP_N, CUBLAS_OP_T,
                             HS, T, T,
-                            &alpha,
+                            &one,
                             q, HS, T * HS,
                             dpreatt, T, T * T,
-                            &beta,
+                            &zero,
                             dk, HS, T * HS,
                             B * NH);
 
@@ -1154,7 +1148,7 @@ typedef struct {
     float* v_accum; // (L, B, T, C)
 } ActivationTensors;
 
-float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) {
+float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
     size_t num_activations = 0;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         num_activations += act_sizes[i];
@@ -1204,6 +1198,7 @@ typedef struct {
     size_t num_activations;
     // gradients of the activations
     ActivationTensors grads_acts;
+    size_t num_grad_acts;
     float* grads_acts_memory;
     // other run state configuration
     int batch_size; // the batch size (B) of current forward pass
@@ -1288,6 +1283,39 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
+void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
+    int V = config.vocab_size;
+    int L = config.num_layers;
+    int NH = config.num_heads;
+    int C = config.channels;
+
+    act_sizes[0] = B * T * C; // encoded
+    act_sizes[1] = L * B * T * C; // ln1
+    act_sizes[2] = L * B * T; // ln1_mean
+    act_sizes[3] = L * B * T; // ln1_rstd
+    act_sizes[4] = L * B * T * 3*C; // qkv
+    act_sizes[5] = L * B * T * C; // atty
+    act_sizes[6] = L * B * NH * T * T; // preatt
+    act_sizes[7] = L * B * NH * T * T; // att
+    act_sizes[8] = L * B * T * C; // attproj
+    act_sizes[9] = L * B * T * C; // residual2
+    act_sizes[10] = L * B * T * C; // ln2
+    act_sizes[11] = L * B * T; // ln2_mean
+    act_sizes[12] = L * B * T; // ln2_rstd
+    act_sizes[13] = L * B * T * 4*C; // fch
+    act_sizes[14] = L * B * T * 4*C; // fch_gelu
+    act_sizes[15] = L * B * T * C; // fcproj
+    act_sizes[16] = L * B * T * C; // residual3
+    act_sizes[17] = B * T * C; // lnf
+    act_sizes[18] = B * T; // lnf_mean
+    act_sizes[19] = B * T; // lnf_rstd
+    act_sizes[20] = B * T * V; // logits
+    act_sizes[21] = B * T * V; // probs
+    act_sizes[22] = B * T; // losses
+    act_sizes[23] = L * B * T * 3*C; // qkvr
+    act_sizes[24] = L * B * T * C; // v_accum
+}
+
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     // targets are optional and could be NULL
 
@@ -1317,31 +1345,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         model->batch_size = B;
         model->seq_len = T;
         // and now allocate the space
-        model->act_sizes[0] = B * T * C; // encoded
-        model->act_sizes[1] = L * B * T * C; // ln1
-        model->act_sizes[2] = L * B * T; // ln1_mean
-        model->act_sizes[3] = L * B * T; // ln1_rstd
-        model->act_sizes[4] = L * B * T * 3*C; // qkv
-        model->act_sizes[5] = L * B * T * C; // atty
-        model->act_sizes[6] = L * B * NH * T * T; // preatt
-        model->act_sizes[7] = L * B * NH * T * T; // att
-        model->act_sizes[8] = L * B * T * C; // attproj
-        model->act_sizes[9] = L * B * T * C; // residual2
-        model->act_sizes[10] = L * B * T * C; // ln2
-        model->act_sizes[11] = L * B * T; // ln2_mean
-        model->act_sizes[12] = L * B * T; // ln2_rstd
-        model->act_sizes[13] = L * B * T * 4*C; // fch
-        model->act_sizes[14] = L * B * T * 4*C; // fch_gelu
-        model->act_sizes[15] = L * B * T * C; // fcproj
-        model->act_sizes[16] = L * B * T * C; // residual3
-        model->act_sizes[17] = B * T * C; // lnf
-        model->act_sizes[18] = B * T; // lnf_mean
-        model->act_sizes[19] = B * T; // lnf_rstd
-        model->act_sizes[20] = B * T * V; // logits
-        model->act_sizes[21] = B * T * V; // probs
-        model->act_sizes[22] = B * T; // losses
-        model->act_sizes[23] = L * B * T * 3*C; // qkvr
-        model->act_sizes[24] = L * B * T * C; // v_accum
+        fill_in_activation_sizes(model->act_sizes, B, T, model->config);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
@@ -1449,7 +1453,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 }
 
 void gpt2_zero_grad(GPT2 *model) {
-    if (model->grads_acts_memory != NULL) { cudaCheck(cudaMemset(model->grads_acts_memory, 0, model->num_activations * sizeof(float))); }
+    if (model->grads_acts_memory != NULL) { cudaCheck(cudaMemset(model->grads_acts_memory, 0, model->num_grad_acts * sizeof(float))); }
     if (model->grads_memory != NULL) { cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(float))); }
 }
 
@@ -1463,8 +1467,32 @@ void gpt2_backward(GPT2 *model) {
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
+        // allocate buffers for weight gradients
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes, 1);
-        model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, model->act_sizes);
+
+        // we're going to be clever for the activations backward pass. we don't need to exactly
+        // mirror the forward pass acrtivations and we will save memory.
+        size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
+        GPT2Config cfg = model->config;
+        cfg.num_layers = 1; // copy the configuration but override number of layers to 1
+        fill_in_activation_sizes(bw_act_sizes, model->batch_size, model->seq_len, cfg);
+        // on top of that, some buffers are not needed at all, set their sizes to zero
+        bw_act_sizes[0] = 0; // encoded
+        bw_act_sizes[2] = 0; // ln1_mean
+        bw_act_sizes[3] = 0; // ln1_rstd
+        bw_act_sizes[8] = 0; // attproj
+        bw_act_sizes[9] = 0; // residual2
+        bw_act_sizes[11] = 0; // ln2_mean
+        bw_act_sizes[12] = 0; // ln2_rstd
+        bw_act_sizes[18] = 0; // lnf_mean
+        bw_act_sizes[19] = 0; // lnf_rstd
+        bw_act_sizes[21] = 0; // probs
+        // count up and allocate the space
+        model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, bw_act_sizes);
+        model->num_grad_acts = 0;
+        for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+            model->num_grad_acts += bw_act_sizes[i];
+        }
         gpt2_zero_grad(model);
     }
 
@@ -1493,13 +1521,12 @@ void gpt2_backward(GPT2 *model) {
     matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, V);
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // and its gradient
+    float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
 
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
-        dresidual = l == 0 ? grads_acts.encoded : grads_acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
         float* l_ln1w = params.ln1w + l * C;
@@ -1538,34 +1565,32 @@ void gpt2_backward(GPT2 *model) {
         float* l_fch = acts.fch + l * B * T * 4*C;
         float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
         // get the pointers of the gradients of the activations for this layer
-        float* dl_ln1 = grads_acts.ln1 + l * B * T * C;
-        float* dl_qkv = grads_acts.qkv + l * B * T * 3*C;
-        float* dl_qkvr = grads_acts.qkvr + l * B * T * 3*C;
-        float* dl_atty = grads_acts.atty + l * B * T * C;
-        float* dl_preatt = grads_acts.preatt + l * B * NH * T * T;
-        float* dl_att = grads_acts.att + l * B * NH * T * T;
-        float* dl_v_accum = grads_acts.v_accum + l * B * T * C;
-        float* dl_attproj = grads_acts.attproj + l * B * T * C;
-        float* dl_residual2 = grads_acts.residual2 + l * B * T * C;
-        float* dl_ln2 = grads_acts.ln2 + l * B * T * C;
-        float* dl_fch = grads_acts.fch + l * B * T * 4*C;
-        float* dl_fch_gelu = grads_acts.fch_gelu + l * B * T * 4*C;
-        float* dl_fcproj = grads_acts.fcproj + l * B * T * C;
-        float* dl_residual3 = grads_acts.residual3 + l * B * T * C;
+        // notice that there is no l *, because we just have a single copy, and keep
+        // re-using this memory in every Transformer block as we calculate backward pass
+        float* dl_ln1 = grads_acts.ln1;
+        float* dl_qkv = grads_acts.qkv;
+        float* dl_qkvr = grads_acts.qkvr;
+        float* dl_atty = grads_acts.atty;
+        float* dl_preatt = grads_acts.preatt;
+        float* dl_att = grads_acts.att;
+        float* dl_v_accum = grads_acts.v_accum;
+        float* dl_ln2 = grads_acts.ln2;
+        float* dl_fch = grads_acts.fch;
+        float* dl_fch_gelu = grads_acts.fch_gelu;
 
         // backprop this layer
-        residual_backward(dl_residual2, dl_fcproj, dl_residual3, B*T*C);
-        matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
+        matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
         gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
         matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
-        layernorm_backward(dl_residual2, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
-        residual_backward(dresidual, dl_attproj, dl_residual2, B*T*C);
-        matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C);
+        // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
+        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
+        matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
         attention_backward(dl_qkv, dl_qkvr, dl_preatt, dl_att, dl_v_accum, dl_atty, l_qkv, l_qkvr, l_preatt, l_att, l_v_accum, B, T, C, NH);
         matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
+        // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
-    encoder_backward(grads.wte, grads.wpe, grads_acts.encoded, model->inputs, B, T, C);
+    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
 }
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
