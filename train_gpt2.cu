@@ -344,7 +344,7 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    int idx = (gridDim.x - blockIdx.x -1) * warp.meta_group_size() + warp.meta_group_rank();
     if(idx >= N * T) {
         return;
     }
