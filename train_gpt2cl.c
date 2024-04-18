@@ -13,6 +13,9 @@ This version uses OpenCL
 #include <string.h>
 #include <unistd.h>
 #include "dev/opencl/routines.h"
+#ifdef OMP
+#include <omp.h>
+#endif
 
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
@@ -153,6 +156,7 @@ void matmul_forward(float* out,
     // OC is short for "output channels"
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
     // out will be (B,T,OC)
+    #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             float* out_bt = out + b * T * OC + t * OC;
@@ -177,6 +181,7 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     // but that doesn't afford an efficient parallelization strategy
 
     // backward into inp first, parallelize over B,T
+    #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             float* dout_bt = dout + b * T * OC + t * OC;
@@ -191,6 +196,7 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
         }
     }
     // backward into weight/bias, parallelize over output channels OC
+    #pragma omp parallel for
     for (int o = 0; o < OC; o++) {
         for (int b = 0; b < B; b++) {
             for (int t = 0; t < T; t++) {
@@ -221,6 +227,7 @@ void attention_forward(float* out, float* preatt, float* att,
     int hs = C / NH; // head size
     float scale = 1.0 / sqrtf(hs);
 
+    #pragma omp parallel for collapse(3)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
@@ -381,6 +388,7 @@ void residual_backward(float* dinp1, float* dinp2, float* dout, int N) {
 void softmax_forward(float* probs, float* logits, int B, int T, int V) {
     // output: probs are (B,T,V) of the probabilities (sums to 1.0 in each b,t position)
     // input: logits is (B,T,V) of the unnormalized log probabilities
+    #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // probs <- softmax(logits)

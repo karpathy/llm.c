@@ -47,6 +47,7 @@ void cl_matmul_forward_bias(GPT2_CL *gcl, float* out,
                     int B, int T, int C, int OC) {
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
     // out will be (B,T,OC)
+    #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             float* out_bt = out + b * T * OC + t * OC;
