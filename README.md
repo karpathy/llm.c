@@ -149,7 +149,7 @@ And being gone to find some gentleman to his place
 Zilled me with his eagle; and thus to find my light
 ```
 
-So as currently configured, we come down to validation loss of 3.51 and can generate okay samples. This runs on my A100 in about ~30 seconds.
+So as currently configured, we come down to validation loss of 3.51 and can generate okay samples. This runs on my A100 in about ~30 seconds. Even so, this training loop in PyTorch is about 80ms/iteration, so we are currently ~5X slower. The kernels are being actively optimized and worked on and we aspire to reach the same vicinity soon^TM.
 
 **Timing**. Finally we can time the code and compare the speed to PyTorch. Because the backward pass CUDA kernels are still very new and being optimized, I'd recommend turning off the backward + update in `train_gpt2.cu`:
 
