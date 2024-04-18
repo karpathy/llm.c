@@ -164,11 +164,13 @@ __device__ SoftmaxParams prepare_softmax_blockwide(cg::thread_block_tile<32>& wa
     float thread_sumval = 0.0f;
     // do the loop in reverse to maximise probability of L2 cache hits
     // so even small L2s get some hits on the 2nd read of the same thread
-    for (int i = (V+3)/4 + (threadIdx.x - blockDim.x); i >= 0; i -= blockDim.x) {
+    for (int i = (V+3)/4 + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
         float4 v4 = x_vec4[i];
         #pragma unroll
-        for(int k = 0; k < 4; ++k) {
-            float v = (i*4+k < V) ? vec_at(v4, k) : 0.f; // bounds checking against real V
+        for(int k = 0; k < 4; k++) {
+            if (i*4+k >= V) {  // bounds checking against real V
+                continue;
+            }
             float old_maxval = thread_maxval;
             thread_maxval = fmaxf(thread_maxval, vec_at(v4, k));
             thread_sumval *= expf((old_maxval - thread_maxval));
