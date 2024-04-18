@@ -500,11 +500,51 @@ __global__ void softmax_autoregressive_backward_kernel5(float* __restrict__ dpre
             att_at_t3[k] = att_bth[min(t, t3 + k)];
         }
 
-        for (int t2 = warp.thread_rank(); t2 <= t; t2 += warp.size()) {
+        // the code below is actually just a for loop; except,
+        // we have to do something special in one iteration in
+        // the middle, and an if turned out to have significant
+        // performance impact.
+        // so we split the loop in three parts. Ugly, but effective.
+
+        // the beginning/end loop does the same thing, so we write the code
+        // just once in a lambda. In this step, we're guaranteed that
+        // indicator == 0
+        auto loop_step = [&](int t2){
             float p = att_bth[t2] * datt_bth[t2];
-            for(int k = 0; k < UNROLL; ++k) {
-                float indicator = t2 == (t3 + k) ? 1.0f : 0.0f;
-                result[k] += p * (indicator - att_at_t3[k]);
+            for (int k = 0; k < UNROLL; ++k) {
+                result[k] -= p * att_at_t3[k];
+            }
+        };
+
+        // Now the actual loop.
+        {
+            // declare the loop iterator. Needs to be kept across the
+            // three different parts, so it's not a local variable in
+            // the for loop.
+            int t2 = warp.thread_rank();
+
+            // first part, as long as t2 < t3, indicator == 0
+            for (; t2 < t3; t2 += warp.size()) {
+                loop_step(t2);
+            }
+
+            // because k <= warp.size() (==32), the event that t3+k == t2
+            // has to happen at this particular step.
+            static_assert(UNROLL <= 32, "UNROLL is too large, this won't produce correct results.");
+            if (t2 <= t) {
+                float att_t2 = att_bth[t2];
+                float datt_t2 = datt_bth[t2];
+                float p = att_t2 * datt_t2;
+                for (int k = 0; k < UNROLL; ++k) {
+                    float indicator = t2 == (t3 + k) ? 1.0f : 0.0f;
+                    result[k] += p * (indicator - att_at_t3[k]);
+                }
+                t2 += warp.size();
+            }
+
+            // rest of the loop, indicator == 0 again
+            for (; t2 <= t; t2 += warp.size()) {
+                loop_step(t2);
             }
         }
 
