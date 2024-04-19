@@ -14,6 +14,7 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdint.h>
 #include <math.h>
 #include <time.h>
 #include <assert.h>
@@ -1694,14 +1695,14 @@ void dataloader_free(DataLoader *loader) {
 
 #define GPT2_EOT 50256
 
-unsigned int random_u32(unsigned long long *state) {
+uint32_t random_u32(uint64_t *state) {
     // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
     *state ^= *state >> 12;
     *state ^= *state << 25;
     *state ^= *state >> 27;
-    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
+    return static_cast<uint32_t>((*state * 0x2545F4914F6CDD1Dull) >> 32);
 }
-float random_f32(unsigned long long *state) { // random float32 in [0,1)
+float random_f32(uint64_t *state) { // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
@@ -1860,7 +1861,7 @@ int main() {
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
     // some memory for generating samples from the model
-    unsigned long long rng_state = 1337;
+    uint64_t rng_state = 1337;
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     float* cpu_probs = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
