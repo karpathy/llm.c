@@ -632,9 +632,10 @@ __global__ void __launch_bounds__(BlockSize) softmax_autoregressive_backward_ker
     }
 }
 
+// Actually disentangling the loops and simplifying the resulting math gives us this pretty nice kernel.
 template<int BlockSize>
 __global__ void softmax_autoregressive_backward_kernel7(float* dpreatt, const float* datt, const float* att,
-                                                        int B, int T, int C, int NH) {
+                                                        int B, int T, int C, float scale) {
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
@@ -647,8 +648,6 @@ __global__ void softmax_autoregressive_backward_kernel7(float* dpreatt, const fl
     datt += idx * T * T;
     dpreatt += idx * T * T;
 
-    int hs = C / NH; // head size
-    float scale = 1.0f / sqrtf(hs);
     const float* att_bth = att + t * T;
     const float* datt_bth = datt + t * T;
     float* dpreatt_bth = dpreatt + t * T;
@@ -666,12 +665,59 @@ __global__ void softmax_autoregressive_backward_kernel7(float* dpreatt, const fl
     block.sync();
     local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
 
-    for (int t3 = block.thread_rank(); t3 <= t; t3  += BlockSize) {
-        float at3 = att_bth[t3];
-        float acc = -local_sum * at3;
-        float at_t2_eq_t3 = at3 * datt_bth[t3];
-        acc += (at_t2_eq_t3 * (1.f - at3) - at_t2_eq_t3 * (0.f - at3));
+    for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
+        float acc = att_bth[t3] * (datt_bth[t3] - local_sum);
         dpreatt_bth[t3] = scale * acc;
+    }
+}
+
+// The slightly less pretty version of kernel 7. Adding in all the dirty tricks that can give us a few more percent
+//  - streaming memory access instructions
+//  - reordering blocks to prevent tail effect
+//  - multiple values of T per block
+template<int BlockSize>
+__global__ void softmax_autoregressive_backward_kernel8(float* dpreatt, const float* datt, const float* att,
+                                                        int B, int T, int C, float scale) {
+    namespace cg = cooperative_groups;
+    constexpr int T_per_block = 4;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    __shared__ float block_acc[32];
+
+    int idx = blockIdx.y;
+    // go through blocks in reverse order, so the slowest block starts first
+    int t0 = T - 1 - T_per_block*blockIdx.x;
+
+    att += idx * T * T;
+    datt += idx * T * T;
+    dpreatt += idx * T * T;
+
+    if (warp.meta_group_rank() == 0) {
+        block_acc[warp.thread_rank()] = 0;
+    }
+
+    for(int to = 0; to < T_per_block; ++to) {
+        int t = t0 - to;
+        if(t < 0) return;
+        const float* att_bth = att + t * T;
+        const float* datt_bth = datt + t * T;
+        float* dpreatt_bth = dpreatt + t * T;
+
+        float local_sum = 0;
+        for (int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
+            local_sum += att_bth[t2] * datt_bth[t2];
+        }
+
+        block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
+        block.sync();
+        local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+
+        for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
+            // don't touch the cache. Some parts will still be here from the previous loop, and
+            // we want to exploit those.
+            float acc = __ldcs(att_bth + t3) * (__ldcs(datt_bth + t3) - local_sum);
+            __stcs(dpreatt_bth + t3, scale * acc);
+        }
     }
 }
 
@@ -788,10 +834,23 @@ void launch_softmax_6(float* dpreatt, float* datt, const float* att, int B, int 
 }
 
 void launch_softmax_7(float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
     auto launch = [&](auto int_const) {
         constexpr int block_size = int_const.value;
         softmax_autoregressive_backward_kernel7<block_size><<<dim3(T, B * NH), block_size>>>
-                                                              (dpreatt, datt, att, B, T, C, NH);
+                                                              (dpreatt, datt, att, B, T, C, scale);
+    };
+    dispatch_launch(launch, block_size);
+}
+
+void launch_softmax_8(float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    auto launch = [&](auto int_const) {
+        constexpr int block_size = int_const.value;
+        softmax_autoregressive_backward_kernel8<block_size><<<dim3(T / 4, B * NH), block_size>>>
+                                                              (dpreatt, datt, att, B, T, C, scale);
     };
     dispatch_launch(launch, block_size);
 }
@@ -821,6 +880,7 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
     // backward through the unpermute operation
     int num_blocks = ceil_div(B * T * C, block_size);
     unpermute_kernel_backward<<<num_blocks, block_size>>>(dvaccum, dout, B, T, NH, HS);
+    cudaCheck(cudaGetLastError());
 
     // backward into datt
     cublasCheck(cublasSgemmStridedBatched(cublas_handle,
@@ -872,6 +932,7 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
     // backward into inp
     num_blocks = ceil_div(B * NH * T * HS, block_size);
     permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
+    cudaCheck(cudaGetLastError());
 }
 
 // kernel version dispatch
@@ -909,6 +970,10 @@ void attention_backward(int kernel_num,
         case 7:
             attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
                                 launch_softmax_7, block_size);
+            break;
+        case 8:
+            attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
+                                launch_softmax_8, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
