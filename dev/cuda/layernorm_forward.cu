@@ -156,7 +156,7 @@ __global__ void rstd_kernel(float* rstd, const float* inp, const float* mean, in
     }
 }
 
-__global__ void normalization_kernel(float* out, const float* inp, float* mean, float* rstd,
+__global__ void normalization_kernel(float* out, const float* inp, const float* mean, const float* rstd,
                                      const float* weight, const float* bias, int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
