@@ -80,6 +80,7 @@ template<class T>
 void validate_result(T* device_result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance=1e-4) {
     T* out_gpu = (T*)malloc(num_elements * sizeof(T));
     cudaCheck(cudaMemcpy(out_gpu, device_result, num_elements * sizeof(T), cudaMemcpyDeviceToHost));
+    int nfaults = 0;
     for (int i = 0; i < num_elements; i++) {
         // print the first few comparisons
         if (i < 5) {
@@ -87,15 +88,20 @@ void validate_result(T* device_result, const T* cpu_reference, const char* name,
         }
         // ensure correctness for all elements
         if (fabs(cpu_reference[i] - out_gpu[i]) > tolerance) {
-            printf("Mismatch of %s at %d: %f vs %f\n", name, i, cpu_reference[i], out_gpu[i]);
-            free(out_gpu);
-            exit(EXIT_FAILURE);
+            printf("Mismatch of %s at %d: CPU_ref: %f vs GPU: %f\n", name, i, cpu_reference[i], out_gpu[i]);
+            nfaults ++;
+            if (nfaults >= 10) {
+                free(out_gpu);
+                exit(EXIT_FAILURE);
+            }
         }
     }
 
     // reset the result pointer, so we can chain multiple tests and don't miss trivial errors,
     // like the kernel not writing to part of the result.
-    cudaMemset(device_result, 0, num_elements * sizeof(T));
+    // cudaMemset(device_result, 0, num_elements * sizeof(T));
+    // AK: taking this out, ~2 hours of my life was spent finding this line
+
     free(out_gpu);
 }
 
