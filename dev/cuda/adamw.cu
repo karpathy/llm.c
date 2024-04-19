@@ -29,7 +29,7 @@ thread coarsening/ILP
 // ----------------------------------------------------------------------------
 // CPU code reference
 
-void adamw_cpu(float* params_memory, float* grads_memory, float* m_memory, float* v_memory, int t, long num_parameters, float learning_rate=1e-3, float beta1=0.9, float beta2=0.999, float eps=1e-8, float weight_decay=0.0) {
+void adamw_cpu(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, int t, long num_parameters, float learning_rate=1e-3, float beta1=0.9, float beta2=0.999, float eps=1e-8, float weight_decay=0.0) {
     // adapted from: train_gpt2.c
 
     for (int i = 0; i < num_parameters; i++) {
@@ -63,7 +63,7 @@ __device__ inline float lerp(float start, float end, float weight) {
 }
 
 // naive fused kernel
-__global__ void adamw_kernel1(float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+__global__ void adamw_kernel1(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
    int i = blockIdx.x * blockDim.x + threadIdx.x;
    if (i >= num_parameters) return;  // guard
@@ -79,7 +79,7 @@ __global__ void adamw_kernel1(float* params_memory, float* grads_memory, float* 
 // Slightly more optimized AdamW kernel by:
 // * loading data that is accessed more than once into registers,
 // * using optimized linear interpolation for the moment updates.
-__global__ void adamw_kernel2(float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+__global__ void adamw_kernel2(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
    int i = blockIdx.x * blockDim.x + threadIdx.x;
    if (i >= num_parameters) return;  // guard
@@ -102,7 +102,7 @@ __global__ void adamw_kernel2(float* params_memory, float* grads_memory, float* 
 // kernel launcher
 
 // version 1: naive dispatch to naive kernel
-void adamw_dispatch1(float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+void adamw_dispatch1(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                      float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
     unsigned int block_size = 512;
     unsigned int num_blocks = ceil_div(num_parameters, (long) block_size);
@@ -112,7 +112,7 @@ void adamw_dispatch1(float* params_memory, float* grads_memory, float* m_memory,
 }
 
 // version 2: naive dispatch to slightly optimized kernel
-void adamw_dispatch2(float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+void adamw_dispatch2(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                      float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
     unsigned int block_size = 512;
     unsigned int num_blocks = ceil_div(num_parameters, (long) block_size);
@@ -122,7 +122,7 @@ void adamw_dispatch2(float* params_memory, float* grads_memory, float* m_memory,
 }
 
 void adamw(int kernel_num,
-           float* params_memory, float* grads_memory, float* m_memory, float* v_memory, int t, long num_parameters,
+           float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, int t, long num_parameters,
            float learning_rate=1e-3, float beta1=0.9, float beta2=0.999, float eps=1e-8, float weight_decay=0.0) {
     // calculate the m_hat and v_hat correction terms once as they are the same for every param/thread
     float beta1_correction = 1.0f - powf(beta1, t);
@@ -150,11 +150,11 @@ int main(int argc, char **argv) {
     const long num_parameters = 1048576;
     const int t = 10;
 
-    const float learning_rate = 1e-3;
-    const float beta1 = 0.9;
-    const float beta2 = 0.999;
-    const float eps = 1e-8;
-    const float weight_decay = 0.0;
+    const float learning_rate = 1e-3f;
+    const float beta1 = 0.9f;
+    const float beta2 = 0.999f;
+    const float eps = 1e-8f;
+    const float weight_decay = 0.0f;
 
 
     // set up the device
