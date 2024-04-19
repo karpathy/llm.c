@@ -244,9 +244,10 @@ __global__ void fused_classifier_kernel2(float* dlogits, float* losses, float* p
         losses[idx] = -logf(prob);
     }
 
+    // very sensible default for dlosses is 1/(B*T), which is the uniform loss
+    float dloss = dlosses != NULL ? dlosses[idx] : 1.0f / (B*T);
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
-    float dloss = dlosses ? dlosses[idx] : 0.f;
     const float4* logits_vec4 = reinterpret_cast<const float4*>(logits + idx * P);
     for (int i = threadIdx.x; i < (V+3)/4; i += blockDim.x) {
         // this is the 2nd read of logits after the one in prepare_softmax2
