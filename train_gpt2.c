@@ -489,7 +489,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += param_sizes[i];
     }
-    // mallocCheck all parameters all at once
+    // malloc all parameters all at once
     float* params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
     // assign all the tensors
     float** ptrs[] = {
