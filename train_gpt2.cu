@@ -60,6 +60,8 @@ static cublasComputeType_t cublas_compute_type;
 cublasHandle_t cublas_handle;
 cublasLtHandle_t cublaslt_handle;
 
+namespace cg = cooperative_groups;
+
 // ----------------------------------------------------------------------------
 // fread convenience utils, with nice handling of error checking using macros
 // simple replace fopen, fread, fclose with fopenCheck, freadCheck, fcloseCheck
@@ -199,7 +201,6 @@ __global__ void encoder_backward_kernel(float* dwte, float* dwpe,
 __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const float*  __restrict__ inp, const float*  __restrict__ weight,
                                     const float* __restrict__ bias, int N, int C) {
-    namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
@@ -350,7 +351,6 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     // directly autoregressive, so we only compute the lower triangular part
     // uses the online softmax algorithm
     assert(T % 4  == 0);
-    namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
@@ -609,7 +609,6 @@ __global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* do
 __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* dbias,
                         const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                         int B, int T, int C) {
-    namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
@@ -661,18 +660,10 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
     }
 }
 
-__global__ void setConstant(float* vec, float constant, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        vec[idx] = constant;
-    }
-}
-
 // naive kernel to backward through an autoregressive softmax, just to get correctness
 __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
                                                        int B, int T, int C, int NH) {
     constexpr int UNROLL = 8;
-    namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int t3 = UNROLL * (blockIdx.x * warp.meta_group_size() + warp.meta_group_rank());
@@ -780,6 +771,101 @@ __global__ void adamw_kernel2(float* params_memory, float* grads_memory, float* 
    m /= beta1_correction;  // m_hat
    v /= beta2_correction;  // v_hat
    params_memory[i] -= learning_rate * (m / (sqrtf(v) + eps) + weight_decay * params_memory[i]);
+}
+
+struct SoftmaxParams {
+    float Scale;
+    float Offset;
+};
+
+
+__device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_tile<32>& warp,
+                                                   int idx, const float* inp, int V, int P) {
+    // same but not float4
+    // one row of inp, i.e. inp[idx, :] of shape (V,)
+
+    const float* x = inp + idx * P;
+    float thread_maxval = -INFINITY;
+    float thread_sumval = 0.0f;
+    // do the loop in reverse to maximise probability of L2 cache hits
+    // so even small L2s get some hits on the 2nd read of the same thread
+    for (int i = V + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
+        float v = x[i];
+        float old_maxval = thread_maxval;
+        thread_maxval = fmaxf(thread_maxval, v);
+        thread_sumval *= expf((old_maxval - thread_maxval));
+        thread_sumval += expf(v - thread_maxval);
+    }
+
+    // two reductions of up to 1024 threads:
+    // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
+    // this results in much cleaner assembly than a multi-warp cg::reduce
+    __shared__ float shared_maxval[32];
+    __shared__ float shared_sumval[32];
+    int num_warps = blockDim.x / 32;
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+
+    // reduce maxval within each warp
+    float warp_maxval = cg::reduce(warp, thread_maxval, cg::greater<float>{});
+    // thread 0 in each warp writes to shared memory
+    if (lane_id == 0) { shared_maxval[warp_id] = warp_maxval; }
+    __syncthreads();
+    // each thread now loads the maxval across previous warps
+    // if the thread is "out of range" of data, use -FLT_MAX as the maxval
+    warp_maxval = (lane_id < num_warps) ? shared_maxval[lane_id] : -FLT_MAX;
+    // now reduce the maxval among the warp threads
+    float block_maxval = cg::reduce(warp, warp_maxval, cg::greater<float>{});
+    // each thread uses maxval to scale sumval to avoid numerical instability / overflow
+    thread_sumval *= expf(thread_maxval - block_maxval);
+    // (warp-level) reduce sumval, thread 0 in each warp saves result in shared memory
+    float warp_sumval = cg::reduce(warp, thread_sumval, cg::plus<float>{});
+    if (lane_id == 0) { shared_sumval[warp_id] = warp_sumval; }
+    __syncthreads();
+    // same strategy, now reduce sumval across warps
+    warp_sumval = (lane_id < num_warps) ? shared_sumval[lane_id] : 0.0f;
+    float block_sumval = cg::reduce(warp, warp_sumval, cg::plus<float>{});
+    // return the softmax parameters
+    return SoftmaxParams{1.f / block_sumval, block_maxval};
+}
+
+// same as 2 but not using float4 (see dev/cuda/classifier_fused.cu)
+__global__ void fused_classifier_kernel3(float* dlogits, float* losses, float* probs,
+                                         const float* logits, const float* dlosses, const int* targets,
+                                         int B, int T, int V, int P) {
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int idx = blockIdx.x;
+    int ix = targets[idx];
+
+    // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
+    SoftmaxParams sp = prepare_softmax_blockwide_nofloat4(warp, idx, logits, V, P);
+
+    // calculate the probability needed for the loss and update (single-threaded)
+    if(threadIdx.x == 0) {
+        float prob = expf(logits[idx * P + ix] - sp.Offset) * sp.Scale;
+        losses[idx] = -logf(prob);
+    }
+
+    // very sensible default for dlosses is 1/(B*T), which is the uniform loss
+    float dloss = dlosses != NULL ? dlosses[idx] : 1.0f / (B*T);
+    // calculate the gradients directly, saves bandwidth from probs during training
+    // but also supports writing probs for inference-only and debugging
+    const float* logits_vec = logits + idx * P;
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        // this is the 2nd read of logits after the one in prepare_softmax2
+        // this data will never be needed again, so we reduce cache persistence
+        float v = __ldcs(&logits_vec[i]);
+        float prob = expf(v - sp.Offset) * sp.Scale;
+        if (probs != NULL) {
+            probs[idx * P + i] = prob;
+        }
+        if (dlogits != NULL) {
+            float indicator = (i == ix) ? 1.0f : 0.0f;
+            dlogits[idx * P + i] = (prob - indicator) * dloss;
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1119,8 +1205,26 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
 }
 
+void fused_classifier3(float* dlogits, float* losses,
+                      const float* logits, const float* dlosses, const int* targets,
+                      int B, int T, int V, int P) {
+    const int block_size = 1024;
+    const int N = B * T;
+    const int grid_size = N;
+    fused_classifier_kernel3<<<grid_size, block_size>>>(dlogits, losses, NULL, logits, dlosses, targets, B, T, V, P);
+    cudaCheck(cudaGetLastError());
+}
+
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
+
+typedef struct {
+    int max_seq_len; // max sequence length, e.g. 1024
+    int vocab_size; // vocab size, e.g. 50257
+    int num_layers; // number of layers, e.g. 12
+    int num_heads; // number of heads in attention, e.g. 12
+    int channels; // number of channels, e.g. 768
+} GPT2Config;
 
 // the parameters of the model
 #define NUM_PARAMETER_TENSORS 16
@@ -1143,6 +1247,28 @@ typedef struct {
     float* lnfb; // (C)
 } ParameterTensors;
 
+void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
+    int V = config.vocab_size;
+    int C = config.channels;
+    int maxT = config.max_seq_len;
+    int L = config.num_layers;
+    param_sizes[0] = V * C; // wte
+    param_sizes[1] = maxT * C; // wpe
+    param_sizes[2] = L * C; // ln1w
+    param_sizes[3] = L * C; // ln1b
+    param_sizes[4] = L * (3 * C) * C; // qkvw
+    param_sizes[5] = L * (3 * C); // qkvb
+    param_sizes[6] = L * C * C; // attprojw
+    param_sizes[7] = L * C; // attprojb
+    param_sizes[8] = L * C; // ln2w
+    param_sizes[9] = L * C; // ln2b
+    param_sizes[10] = L * (4 * C) * C; // fcw
+    param_sizes[11] = L * (4 * C); // fcb
+    param_sizes[12] = L * C * (4 * C); // fcprojw
+    param_sizes[13] = L * C; // fcprojb
+    param_sizes[14] = C; // lnfw
+    param_sizes[15] = C; // lnfb
+}
 
 // allocate memory for the parameters and point the individual tensors to the right places
 float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes, int on_device) {
@@ -1173,8 +1299,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     return params_memory;
 }
 
-
-#define NUM_ACTIVATION_TENSORS 25
+#define NUM_ACTIVATION_TENSORS 26
 typedef struct {
     float* encoded; // (B, T, C)
     float* ln1; // (L, B, T, C)
@@ -1202,7 +1327,42 @@ typedef struct {
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
     float* qkvr; // (L, B, T, 3*C)
     float* v_accum; // (L, B, T, C)
+    // dlogits is used in fused_classifier. we backprop into it in the fused fwdbwd kernel for speed
+    float* dlogits; // (B,T,V)
 } ActivationTensors;
+
+void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
+    int V = config.vocab_size;
+    int L = config.num_layers;
+    int NH = config.num_heads;
+    int C = config.channels;
+    act_sizes[0] = B * T * C; // encoded
+    act_sizes[1] = L * B * T * C; // ln1
+    act_sizes[2] = L * B * T; // ln1_mean
+    act_sizes[3] = L * B * T; // ln1_rstd
+    act_sizes[4] = L * B * T * 3*C; // qkv
+    act_sizes[5] = L * B * T * C; // atty
+    act_sizes[6] = L * B * NH * T * T; // preatt
+    act_sizes[7] = L * B * NH * T * T; // att
+    act_sizes[8] = L * B * T * C; // attproj
+    act_sizes[9] = L * B * T * C; // residual2
+    act_sizes[10] = L * B * T * C; // ln2
+    act_sizes[11] = L * B * T; // ln2_mean
+    act_sizes[12] = L * B * T; // ln2_rstd
+    act_sizes[13] = L * B * T * 4*C; // fch
+    act_sizes[14] = L * B * T * 4*C; // fch_gelu
+    act_sizes[15] = L * B * T * C; // fcproj
+    act_sizes[16] = L * B * T * C; // residual3
+    act_sizes[17] = B * T * C; // lnf
+    act_sizes[18] = B * T; // lnf_mean
+    act_sizes[19] = B * T; // lnf_rstd
+    act_sizes[20] = B * T * V; // logits
+    act_sizes[21] = B * T * V; // probs
+    act_sizes[22] = B * T; // losses
+    act_sizes[23] = L * B * T * 3*C; // qkvr
+    act_sizes[24] = L * B * T * C; // v_accum
+    act_sizes[25] = B * T * V; // dlogits (for fused_classifier)
+}
 
 float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
     size_t num_activations = 0;
@@ -1216,7 +1376,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
         &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
         &acts->lnf_mean, &acts->lnf_rstd, &acts->logits, &acts->probs, &acts->losses,
-        &acts->qkvr, &acts->v_accum
+        &acts->qkvr, &acts->v_accum, &acts->dlogits
     };
     float* acts_memory_iterator = acts_memory;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
@@ -1225,14 +1385,6 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
     }
     return acts_memory;
 }
-
-typedef struct {
-    int max_seq_len; // max sequence length, e.g. 1024
-    int vocab_size; // vocab size, e.g. 50257
-    int num_layers; // number of layers, e.g. 12
-    int num_heads; // number of heads in attention, e.g. 12
-    int channels; // number of channels, e.g. 768
-} GPT2Config;
 
 typedef struct {
     GPT2Config config;
@@ -1290,22 +1442,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     printf("channels: %d\n", C);
 
     // allocate space for all the parameters and read them in
-    model->param_sizes[0] = V * C; // wte
-    model->param_sizes[1] = maxT * C; // wpe
-    model->param_sizes[2] = L * C; // ln1w
-    model->param_sizes[3] = L * C; // ln1b
-    model->param_sizes[4] = L * (3 * C) * C; // qkvw
-    model->param_sizes[5] = L * (3 * C); // qkvb
-    model->param_sizes[6] = L * C * C; // attprojw
-    model->param_sizes[7] = L * C; // attprojb
-    model->param_sizes[8] = L * C; // ln2w
-    model->param_sizes[9] = L * C; // ln2b
-    model->param_sizes[10] = L * (4 * C) * C; // fcw
-    model->param_sizes[11] = L * (4 * C); // fcb
-    model->param_sizes[12] = L * C * (4 * C); // fcprojw
-    model->param_sizes[13] = L * C; // fcprojb
-    model->param_sizes[14] = C; // lnfw
-    model->param_sizes[15] = C; // lnfb
+    fill_in_parameter_sizes(model->param_sizes, model->config);
 
     // count the number of parameters
     size_t num_parameters = 0;
@@ -1338,39 +1475,6 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
-}
-
-void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
-    int V = config.vocab_size;
-    int L = config.num_layers;
-    int NH = config.num_heads;
-    int C = config.channels;
-
-    act_sizes[0] = B * T * C; // encoded
-    act_sizes[1] = L * B * T * C; // ln1
-    act_sizes[2] = L * B * T; // ln1_mean
-    act_sizes[3] = L * B * T; // ln1_rstd
-    act_sizes[4] = L * B * T * 3*C; // qkv
-    act_sizes[5] = L * B * T * C; // atty
-    act_sizes[6] = L * B * NH * T * T; // preatt
-    act_sizes[7] = L * B * NH * T * T; // att
-    act_sizes[8] = L * B * T * C; // attproj
-    act_sizes[9] = L * B * T * C; // residual2
-    act_sizes[10] = L * B * T * C; // ln2
-    act_sizes[11] = L * B * T; // ln2_mean
-    act_sizes[12] = L * B * T; // ln2_rstd
-    act_sizes[13] = L * B * T * 4*C; // fch
-    act_sizes[14] = L * B * T * 4*C; // fch_gelu
-    act_sizes[15] = L * B * T * C; // fcproj
-    act_sizes[16] = L * B * T * C; // residual3
-    act_sizes[17] = B * T * C; // lnf
-    act_sizes[18] = B * T; // lnf_mean
-    act_sizes[19] = B * T; // lnf_rstd
-    act_sizes[20] = B * T * V; // logits
-    act_sizes[21] = B * T * V; // probs
-    act_sizes[22] = B * T; // losses
-    act_sizes[23] = L * B * T * 3*C; // qkvr
-    act_sizes[24] = L * B * T * C; // v_accum
 }
 
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
@@ -1489,13 +1593,13 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
     matmul_forward_cublas(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
-    softmax_forward(acts.probs, acts.logits, B*T, V);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
-        crossentropy_forward(acts.losses, acts.probs, model->targets, B, T, V);
-
-        // for convenience also evaluate the mean loss
+        // fused classifier: does the forward pass and first part of the backward pass
+        // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
+        fused_classifier3(acts.dlogits, acts.losses, acts.logits, NULL, model->targets, B, T, V, V);
+        // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         // move the (B,T) losses to CPU
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
         float mean_loss = 0.0f;
@@ -1504,7 +1608,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         model->mean_loss = mean_loss;
 
     } else {
-        // if we don't have targets, we don't have a loss
+        // if we don't have targets, we don't have loss
+        softmax_forward(acts.probs, acts.logits, B*T, V);
         model->mean_loss = -1.0f;
     }
 }
@@ -1544,6 +1649,7 @@ void gpt2_backward(GPT2 *model) {
         bw_act_sizes[18] = 0; // lnf_mean
         bw_act_sizes[19] = 0; // lnf_rstd
         bw_act_sizes[21] = 0; // probs
+        bw_act_sizes[25] = 0; // dlogits are already in the forward pass
         // count up and allocate the space
         model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, bw_act_sizes);
         model->num_grad_acts = 0;
@@ -1570,14 +1676,11 @@ void gpt2_backward(GPT2 *model) {
     ActivationTensors grads_acts = model->grads_acts;
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
-    // technically this is a small, inline backward() pass of calculating
+    // this was done in the fused classifier kernel as last step of forward pass
+    // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
-    float dloss_mean = 1.0f / (B*T);
-    setConstant<<<CEIL_DIV(B*T, 256), 256>>>(grads_acts.losses, dloss_mean, B*T); // silly; to refactor later
-    cudaCheck(cudaGetLastError());
-    crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V);
-    // backward the classifier matmul
-    matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, V);
+    // next: backward the classifier matmul
+    matmul_backward(grads_acts.lnf, grads.wte, NULL, acts.dlogits, acts.lnf, params.wte, B, T, C, V);
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass
