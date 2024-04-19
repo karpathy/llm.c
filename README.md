@@ -179,6 +179,9 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 - Mojo
   - [llm.🔥](https://github.com/dorjeduck/llm.mojo) by @[dorjeduck](https://github.com/dorjeduck): a Mojo port of this project
 
+- C#
+  - [llm.cs](https://github.com/azret/llm.cs) by @[azret](https://github.com/azret): a C# port of this project
+
 ## discussions
 
 Ways of organizing development:
