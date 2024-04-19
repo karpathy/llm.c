@@ -637,29 +637,21 @@ __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const flo
         block_acc[warp.thread_rank()] = 0;
     }
 
-    int block_steps = CEIL_DIV(t+1, BlockSize);
-    // very important: This loop condition needs to be the same for all threads.
-    // even if a thread later on is not going to do any work, it needs to participate in the
-    // data loading process!
-    for (int t3f = 0; t3f < block_steps; ++t3f) {
-        int t3 = t3f * BlockSize + block.thread_rank();
+    float local_sum = 0;
+    for(int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
+        local_sum += att_bth[t2] * datt_bth[t2];
+    }
 
-        float at3 = att_bth[min(t, t3)];
-        float local_sum = 0;
-        for(int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
-            local_sum += att_bth[t2] * datt_bth[t2];
-        }
-        block.sync();
-        block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
-        block.sync();
-        local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+    block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
+    block.sync();
+    local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
 
+    for (int t3 = block.thread_rank(); t3 <= t; t3  += BlockSize) {
+        float at3 = att_bth[t3];
         float acc = -local_sum * at3;
-        float at_t2_eq_t3 = at3 * datt_bth[min(t, t3)];
+        float at_t2_eq_t3 = at3 * datt_bth[t3];
         acc += (at_t2_eq_t3 * (1.f - at3) - at_t2_eq_t3 * (0.f - at3));
-        if(t3 <= t) {
-            dpreatt_bth[t3] = scale * acc;
-        }
+        dpreatt_bth[t3] = scale * acc;
     }
 }
 
