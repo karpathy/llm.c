@@ -245,25 +245,13 @@ __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __rest
     }
 }
 
-__global__ void add_bias(float* out, float* bias, int B, int T, int OC) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-    for (int i = idx; i < B*T*OC; i += stride) {
-        int col = i % OC;
-        out[i] += bias[col];
-    }
-}
-
-
 __global__ void permute_kernel(float* q, float* k, float* v,
                                const float* inp,
                                int B, int N, int NH, int d) {
     // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
     // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
     // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
-
     if (idx < B * NH * N * d) {
         int b = idx / (NH * N * d);
         int rest = idx % (NH * N * d);
@@ -271,14 +259,7 @@ __global__ void permute_kernel(float* q, float* k, float* v,
         rest = rest % (N * d);
         int n = rest / d;
         int d_ = rest % d;
-
-        int inp_idx = \
-            (b * N * 3 * NH * d)
-            +   (n * 3 * NH * d)
-            +       (0 * NH * d)
-            +          (nh_ * d)
-            +                d_;
-
+        int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
         q[idx] = __ldcs(&inp[inp_idx]);
         k[idx] = __ldcs(&inp[inp_idx + NH * d]);
         v[idx] = __ldcs(&inp[inp_idx + 2 * (NH * d)]);
@@ -307,7 +288,6 @@ __global__ void permute_kernel_backward(float* dinp,
 __global__ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, int d) {
    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
     // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
     if (idx < B * NH * N * d) {
         int b = idx / (NH * N * d);
@@ -316,7 +296,6 @@ __global__ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, i
         rest = rest % (N * d);
         int n = rest / d;
         int d_ = rest % d;
-
         int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
         out[other_idx] = __ldcs(&inp[idx]);
     }
@@ -331,7 +310,6 @@ __global__ void unpermute_kernel_backward(float* dinp, const float *dout, int B,
         rest = rest % (N * d);
         int n = rest / d;
         int d_ = rest % d;
-
         int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
         dinp[idx] = dout[other_idx];
     }
@@ -434,19 +412,6 @@ __global__ void gelu_backward_kernel(float* dinp, const float* inp, const float*
         float sech_out = 1.0f / (coshf_out * coshf_out);
         float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
         dinp[i] = local_grad * dout[i];
-    }
-}
-
-__global__ void crossentropy_forward_kernel1(float* losses,
-                            float* probs, int* targets,
-                            int B, int T, int V) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < B * T) {
-        int b = i / T;
-        int t = i % T;
-        float* probs_bt = probs + b * T * V + t * V;
-        int ix = targets[b * T + t];
-        losses[b * T + t] = -logf(probs_bt[ix]);
     }
 }
 
@@ -564,24 +529,6 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
                 y[i + u*blockDim.x] = reg_array[u] / sum;
             }
         }
-    }
-}
-
-__global__ void crossentropy_softmax_backward_kernel1(float* dlogits,
-                           const float* dlosses, const float* probs, const int* targets,
-                           int B, int T, int V) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < B * T * V) {
-        int b = i / (T * V);
-        int t = (i / V) % T;
-        int v = i % V;
-        float* dlogits_bt = dlogits + b * T * V + t * V;
-        const float* probs_bt = probs + b * T * V + t * V;
-        float dloss = dlosses[b * T + t];
-        int ix = targets[b * T + t];
-        float p = probs_bt[v];
-        float indicator = v == ix ? 1.0f : 0.0f;
-        dlogits_bt[v] = (p - indicator) * dloss;
     }
 }
 
@@ -715,8 +662,6 @@ __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const flo
         }
     }
 }
-
-
 
 // Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
 // Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
@@ -874,18 +819,10 @@ void layernorm_forward(float* out, float* mean, float* rstd,
 void matmul_forward_cublas(float* out,
                     float* inp, float* weight, float* bias,
                     int B, int T, int C, int OC) {
-    const int sqrt_block_size = 32;
+    assert(bias == NULL); // bias is not supported for this kernel
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC));
-
-    // and now we still have to add the bias... (ew)
-    if (bias != NULL) {
-        int block_size = sqrt_block_size * sqrt_block_size;
-        int grid_size = CEIL_DIV(OC * B * T, block_size);
-        add_bias<<<grid_size, block_size>>>(out, bias, B, T, OC);
-        cudaCheck(cudaGetLastError());
-    }
 }
 
 // uses cuBLASLt to fuse the bias and gelu. does not work with OC = 50257 (last layer)
@@ -958,7 +895,6 @@ void matmul_forward_cublaslt(float* out,
     cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
 }
 
-
 void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
                         float* inp,
                         int B, int T, int C, int NH) {
@@ -983,15 +919,7 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
     // batched matrix multiply with cuBLAS
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
-                                     CUBLAS_OP_T, CUBLAS_OP_N,
-                                     T, T, HS,
-                                     &alpha,
-                                     k, HS, T * HS,
-                                     q, HS, T * HS,
-                                     &beta,
-                                     preatt, T, T * T,
-                                     B * NH));
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha, k, HS, T * HS, q, HS, T * HS, &beta, preatt, T, T * T, B * NH));
 
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
@@ -1001,15 +929,7 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
-                                     CUBLAS_OP_N, CUBLAS_OP_N,
-                                     HS, T, T,
-                                     &alpha,
-                                     v, HS, T * HS,
-                                     att, T, T * T,
-                                     &beta,
-                                     vaccum, HS, T * HS,
-                                     B * NH));
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha, v, HS, T * HS, att, T, T * T, &beta, vaccum, HS, T * HS, B * NH));
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -1044,26 +964,6 @@ void softmax_forward(float* out, float* inp, int N, int C) {
     const int block_size = 512;
     size_t shared_mem_size = 2 * block_size / 32 * sizeof(float);
     softmax_forward_kernel7<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
-    cudaCheck(cudaGetLastError());
-}
-
-void crossentropy_forward(float* losses,
-                            float* probs, int* targets,
-                            int B, int T, int V) {
-    const int block_size = 128;
-    const int N = B * T;
-    const int grid_size = CEIL_DIV(N, block_size);
-    crossentropy_forward_kernel1<<<grid_size, block_size>>>(losses, probs, targets, B, T, V);
-    cudaCheck(cudaGetLastError());
-}
-
-void crossentropy_softmax_backward(float* dlogits,
-                           const float* dlosses, const float* probs, const int* targets,
-                           int B, int T, int V) {
-    const int block_size = 256;
-    const int N = B * T * V;
-    const int grid_size = CEIL_DIV(N, block_size);
-    crossentropy_softmax_backward_kernel1<<<grid_size, block_size>>>(dlogits, dlosses, probs, targets, B, T, V);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1105,7 +1005,6 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
                         const float* inp, const float* qkvr, const float* preatt, const float* att, const float* vaccum,
                         int B, int T, int C, int NH) {
     const int block_size = 256;
-
     int HS = C / NH; // head size
     const float one = 1.0f;
     const float zero = 0.0f; // note beta = 1.0f so that we accumulate gradients (+=)
@@ -1118,57 +1017,19 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     dq = dqkvr + 0 * B * T * C;
     dk = dqkvr + 1 * B * T * C;
     dv = dqkvr + 2 * B * T * C;
-
     // backward through the unpermute operation
     int num_blocks = CEIL_DIV(B * T * C, block_size);
     unpermute_kernel_backward<<<num_blocks, block_size>>>(dvaccum, dout, B, T, NH, HS);
-
     // backward into datt
-    cublasSgemmStridedBatched(cublas_handle,
-                            CUBLAS_OP_T, CUBLAS_OP_N,
-                            T, T, HS,
-                            &one,
-                            v, HS, T * HS,
-                            dvaccum, HS, T * HS,
-                            &zero,
-                            datt, T, T * T,
-                            B * NH);
-
+    cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &one, v, HS, T * HS, dvaccum, HS, T * HS, &zero, datt, T, T * T, B * NH);
     // backward into dv
-    cublasSgemmStridedBatched(cublas_handle,
-            CUBLAS_OP_N, CUBLAS_OP_T,
-            HS, T, T,
-            &one,
-            dvaccum, HS, T * HS,
-            att, T, T * T,
-            &zero,
-            dv, HS, T * HS,
-            B * NH);
-
+    cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, dvaccum, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH);
     // backward into preatt
     softmax_autoregressive_backward_kernel<<<dim3(T, B*NH), 256>>>(dpreatt, datt, att, B, T, C, NH);
-
     // backward into q
-    cublasSgemmStridedBatched(cublas_handle,
-                            CUBLAS_OP_N, CUBLAS_OP_N,
-                            HS, T, T,
-                            &one,
-                            k, HS, T * HS,
-                            dpreatt, T, T * T,
-                            &zero,
-                            dq, HS, T * HS,
-                            B * NH);
+    cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &one, k, HS, T * HS, dpreatt, T, T * T, &zero, dq, HS, T * HS, B * NH);
     // backward into k
-    cublasSgemmStridedBatched(cublas_handle,
-                            CUBLAS_OP_N, CUBLAS_OP_T,
-                            HS, T, T,
-                            &one,
-                            q, HS, T * HS,
-                            dpreatt, T, T * T,
-                            &zero,
-                            dk, HS, T * HS,
-                            B * NH);
-
+    cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, q, HS, T * HS, dpreatt, T, T * T, &zero, dk, HS, T * HS, B * NH);
     // backward into inp
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
     permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
@@ -1385,7 +1246,6 @@ typedef struct {
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
 } GPT2;
-
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
@@ -1763,8 +1623,7 @@ void gpt2_free(GPT2 *model) {
 // if we are TESTING (see test_gpt2.cu), we'll skip the int main below
 
 // ----------------------------------------------------------------------------
-// data loader lite
-// returns random batches of data from a file of integers
+// data loader lite: returns random batches of data from a file of integers
 
 typedef struct {
     // hyperparameters
@@ -1831,9 +1690,8 @@ void dataloader_free(DataLoader *loader) {
     cudaFreeHost(loader->batch);
 }
 
-
 // ----------------------------------------------------------------------------
-// sampler
+// sampler: takes probabilities and samples integers from them
 
 #define GPT2_EOT 50256
 
@@ -1862,7 +1720,7 @@ int sample_mult(float* probabilities, int n, float coin) {
 }
 
 // ----------------------------------------------------------------------------
-// Tokenizer (only supports decoding)
+// Tokenizer (only supports decoding: tokens (integers) -> strings)
 
 typedef struct {
     uint32_t vocab_size;
