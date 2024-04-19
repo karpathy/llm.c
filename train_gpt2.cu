@@ -587,7 +587,7 @@ __global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* do
     int block_size = blockDim.x;
     const float* x = dout + o;
     // thread coarsening
-    double sum = 0.0f;
+    double sum = 0.0;
     for (int i = tid; i < B * T; i += block_size) {
         sum += x[i * OC];
     }
