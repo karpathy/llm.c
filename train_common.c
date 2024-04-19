@@ -2,50 +2,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <ctype.h>
+#include <assert.h>
+#if 0
 #include <math.h>
 #include <time.h>
-#include <assert.h>
 #include <float.h>
-#include <string.h>
 #include <unistd.h>
 #include <assert.h>
 #ifdef OMP
 #include <omp.h>
 #endif
-
-#ifdef TRAIN_CUDA
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
-#include <cublasLt.h>
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
 #endif
 
 #include "train_common.h"
 
 
-
-#ifdef TRAIN_CUDA
-
-// CUDA error checking
-void cudaDoCheck(cudaError_t error, const char *file, int line) {
-  if (error != cudaSuccess) {
-    printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
-           cudaGetErrorString(error));
-    exit(EXIT_FAILURE);
-  }
-};
-
-// cuBLAS error checking
-void cublasDoCheck(cublasStatus_t status, const char *file, int line) {
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        printf("[cuBLAS ERROR]: %d %s %d\n", status, file, line);
-        exit(EXIT_FAILURE);
-    }
-}
-
-#endif
 
 
 // ----------------------------------------------------------------------------

@@ -21,7 +21,10 @@ There will be other versions of this code that specialize it and make it fast.
 #include <omp.h>
 #endif
 
-#include "train_common.h"
+
+// ----------------------------------------------------------------------------
+// source common to train_gpt2.cu and train_gpt2.cu
+#include "train_common.c"
 
 
 // ----------------------------------------------------------------------------
@@ -456,6 +459,30 @@ void crossentropy_softmax_backward(float* dlogits,
     }
 }
 
+// ----------------------------------------------------------------------------
+// GPT-2 model definition
+
+// the parameters of the model
+#define NUM_PARAMETER_TENSORS 16
+typedef struct {
+    float* wte; // (V, C)
+    float* wpe; // (maxT, C)
+    float* ln1w; // (L, C)
+    float* ln1b; // (L, C)
+    float* qkvw; // (L, 3*C, C)
+    float* qkvb; // (L, 3*C)
+    float* attprojw; // (L, C, C)
+    float* attprojb; // (L, C)
+    float* ln2w; // (L, C)
+    float* ln2b; // (L, C)
+    float* fcw; // (L, 4*C, C)
+    float* fcb; // (L, 4*C)
+    float* fcprojw; // (L, C, 4*C)
+    float* fcprojb; // (L, C)
+    float* lnfw; // (C)
+    float* lnfb; // (C)
+} ParameterTensors;
+
 // allocate memory for the parameters and point the individual tensors to the right places
 float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes) {
     size_t num_parameters = 0;
@@ -526,6 +553,14 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
 }
 
 typedef struct {
+    int max_seq_len; // max sequence length, e.g. 1024
+    int vocab_size; // vocab size, e.g. 50257
+    int num_layers; // number of layers, e.g. 12
+    int num_heads; // number of heads in attention, e.g. 12
+    int channels; // number of channels, e.g. 768
+} GPT2Config;
+
+typedef struct {
     GPT2Config config;
     // the weights (parameters) of the model, and their sizes
     ParameterTensors params;
@@ -553,6 +588,8 @@ typedef struct {
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
 } GPT2;
+
+#define GPT2_EOT 50256
 
 void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
 

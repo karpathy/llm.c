@@ -27,7 +27,11 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
-#include "train_common.h"
+
+// ----------------------------------------------------------------------------
+// source common to train_gpt2.cu and train_gpt2.cu
+#include "train_common.c"
+
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -1153,6 +1157,35 @@ void fused_classifier3(float* dlogits, float* losses,
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
 
+typedef struct {
+    int max_seq_len; // max sequence length, e.g. 1024
+    int vocab_size; // vocab size, e.g. 50257
+    int num_layers; // number of layers, e.g. 12
+    int num_heads; // number of heads in attention, e.g. 12
+    int channels; // number of channels, e.g. 768
+} GPT2Config;
+
+// the parameters of the model
+#define NUM_PARAMETER_TENSORS 16
+typedef struct {
+    float* wte; // (V, C)
+    float* wpe; // (maxT, C)
+    float* ln1w; // (L, C)
+    float* ln1b; // (L, C)
+    float* qkvw; // (L, 3*C, C)
+    float* qkvb; // (L, 3*C)
+    float* attprojw; // (L, C, C)
+    float* attprojb; // (L, C)
+    float* ln2w; // (L, C)
+    float* ln2b; // (L, C)
+    float* fcw; // (L, 4*C, C)
+    float* fcb; // (L, 4*C)
+    float* fcprojw; // (L, C, 4*C)
+    float* fcprojb; // (L, C)
+    float* lnfw; // (C)
+    float* lnfb; // (C)
+} ParameterTensors;
+
 void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
     int V = config.vocab_size;
     int C = config.channels;
@@ -1322,6 +1355,8 @@ typedef struct {
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
 } GPT2;
+
+#define GPT2_EOT 50256
 
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
