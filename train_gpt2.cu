@@ -612,46 +612,48 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
     }
 }
 
-// naive kernel to backward through an autoregressive softmax, just to get correctness
 __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
-                                                       int B, int T, int C, int NH) {
+                                                       int B, int T, int C, float scale) {
     constexpr const int BlockSize = 256;
+    constexpr int T_per_block = 4;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     __shared__ float block_acc[32];
 
     int idx = blockIdx.y;
-    int t = blockIdx.x;
+    // go through blocks in reverse order, so the slowest block starts first
+    int t0 = T - 1 - T_per_block*blockIdx.x;
 
     att += idx * T * T;
     datt += idx * T * T;
     dpreatt += idx * T * T;
 
-    int hs = C / NH; // head size
-    float scale = 1.0f / sqrtf(hs);
-    const float* att_bth = att + t * T;
-    const float* datt_bth = datt + t * T;
-    float* dpreatt_bth = dpreatt + t * T;
-
-    if(warp.meta_group_rank() == 0) {
+    if (warp.meta_group_rank() == 0) {
         block_acc[warp.thread_rank()] = 0;
     }
 
-    float local_sum = 0;
-    for(int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
-        local_sum += att_bth[t2] * datt_bth[t2];
-    }
+    for(int to = 0; to < T_per_block; ++to) {
+        int t = t0 - to;
+        if(t < 0) return;
+        const float* att_bth = att + t * T;
+        const float* datt_bth = datt + t * T;
+        float* dpreatt_bth = dpreatt + t * T;
 
-    block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
-    block.sync();
-    local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+        float local_sum = 0;
+        for (int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
+            local_sum += att_bth[t2] * datt_bth[t2];
+        }
 
-    for (int t3 = block.thread_rank(); t3 <= t; t3  += BlockSize) {
-        float at3 = att_bth[t3];
-        float acc = -local_sum * at3;
-        float at_t2_eq_t3 = at3 * datt_bth[t3];
-        acc += (at_t2_eq_t3 * (1.f - at3) - at_t2_eq_t3 * (0.f - at3));
-        dpreatt_bth[t3] = scale * acc;
+        block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
+        block.sync();
+        local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+
+        for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
+            // don't touch the cache. Some parts will still be here from the previous loop, and
+            // we want to exploit those.
+            float acc = __ldcs(att_bth + t3) * (__ldcs(datt_bth + t3) - local_sum);
+            __stcs(dpreatt_bth + t3, scale * acc);
+        }
     }
 }
 
@@ -1018,7 +1020,9 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     // backward into dv
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, dvaccum, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH));
     // backward into preatt
-    softmax_autoregressive_backward_kernel<<<dim3(T, B*NH), 256>>>(dpreatt, datt, att, B, T, C, NH);
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, C, scale);
     cudaCheck(cudaGetLastError());
     // backward into q
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &one, k, HS, T * HS, dpreatt, T, T * T, &zero, dq, HS, T * HS, B * NH));

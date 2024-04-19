@@ -671,43 +671,53 @@ __global__ void softmax_autoregressive_backward_kernel7(float* dpreatt, const fl
     }
 }
 
-
+// The slightly less pretty version of kernel 7. Adding in all the dirty tricks that can give us a few more percent
+//  - streaming memory access instructions
+//  - reordering blocks to prevent tail effect
+//  - multiple values of T per block
 template<int BlockSize>
 __global__ void softmax_autoregressive_backward_kernel8(float* dpreatt, const float* datt, const float* att,
                                                         int B, int T, int C, float scale) {
     namespace cg = cooperative_groups;
+    constexpr int T_per_block = 4;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     __shared__ float block_acc[32];
 
     int idx = blockIdx.y;
     // go through blocks in reverse order, so the slowest block starts first
-    int t = T - 1 - blockIdx.x;
+    int t0 = T - 1 - T_per_block*blockIdx.x;
 
     att += idx * T * T;
     datt += idx * T * T;
     dpreatt += idx * T * T;
 
-    const float* att_bth = att + t * T;
-    const float* datt_bth = datt + t * T;
-    float* dpreatt_bth = dpreatt + t * T;
-
-    if(warp.meta_group_rank() == 0) {
+    if (warp.meta_group_rank() == 0) {
         block_acc[warp.thread_rank()] = 0;
     }
 
-    float local_sum = 0;
-    for(int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
-        local_sum += att_bth[t2] * datt_bth[t2];
-    }
+    for(int to = 0; to < T_per_block; ++to) {
+        int t = t0 - to;
+        if(t < 0) return;
+        const float* att_bth = att + t * T;
+        const float* datt_bth = datt + t * T;
+        float* dpreatt_bth = dpreatt + t * T;
 
-    block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
-    block.sync();
-    local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+        float local_sum = 0;
+        for (int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
+            local_sum += att_bth[t2] * datt_bth[t2];
+        }
 
-    for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
-        float acc = __ldcs(att_bth + t3) * (__ldcs(datt_bth + t3) - local_sum);
-        __stcs(dpreatt_bth + t3, scale * acc);
+        block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
+        block.sync();
+        local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+
+        for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
+            // don't touch the cache. Some parts will still be here from the previous loop, and
+            // we want to exploit those.
+            float acc = __ldcs(att_bth + t3) * (__ldcs(datt_bth + t3) - local_sum);
+            __stcs(dpreatt_bth + t3, scale * acc);
+        }
     }
 }
 
@@ -839,7 +849,7 @@ void launch_softmax_8(float* dpreatt, float* datt, const float* att, int B, int 
     float scale = 1.0f / sqrtf(hs);
     auto launch = [&](auto int_const) {
         constexpr int block_size = int_const.value;
-        softmax_autoregressive_backward_kernel8<block_size><<<dim3(T, B * NH), block_size>>>
+        softmax_autoregressive_backward_kernel8<block_size><<<dim3(T / 4, B * NH), block_size>>>
                                                               (dpreatt, datt, att, B, T, C, scale);
     };
     dispatch_launch(launch, block_size);
