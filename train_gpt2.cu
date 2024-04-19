@@ -2045,7 +2045,7 @@ int main() {
 
     // train
     struct timespec start, end;
-    double total_sum_iteration_time_s = 0.0f;
+    double total_sum_iteration_time_s = 0.0;
     for (int step = 0; step <= train_num_batches; step++) {
         int last_step = step == train_num_batches;
 
