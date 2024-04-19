@@ -1,12 +1,13 @@
 # llm.c
 
-LLM training in simple, pure C/CUDA. There is no need for 245MB of PyTorch or 107MB of cPython. For example, training GPT-2 (CPU, fp32) is ~1,000 lines of clean code in a single file. It compiles and runs instantly, and exactly matches the PyTorch reference implementation. I chose GPT-2 as the first working example because it is the grand-daddy of LLMs, the first time the modern stack was put together.
+LLM training in simple, pure C/CUDA. There is no need for 245MB of PyTorch or 107MB of cPython. Training GPT-2 (CPU, fp32) is ~1,000 lines of clean code in a single file, and training it on GPU is ~2,000 lines (adds CUDA kernels). It compiles and runs instantly, and exactly matches the PyTorch reference implementation. I chose GPT-2 as the first working example because it is the grand-daddy of LLMs, the first time the modern stack was put together.
 
 Currently, we are working on:
 
-- optimize the CUDA implementation to compete with PyTorch
+- optimize the CUDA implementation further to match/exceed PyTorch speed
 - lower the precision from fp32 to mixed precision training
-- reproduce the GPT-2 training run (data, evals)
+- add multi-gpu training, starting with DDP
+- reproduce the GPT-2 training run (add data, evals)
 - more modern architectures, Llama 2, Gemma, Mistral, etc.
 
 I'd like this repo to only maintain C and CUDA code. Ports of this repo to other languages are very welcome, but should be done in separate repos, and then I am happy to link to them below in the "notable forks" section, just like I did in [llama2.c notable forks](https://github.com/karpathy/llama2.c/tree/master?tab=readme-ov-file#notable-forks).
@@ -108,9 +109,9 @@ This now loads the `gpt2_124M_debug_state.bin` file, runs a forward pass, compar
 
 I attached a very small tutorial here, in [doc/layernorm/layernorm.md](doc/layernorm/layernorm.md). It's a simple, step-by-step guide to implementing a single layer of the GPT-2 model, the layernorm layer. This is a good starting point to understand how the layers are implemented in C.
 
-## cuda
+## CUDA
 
-As of April 17, 2024 the full training loop is now implemented in pure CUDA in one file, but has not been optimized yet. The way we organize code is that we have a growing collection of kernels of increasing complexity in the `dev/cuda` folder, see [dev/cuda/README.md](dev/cuda/README.md). We then copy paste the best kernels into the main training loop in the single training file `train_gpt2cu.cu`.
+The full training loop is also implemented in pure CUDA in one file, but optimizations of the kernels are ongoing. Currently, we roughly match the speed of PyTorch. The way we organize code is that we have a growing collection of kernels of increasing complexity in the `dev/cuda` folder, see [dev/cuda/README.md](dev/cuda/README.md). We then copy paste the best kernels into the main training loop in the single training file `train_gpt2cu.cu`.
 
 **Correctness**. First, we can do 10 iterations of training and verify that our code exactly matches and preproduces the numbers from PyTorch:
 
@@ -131,15 +132,15 @@ make train_gpt2cu
 This will load the tiny_shakespeare dataset validation and training splits. At the default settings of B=4, T=1024, there are 8 validation batches and 74 training batches. The script is currently configured to do a single epoch of finetuning with learning rate 1e-4, and along the way it evaluates the validation performance and generates samples, e.g.:
 
 ```
-step 1/74: train loss 4.367631 (198.891516 ms)
-step 2/74: train loss 4.031111 (190.001214 ms)
-step 3/74: train loss 4.034153 (192.847519 ms)
-step 4/74: train loss 3.859954 (196.304713 ms)
+step 1/74: train loss 4.367631 (80.639749 ms)
+step 2/74: train loss 4.031242 (77.378867 ms)
+step 3/74: train loss 4.034144 (77.315861 ms)
+step 4/74: train loss 3.859865 (77.357575 ms)
 ...
-step 72/74: train loss 3.085107 (198.018706 ms)
-step 73/74: train loss 3.667800 (198.899291 ms)
-step 74/74: train loss 3.467458 (195.024231 ms)
-val loss 3.516406
+step 72/74: train loss 3.085081 (78.850895 ms)
+step 73/74: train loss 3.668018 (78.197064 ms)
+step 74/74: train loss 3.467508 (78.009975 ms)
+val loss 3.516490
 generating:
 ---
 ?Where will you go?
@@ -151,53 +152,15 @@ For on his rock shall he be opencast.
 Keep on with me, my
 ```
 
-So as currently configured, we come down to validation loss of 3.51 and can generate okay samples. This runs on my A100 in about ~15 seconds. Even so, this training loop in PyTorch is about 80ms/iteration, so at 200ms/iter we are currently ~2.5X slower. The kernels are being actively optimized and worked on and we aspire to reach the same vicinity soon^TM.
+This runs on my A100 in about ~10 seconds. This training loop in the PyTorch script is about 80ms/iteration, so we are slightly better than PyTorch here. However, this is measured with PyTorch that is a bit stale (I'm on 2.1.0) and we're not yet including FlashAttention or the PyTorch scaled_dot_product_attention fused operation.
 
-**Timing**. Finally we can time the code and compare the speed to PyTorch. Because the backward pass CUDA kernels are still very new and being optimized, I'd recommend turning off the backward + update in `train_gpt2.cu`:
-
-```
-// gpt2_zero_grad(&model);
-// gpt2_backward(&model);
-// gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
-```
-
-And then re-compile and run just the forward pass in a loop:
+We can compare to naive PyTorch like this, where we turn on `torch.compile` and the use of TensorCores, which use tf32 type:
 
 ```bash
-make train_gpt2cu
-./train_gpt2cu
+python train_gpt2.py --write_tensors 0 --sequence_length 1024 --batch_size 4 --compile 1 --tensorcores 1
 ```
 
-This will print a bunch of hyperparameters and then you'll see the loop:
-
-```
-val loss 4.517179
-step 0: train loss 4.367631 (took 25.868564 ms)
-step 1: train loss 4.406341 (took 26.112257 ms)
-step 2: train loss 4.484756 (took 26.124789 ms)
-step 3: train loss 4.345182 (took 26.149837 ms)
-...
-```
-
-The loss is changing because we are still loading real data batches from our dataset, but there is no training so they won't go down over time. In any case, on my A100 40GB PCIe GPU we are seeing about 28ms/iteration. We can compare this to PyTorch fp32 training by calling our python script like this:
-
-```bash
-python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4
-```
-
-Which shows time per iteration with the same hyperparameters (batch 4, time 1024) at 104ms/iteration. We can then enable `torch.compile` by adding the `--compile 1` flag:
-
-```bash
-python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4 --compile 1
-```
-
-And see that the first iteration now takes 20 seconds (compilation time), but all following iterations take ~86ms. And if we additionally turn on the use of fp32 tensorcores (only GPUs since Volta) with `--tensorcores 1`:
-
-```bash
-python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4 --compile 1 --tensorcores 1
-```
-
-The time drops down to 26.2ms/iteration. So at the current 26.2ms/iteration we, amusingly and right now, have an identical running time. This somewhat makes sense because most of the FLOPs are in the matmul, and we both call about the same kernels. The remainder of the difference is likely our self-attention implementation, and possibly the round trips for GeLU, and permute/unpermute.
+The compilation (first iteration) is ~27 seconds, but after that on my A100 this currently runs at ~80ms/iteration.
 
 ## repo philosophy
 
