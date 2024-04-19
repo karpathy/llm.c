@@ -589,6 +589,7 @@ typedef struct {
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
 } GPT2;
 
+// the GPT-2 end-of-text token id
 #define GPT2_EOT 50256
 
 void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {

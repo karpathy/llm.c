@@ -1356,6 +1356,7 @@ typedef struct {
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
 } GPT2;
 
+// the GPT-2 end-of-text token id
 #define GPT2_EOT 50256
 
 
