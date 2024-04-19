@@ -623,14 +623,64 @@ __global__ void __launch_bounds__(BlockSize) softmax_autoregressive_backward_ker
                 }
             } else {
                 for (int t2i = 0; t2i < end; t2i++) {
-                    int t2 = t2b + t2i;
                     acc +=  att_bth_s[t2i] * (0.f - at3);
                 }
             }
         }
-        dpreatt_bth[t3] += scale * acc;
+        dpreatt_bth[t3] = scale * acc;
     }
 }
+
+template<int BlockSize>
+__global__ void __launch_bounds__(BlockSize) softmax_autoregressive_backward_kernel7(float* dpreatt, const float* datt, const float* att,
+                                                                                     int B, int T, int C, int NH) {
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    __shared__ float att_bth_s[BlockSize];
+
+    int idx = blockIdx.y;
+    int t = blockIdx.x;
+
+    att += idx * T * T;
+    datt += idx * T * T;
+    dpreatt += idx * T * T;
+
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    const float* att_bth = att + t * T;
+    const float* datt_bth = datt + t * T;
+    float* dpreatt_bth = dpreatt + t * T;
+
+    int block_steps = ceil_div(t+1, BlockSize);
+    // very important: This loop condition needs to be the same for all threads.
+    // even if a thread later on is not going to do any work, it needs to participate in the
+    // data loading process!
+    for (int t3f = 0; t3f < block_steps; ++t3f) {
+        int t3 = t3f * BlockSize + block.thread_rank();
+        float acc = 0.f;
+        float at3 = att_bth[t3];
+        for (int t2b = 0; t2b <= t; t2b += BlockSize) {
+            int end = min(t + 1 - t2b, BlockSize);
+            block.sync();
+            {
+                int t2i = block.thread_rank();
+                int t2 = min(t, t2b + t2i);
+                att_bth_s[t2i] = att_bth[t2] * datt_bth[t2];
+            }
+
+            block.sync();
+            float sub = 0.0;
+            for (int t2i = 0; t2i < end; t2i++) {
+                sub += att_bth_s[t2i];
+            }
+            acc -= sub * at3;
+        }
+        float at_t2_eq_t3 = att_bth[t3] * datt_bth[t3];
+        acc += (at_t2_eq_t3 * (1.f - at3) - at_t2_eq_t3 * (0.f - at3));
+        dpreatt_bth[t3] = scale * acc;
+    }
+}
+
 
 // ----------------------------------------------------------------------------
 // kernel launchers
@@ -716,27 +766,40 @@ void launch_softmax_5(float* dpreatt, float* datt, const float* att, int B, int 
     softmax_autoregressive_backward_kernel5<<<dim3(num_blocks, B*NH), block_size>>>(dpreatt, datt, att, B, T, C, NH);
 }
 
-void launch_softmax_6(float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+template<class Launcher>
+void dispatch_launch(Launcher&& launch, int block_size) {
     switch(block_size) {
         case 32:
-        softmax_autoregressive_backward_kernel6<32><<<dim3(T, B * NH), 32>>>(dpreatt, datt, att, B, T, C, NH);
-        break;
+            return launch(std::integral_constant<int, 32>{});
         case 64:
-        softmax_autoregressive_backward_kernel6<64><<<dim3(T, B * NH), 64>>>(dpreatt, datt, att, B, T, C, NH);
-        break;
+            return launch(std::integral_constant<int, 64>{});
         case 128:
-        softmax_autoregressive_backward_kernel6<128><<<dim3(T, B * NH), 128>>>(dpreatt, datt, att, B, T, C, NH);
-        break;
+            return launch(std::integral_constant<int, 128>{});
         case 256:
-        softmax_autoregressive_backward_kernel6<256><<<dim3(T, B * NH), 256>>>(dpreatt, datt, att, B, T, C, NH);
-        break;
+            return launch(std::integral_constant<int, 256>{});
         case 512:
-        softmax_autoregressive_backward_kernel6<512><<<dim3(T, B * NH), 512>>>(dpreatt, datt, att, B, T, C, NH);
-        break;
+            return launch(std::integral_constant<int, 512>{});
         case 1024:
-        softmax_autoregressive_backward_kernel6<1024><<<dim3(T, B * NH), 1024>>>(dpreatt, datt, att, B, T, C, NH);
-        break;
+            return launch(std::integral_constant<int, 1024>{});
+        default:
+            assert(false && "Invalid block size");
     }
+}
+
+void launch_softmax_6(float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+    auto launch = [&](auto int_const) {
+        softmax_autoregressive_backward_kernel6<int_const.value><<<dim3(T, B * NH), int_const.value>>>(dpreatt, datt, att, B, T, C, NH);
+    };
+    dispatch_launch(launch, block_size);
+}
+
+void launch_softmax_7(float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+    auto launch = [&](auto int_const) {
+        constexpr int block_size = int_const.value;
+        softmax_autoregressive_backward_kernel7<block_size><<<dim3(T, B * NH), block_size>>>
+                                                              (dpreatt, datt, att, B, T, C, NH);
+    };
+    dispatch_launch(launch, block_size);
 }
 
 // the sequence of transformations in this compound op is:
@@ -848,6 +911,10 @@ void attention_backward(int kernel_num,
         case 6:
             attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
                                 launch_softmax_6, block_size);
+            break;
+        case 7:
+            attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
+                                launch_softmax_7, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
