@@ -327,7 +327,7 @@ __global__ void softmax_forward_online_kernel1(float* out, const float* inp, int
         float* out_row = out + i * C;
 
         float maxval = -INFINITY;
-        double sum = 0.0f;
+        double sum = 0.0;
         for (int j = 0; j < C; j++) {
             float maxval_prev = maxval;
 			if (inp_row[j] > maxval) {
