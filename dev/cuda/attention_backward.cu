@@ -28,6 +28,7 @@ OMP_NUM_THREADS=32 ./attention_backward 5
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cooperative_groups/scan.h>
 #include "common.h"
 
 // ----------------------------------------------------------------------------
@@ -636,7 +637,9 @@ __global__ void __launch_bounds__(BlockSize) softmax_autoregressive_backward_ker
                                                                                      int B, int T, int C, int NH) {
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     __shared__ float att_bth_s[BlockSize];
+    __shared__ float att_bth_prefix[32];
 
     int idx = blockIdx.y;
     int t = blockIdx.x;
@@ -651,30 +654,28 @@ __global__ void __launch_bounds__(BlockSize) softmax_autoregressive_backward_ker
     const float* datt_bth = datt + t * T;
     float* dpreatt_bth = dpreatt + t * T;
 
+    if(warp.meta_group_rank() == 0) {
+        att_bth_prefix[warp.thread_rank()] = 0;
+    }
+
     int block_steps = ceil_div(t+1, BlockSize);
     // very important: This loop condition needs to be the same for all threads.
     // even if a thread later on is not going to do any work, it needs to participate in the
     // data loading process!
     for (int t3f = 0; t3f < block_steps; ++t3f) {
         int t3 = t3f * BlockSize + block.thread_rank();
-        float acc = 0.f;
-        float at3 = att_bth[t3];
-        for (int t2b = 0; t2b <= t; t2b += BlockSize) {
-            int end = min(t + 1 - t2b, BlockSize);
-            block.sync();
-            {
-                int t2i = block.thread_rank();
-                int t2 = min(t, t2b + t2i);
-                att_bth_s[t2i] = att_bth[t2] * datt_bth[t2];
-            }
 
-            block.sync();
-            float sub = 0.0;
-            for (int t2i = 0; t2i < end; t2i++) {
-                sub += att_bth_s[t2i];
-            }
-            acc -= sub * at3;
+        float at3 = att_bth[t3];
+        float local_sum = 0;
+        for(int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
+            local_sum += att_bth[t2] * datt_bth[t2];
         }
+        block.sync();
+        att_bth_prefix[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
+        block.sync();
+        local_sum =  cg::reduce(warp, att_bth_prefix[warp.thread_rank()], cg::plus<float>{});
+
+        float acc = -local_sum * at3;
         float at_t2_eq_t3 = att_bth[t3] * datt_bth[t3];
         acc += (at_t2_eq_t3 * (1.f - at3) - at_t2_eq_t3 * (0.f - at3));
         dpreatt_bth[t3] = scale * acc;
