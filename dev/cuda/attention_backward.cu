@@ -638,8 +638,7 @@ __global__ void __launch_bounds__(BlockSize) softmax_autoregressive_backward_ker
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    __shared__ float att_bth_s[BlockSize];
-    __shared__ float att_bth_prefix[32];
+    __shared__ float block_acc[32];
 
     int idx = blockIdx.y;
     int t = blockIdx.x;
@@ -655,7 +654,7 @@ __global__ void __launch_bounds__(BlockSize) softmax_autoregressive_backward_ker
     float* dpreatt_bth = dpreatt + t * T;
 
     if(warp.meta_group_rank() == 0) {
-        att_bth_prefix[warp.thread_rank()] = 0;
+        block_acc[warp.thread_rank()] = 0;
     }
 
     int block_steps = ceil_div(t+1, BlockSize);
@@ -665,20 +664,22 @@ __global__ void __launch_bounds__(BlockSize) softmax_autoregressive_backward_ker
     for (int t3f = 0; t3f < block_steps; ++t3f) {
         int t3 = t3f * BlockSize + block.thread_rank();
 
-        float at3 = att_bth[t3];
+        float at3 = att_bth[min(t, t3)];
         float local_sum = 0;
         for(int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
             local_sum += att_bth[t2] * datt_bth[t2];
         }
         block.sync();
-        att_bth_prefix[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
+        block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
         block.sync();
-        local_sum =  cg::reduce(warp, att_bth_prefix[warp.thread_rank()], cg::plus<float>{});
+        local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
 
         float acc = -local_sum * at3;
-        float at_t2_eq_t3 = att_bth[t3] * datt_bth[t3];
+        float at_t2_eq_t3 = at3 * datt_bth[min(t, t3)];
         acc += (at_t2_eq_t3 * (1.f - at3) - at_t2_eq_t3 * (0.f - at3));
-        dpreatt_bth[t3] = scale * acc;
+        if(t3 <= t) {
+            dpreatt_bth[t3] = scale * acc;
+        }
     }
 }
 

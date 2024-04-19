@@ -668,9 +668,10 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
 // naive kernel to backward through an autoregressive softmax, just to get correctness
 __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
                                                        int B, int T, int C, int NH) {
-    constexpr const int BlockSize = 64;
+    constexpr const int BlockSize = 256;
     cg::thread_block block = cg::this_thread_block();
-    __shared__ float att_bth_s[BlockSize];
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    __shared__ float block_acc[32];
 
     int idx = blockIdx.y;
     int t = blockIdx.x;
@@ -685,39 +686,36 @@ __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const flo
     const float* datt_bth = datt + t * T;
     float* dpreatt_bth = dpreatt + t * T;
 
+    if(warp.meta_group_rank() == 0) {
+        block_acc[warp.thread_rank()] = 0;
+    }
+
     int block_steps = CEIL_DIV(t+1, BlockSize);
+    // very important: This loop condition needs to be the same for all threads.
+    // even if a thread later on is not going to do any work, it needs to participate in the
+    // data loading process!
     for (int t3f = 0; t3f < block_steps; ++t3f) {
         int t3 = t3f * BlockSize + block.thread_rank();
-        float acc = 0.f;
-        float at3 = att_bth[t3];
-        for (int t2b = 0; t2b <= t; t2b += BlockSize) {
-            int end = min(t + 1 - t2b, BlockSize);
-            block.sync();
-            {
-                int t2i = block.thread_rank();
-                int t2 = min(t, t2b + t2i);
-                att_bth_s[t2i] = att_bth[t2] * datt_bth[t2];
-            }
 
-            block.sync();
-            if(t3f * BlockSize == t2b) {
-                for (int t2i = 0; t2i < end; t2i++) {
-                    int t2 = t2b + t2i;
-                    float indicator = t2 == t3 ? 1.0f : 0.0f;
-                    float local_derivative = att_bth_s[t2i] * (indicator - at3);
-                    acc += local_derivative;
-                }
-            } else {
-                for (int t2i = 0; t2i < end; t2i++) {
-                    int t2 = t2b + t2i;
-                    float local_derivative = att_bth_s[t2i] * (0.f - at3);
-                    acc += local_derivative;
-                }
-            }
+        float at3 = att_bth[min(t, t3)];
+        float local_sum = 0;
+        for(int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
+            local_sum += att_bth[t2] * datt_bth[t2];
         }
-        dpreatt_bth[t3] = scale * acc;
+        block.sync();
+        block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
+        block.sync();
+        local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+
+        float acc = -local_sum * at3;
+        float at_t2_eq_t3 = at3 * datt_bth[min(t, t3)];
+        acc += (at_t2_eq_t3 * (1.f - at3) - at_t2_eq_t3 * (0.f - at3));
+        if(t3 <= t) {
+            dpreatt_bth[t3] = scale * acc;
+        }
     }
 }
+
 
 
 // Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
@@ -1148,7 +1146,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
             B * NH);
 
     // backward into preatt
-    softmax_autoregressive_backward_kernel<<<dim3(T, B*NH), 64>>>(dpreatt, datt, att, B, T, C, NH);
+    softmax_autoregressive_backward_kernel<<<dim3(T, B*NH), 256>>>(dpreatt, datt, att, B, T, C, NH);
 
     // backward into q
     cublasSgemmStridedBatched(cublas_handle,
