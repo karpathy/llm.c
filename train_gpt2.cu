@@ -1826,8 +1826,8 @@ int main() {
     const char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
-    int B = 4;
-    int T = 1024;
+    const int B = 4;
+    const int T = 1024;
     printf("batch size: %d\n", B);
     printf("sequence length: %d\n", T);
 
@@ -1854,7 +1854,7 @@ int main() {
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
+    int gen_tokens[B * T];
     float* cpu_probs = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
     // train
@@ -1941,7 +1941,6 @@ int main() {
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
     free(cpu_probs);
-    free(gen_tokens);
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
