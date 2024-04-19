@@ -353,7 +353,12 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     assert(T % 4  == 0);
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    // micro-optimization: we iterate backwards so that
+    // after the softmax backward operation completes, the cache retains the
+    // part of the matrix close to the upper left corner, which benefits the
+    // matmul operation that immediately follows.
+    // int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank(); // forward order
+    int idx = (gridDim.x - blockIdx.x - 1) * warp.meta_group_size() + warp.meta_group_rank(); // backward order
     if(idx >= N * T) {
         return;
     }
@@ -2040,6 +2045,7 @@ int main() {
 
     // train
     struct timespec start, end;
+    double total_sum_iteration_time_s = 0.0f;
     for (int step = 0; step <= train_num_batches; step++) {
         int last_step = step == train_num_batches;
 
@@ -2109,8 +2115,11 @@ int main() {
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        total_sum_iteration_time_s += time_elapsed_s;
         printf("step %d/%d: train loss %f (%f ms)\n", step + 1, train_num_batches, model.mean_loss, time_elapsed_s * 1000);
     }
+    // add a total average, for optimizations that are only mild improvements
+    printf("total average iteration time: %f ms\n", total_sum_iteration_time_s / train_num_batches * 1000);
 
     // free
     dataloader_free(&train_loader);
