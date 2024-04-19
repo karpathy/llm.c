@@ -560,6 +560,78 @@ __global__ void softmax_autoregressive_backward_kernel5(float* __restrict__ dpre
     }
 }
 
+
+// I want `BlockSize` to be statically known to the compiler, thus we get a template here.
+// This kernel takes a step back, and looks at the original CPU code again. We have some simple outer loops
+// That are independent, (b, t, h), and then the inner loops over (t2, t3) where we're combining elements -- this is
+// where we can reuse data and be more efficient
+// => handle b, t, h  through block indices; each block does all the work for the (t2, t3) loop cooperatively.
+// Now we have two nested loops, and in the inner instruction, we combine indexing from both => this calls for
+// loop tiling, and lifting some of the memory ops out of the loop.
+// We're in luck here;  if we tile so that t3 is the outer loop, we can get a sinlge write op per result, AND also cache
+// the t2-indexed part of the computation, which is the problematic one because it contains a multiplication that now we
+// do not have to repeat over and over.
+// => do an outer t3 loop where each thread gets one t3 index. Then, do an outer t2 loop in steps of BlockSize, and
+// prepare BlockSize many elements for the inner loop. Here, each thread calculates one element and stores it in shmem.
+// Then, in the inner t2 loop, each thread reads *all* the elements previously stored and does its computations.
+// This way, we do 3*BlockSize loads, but BlockSize^2 computation steps => This kernel is now entirely compute bound.
+// To fix up the compute issues, as above, we replace ifs in memory reading with min, and also split the inner loop
+// into a large region where we don't have to calculate the indicator, and a small, costly region where we do.
+template<int BlockSize>
+__global__ void __launch_bounds__(BlockSize) softmax_autoregressive_backward_kernel6(float* dpreatt, const float* datt, const float* att,
+                                                        int B, int T, int C, int NH) {
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    __shared__ float att_bth_s[BlockSize];
+
+    int idx = blockIdx.y;
+    int t = blockIdx.x;
+
+    att += idx * T * T;
+    datt += idx * T * T;
+    dpreatt += idx * T * T;
+
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    const float* att_bth = att + t * T;
+    const float* datt_bth = datt + t * T;
+    float* dpreatt_bth = dpreatt + t * T;
+
+    int block_steps = ceil_div(t+1, BlockSize);
+    // very important: This loop condition needs to be the same for all threads.
+    // even if a thread later on is not going to do any work, it needs to participate in the
+    // data loading process!
+    for (int t3f = 0; t3f < block_steps; ++t3f) {
+        int t3 = t3f * BlockSize + block.thread_rank();
+        float acc = 0.f;
+        float at3 = att_bth[t3];
+        for (int t2b = 0; t2b <= t; t2b += BlockSize) {
+            int end = min(t + 1 - t2b, BlockSize);
+            block.sync();
+            {
+                int t2i = block.thread_rank();
+                int t2 = min(t, t2b + t2i);
+                att_bth_s[t2i] = att_bth[t2] * datt_bth[t2];
+            }
+
+            block.sync();
+            if(t3f * BlockSize == t2b) {
+                for (int t2i = 0; t2i < end; t2i++) {
+                    int t2 = t2b + t2i;
+                    float indicator = t2 == t3 ? 1.0f : 0.0f;
+                    acc += att_bth_s[t2i] * (indicator - at3);
+                }
+            } else {
+                for (int t2i = 0; t2i < end; t2i++) {
+                    int t2 = t2b + t2i;
+                    acc +=  att_bth_s[t2i] * (0.f - at3);
+                }
+            }
+        }
+        dpreatt_bth[t3] += scale * acc;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -644,6 +716,29 @@ void launch_softmax_5(float* dpreatt, float* datt, const float* att, int B, int 
     softmax_autoregressive_backward_kernel5<<<dim3(num_blocks, B*NH), block_size>>>(dpreatt, datt, att, B, T, C, NH);
 }
 
+void launch_softmax_6(float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+    switch(block_size) {
+        case 32:
+        softmax_autoregressive_backward_kernel6<32><<<dim3(T, B * NH), 32>>>(dpreatt, datt, att, B, T, C, NH);
+        break;
+        case 64:
+        softmax_autoregressive_backward_kernel6<64><<<dim3(T, B * NH), 64>>>(dpreatt, datt, att, B, T, C, NH);
+        break;
+        case 128:
+        softmax_autoregressive_backward_kernel6<128><<<dim3(T, B * NH), 128>>>(dpreatt, datt, att, B, T, C, NH);
+        break;
+        case 256:
+        softmax_autoregressive_backward_kernel6<256><<<dim3(T, B * NH), 256>>>(dpreatt, datt, att, B, T, C, NH);
+        break;
+        case 512:
+        softmax_autoregressive_backward_kernel6<512><<<dim3(T, B * NH), 512>>>(dpreatt, datt, att, B, T, C, NH);
+        break;
+        case 1024:
+        softmax_autoregressive_backward_kernel6<1024><<<dim3(T, B * NH), 1024>>>(dpreatt, datt, att, B, T, C, NH);
+        break;
+    }
+}
+
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
 template<class SoftmaxKernel>
@@ -671,7 +766,7 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
     unpermute_kernel_backward<<<num_blocks, block_size>>>(dvaccum, dout, B, T, NH, HS);
 
     // backward into datt
-    cublasSgemmStridedBatched(cublas_handle,
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                             CUBLAS_OP_T, CUBLAS_OP_N,
                             T, T, HS,
                             &alpha,
@@ -679,10 +774,10 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
                             dvaccum, HS, T * HS,
                             &beta,
                             datt, T, T * T,
-                            B * NH);
+                            B * NH));
 
     // backward into dv
-    cublasSgemmStridedBatched(cublas_handle,
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
             CUBLAS_OP_N, CUBLAS_OP_T,
             HS, T, T,
             &alpha,
@@ -690,14 +785,14 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
             att, T, T * T,
             &beta,
             dv, HS, T * HS,
-            B * NH);
+            B * NH));
 
     // backward into preatt
     softmax_autoregressive_backward(dpreatt, datt, att, B, T, C, NH, block_size);
     cudaCheck(cudaGetLastError());
 
     // backward into q
-    cublasSgemmStridedBatched(cublas_handle,
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                             CUBLAS_OP_N, CUBLAS_OP_N,
                             HS, T, T,
                             &alpha,
@@ -705,9 +800,9 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
                             dpreatt, T, T * T,
                             &beta,
                             dq, HS, T * HS,
-                            B * NH);
+                            B * NH));
     // backward into k
-    cublasSgemmStridedBatched(cublas_handle,
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                             CUBLAS_OP_N, CUBLAS_OP_T,
                             HS, T, T,
                             &alpha,
@@ -715,7 +810,7 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
                             dpreatt, T, T * T,
                             &beta,
                             dk, HS, T * HS,
-                            B * NH);
+                            B * NH));
 
     // backward into inp
     num_blocks = ceil_div(B * NH * T * HS, block_size);
@@ -749,6 +844,10 @@ void attention_backward(int kernel_num,
         case 5:
             attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
                                 launch_softmax_5, block_size);
+            break;
+        case 6:
+            attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
+                                launch_softmax_6, block_size);
             break;
         default:
             printf("Invalid kernel number\n");

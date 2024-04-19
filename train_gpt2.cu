@@ -668,88 +668,54 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
 // naive kernel to backward through an autoregressive softmax, just to get correctness
 __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
                                                        int B, int T, int C, int NH) {
-    constexpr int UNROLL = 8;
+    constexpr const int BlockSize = 64;
     cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int t3 = UNROLL * (blockIdx.x * warp.meta_group_size() + warp.meta_group_rank());
+    __shared__ float att_bth_s[BlockSize];
 
-    int idx = blockIdx.y * T * T;
-    if (t3 >= T) { return; }
+    int idx = blockIdx.y;
+    int t = blockIdx.x;
+
+    att += idx * T * T;
+    datt += idx * T * T;
+    dpreatt += idx * T * T;
 
     int hs = C / NH; // head size
     float scale = 1.0f / sqrtf(hs);
-    for (int t = t3; t < T; t++) {
-        float result[UNROLL] = {};
-        const float* att_bth = att + idx + t * T;
-        const float* datt_bth = datt + idx + t * T;
-        float* dpreatt_bth = dpreatt + idx + t * T;
+    const float* att_bth = att + t * T;
+    const float* datt_bth = datt + t * T;
+    float* dpreatt_bth = dpreatt + t * T;
 
-        float att_at_t3[UNROLL];
-        for(int k = 0; k < UNROLL; ++k) {
-            // if t < t3+k, we're out of bounds.
-            // in that case, we don't care what we read, because later on,
-            // we won't write the corresponding result. So just clip to
-            // make sure this is a valid (in-bounds) memory access.
-            att_at_t3[k] = att_bth[min(t, t3 + k)];
-        }
-
-        // the code below is actually just a for loop; except,
-        // we have to do something special in one iteration in
-        // the middle, and an if turned out to have significant
-        // performance impact.
-        // so we split the loop in three parts. Ugly, but effective.
-
-        // the beginning/end loop does the same thing, so we write the code
-        // just once in a lambda. In this step, we're guaranteed that
-        // indicator == 0
-        auto loop_step = [&](int t2){
-            float p = att_bth[t2] * datt_bth[t2];
-            for (int k = 0; k < UNROLL; ++k) {
-                result[k] -= p * att_at_t3[k];
-            }
-        };
-
-        // Now the actual loop.
-        {
-            // declare the loop iterator. Needs to be kept across the
-            // three different parts, so it's not a local variable in
-            // the for loop.
-            int t2 = warp.thread_rank();
-
-            // first part, as long as t2 < t3, indicator == 0
-            for (; t2 < t3; t2 += warp.size()) {
-                loop_step(t2);
+    int block_steps = CEIL_DIV(t+1, BlockSize);
+    for (int t3f = 0; t3f < block_steps; ++t3f) {
+        int t3 = t3f * BlockSize + block.thread_rank();
+        float acc = 0.f;
+        float at3 = att_bth[t3];
+        for (int t2b = 0; t2b <= t; t2b += BlockSize) {
+            int end = min(t + 1 - t2b, BlockSize);
+            block.sync();
+            {
+                int t2i = block.thread_rank();
+                int t2 = min(t, t2b + t2i);
+                att_bth_s[t2i] = att_bth[t2] * datt_bth[t2];
             }
 
-            // because k <= warp.size() (==32), the event that t3+k == t2
-            // has to happen at this particular step.
-            static_assert(UNROLL <= 32, "UNROLL is too large, this won't produce correct results.");
-            if (t2 <= t) {
-                float att_t2 = att_bth[t2];
-                float datt_t2 = datt_bth[t2];
-                float p = att_t2 * datt_t2;
-                for (int k = 0; k < UNROLL; ++k) {
-                    float indicator = t2 == (t3 + k) ? 1.0f : 0.0f;
-                    result[k] += p * (indicator - att_at_t3[k]);
+            block.sync();
+            if(t3f * BlockSize == t2b) {
+                for (int t2i = 0; t2i < end; t2i++) {
+                    int t2 = t2b + t2i;
+                    float indicator = t2 == t3 ? 1.0f : 0.0f;
+                    float local_derivative = att_bth_s[t2i] * (indicator - at3);
+                    acc += local_derivative;
                 }
-                t2 += warp.size();
+            } else {
+                for (int t2i = 0; t2i < end; t2i++) {
+                    int t2 = t2b + t2i;
+                    float local_derivative = att_bth_s[t2i] * (0.f - at3);
+                    acc += local_derivative;
+                }
             }
-
-            // rest of the loop, indicator == 0 again
-            for (; t2 <= t; t2 += warp.size()) {
-                loop_step(t2);
-            }
         }
-
-        for(int k = 0; k < UNROLL; ++k) {
-            result[k] = cg::reduce(warp, result[k], cg::plus<float>());
-        }
-
-        // when storing, we need to check that this is actually a valid result.
-        // here, warp.thread_rank() corresponds to `k` in the previous loops.
-        if (warp.thread_rank() < UNROLL && t >= t3 + warp.thread_rank()) {
-            dpreatt_bth[t3 + warp.thread_rank()] = scale * result[warp.thread_rank()];
-        }
+        dpreatt_bth[t3] = scale * acc;
     }
 }
 
@@ -1182,7 +1148,7 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
             B * NH);
 
     // backward into preatt
-    softmax_autoregressive_backward_kernel<<<dim3(CEIL_DIV(B * T * C, block_size/4), B*NH), block_size>>>(dpreatt, datt, att, B, T, C, NH);
+    softmax_autoregressive_backward_kernel<<<dim3(T, B*NH), 64>>>(dpreatt, datt, att, B, T, C, NH);
 
     // backward into q
     cublasSgemmStridedBatched(cublas_handle,
