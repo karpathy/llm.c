@@ -176,7 +176,8 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 
 ## notable forks
 
-will go here, similar to [llama2.c notable forks](https://github.com/karpathy/llama2.c/tree/master?tab=readme-ov-file#notable-forks)
+- Mojo
+  - [llm.🔥](https://github.com/dorjeduck/llm.mojo) by @[dorjeduck](https://github.com/dorjeduck): a Mojo port of this project
 
 ## discussions
 
