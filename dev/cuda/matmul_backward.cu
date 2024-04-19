@@ -23,7 +23,7 @@ static cublasHandle_t cublas_handle;
 // CPU code reference
 
 void matmul_backward_cpu(float* dinp, float* dweight, float* dbias,
-                     float* dout, float* inp, float* weight,
+                     const float* dout, const float* inp, const float* weight,
                      int B, int T, int C, int OC) {
     // most of the running time is spent here and in matmul_forward
     // this backward could be done in a single "round" of loops
@@ -33,10 +33,10 @@ void matmul_backward_cpu(float* dinp, float* dweight, float* dbias,
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            float* dout_bt = dout + b * T * OC + t * OC;
+            const float* dout_bt = dout + b * T * OC + t * OC;
             float* dinp_bt = dinp + b * T * C + t * C;
             for (int o = 0; o < OC; o++) {
-                float* wrow = weight + o*C;
+                const float* wrow = weight + o*C;
                 float d = dout_bt[o];
                 for (int i = 0; i < C; i++) {
                     dinp_bt[i] += wrow[i] * d;
@@ -50,8 +50,8 @@ void matmul_backward_cpu(float* dinp, float* dweight, float* dbias,
         double sum = 0.0;
         for (int b = 0; b < B; b++) {
             for (int t = 0; t < T; t++) {
-                float* dout_bt = dout + b * T * OC + t * OC;
-                float* inp_bt = inp + b * T * C + t * C;
+                const float* dout_bt = dout + b * T * OC + t * OC;
+                const float* inp_bt = inp + b * T * C + t * C;
                 float* dwrow = dweight + o*C;
                 float d = dout_bt[o];
                 if (dbias != NULL) { sum += d; }
@@ -113,7 +113,7 @@ __global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* do
 
 // version1: simple cuBLAS calls
 void matmul_backward1(float* dinp, float* dweight, float* dbias,
-                      float* dout, float* inp, float* weight, float* ones,
+                      const float* dout, const float* inp, const float* weight, const float* ones,
                       int B, int T, int C, int OC) {
     float alpha = 1.0f;
     float beta = 1.0f; // note we must use beta = 1.0 so that we do a +=, as we should, because gradients add
@@ -168,7 +168,7 @@ void matmul_backward1(float* dinp, float* dweight, float* dbias,
 
 void matmul_backward(int kernel_num,
                      float* dinp, float* dweight, float* dbias,
-                     float* dout, float* inp, float* weight, float* ones,
+                     const float* dout, const float* inp, const float* weight, const float* ones,
                      int B, int T, int C, int OC) {
     switch (kernel_num) {
         case 1:
