@@ -1,24 +1,16 @@
 
+// ----------------------------------------------------------------------------
+// source code common to train_gpt2.cu and train_gpt2.cu
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
-#if 0
-#include <math.h>
-#include <time.h>
-#include <float.h>
-#include <unistd.h>
-#include <assert.h>
-#ifdef OMP
-#include <omp.h>
-#endif
-#endif
 
 #include "train_common.h"
-
-
 
 
 // ----------------------------------------------------------------------------
