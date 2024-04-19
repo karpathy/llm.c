@@ -821,6 +821,7 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
     // backward through the unpermute operation
     int num_blocks = ceil_div(B * T * C, block_size);
     unpermute_kernel_backward<<<num_blocks, block_size>>>(dvaccum, dout, B, T, NH, HS);
+    cudaCheck(cudaGetLastError());
 
     // backward into datt
     cublasCheck(cublasSgemmStridedBatched(cublas_handle,
@@ -872,6 +873,7 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
     // backward into inp
     num_blocks = ceil_div(B * NH * T * HS, block_size);
     permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
+    cudaCheck(cudaGetLastError());
 }
 
 // kernel version dispatch
