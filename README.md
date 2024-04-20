@@ -12,7 +12,20 @@ Currently, we are working on:
 
 I'd like this repo to only maintain C and CUDA code. Ports of this repo to other languages are very welcome, but should be done in separate repos, and then I am happy to link to them below in the "notable forks" section, just like I did in [llama2.c notable forks](https://github.com/karpathy/llama2.c/tree/master?tab=readme-ov-file#notable-forks).
 
-## quick start
+## quick start (GPU)
+
+The "I don't care about anything I just want to train and I have a GPU" section. Run:
+
+```bash
+python prepro_tinyshakespeare.py
+python train_gpt2.py
+make train_gpt2cu
+./train_gpt2cu
+```
+
+The above lines (1) download the [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset, tokenize it with the GPT-2 Tokenizer, (2) save the GPT-2 (124M) weights, (3) init from them in C/CUDA and train for one epoch on tineshakespeare with AdamW (using batch size 4, contenxt length 1024, total of 74 steps), evaluate validation loss, and sample some text.
+
+## train
 
 Download and tokenize a dataset. The [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset is the fastest to download and tokenize:
 
