@@ -1,3 +1,22 @@
+/*
+This code is a convenience tool for profiling the CUDA kernels in the training
+loop of train_gpt2.cu. Compile:
+
+make profile_gpt2.cu
+
+And then e.g. use ncu from NVIDIA. The CLI docs for example:
+https://docs.nvidia.com/nsight-compute/NsightComputeCli/
+
+TLDR run like:
+
+ncu -o profile ./profile_gpt2cu
+
+(you may have to sudo it.) This writes results into profile.ncu-rep
+You can open this up in NVIDIA Nsight Compute UI.
+For example, I have NVIDIA Nsight Compute installed on my Mac, and I rsync
+the profile.ncu-rep from a cloud box to local to pretty view.
+*/
+
 #define TESTING
 #include "train_gpt2.cu"
 
