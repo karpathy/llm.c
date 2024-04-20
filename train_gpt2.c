@@ -363,6 +363,8 @@ void gelu_forward(float* out, float* inp, int N) {
     }
 }
 
+#pragma float_control(precise, on, push) // On msvc /fp:fast is a lot faster, but the expf inside coshf breaks the model
+__attribute__((optimize("no-finite-math-only"))) // same for gcc -Ofast 
 void gelu_backward(float* dinp, float* inp, float* dout, int N) {
     for (int i = 0; i < N; i++) {
         float x = inp[i];
@@ -375,6 +377,7 @@ void gelu_backward(float* dinp, float* inp, float* dout, int N) {
         dinp[i] += local_grad * dout[i];
     }
 }
+#pragma float_control(pop) 
 
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
     for (int i = 0; i < N; i++) {
