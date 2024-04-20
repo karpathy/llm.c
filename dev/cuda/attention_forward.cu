@@ -574,6 +574,81 @@ __global__ void scale_kernel(float* inp, float scale, int B, int NH, int T) {
     }
 }
 
+// direct translation of the CPU kernel. Each warp handles ont (b, h, t) combination.
+// The important changes compared to the CPU version:
+//  - each inner loop is handled by a warp
+//  - don't write non-autoregressive parts
+//  - reordered the last loops so that we can do all writing in the outer loop.
+__global__ void attention_forward_fused1(float* out, float* preatt, float* att,
+                                         const float* inp,
+                                         int B, int T, int C, int NH) {
+    // input is (B, T, 3C) Q,K,V
+    // preatt, att are (B, NH, T, T)
+    // output is (B, T, C)
+    int C3 = C*3;
+    int hs = C / NH; // head size
+    float scale = 1.0 / sqrtf(hs);
+
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int t = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    int h = blockIdx.y;
+    int b = blockIdx.z;
+
+    if(t >= T) return;
+
+    const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
+    float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
+    float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+
+    // pass 1: calculate query dot key and maxval
+    float maxval = -INFINITY;
+    for (int t2 = 0; t2 <= t; t2++) {
+        const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+
+        // (query_t) dot (key_t2)
+        float val = 0.0f;
+        for (int i = warp.thread_rank(); i < hs; i += warp.size()) {
+            val += query_t[i] * key_t2[i];
+        }
+        val = cg::reduce(warp, val, cg::plus<float>{});
+        val *= scale;
+        maxval = max(maxval, val);
+        if(warp.thread_rank() == 0) {
+            preatt_bth[t2] = val;
+        }
+    }
+
+    // pass 2: calculate the exp and keep track of sum
+    float expsum = 0.0f;
+    for (int t2 = warp.thread_rank(); t2 <= t; t2 += warp.size()) {
+        float expv = expf(preatt_bth[t2] - maxval);
+        expsum += expv;
+    }
+
+    expsum = cg::reduce(warp, expsum, cg::plus<float>{});
+
+    float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
+
+    // pass 3: normalize to get the softmax is combined with the next loop to reduce memory round-trips
+    for (int t2 = warp.thread_rank(); t2 <= t; t2 += warp.size()) {
+        att_bth[t2] = expf(preatt_bth[t2] - maxval) * expsum_inv;
+    }
+
+    // pass 4: accumulate weighted values into the output of attention
+    float* out_bth = out + b * T * C + t * C + h * hs;
+    for (int i = warp.thread_rank(); i < hs; i += warp.size()) {
+        float o = 0.f;
+        for (int t2 = 0; t2 <= t; t2++) {
+            const float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C * 2; // +C*2 because it's value
+            float att_btht2 = att_bth[t2];
+            o += att_btht2 * value_t2[i];
+        }
+        out_bth[i] = o;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -787,6 +862,15 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
 }
 
+void attention_forward5(float* out, float* preatt, float* att,
+                        const float* inp,
+                        int B, int T, int C, int NH,
+                        const int block_size) {
+    // attention calculation
+    int x_blocks = ceil_div(T, block_size / 32);
+    attention_forward_fused1<<<dim3(x_blocks, NH, B), block_size>>>(out, preatt, att, inp, B, T, C, NH);
+}
+
 // kernel version dispatch
 void attention_forward(int kernel_num,
                        float* out, float* vaccum, float* qkvr, float* preatt, float* att,
@@ -805,6 +889,9 @@ void attention_forward(int kernel_num,
             break;
         case 4:
             attention_forward4(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+            break;
+        case 5:
+            attention_forward5(out, preatt, att, inp, B, T, C, NH, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -868,7 +955,7 @@ int main(int argc, char **argv) {
             // that estimates the softmax online and never materializes preatt/att
             validate_result(d_att, att, "att", B * NH * T * T, 1e-4f);
         }
-        if (kernel_num != 2 && kernel_num != 4) {
+        if (kernel_num != 2 && kernel_num != 4 && kernel_num != 5) {
             // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
             // into the softmax, so preatt is off by 1.0f / sqrt(HS)
             // but att and out (checked below) should match.

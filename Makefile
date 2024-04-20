@@ -1,5 +1,5 @@
 CC ?= clang
-CFLAGS = -Ofast -fno-finite-math-only -Wno-unused-result -march=native
+CFLAGS = -Ofast -Wno-unused-result -march=native
 LDFLAGS =
 LDLIBS = -lm
 INCLUDES =
@@ -57,6 +57,9 @@ train_gpt2cu: train_gpt2.cu
 
 test_gpt2cu: test_gpt2.cu
 	nvcc -O3 --use_fast_math $< -lcublas -lcublasLt -o $@
+
+profile_gpt2cu: profile_gpt2.cu
+	nvcc -O3 --use_fast_math -lineinfo $< -lcublas -lcublasLt -o $@
 
 clean:
 	rm -f train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu

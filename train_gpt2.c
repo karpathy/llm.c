@@ -363,6 +363,9 @@ void gelu_forward(float* out, float* inp, int N) {
     }
 }
 
+// we want to use -Ofast optimization, but sadly GeLU breaks, so disable this flag just for it (#168)
+#pragma float_control(precise, on, push) // On msvc /fp:fast is a lot faster, but the expf inside coshf breaks the model
+__attribute__((optimize("no-finite-math-only"))) // same for gcc -Ofast
 void gelu_backward(float* dinp, float* inp, float* dout, int N) {
     for (int i = 0; i < N; i++) {
         float x = inp[i];
@@ -375,6 +378,7 @@ void gelu_backward(float* dinp, float* inp, float* dout, int N) {
         dinp[i] += local_grad * dout[i];
     }
 }
+#pragma float_control(pop)
 
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
     for (int i = 0; i < N; i++) {
@@ -1159,7 +1163,7 @@ int main() {
     DataLoader val_loader;
     dataloader_init(&val_loader, val_tokens, B, T);
     printf("val dataset num_batches: %d\n", val_loader.num_batches);
-    int val_num_batches = 10;
+    int val_num_batches = 5;
 
     // build the Tokenizer
     Tokenizer tokenizer;
