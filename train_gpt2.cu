@@ -1799,8 +1799,61 @@ void tokenizer_free(Tokenizer *tokenizer) {
 }
 
 // ----------------------------------------------------------------------------
+// CLI, poor man's argparse
+
+void error_usage() {
+    // default run = debugging run with TinyShakespeare
+    // bigger run = train on TinyStories! e.g. val/sample less often, but sample more tokens
+    fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
+    fprintf(stderr, "Example: ./train_gpt2cu -i data/TinyStories -v 100 -s 100 -g 144\n");
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -i <string> input dataset prefix (default = data/tiny_shakespeare)\n");
+    fprintf(stderr, "  -b <int>    batch size B (default = 4)\n");
+    fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
+    fprintf(stderr, "  -l <float>  learning rate (default = 1e-4f)\n");
+    fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
+    fprintf(stderr, "  -m <int>    val_max_batches, up to how many val batches to estimate val loss? (default = 20)\n");
+    fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
+    fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
+    exit(EXIT_FAILURE);
+}
+
+// ----------------------------------------------------------------------------
 // main training loop
-int main() {
+int main(int argc, char *argv[]) {
+
+    // read in the (optional) command line arguments
+    const char* input_dataset_prefix = "data/tiny_shakespeare"; // or e.g. data/TinyStories
+    int B = 4; // batch size
+    int T = 1024; // sequence length max
+    float learning_rate = 1e-4f;
+    int val_loss_every = 20; // every how many steps do we eval validation loss?
+    int val_max_batches = 20; // how many batches max do we eval for validation loss?
+    int sample_every = 20; // every how many steps to do inference?
+    int genT = 64; // number of steps of inference we will do
+    for (int i = 1; i < argc; i+=2) {
+        if (i + 1 >= argc) { error_usage(); } // must have arg after flag
+        if (argv[i][0] != '-') { error_usage(); } // must start with dash
+        if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
+        // read in the args
+        if (argv[i][1] == 'i') { input_dataset_prefix = argv[i+1]; }
+        else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); }
+        else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'l') { learning_rate = atof(argv[i+1]); }
+        else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm') { val_max_batches = atoi(argv[i+1]); }
+        else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
+        else { error_usage(); }
+    }
+    printf("input dataset prefix: %s\n", input_dataset_prefix);
+    printf("batch size B: %d\n", B);
+    printf("sequence length T: %d\n", T);
+    printf("learning rate: %f\n", learning_rate);
+    printf("val_loss_every: %d\n", val_loss_every);
+    printf("val_max_batches: %d\n", val_max_batches);
+    printf("sample_every: %d\n", sample_every);
+    printf("genT: %d\n", genT);
 
     // set up the device
     int deviceIdx = 0;
@@ -1819,7 +1872,6 @@ int main() {
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
-    // setup the (global) cuBLASLt workspace
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     // build the GPT-2 model from a checkpoint
@@ -1827,33 +1879,21 @@ int main() {
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
-    const char* tiny_stories_train = "data/TinyStories_train.bin";
-    const char* tiny_stories_val = "data/TinyStories_val.bin";
-    const char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
-    const char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
-    const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
-    const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
-    int B = 4;
-    int T = 1024;
-    printf("batch size: %d\n", B);
-    printf("sequence length: %d\n", T);
+    char train_tokens_filename[128];
+    char val_tokens_filename[128];
+    assert(strlen(input_dataset_prefix) < 100); // being bit lazy here, make sure we don't overflow
+    sprintf(train_tokens_filename, "%s_train.bin", input_dataset_prefix);
+    sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
 
     // set up the dataloaders
     DataLoader train_loader;
-    dataloader_init(&train_loader, train_tokens, B, T);
-    printf("train dataset num_batches: %d\n", train_loader.num_batches);
+    dataloader_init(&train_loader, train_tokens_filename, B, T);
     DataLoader val_loader;
-    dataloader_init(&val_loader, val_tokens, B, T);
+    dataloader_init(&val_loader, val_tokens_filename, B, T);
+    int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default
+    int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
+    printf("train dataset num_batches: %d\n", train_loader.num_batches);
     printf("val dataset num_batches: %d\n", val_loader.num_batches);
-
-    // run configuration variables
-    // for now, let's do exactly 1 epoch of training
-    // and let's do 1 epoch of validation after every 10 steps
-    int val_num_batches = val_loader.num_batches;
-    int train_num_batches = train_loader.num_batches;
-    int val_loss_every = 20; // every how many steps do we eval validation loss?
-    int sample_every = 20; // every how many steps to do inference?
-    const int genT = 64; // number of steps of inference we will do
 
     // build the Tokenizer
     Tokenizer tokenizer;
@@ -1932,7 +1972,7 @@ int main() {
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
-        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
+        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
