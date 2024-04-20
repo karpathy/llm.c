@@ -1204,9 +1204,9 @@ int main(int argc, char** argv) {
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
-    char* tiny_stories__base = "data/TinyStories_train";
+    char* tiny_stories_base = "data/TinyStories_train";
     char tiny_stories_train[50];
-    sprintf(tiny_stories_train, "%s%d.bin", tiny_stories__base, world_rank);
+    sprintf(tiny_stories_train, "%s%d.bin", tiny_stories_base, world_rank);
     char* tiny_stories_val = "data/TinyStories_val.bin";
     char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
     char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
