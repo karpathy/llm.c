@@ -532,29 +532,27 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
     }
 }
 
-__global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* dout, int B, int T, int OC) {
-    extern __shared__ float shared[];
-    int o = blockIdx.x; // range [0, OC)
-    int tid = threadIdx.x; // range [0, block_size)
-    int block_size = blockDim.x;
-    const float* x = dout + o;
-    // thread coarsening
-    double sum = 0.0;
-    for (int i = tid; i < B * T; i += block_size) {
-        sum += x[i * OC];
+// cooperative groups solution, one warp per output channel
+__global__ void matmul_backward_bias_kernel2(float* dbias, const float* dout, int B, int T, int OC) {
+    // dout is (B, T, OC), dbias is (OC)
+    // e.g. if block_size = 128, then we have 4 warps per block, each in charge of one output channel
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    // meta_group_size is the number of warps in a block (e.g. 4), meta_group_rank is the warp index (0,1,2,3)
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if(idx >= OC) { return; }
+    int BT = B * T; // number of elements to reduce in total, per channel
+    // first, thread coarsening to sum reduce the problem size from B*T to 32
+    float sum = 0.0f;
+    for(int i = warp.thread_rank(); i < BT; i += warp.size()) {
+        sum += dout[i * OC + idx];
     }
-    shared[tid] = (float) sum;
-    __syncthreads();
-    // reductions
-    for (int stride = block_size / 2; stride >= 1; stride /= 2) {
-        __syncthreads();
-        if (tid < stride) {
-            shared[tid] += shared[tid + stride];
-        }
-    }
-    // write the final result (at thread 0) to global memory
-    if (tid == 0) {
-        dbias[o] += shared[0];
+    // now do a warp-level reduce to get the sum across the 32 threads in this warp
+    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    // write the result to output (global memory)
+    if(warp.thread_rank() == 0) {
+        dbias[idx] += sum;
     }
 }
 
@@ -971,11 +969,9 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &one, inp, C, dout, OC, &one, dweight, C));
     // backward to bias, if given, does a +=
     if (dbias != NULL) {
-        const int block_size=512;
-        dim3 block_dim(block_size);
-        dim3 grid_dim(OC);
-        size_t shared_mem_size = block_size * sizeof(float);
-        matmul_backward_bias_kernel_faster<<<grid_dim, block_dim, shared_mem_size>>>(dbias, dout, B, T, OC);
+        const int block_size = 512;
+        const int grid_size = CEIL_DIV(OC * 32, block_size);
+        matmul_backward_bias_kernel2<<<grid_size, block_size>>>(dbias, dout, B, T, OC);
         cudaCheck(cudaGetLastError());
     }
 }
