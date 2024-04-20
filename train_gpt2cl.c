@@ -1156,7 +1156,7 @@ int main() {
     DataLoader val_loader;
     dataloader_init(&val_loader, val_tokens, B, T);
     printf("val dataset num_batches: %d\n", val_loader.num_batches);
-    int val_num_batches = 10;
+    int val_num_batches = 5;
 
     // build the Tokenizer
     Tokenizer tokenizer;
