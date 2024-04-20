@@ -1128,7 +1128,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     return params_memory;
 }
 
-#define NUM_ACTIVATION_TENSORS 25
+#define NUM_ACTIVATION_TENSORS 24
 typedef struct {
     float* encoded; // (B, T, C)
     float* ln1; // (L, B, T, C)
@@ -1150,9 +1150,15 @@ typedef struct {
     float* lnf; // (B, T, C)
     float* lnf_mean; // (B, T)
     float* lnf_rstd; // (B, T)
-    // if we have targets, this will be the logit _gradients_.
-    float* logits; // (B, T, V)
-    float* probs; // (B, T, V)
+    // this buffer is used for all of these three tensors. We never require them at the same
+    // time, so we can safely reuse that memory. The union exists so the code is more self-documenting,
+    // because each access shows the current interpretation of the buffer.
+    union {
+        float* dlogits;
+        float* logits;
+        float* probs;
+    } output; // (B, T, V)
+
     float* losses; // (B, T)
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
     float* qkvr; // (L, B, T, 3*C)
@@ -1185,10 +1191,9 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[18] = B * T; // lnf_mean
     act_sizes[19] = B * T; // lnf_rstd
     act_sizes[20] = B * T * V; // logits
-    act_sizes[21] = B * T * V; // probs
-    act_sizes[22] = B * T; // losses
-    act_sizes[23] = L * B * T * 3*C; // qkvr
-    act_sizes[24] = B * T * C; // v_accum
+    act_sizes[21] = B * T; // losses
+    act_sizes[22] = L * B * T * 3*C; // qkvr
+    act_sizes[23] = B * T * C; // v_accum
 }
 
 float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
@@ -1202,7 +1207,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
         &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
-        &acts->lnf_mean, &acts->lnf_rstd, &acts->logits, &acts->probs, &acts->losses,
+        &acts->lnf_mean, &acts->lnf_rstd, &acts->output.logits, &acts->losses,
         &acts->qkvr, &acts->v_accum
     };
     float* acts_memory_iterator = acts_memory;
@@ -1420,13 +1425,13 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_cublas(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
+    matmul_forward_cublas(acts.output.logits, acts.lnf, params.wte, NULL, B, T, C, V);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         // fused classifier: does the forward pass and first part of the backward pass
         // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
-        fused_classifier3(acts.logits, acts.losses, NULL, model->targets, B, T, V, V);
+        fused_classifier3(acts.output.dlogits, acts.losses, NULL, model->targets, B, T, V, V);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         // move the (B,T) losses to CPU
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
@@ -1437,7 +1442,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     } else {
         // if we don't have targets, we don't have loss
-        softmax_forward(acts.probs, acts.logits, B*T, V);
+        softmax_forward(acts.output.probs, acts.output.logits, B*T, V);
         model->mean_loss = -1.0f;
     }
 }
@@ -1476,7 +1481,7 @@ void gpt2_backward(GPT2 *model) {
         bw_act_sizes[12] = 0; // ln2_rstd
         bw_act_sizes[18] = 0; // lnf_mean
         bw_act_sizes[19] = 0; // lnf_rstd
-        bw_act_sizes[21] = 0; // probs
+        bw_act_sizes[20] = 0; // probs
         // count up and allocate the space
         model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, bw_act_sizes);
         model->num_grad_acts = 0;
@@ -1507,7 +1512,7 @@ void gpt2_backward(GPT2 *model) {
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.lnf, grads.wte, NULL, acts.logits, acts.lnf, params.wte, B, T, C, V);
+    matmul_backward(grads_acts.lnf, grads.wte, NULL, acts.output.dlogits, acts.lnf, params.wte, B, T, C, V);
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass
@@ -1977,7 +1982,7 @@ int main(int argc, char *argv[]) {
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
                 // get the V-dimensional vector probs[0, t-1, :]
-                float* probs = model.acts.probs + (t-1) * model.config.vocab_size;
+                float* probs = model.acts.output.probs + (t-1) * model.config.vocab_size;
                 // move probs back to CPU and sample
                 cudaCheck(cudaMemcpy(cpu_probs, probs, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
                 float coin = random_f32(&rng_state);
