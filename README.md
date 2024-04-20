@@ -84,6 +84,12 @@ Once `train_gpt2` is compiled, you can run it:
 OMP_NUM_THREADS=8 ./train_gpt2
 ```
 
+For DDP training with MPI for TinyStories dataset
+
+```bash
+OMP_NUM_THREADS=8 mpirun -np 4 ./train_gpt2
+```
+
 You should tune the number of threads depending on how many cores your CPU has. The program will load the model weights, the tokens, it will run a finetuning loop for a few iterations with Adam lr 1e-4, and then generate a sample from the model. The file is (I think) very readable and you should have a look. Simply, there are implementations for the forward and backward pass of all the layers, and they get strung together into a large, manual, forward/backward/update loop. The output looks like this on my MacBook Pro (Apple Silicon M3 Max):
 
 ```

@@ -4,6 +4,14 @@ LDFLAGS =
 LDLIBS = -lm
 INCLUDES =
 
+MPI_LDFLAGS = -L/usr/lib/x86_64-linux-gnu/openmpi/lib
+MPI_LDLIBS = -lmpi
+MPI_INCLUDES = -I/usr/lib/x86_64-linux-gnu/openmpi/include/ -I/usr/lib/x86_64-linux-gnu/openmpi/include/openmpi/
+
+LDFLAGS += $(MPI_LDFLAGS)
+LDLIBS += $(MPI_LDLIBS) 
+INCLUDES += $(MPI_INCLUDES)
+
 # Check if OpenMP is available
 # This is done by attempting to compile an empty file with OpenMP flags
 # OpenMP makes the code a lot faster so I advise installing it
