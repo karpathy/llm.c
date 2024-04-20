@@ -322,18 +322,18 @@ __global__ void layernorm_forward_kernel5(float* __restrict__ out, float* __rest
     float var = block_sum2 - m * m;
     float s = rsqrtf(var + 1e-5f);
     // store the mean, no need to cache it
-    if(warp.thread_rank() == 0 && mean != nullptr) {
+    if(threadIdx.x == 0 && mean != nullptr) {
         __stcs(mean + idx, m);
     }
     // store the rstd, no need to cache it
-    if(warp.thread_rank() == 0 && rstd != nullptr) {
+    if(threadIdx.x == 0 && rstd != nullptr) {
         __stcs(rstd + idx, s);
     }
     // final normalization and scaling by weight/bias
     float* o = out + idx * C;
-    for (int c = warp.thread_rank(); c < C; c += warp.size()) {
-        float n = s * (__ldcs(x+c) - m);
-        __stcs(o+c, n * weight[c] + bias[c]);
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        float n = s * (__ldcs(x+i) - m);
+        __stcs(o+i, n * weight[i] + bias[i]);
     }
 }
 
@@ -497,7 +497,7 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
 
-        int repeat_times = 1000;
+        int repeat_times = 2000;
         float elapsed_time = benchmark_kernel(repeat_times, layernorm_forward,
                                               kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight, d_bias,
                                               B, T, C, block_size);
