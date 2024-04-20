@@ -74,6 +74,8 @@ $(WINDOWS_UNISTD_H):
 	@echo #include  ^<io.h^> ^/* needed for access below *^/ >>  $(WINDOWS_UNISTD_H)
 	@echo #define F_OK 0 >>  $(WINDOWS_UNISTD_H)
 	@echo #define access _access >>  $(WINDOWS_UNISTD_H)
+	@echo #define TURN_OFF_FP_FAST __pragma(float_control( precise, on, push )) ^/^/ Save current setting and turn on ^/fp:precise  >>  $(WINDOWS_UNISTD_H)
+	@echo #define TURN_ON_FP_FAST  __pragma(float_control(pop)) ^/^/ Restore file's default settings  >>  $(WINDOWS_UNISTD_H)
 	@echo #endif >>  $(WINDOWS_UNISTD_H)
 	@echo $(WINDOWS_UNISTD_H) created.
    endif
