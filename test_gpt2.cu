@@ -90,6 +90,27 @@ int main(int argc, char *argv[]) {
     // overall OK signal for the test
     int allok = 1;
 
+    // First, do target-free forward pass to validate logits
+    gpt2_forward(&model, x, NULL, B, T);
+    // at this point, target should be equal to expected_logits, let's compare
+    // copy logits to CPU so we can compare them
+    float* logits_cpu = (float*)mallocCheck(B * T * V * sizeof(float));
+    cudaMemcpy(logits_cpu, model.acts.logits, B * T * V * sizeof(float), cudaMemcpyDeviceToHost);
+    int logits_ok = 1;
+    for (int i=0; i<B*T*V; i++) {
+        if(i < 3) {
+            printf("%f %f\n", expected_logits[i], logits_cpu[i]);
+        }
+        if (fabsf(expected_logits[i] - logits_cpu[i]) >= 1e-2) {
+            printf("MISMATCH AT INDEX %d: ", i);
+            printf("%f %f\n", expected_logits[i],logits_cpu[i]);
+            logits_ok = 0;
+            break;
+        }
+    }
+    if(!logits_ok) { printf("NOT "); }
+    printf("OK (LOGITS)\n");
+
     // let's do 10 training iterations, following the pytorch code
     float losses[10];
     for (int step = 0; step < 10; step++) {
@@ -104,24 +125,7 @@ int main(int argc, char *argv[]) {
         if (step == 0) {
             // error checking at step 0 for reference activations
 
-            // at this point, target should be equal to expected_logits, let's compare
-            // copy logits to CPU so we can compare them
-            float* logits_cpu = (float*)mallocCheck(B * T * V * sizeof(float));
-            cudaMemcpy(logits_cpu, model.acts.logits, B * T * V * sizeof(float), cudaMemcpyDeviceToHost);
-            int logits_ok = 1;
-            for (int i=0; i<B*T*V; i++) {
-                if(i < 3) {
-                    printf("%f %f\n", expected_logits[i], logits_cpu[i]);
-                }
-                if (fabsf(expected_logits[i] - logits_cpu[i]) >= 1e-2) {
-                    printf("MISMATCH AT INDEX %d: ", i);
-                    printf("%f %f\n", expected_logits[i],logits_cpu[i]);
-                    logits_ok = 0;
-                    break;
-                }
-            }
-            if(!logits_ok) { printf("NOT "); }
-            printf("OK (LOGITS)\n");
+
             allok = allok && logits_ok;
             free(logits_cpu);
 
