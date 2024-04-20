@@ -49,11 +49,11 @@ __global__ void matmul_backward_bias_kernel1(float* dbias, const float* dout, in
     int block_size = blockDim.x;
     const float* x = dout + o;
     // thread coarsening
-    double sum = 0.0;
+    float sum = 0.0;
     for (int i = tid; i < B * T; i += block_size) {
         sum += x[i * OC];
     }
-    shared[tid] = (float) sum;
+    shared[tid] = sum;
     __syncthreads();
     // reductions
     for (int stride = block_size / 2; stride >= 1; stride /= 2) {
