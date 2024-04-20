@@ -995,7 +995,7 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
 void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, float* dvaccum,
                         const float* dout,
-                        const float* inp, const float* qkvr, const float* att,
+                        const float* qkvr, const float* att,
                         int B, int T, int C, int NH) {
     const int block_size = 256;
     int HS = C / NH; // head size
@@ -1168,7 +1168,7 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[1] = L * B * T * C; // ln1
     act_sizes[2] = L * B * T; // ln1_mean
     act_sizes[3] = L * B * T; // ln1_rstd
-    act_sizes[4] = L * B * T * 3*C; // qkv
+    act_sizes[4] = B * T * 3*C; // qkv
     act_sizes[5] = L * B * T * C; // atty
     act_sizes[6] = B * NH * T * T; // preatt
     act_sizes[7] = L * B * NH * T * T; // att
@@ -1387,7 +1387,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         float* l_ln1 = acts.ln1 + l * B * T * C;
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float* l_qkv = acts.qkv + l * B * T * 3*C;
+        float* l_qkv = acts.qkv;
         float* l_qkvr = acts.qkvr + l * B * T * 3*C;
         float* l_atty = acts.atty + l * B * T * C;
         float* l_att = acts.att + l * B * NH * T * T;
@@ -1541,7 +1541,6 @@ void gpt2_backward(GPT2 *model) {
         float* l_ln1 = acts.ln1 + l * B * T * C;
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float* l_qkv = acts.qkv + l * B * T * 3*C;
         float* l_qkvr = acts.qkvr + l * B * T * 3*C;
         float* l_atty = acts.atty + l * B * T * C;
         float* l_att = acts.att + l * B * NH * T * T;
@@ -1572,7 +1571,7 @@ void gpt2_backward(GPT2 *model) {
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
         matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
-        attention_backward(dl_qkv, dl_qkvr, dl_preatt, dl_att, dl_v_accum, dl_atty, l_qkv, l_qkvr, l_att, B, T, C, NH);
+        attention_backward(dl_qkv, dl_qkvr, dl_preatt, dl_att, dl_v_accum, dl_atty, l_qkvr, l_att, B, T, C, NH);
         matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
