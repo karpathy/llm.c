@@ -9,9 +9,16 @@ https://docs.nvidia.com/nsight-compute/NsightComputeCli/
 
 TLDR run like:
 
-ncu -o profile ./profile_gpt2cu
+sudo ncu --set full --import-source yes -o profile -f ./profile_gpt2cu
 
-(you may have to sudo it.) This writes results into profile.ncu-rep
+This:
+- `--set full` means we'll collect A LOT of metrics. take out for less
+- `--import-source yes` means we'll get the source code in the profile
+- `-o profile` writes the results into file profile.ncu-rep
+- `-f` forces overwrite of the profile.ncu-rep file
+- `./profile_gpt2cu` is the executable we want to profile
+
+This writes results into profile.ncu-rep output file.
 You can open this up in NVIDIA Nsight Compute UI.
 For example, I have NVIDIA Nsight Compute installed on my Mac, and I rsync
 the profile.ncu-rep from a cloud box to local to pretty view.
