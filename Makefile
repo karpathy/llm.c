@@ -53,7 +53,7 @@ test_gpt2: test_gpt2.c
 
 # possibly may want to disable warnings? e.g. append -Xcompiler -Wno-unused-result
 train_gpt2cu: train_gpt2.cu
-	nvcc -O3 --use_fast_math $< -lcublas -lcublasLt -o $@
+	nvcc -O3 --use_fast_math $(MPI_INCLUDES) $(MPI_LDFLAGS) $< -lcublas -lcublasLt $(MPI_LDLIBS) -o $@
 
 test_gpt2cu: test_gpt2.cu
 	nvcc -O3 --use_fast_math $< -lcublas -lcublasLt -o $@

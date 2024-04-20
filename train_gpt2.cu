@@ -26,6 +26,7 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <mpi.h>
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -776,6 +777,15 @@ __global__ void fused_classifier_kernel3(float* dlogits, float* losses, float* p
     }
 }
 
+__global__ void grad_accumulate_kernel(float *dest, const float *src, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dest[idx] += src[idx];
+    }
+}
+
+
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -1041,6 +1051,14 @@ void fused_classifier3(float* dlogits, float* losses,
     const int N = B * T;
     const int grid_size = N;
     fused_classifier_kernel3<<<grid_size, block_size>>>(dlogits, losses, NULL, logits, dlosses, targets, B, T, V, P);
+    cudaCheck(cudaGetLastError());
+}
+
+void grad_accumulate(float *acc_src, float *accum_buff, int P)
+{
+    const int blockSize = 256;
+    const int numBlocks = (P + blockSize - 1) / blockSize;
+    grad_accumulate_kernel<<<numBlocks, blockSize>>>(accum_buff, acc_src, P);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1447,6 +1465,55 @@ void gpt2_zero_grad(GPT2 *model) {
     if (model->grads_memory != NULL) { cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(float))); }
 }
 
+void gpt2_accumulate_grad(GPT2 *model) {
+    if (model->grads_memory == NULL) return;
+
+    int world_rank, world_size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    // Allocate temp buffers on device
+    float *send_buff, *recv_buff, *accum_buff;
+    cudaMalloc((void**)&send_buff, model->num_parameters * sizeof(float));
+    cudaMalloc((void**)&recv_buff, model->num_parameters * sizeof(float));
+    cudaMalloc((void**)&accum_buff, model->num_parameters * sizeof(float));
+
+    // Initialize buffers
+    cudaMemcpy(send_buff, model->grads_memory, model->num_parameters * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(recv_buff, model->grads_memory, model->num_parameters * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(accum_buff, model->grads_memory, model->num_parameters * sizeof(float), cudaMemcpyDeviceToDevice);
+
+    int left = (world_rank - 1 + world_size) % world_size;
+    int right = (world_rank + 1) % world_size;
+    MPI_Request send_req, recv_req;
+
+    for (int i = 0; i < world_size - 1; i++) {
+        if (i % 2 == 0) {
+            // Initiate non-blocking send and receive
+            MPI_Isend(send_buff, model->num_parameters, MPI_FLOAT, right, 0, MPI_COMM_WORLD, &send_req);
+            MPI_Irecv(recv_buff, model->num_parameters, MPI_FLOAT, left, 0, MPI_COMM_WORLD, &recv_req);
+        } else {
+            MPI_Isend(recv_buff, model->num_parameters, MPI_FLOAT, right, 0, MPI_COMM_WORLD, &send_req);
+            MPI_Irecv(send_buff, model->num_parameters, MPI_FLOAT, left, 0, MPI_COMM_WORLD, &recv_req);
+        }
+
+        // Wait for async communication to complete
+        MPI_Wait(&recv_req, MPI_STATUS_IGNORE);
+        MPI_Wait(&send_req, MPI_STATUS_IGNORE);
+
+        // Accumulate received gradients
+        float *acc_src = (i % 2 == 0) ? recv_buff : send_buff;
+        grad_accumulate(acc_src, accum_buff, model->num_parameters);
+    }
+
+    // Update the final gradients back to model
+    cudaMemcpy(model->grads_memory, accum_buff, model->num_parameters * sizeof(float), cudaMemcpyDeviceToDevice);
+
+    cudaFree(send_buff);
+    cudaFree(recv_buff);
+    cudaFree(accum_buff);
+}
+
 void gpt2_backward(GPT2 *model) {
 
     // double check we forwarded previously, with targets
@@ -1800,10 +1867,15 @@ void tokenizer_free(Tokenizer *tokenizer) {
 
 // ----------------------------------------------------------------------------
 // main training loop
-int main() {
+int main(int argc, char** argv) {
+
+    //setup mpi and acquire the rank
+    MPI_Init(&argc, &argv);
+    int world_rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
     // set up the device
-    int deviceIdx = 0;
+    int deviceIdx = world_rank;
     cudaCheck(cudaSetDevice(deviceIdx));
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
@@ -1827,7 +1899,9 @@ int main() {
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
-    const char* tiny_stories_train = "data/TinyStories_train.bin";
+    const char* tiny_stories_base = "data/TinyStories_train";
+    char tiny_stories_train[50];
+    sprintf(tiny_stories_train, "%s%d.bin", tiny_stories_base, world_rank);
     const char* tiny_stories_val = "data/TinyStories_val.bin";
     const char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
     const char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
@@ -1932,6 +2006,7 @@ int main() {
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
+        gpt2_accumulate_grad(&model);
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
@@ -1952,6 +2027,8 @@ int main() {
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
+
+    MPI_Finalize();
 
     return 0;
 }
