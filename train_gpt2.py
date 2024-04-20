@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import torch._inductor.config as config
 
 class NewGELU(nn.Module):
     """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
@@ -356,6 +357,7 @@ if __name__ == "__main__":
     model.train()
     model.to(device)
     if args.compile:
+        config.coordinate_descent_tuning = True # suggested by @Chillee
         print("compiling the model...")
         model = torch.compile(model)
 

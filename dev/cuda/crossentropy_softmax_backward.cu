@@ -132,6 +132,7 @@ int main(int argc, char **argv) {
 
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
+        cudaCheck(cudaMemset(d_dlogits, 0, B * T * V * sizeof(float)));
         printf("Checking block size %d.\n", block_size);
         crossentropy_softmax_backward(kernel_num, d_dlogits, d_dlosses, d_probs, d_targets, B, T, V, block_size);
         validate_result(d_dlogits, dlogits, "dlogits", B * T * V, 1e-5f);
