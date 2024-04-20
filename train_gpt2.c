@@ -17,6 +17,7 @@ There will be other versions of this code that specialize it and make it fast.
 #include <time.h>
 #include <string.h>
 #include <unistd.h>
+#include <mpi.h>
 #ifdef OMP
 #include <omp.h>
 #endif
@@ -805,6 +806,60 @@ void gpt2_zero_grad(GPT2 *model) {
     if(model->grads_acts_memory != NULL) { memset(model->grads_acts_memory, 0, model->num_activations * sizeof(float)); }
 }
 
+void gpt2_accumulate_grad(GPT2 *model) {
+    if (model->grads_memory == NULL) return;
+
+    int world_rank, world_size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    float* send_buff = (float*)malloc(model->num_parameters * sizeof(float));
+    float* recv_buff = (float*)malloc(model->num_parameters * sizeof(float));
+    float* accum_buff = (float*)malloc(model->num_parameters * sizeof(float));
+
+    // Initialize buffers
+    for (int i = 0; i < model->num_parameters; i++) {
+        send_buff[i] = model->grads_memory[i];
+        recv_buff[i] = model->grads_memory[i];
+        accum_buff[i] = model->grads_memory[i];
+    }
+
+    int left = (world_rank - 1 + world_size) % world_size;
+    int right = (world_rank + 1) % world_size;
+    MPI_Request send_req, recv_req;
+    MPI_Status status;
+
+    for (int i = 0; i < world_size - 1; i++) {
+        if (i % 2 == 0) {
+            // Initiate non-blocking send and receive
+            MPI_Isend(send_buff, model->num_parameters, MPI_FLOAT, right, 0, MPI_COMM_WORLD, &send_req);
+            MPI_Irecv(recv_buff, model->num_parameters, MPI_FLOAT, left, 0, MPI_COMM_WORLD, &recv_req);
+        } else {
+            // Alternate the buffers for send and receive
+            MPI_Isend(recv_buff, model->num_parameters, MPI_FLOAT, right, 0, MPI_COMM_WORLD, &send_req);
+            MPI_Irecv(send_buff, model->num_parameters, MPI_FLOAT, left, 0, MPI_COMM_WORLD, &recv_req);
+        }
+
+        // Wait for the async comms to complete
+        MPI_Wait(&recv_req, &status);
+        MPI_Wait(&send_req, &status);
+
+        // Accumulate received gradients
+        for (int j = 0; j < model->num_parameters; j++) {
+            accum_buff[j] += (i % 2 == 0) ? recv_buff[j] : send_buff[j];
+        }
+    }
+
+    // Update the final gradients back to model
+    for (int i = 0; i < model->num_parameters; i++) {
+        model->grads_memory[i] = accum_buff[i];
+    }
+
+    free(send_buff);
+    free(recv_buff);
+    free(accum_buff);
+}
+
 void gpt2_backward(GPT2 *model) {
 
     // double check we forwarded previously, with targets
@@ -1138,14 +1193,20 @@ void tokenizer_free(Tokenizer *tokenizer) {
 
 // ----------------------------------------------------------------------------
 // main training loop
-int main() {
+int main(int argc, char** argv) {
+
+    MPI_Init(&argc, &argv);
+    int world_rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
-    char* tiny_stories_train = "data/TinyStories_train.bin";
+    char* tiny_stories__base = "data/TinyStories_train";
+    char tiny_stories_train[50];
+    sprintf(tiny_stories_train, "%s%d.bin", tiny_stories__base, world_rank);
     char* tiny_stories_val = "data/TinyStories_val.bin";
     char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
     char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
@@ -1228,6 +1289,7 @@ int main() {
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
+        gpt2_accumulate_grad(&model);
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
@@ -1240,6 +1302,9 @@ int main() {
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
     free(gen_tokens);
+
+    MPI_Finalize();
+    
     return 0;
 }
 #endif
