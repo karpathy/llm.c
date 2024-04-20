@@ -36,3 +36,9 @@ Solution.VC.*
 *.FileListAbsolute.txt
 DocumentLayout.*
 *.vsidx
+platform/windows/unistd.h
+*.iobj
+*.ipdb
+*.sqlite
+*.wsuo
+*.json
