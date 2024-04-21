@@ -888,9 +888,9 @@ void matmul_forward_cublaslt(float* out,
     cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
 }
 
-void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
-                        float* inp,
-                        int B, int T, int C, int NH) {
+void attention_forward(float* out, float* scratch, float* qkvr, float* preatt, float* att,
+                       float* inp,
+                       int B, int T, int C, int NH) {
     const int block_size = 256;
     const int softmax_block_size = 256;
 
@@ -922,12 +922,12 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha, v, HS, T * HS, att, T, T * T, &beta, vaccum, HS, T * HS, B * NH));
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha, v, HS, T * HS, att, T, T * T, &beta, scratch, HS, T * HS, B * NH));
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+    unpermute_kernel<<<num_blocks, block_size>>>(scratch, out, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
 
@@ -993,7 +993,7 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
 
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
-void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, float* dvaccum,
+void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, float* scratch,
                         const float* dout,
                         const float* qkvr, const float* att,
                         int B, int T, int C, int NH) {
@@ -1012,12 +1012,12 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     dv = dqkvr + 2 * B * T * C;
     // backward through the unpermute operation
     int num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel_backward<<<num_blocks, block_size>>>(dvaccum, dout, B, T, NH, HS);
+    unpermute_kernel_backward<<<num_blocks, block_size>>>(scratch, dout, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
     // backward into datt
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &one, v, HS, T * HS, dvaccum, HS, T * HS, &zero, datt, T, T * T, B * NH));
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &one, v, HS, T * HS, scratch, HS, T * HS, &zero, datt, T, T * T, B * NH));
     // backward into dv
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, dvaccum, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH));
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, scratch, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH));
     // backward into preatt
     int hs = C / NH; // head size
     float scale = 1.0f / sqrtf(hs);
@@ -1134,9 +1134,9 @@ typedef struct {
     float* ln1; // (L, B, T, C)
     float* ln1_mean; // (L, B, T)
     float* ln1_rstd; // (L, B, T)
-    float* qkv; // (L, B, T, 3*C)
+    float* qkv; // (B, T, 3*C)
     float* atty; // (L, B, T, C)
-    float* preatt; // (L, B, NH, T, T)
+    float* preatt; // (B, NH, T, T)
     float* att; // (L, B, NH, T, T)
     float* attproj; // (L, B, T, C)
     float* residual2; // (L, B, T, C)
@@ -1157,7 +1157,8 @@ typedef struct {
     float* losses; // (B, T)
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
     float* qkvr; // (L, B, T, 3*C)
-    float* v_accum; // (L, B, T, C)
+    // general scratchpad buffer, large enough to hold (B, T, C) and (B, NH, T, T) shaped tensors.
+    float* scratch;
 } ActivationTensors;
 
 void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
@@ -1188,7 +1189,7 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[20] = B * T * V; // logits
     act_sizes[21] = B * T; // losses
     act_sizes[22] = L * B * T * 3*C; // qkvr
-    act_sizes[23] = B * T * C; // v_accum
+    act_sizes[23] = B * T * max(C, NH*T); // scratch
 }
 
 float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
@@ -1203,7 +1204,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
         &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
         &acts->lnf_mean, &acts->lnf_rstd, &acts->output, &acts->losses,
-        &acts->qkvr, &acts->v_accum
+        &acts->qkvr, &acts->scratch
     };
     float* acts_memory_iterator = acts_memory;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
@@ -1403,12 +1404,12 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         float* l_preatt = acts.preatt;
-        float* l_v_accum = acts.v_accum;
+        float* scratch = acts.scratch;
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
         matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward(l_atty, l_v_accum, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH);
+        attention_forward(l_atty, scratch, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH);
         matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
@@ -1475,7 +1476,9 @@ void gpt2_backward(GPT2 *model) {
         bw_act_sizes[12] = 0; // ln2_rstd
         bw_act_sizes[18] = 0; // lnf_mean
         bw_act_sizes[19] = 0; // lnf_rstd
-        bw_act_sizes[20] = 0; // probs
+        bw_act_sizes[20] = 0; // logits
+        bw_act_sizes[21] = 0; // losses
+        bw_act_sizes[23] = 0; // scratch
         // count up and allocate the space
         model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, bw_act_sizes);
         model->num_grad_acts = 0;
@@ -1558,10 +1561,12 @@ void gpt2_backward(GPT2 *model) {
         float* dl_atty = grads_acts.atty;
         float* dl_preatt = grads_acts.preatt;
         float* dl_att = grads_acts.att;
-        float* dl_v_accum = grads_acts.v_accum;
         float* dl_ln2 = grads_acts.ln2;
         float* dl_fch = grads_acts.fch;
         float* dl_fch_gelu = grads_acts.fch_gelu;
+
+        // re-use scratch buffer of the forward pass
+        float* scratch = acts.scratch;
 
         // backprop this layer
         matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
@@ -1570,7 +1575,7 @@ void gpt2_backward(GPT2 *model) {
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
         matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
-        attention_backward(dl_qkv, dl_qkvr, dl_preatt, dl_att, dl_v_accum, dl_atty, l_qkvr, l_att, B, T, C, NH);
+        attention_backward(dl_qkv, dl_qkvr, dl_preatt, dl_att, scratch, dl_atty, l_qkvr, l_att, B, T, C, NH);
         matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
