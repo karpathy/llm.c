@@ -1195,17 +1195,13 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
 // Backward pass is conceptually quite different from forward, because we can discard
 // the activations of a layer as soon as we're done with it. This lets us aggressively
 // reuse memory, so that we need far fewer tensors for backward state.
-#define NUM_BACKWARD_TENSORS 10
+#define NUM_BACKWARD_TENSORS 6
 typedef struct {
-    float* ln1; // (B, T, C)
-    float* qkv; // (B, T, 3*C)
-    float* atty; // (B, T, C)
+    float* btc; // (B, T, C)
+    float* bt4c; // (B, T, 4*C)
     float* preatt; // (B, NH, T, T)
     float* att; // (B, NH, T, T)
-    float* fch; // (B, T, 4*C)
-    float* fcproj; // (B, T, C)
     float* residual3; // (B, T, C)
-    float* lnf; // (B, T, C)
     float* qkvr; // (B, T, 3C)
 } GradActTensors;
 
@@ -1213,16 +1209,12 @@ typedef struct {
 void fill_in_grad_act_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
     size_t NH = config.num_heads;
     size_t C = config.channels;
-    act_sizes[0] = B * T * C; // ln1
-    act_sizes[1] = B * T * 3 * C; // qkv
-    act_sizes[2] = B * T * C; // atty
-    act_sizes[3] = B * NH * T * T; // preatt
-    act_sizes[4] = B * NH * T * T; // att
-    act_sizes[5] = B * T * 4 * C; // fch
-    act_sizes[6] = B * T * C; // fcproj
-    act_sizes[7] = B * T * C; // residual3
-    act_sizes[8] = B * T * C; // lnf
-    act_sizes[9] = B * T * 3 * C; // qkvr
+    act_sizes[0] = B * T * C;   // ln
+    act_sizes[1] = B * T * 4 * C; // bt4c
+    act_sizes[2] = B * NH * T * T; // preatt
+    act_sizes[3] = B * NH * T * T; // att
+    act_sizes[4] = B * T * C; // residual3
+    act_sizes[5] = B * T * 3 * C; // qkvr
 }
 
 
@@ -1254,8 +1246,8 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
 
 float* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) {
     float** ptrs[] = {
-        &acts->ln1, &acts->qkv, &acts->atty, &acts->preatt, &acts->att,
-        &acts->fch, &acts->fcproj, &acts->residual3, &acts->lnf, &acts->qkvr
+        &acts->btc, &acts->bt4c, &acts->preatt, &acts->att,
+        &acts->residual3, &acts->qkvr
     };
     return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
@@ -1540,11 +1532,11 @@ void gpt2_backward(GPT2 *model) {
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.lnf, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, V);
+    matmul_backward(grads_acts.btc, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, V);
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.btc, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
 
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
@@ -1586,28 +1578,26 @@ void gpt2_backward(GPT2 *model) {
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
-        float* dl_ln = grads_acts.ln1;
-        float* dl_qkv = grads_acts.qkv;
+        float* dl_btc = grads_acts.btc;
+        float* dl_bt4c = grads_acts.bt4c;
         float* dl_qkvr = grads_acts.qkvr;
-        float* dl_atty = grads_acts.atty;
         float* dl_preatt = grads_acts.preatt;
         float* dl_att = grads_acts.att;
-        float* dl_fch = grads_acts.fch;
 
         // re-use scratch buffer of the forward pass
         float* scratch = acts.scratch;
 
         // backprop this layer
-        matmul_backward(dl_fch, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
-        gelu_backward(dl_fch, l_fch, dl_fch, B*T*4*C);
-        matmul_backward(dl_ln, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
+        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
+        gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C);
+        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, B, T, C, 4 * C);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
-        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_ln, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
-        matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
-        attention_backward(dl_qkv, dl_qkvr, dl_preatt, dl_att, scratch, dl_atty, l_qkvr, l_att, B, T, C, NH);
-        matmul_backward(dl_ln, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
+        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
+        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
+        attention_backward(dl_bt4c, dl_qkvr, dl_preatt, dl_att, scratch, dl_btc, l_qkvr, l_att, B, T, C, NH);
+        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
 }
