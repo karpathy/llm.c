@@ -29,32 +29,39 @@ $(foreach flag,$(CFLAGS_COND),$(eval $(call check_and_add_flag,$(flag))))
 # e.g. on MacOS: brew install libomp
 # e.g. on Ubuntu: sudo apt-get install libomp-dev
 # later, run the program by prepending the number of threads, e.g.: OMP_NUM_THREADS=8 ./gpt2
-ifeq ($(shell uname), Darwin)
-  # Check if the libomp directory exists
-  ifeq ($(shell [ -d /opt/homebrew/opt/libomp/lib ] && echo "exists"), exists)
-    # macOS with Homebrew and directory exists
-    CFLAGS += -Xclang -fopenmp -DOMP
-    LDFLAGS += -L/opt/homebrew/opt/libomp/lib
-    LDLIBS += -lomp
-    INCLUDES += -I/opt/homebrew/opt/libomp/include
-    $(info OpenMP found, compiling with OpenMP support)
-  else ifeq ($(shell [ -d /usr/local/opt/libomp/lib ] && echo "exists"), exists)
-    CFLAGS += -Xclang -fopenmp -DOMP
-    LDFLAGS += -L/usr/local/opt/libomp/lib
-    LDLIBS += -lomp
-    INCLUDES += -I/usr/local/opt/libomp/include
-    $(info OpenMP found, compiling with OpenMP support)
-  else
-    $(warning OpenMP not found, skipping OpenMP support)
-  endif
+# First, check if NO_OMP is set to 1, if not, proceed with the OpenMP checks
+ifeq ($(NO_OMP), 1)
+  $(info OpenMP is manually disabled)
 else
-  ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
-    # Ubuntu or other Linux distributions
-    CFLAGS += -fopenmp -DOMP
-    LDLIBS += -lgomp
-    $(info OpenMP found, compiling with OpenMP support)
+  # Detect if running on macOS or Linux
+  ifeq ($(shell uname), Darwin)
+    # Check for Homebrew's libomp installation in different common directories
+    ifeq ($(shell [ -d /opt/homebrew/opt/libomp/lib ] && echo "exists"), exists)
+      # macOS with Homebrew on ARM (Apple Silicon)
+      CFLAGS += -Xclang -fopenmp -DOMP
+      LDFLAGS += -L/opt/homebrew/opt/libomp/lib
+      LDLIBS += -lomp
+      INCLUDES += -I/opt/homebrew/opt/libomp/include
+      $(info OpenMP found, compiling with OpenMP support)
+    else ifeq ($(shell [ -d /usr/local/opt/libomp/lib ] && echo "exists"), exists)
+      # macOS with Homebrew on Intel
+      CFLAGS += -Xclang -fopenmp -DOMP
+      LDFLAGS += -L/usr/local/opt/libomp/lib
+      LDLIBS += -lomp
+      INCLUDES += -I/usr/local/opt/libomp/include
+      $(info OpenMP found, compiling with OpenMP support)
+    else
+      $(warning OpenMP not found, skipping OpenMP support)
+    endif
   else
-    $(warning OpenMP not found, skipping OpenMP support)
+    # Check for OpenMP support in GCC or Clang on Linux
+    ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
+      CFLAGS += -fopenmp -DOMP
+      LDLIBS += -lgomp
+      $(info OpenMP found, compiling with OpenMP support)
+    else
+      $(warning OpenMP not found, skipping OpenMP support)
+    endif
   endif
 endif
 
