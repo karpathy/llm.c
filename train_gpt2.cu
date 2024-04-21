@@ -849,6 +849,15 @@ void matmul_forward_cublaslt(float* out,
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias, sizeof(epilogueBias)));
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
 
+    //cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC));
+    //m=OC
+    //n=B*T
+    //k=C
+
+    //cublasCheck(cublasLtMatrixLayoutCreate(&weightLayout, CUDA_R_32F, m, k, m));
+    //cublasCheck(cublasLtMatrixLayoutCreate(&inputLayout, CUDA_R_32F, k, n, k));
+    //cublasCheck(cublasLtMatrixLayoutCreate(&outputLayout, CUDA_R_32F, m, n, m));
+
     // define matrix layouts
     cublasCheck(cublasLtMatrixLayoutCreate(&weightLayout, CUDA_R_32F, C, OC, C));
     cublasCheck(cublasLtMatrixLayoutCreate(&inputLayout, CUDA_R_32F, C, B*T, C));
