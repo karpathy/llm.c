@@ -1132,15 +1132,13 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     return params_memory;
 }
 
-#define NUM_ACTIVATION_TENSORS 24
+#define NUM_ACTIVATION_TENSORS 22
 typedef struct {
     float* encoded; // (B, T, C)
     float* ln1; // (L, B, T, C)
     float* ln1_mean; // (L, B, T)
     float* ln1_rstd; // (L, B, T)
-    float* qkv; // (B, T, 3*C)
     float* atty; // (L, B, T, C)
-    float* preatt; // (B, NH, T, T)
     float* att; // (L, B, NH, T, T)
     float* attproj; // (L, B, T, C)
     float* residual2; // (L, B, T, C)
@@ -1174,56 +1172,92 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[1] = L * B * T * C; // ln1
     act_sizes[2] = L * B * T; // ln1_mean
     act_sizes[3] = L * B * T; // ln1_rstd
-    act_sizes[4] = B * T * 3*C; // qkv
-    act_sizes[5] = L * B * T * C; // atty
-    act_sizes[6] = B * NH * T * T; // preatt
-    act_sizes[7] = L * B * NH * T * T; // att
-    act_sizes[8] = L * B * T * C; // attproj
-    act_sizes[9] = L * B * T * C; // residual2
-    act_sizes[10] = L * B * T * C; // ln2
-    act_sizes[11] = L * B * T; // ln2_mean
-    act_sizes[12] = L * B * T; // ln2_rstd
-    act_sizes[13] = L * B * T * 4*C; // fch
-    act_sizes[14] = L * B * T * 4*C; // fch_gelu
-    act_sizes[15] = L * B * T * C; // fcproj
-    act_sizes[16] = L * B * T * C; // residual3
-    act_sizes[17] = B * T * C; // lnf
-    act_sizes[18] = B * T; // lnf_mean
-    act_sizes[19] = B * T; // lnf_rstd
-    act_sizes[20] = B * T * V; // logits
-    act_sizes[21] = B * T; // losses
-    act_sizes[22] = L * B * T * 3*C; // qkvr
-    act_sizes[23] = B * T * max(3*C, NH*T); // scratch, forward only
+    act_sizes[4] = L * B * T * C; // atty
+    act_sizes[5] = L * B * NH * T * T; // att
+    act_sizes[6] = L * B * T * C; // attproj
+    act_sizes[7] = L * B * T * C; // residual2
+    act_sizes[8] = L * B * T * C; // ln2
+    act_sizes[9] = L * B * T; // ln2_mean
+    act_sizes[10] = L * B * T; // ln2_rstd
+    act_sizes[11] = L * B * T * 4*C; // fch
+    act_sizes[12] = L * B * T * 4*C; // fch_gelu
+    act_sizes[13] = L * B * T * C; // fcproj
+    act_sizes[14] = L * B * T * C; // residual3
+    act_sizes[15] = B * T * C; // lnf
+    act_sizes[16] = B * T; // lnf_mean
+    act_sizes[17] = B * T; // lnf_rstd
+    act_sizes[18] = B * T * V; // logits
+    act_sizes[19] = B * T; // losses
+    act_sizes[20] = L * B * T * 3*C; // qkvr
+    act_sizes[21] = B * T * max(3*C, NH*T); // scratch
 }
 
-float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
+// Backward pass is conceptually quite different from forward, because we can discard
+// the activations of a layer as soon as we're done with it. This lets us aggressively
+// reuse memory, so that we need far fewer tensors for backward state.
+#define NUM_BACKWARD_TENSORS 10
+typedef struct {
+    float* ln1; // (B, T, C)
+    float* qkv; // (B, T, 3*C)
+    float* atty; // (B, T, C)
+    float* preatt; // (B, NH, T, T)
+    float* att; // (B, NH, T, T)
+    float* fch; // (B, T, 4*C)
+    float* fcproj; // (B, T, C)
+    float* residual3; // (B, T, C)
+    float* lnf; // (B, T, C)
+    float* qkvr; // (B, T, 3C)
+} GradActTensors;
+
+
+void fill_in_grad_act_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
+    size_t NH = config.num_heads;
+    size_t C = config.channels;
+    act_sizes[0] = B * T * C; // ln1
+    act_sizes[1] = B * T * 3 * C; // qkv
+    act_sizes[2] = B * T * C; // atty
+    act_sizes[3] = B * NH * T * T; // preatt
+    act_sizes[4] = B * NH * T * T; // att
+    act_sizes[5] = B * T * 4 * C; // fch
+    act_sizes[6] = B * T * C; // fcproj
+    act_sizes[7] = B * T * C; // residual3
+    act_sizes[8] = B * T * C; // lnf
+    act_sizes[9] = B * T * 3 * C; // qkvr
+}
+
+
+float* malloc_and_point(float** targets[], const size_t* act_sizes, int n) {
     size_t num_activations = 0;
-    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+    for (size_t i = 0; i < n; i++) {
         num_activations += act_sizes[i];
     }
     float* acts_memory;
     cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
+    float* acts_memory_iterator = acts_memory;
+    for (size_t i = 0; i < n; i++) {
+        *(targets[i]) = acts_memory_iterator;
+        acts_memory_iterator += act_sizes[i];
+    }
+    return acts_memory;
+}
+
+float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
     float** ptrs[] = {
-        &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
-        &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
+        &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->atty,
+        &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
         &acts->lnf_mean, &acts->lnf_rstd, &acts->output, &acts->losses,
         &acts->qkvr, &acts->scratch
     };
-    float* acts_memory_iterator = acts_memory;
-    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-        // update the pointer to the correct offset within the buffer.
-        // if a certain element is empty (e.g., because it is needed only in forward/only in backward)
-        // set the pointer to NULL instead, so we get crashes instead of memory corruption if we mess this
-        // up.
-        if(act_sizes[i] != 0) {
-            *(ptrs[i]) = acts_memory_iterator;
-        } else {
-            *(ptrs[i]) = NULL;
-        }
-        acts_memory_iterator += act_sizes[i];
-    }
-    return acts_memory;
+    return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
+}
+
+float* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) {
+    float** ptrs[] = {
+        &acts->ln1, &acts->qkv, &acts->atty, &acts->preatt, &acts->att,
+        &acts->fch, &acts->fcproj, &acts->residual3, &acts->lnf, &acts->qkvr
+    };
+    return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
 
 typedef struct {
@@ -1245,7 +1279,7 @@ typedef struct {
     float* acts_memory;
     size_t num_activations;
     // gradients of the activations
-    ActivationTensors grads_acts;
+    GradActTensors grads_acts;
     size_t num_grad_acts;
     float* grads_acts_memory;
     // other run state configuration
@@ -1346,9 +1380,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         model->seq_len = T;
         // and now allocate the space
         fill_in_activation_sizes(model->act_sizes, B, T, model->config);
-        // qkv and preatt are handled in the scratch buffer for the forward pass
-        model->act_sizes[4] = 0;
-        model->act_sizes[6] = 0;
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
@@ -1478,26 +1509,11 @@ void gpt2_backward(GPT2 *model) {
         size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
         GPT2Config cfg = model->config;
         cfg.num_layers = 1; // copy the configuration but override number of layers to 1
-        fill_in_activation_sizes(bw_act_sizes, model->batch_size, model->seq_len, cfg);
-        // on top of that, some buffers are not needed at all, set their sizes to zero
-        bw_act_sizes[0] = 0; // encoded
-        bw_act_sizes[2] = 0; // ln1_mean
-        bw_act_sizes[3] = 0; // ln1_rstd
-        bw_act_sizes[8] = 0; // attproj
-        bw_act_sizes[9] = 0; // residual2
-        bw_act_sizes[10] = 0; // ln2
-        bw_act_sizes[11] = 0; // ln2_mean
-        bw_act_sizes[12] = 0; // ln2_rstd
-        bw_act_sizes[14] = 0; // fch_gelu
-        bw_act_sizes[18] = 0; // lnf_mean
-        bw_act_sizes[19] = 0; // lnf_rstd
-        bw_act_sizes[20] = 0; // logits
-        bw_act_sizes[21] = 0; // losses
-        bw_act_sizes[23] = 0; // scratch
+        fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, cfg);
         // count up and allocate the space
-        model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, bw_act_sizes);
+        model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
         model->num_grad_acts = 0;
-        for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+        for (size_t i = 0; i < NUM_BACKWARD_TENSORS; i++) {
             model->num_grad_acts += bw_act_sizes[i];
         }
         printf("allocated %d MiB for activation gradients\n", (int)round(model->num_grad_acts * sizeof(float) / (1024 * 1024)));
@@ -1517,7 +1533,7 @@ void gpt2_backward(GPT2 *model) {
     ParameterTensors params = model->params; // for brevity
     ParameterTensors grads = model->grads;
     ActivationTensors acts = model->acts;
-    ActivationTensors grads_acts = model->grads_acts;
+    GradActTensors grads_acts = model->grads_acts;
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // this was done in the fused classifier kernel as last step of forward pass
