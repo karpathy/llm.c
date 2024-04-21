@@ -1132,7 +1132,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     return params_memory;
 }
 
-#define NUM_ACTIVATION_TENSORS 22
+#define NUM_ACTIVATION_TENSORS 21
 typedef struct {
     float* encoded; // (B, T, C)
     float* ln1; // (L, B, T, C)
@@ -1152,15 +1152,16 @@ typedef struct {
     float* lnf; // (B, T, C)
     float* lnf_mean; // (B, T)
     float* lnf_rstd; // (B, T)
-    // in inference mode, this buffer will store the logits
-    // in training mode, this buffer will contain the *gradients* of the logits.
-    float* output; // (B, T, V)
 
     float* losses; // (B, T)
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
     float* qkvr; // (L, B, T, 3*C)
-    // general scratchpad buffer, large enough to hold (B, T, 3C) and (B, NH, T, T) shaped tensors.
-    float* scratch;
+    // in inference mode, this buffer will store the logits
+    // in training mode, this buffer will contain the *gradients* of the logits.
+    // during the processing of transformer blocks, we will also use this as a
+    // general scratchpad buffer. Allocation is made large enough to hold (B, T, 3C),
+    // (B, NH, T, T), and (B, T, V) shaped tensors.
+    float* output;
 } ActivationTensors;
 
 void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
@@ -1186,10 +1187,9 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[15] = B * T * C; // lnf
     act_sizes[16] = B * T; // lnf_mean
     act_sizes[17] = B * T; // lnf_rstd
-    act_sizes[18] = B * T * V; // logits
-    act_sizes[19] = B * T; // losses
-    act_sizes[20] = L * B * T * 3*C; // qkvr
-    act_sizes[21] = B * T * max(3*C, NH*T); // scratch
+    act_sizes[18] = B * T; // losses
+    act_sizes[19] = L * B * T * 3*C; // qkvr
+    act_sizes[20] = B * T * max(3*C, max(NH*T, V)); // output / scratch
 }
 
 // Backward pass is conceptually quite different from forward, because we can discard
@@ -1209,7 +1209,7 @@ typedef struct {
 void fill_in_grad_act_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
     size_t NH = config.num_heads;
     size_t C = config.channels;
-    act_sizes[0] = B * T * C;   // ln
+    act_sizes[0] = B * T * C;   // btc
     act_sizes[1] = B * T * 4 * C; // bt4c
     act_sizes[2] = B * NH * T * T; // preatt
     act_sizes[3] = B * NH * T * T; // att
@@ -1238,8 +1238,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->atty,
         &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
-        &acts->lnf_mean, &acts->lnf_rstd, &acts->output, &acts->losses,
-        &acts->qkvr, &acts->scratch
+        &acts->lnf_mean, &acts->lnf_rstd, &acts->losses, &acts->qkvr, &acts->output
     };
     return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
 }
@@ -1440,7 +1439,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         float* l_residual3 = acts.residual3 + l * B * T * C;
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
-        float* scratch = acts.scratch;
+        float* scratch = acts.output;
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
@@ -1585,7 +1584,7 @@ void gpt2_backward(GPT2 *model) {
         float* dl_att = grads_acts.att;
 
         // re-use scratch buffer of the forward pass
-        float* scratch = acts.scratch;
+        float* scratch = acts.output;
 
         // backprop this layer
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
@@ -2006,7 +2005,7 @@ int main(int argc, char *argv[]) {
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
                 // get the V-dimensional vector probs[0, t-1, :]
-                float* logits = model.acts.output + (t-1) * model.config.vocab_size;
+                float* logits = model.acts.output + (t - 1) * model.config.vocab_size;
                 // move probs back to CPU and sample
                 cudaCheck(cudaMemcpy(cpu_logits, logits, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
                 float coin = random_f32(&rng_state);
