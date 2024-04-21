@@ -2,7 +2,7 @@
 #include "train_gpt2.c"
 
 // poor man's tensor checker
-int check_tensor(float *a, float *b, int n, char* label) {
+int check_tensor(float *a, float *b, int n, const char* label) {
     int print_upto = 5;
     int ok = 1;
     float maxdiff = 0.0f;
