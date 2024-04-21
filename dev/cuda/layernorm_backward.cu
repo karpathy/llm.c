@@ -175,6 +175,20 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
     const float mean_bt = mean[b * T + t];
     const float rstd_bt = rstd[b * T + t];
 
+    extern __shared__ float shared[];
+
+    float* dbias_shared = shared;
+    float* dweight_shared = &shared[C];
+
+    // pragma add unrolling if not in compiler
+    #pragma unroll
+	for(int i = threadIdx.x; i < C; i+= blockDim.x){
+       dbias_shared[i] = 0.0f;
+       dweight_shared[i] = 0.0f;
+    }
+
+    __syncthreads();
+
     // first: two reduce operations
     float dnorm_mean = 0.0f;
     float dnorm_norm_mean = 0.0f;
@@ -196,9 +210,9 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
         float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
         float dnorm_i = weight[i] * dout_bt[i];
         // gradient contribution to bias
-        atomicAdd(&dbias[i], dout_bt[i]);
+        atomicAdd(&dbias_shared[i], dout_bt[i]);
         // gradient contribution to weight
-        atomicAdd(&dweight[i], norm_bti * dout_bt[i]);
+        atomicAdd(&dweight_shared[i], norm_bti * dout_bt[i]);
         // gradient contribution to input
         float dval = 0.0f;
         dval += dnorm_i; // term 1
@@ -207,6 +221,12 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
         dval *= rstd_bt; // final scale
         dinp_bt[i] += dval;
     }
+    __syncthreads();
+
+	for(int i = threadIdx.x; i < C; i+= blockDim.x){
+        atomicAdd(&dbias[i], dbias_shared[i]);
+        atomicAdd(&dweight[i], dweight_shared[i]);
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -225,7 +245,9 @@ void layernorm_backward2(float* dinp, float* dweight, float* dbias,
                         int B, int T, int C, const int block_size) {
     const int N = B * T;
     const int grid_size = ceil_div(32*N, block_size);
-    layernorm_backward_kernel2<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+    size_t shared_mem_size = 2 * C * sizeof(float);
+
+    layernorm_backward_kernel2<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
 }
 
 // kernel version dispatch
