@@ -95,7 +95,7 @@ int main(int argc, char *argv[]) {
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
     float* logits_cpu = (float*)mallocCheck(B * T * V * sizeof(float));
-    cudaMemcpy(logits_cpu, model.acts.logits, B * T * V * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(logits_cpu, model.acts.output, B * T * V * sizeof(float), cudaMemcpyDeviceToHost);
     int logits_ok = 1;
     for (int i=0; i<B*T*V; i++) {
         if(i < 3) {
