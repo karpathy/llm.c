@@ -86,8 +86,8 @@ void validate_result(T* device_result, const T* cpu_reference, const char* name,
         if (i < 5) {
             printf("%f %f\n", cpu_reference[i], out_gpu[i]);
         }
-        // ensure correctness for all elements. We can set an "ignore" mask by writing NaN
-        if (fabs(cpu_reference[i] - out_gpu[i]) > tolerance && !isnan(cpu_reference[i])) {
+        // ensure correctness for all elements. Elements that are not finite are ignored
+        if (fabs(cpu_reference[i] - out_gpu[i]) > tolerance && isfinite(cpu_reference[i])) {
             printf("Mismatch of %s at %d: CPU_ref: %f vs GPU: %f\n", name, i, cpu_reference[i], out_gpu[i]);
             nfaults ++;
             if (nfaults >= 10) {
