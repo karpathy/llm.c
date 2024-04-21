@@ -395,7 +395,14 @@ if __name__ == "__main__":
     # forward backward for a few iterations
     data_iter = iter(get_batch())
     x, y = next(data_iter) # we'll overfit this batch below
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+    # do one forward pass to generate ground truth for our C tests
+    if not args.inference_only and args.write_tensors:
+        logits, loss = model(x, y)
+        write_model(model, "gpt2_124M.bin")
+        write_state(model, x, y, logits, loss, "gpt2_124M_debug_state.bin")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, fused=True)
     timings = []
     torch.cuda.reset_peak_memory_stats()
     for i in range(args.num_iterations):
@@ -403,11 +410,8 @@ if __name__ == "__main__":
         logits, loss = model(x, y)
         if not args.inference_only:
             optimizer.zero_grad()
+            del logits
             loss.backward()
-            # on the first iteration only, save the state dict to file for later reference
-            if i == 0 and args.write_tensors:
-                write_model(model, "gpt2_124M.bin")
-                write_state(model, x, y, logits, loss, "gpt2_124M_debug_state.bin")
             optimizer.step()
         if device == "mps":
             torch.mps.synchronize()
@@ -417,8 +421,11 @@ if __name__ == "__main__":
         if i > args.num_iterations - 20:
             timings.append(t1-t0)
         print(f"iteration {i}, loss: {loss.item()}, time: {(t1-t0)*1000:.3f}ms")
-    if len(timings) > 0:
-        print(f"final 20 iters avg: {np.mean(timings)*1000:.3f}ms")
+
+    if len(timings) > 20:
+        print(f"final 20 iters avg: {np.mean(timings[-20:])*1000:.3f}ms")
+    else:
+        print(f"final {len(timings)-1} iters avg: {np.mean(timings[1:])*1000:.3f}ms")
 
     print(f"Peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
