@@ -1485,8 +1485,10 @@ void gpt2_backward(GPT2 *model) {
         bw_act_sizes[3] = 0; // ln1_rstd
         bw_act_sizes[8] = 0; // attproj
         bw_act_sizes[9] = 0; // residual2
+        bw_act_sizes[10] = 0; // ln2
         bw_act_sizes[11] = 0; // ln2_mean
         bw_act_sizes[12] = 0; // ln2_rstd
+        bw_act_sizes[14] = 0; // fch_gelu
         bw_act_sizes[18] = 0; // lnf_mean
         bw_act_sizes[19] = 0; // lnf_rstd
         bw_act_sizes[20] = 0; // logits
@@ -1568,30 +1570,28 @@ void gpt2_backward(GPT2 *model) {
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
-        float* dl_ln1 = grads_acts.ln1;
+        float* dl_ln = grads_acts.ln1;
         float* dl_qkv = grads_acts.qkv;
         float* dl_qkvr = grads_acts.qkvr;
         float* dl_atty = grads_acts.atty;
         float* dl_preatt = grads_acts.preatt;
         float* dl_att = grads_acts.att;
-        float* dl_ln2 = grads_acts.ln2;
         float* dl_fch = grads_acts.fch;
-        float* dl_fch_gelu = grads_acts.fch_gelu;
 
         // re-use scratch buffer of the forward pass
         float* scratch = acts.scratch;
 
         // backprop this layer
-        matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
-        gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
-        matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
+        matmul_backward(dl_fch, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
+        gelu_backward(dl_fch, l_fch, dl_fch, B*T*4*C);
+        matmul_backward(dl_ln, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
-        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
+        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_ln, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
         matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
         attention_backward(dl_qkv, dl_qkvr, dl_preatt, dl_att, scratch, dl_atty, l_qkvr, l_att, B, T, C, NH);
-        matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
+        matmul_backward(dl_ln, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
 }
