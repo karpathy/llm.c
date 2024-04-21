@@ -12,18 +12,13 @@ INCLUDES =
 # later, run the program by prepending the number of threads, e.g.: OMP_NUM_THREADS=8 ./gpt2
 ifeq ($(shell uname), Darwin)
   # Check if the libomp directory exists
-  ifeq ($(shell [ -d /opt/homebrew/opt/libomp/lib ] && echo "exists"), exists)
+  LIBOMP_PREFIX := $(shell brew --prefix libomp 2>/dev/null)
+  ifeq ($(shell [ -d "$(LIBOMP_PREFIX)" ] && echo "exists"), exists)
     # macOS with Homebrew and directory exists
     CFLAGS += -Xclang -fopenmp -DOMP
-    LDFLAGS += -L/opt/homebrew/opt/libomp/lib
+    LDFLAGS += -L"$(LIBOMP_PREFIX)/lib"
     LDLIBS += -lomp
-    INCLUDES += -I/opt/homebrew/opt/libomp/include
-    $(info NICE Compiling with OpenMP support)
-  else ifeq ($(shell [ -d /usr/local/opt/libomp/lib ] && echo "exists"), exists)
-    CFLAGS += -Xclang -fopenmp -DOMP
-    LDFLAGS += -L/usr/local/opt/libomp/lib
-    LDLIBS += -lomp
-    INCLUDES += -I/usr/local/opt/libomp/include
+    INCLUDES += -I"$(LIBOMP_PREFIX)/include"
     $(info NICE Compiling with OpenMP support)
   else
     $(warning OOPS Compiling without OpenMP support)
