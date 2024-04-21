@@ -37,24 +37,24 @@ ifeq ($(shell uname), Darwin)
     LDFLAGS += -L/opt/homebrew/opt/libomp/lib
     LDLIBS += -lomp
     INCLUDES += -I/opt/homebrew/opt/libomp/include
-    $(info NICE Compiling with OpenMP support)
+    $(info OpenMP found, compiling with OpenMP support)
   else ifeq ($(shell [ -d /usr/local/opt/libomp/lib ] && echo "exists"), exists)
     CFLAGS += -Xclang -fopenmp -DOMP
     LDFLAGS += -L/usr/local/opt/libomp/lib
     LDLIBS += -lomp
     INCLUDES += -I/usr/local/opt/libomp/include
-    $(info NICE Compiling with OpenMP support)
+    $(info OpenMP found, compiling with OpenMP support)
   else
-    $(warning OOPS Compiling without OpenMP support)
+    $(warning OpenMP not found, skipping OpenMP support)
   endif
 else
   ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
     # Ubuntu or other Linux distributions
     CFLAGS += -fopenmp -DOMP
     LDLIBS += -lgomp
-    $(info NICE Compiling with OpenMP support)
+    $(info OpenMP found, compiling with OpenMP support)
   else
-    $(warning OOPS Compiling without OpenMP support)
+    $(warning OpenMP not found, skipping OpenMP support)
   endif
 endif
 
@@ -66,9 +66,9 @@ TARGETS = train_gpt2 test_gpt2
 
 # Conditional inclusion of CUDA targets
 ifeq ($(NVCC),)
-    $(info nvcc not found, skipping CUDA build)
+    $(info nvcc not found, skipping CUDA builds)
 else
-    $(info nvcc found, including CUDA build)
+    $(info nvcc found, including CUDA builds)
     TARGETS += train_gpt2cu test_gpt2cu
 endif
 
