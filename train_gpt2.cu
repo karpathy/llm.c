@@ -888,9 +888,11 @@ void matmul_forward_cublaslt(float* out,
     cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
 }
 
-void attention_forward(float* out, float* scratch, float* qkvr, float* preatt, float* att,
+void attention_forward(float* out, float* qkvr, float* att,
                        float* inp,
                        int B, int T, int C, int NH) {
+    // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
+    // Its contents will be overwritten by this function.
     const int block_size = 256;
     const int softmax_block_size = 256;
 
@@ -912,6 +914,7 @@ void attention_forward(float* out, float* scratch, float* qkvr, float* preatt, f
     // batched matrix multiply with cuBLAS
     const float alpha = 1.0f;
     const float beta = 0.0f;
+    float* preatt = inp;
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha, k, HS, T * HS, q, HS, T * HS, &beta, preatt, T, T * T, B * NH));
 
     // multiply all elements of preatt elementwise by scale
@@ -921,13 +924,14 @@ void attention_forward(float* out, float* scratch, float* qkvr, float* preatt, f
     cudaCheck(cudaGetLastError());
 
     // new approach: first cuBLAS another batched matmul
+    float* vaccum = inp;
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha, v, HS, T * HS, att, T, T * T, &beta, scratch, HS, T * HS, B * NH));
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha, v, HS, T * HS, att, T, T * T, &beta, vaccum, HS, T * HS, B * NH));
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size>>>(scratch, out, B, T, NH, HS);
+    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1157,15 +1161,15 @@ typedef struct {
     float* losses; // (B, T)
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
     float* qkvr; // (L, B, T, 3*C)
-    // general scratchpad buffer, large enough to hold (B, T, C) and (B, NH, T, T) shaped tensors.
+    // general scratchpad buffer, large enough to hold (B, T, 3C) and (B, NH, T, T) shaped tensors.
     float* scratch;
 } ActivationTensors;
 
 void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
-    int V = config.vocab_size;
-    int L = config.num_layers;
-    int NH = config.num_heads;
-    int C = config.channels;
+    size_t V = config.vocab_size;
+    size_t L = config.num_layers;
+    size_t NH = config.num_heads;
+    size_t C = config.channels;
     act_sizes[0] = B * T * C; // encoded
     act_sizes[1] = L * B * T * C; // ln1
     act_sizes[2] = L * B * T; // ln1_mean
@@ -1189,7 +1193,7 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[20] = B * T * V; // logits
     act_sizes[21] = B * T; // losses
     act_sizes[22] = L * B * T * 3*C; // qkvr
-    act_sizes[23] = B * T * max(C, NH*T); // scratch
+    act_sizes[23] = B * T * max(3*C, NH*T); // scratch, forward only
 }
 
 float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
@@ -1208,7 +1212,15 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
     };
     float* acts_memory_iterator = acts_memory;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-        *(ptrs[i]) = acts_memory_iterator;
+        // update the pointer to the correct offset within the buffer.
+        // if a certain element is empty (e.g., because it is needed only in forward/only in backward)
+        // set the pointer to NULL instead, so we get crashes instead of memory corruption if we mess this
+        // up.
+        if(act_sizes[i] != 0) {
+            *(ptrs[i]) = acts_memory_iterator;
+        } else {
+            *(ptrs[i]) = NULL;
+        }
         acts_memory_iterator += act_sizes[i];
     }
     return acts_memory;
@@ -1334,6 +1346,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         model->seq_len = T;
         // and now allocate the space
         fill_in_activation_sizes(model->act_sizes, B, T, model->config);
+        // qkv and preatt are handled in the scratch buffer for the forward pass
+        model->act_sizes[4] = 0;
+        model->act_sizes[6] = 0;
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
@@ -1388,7 +1403,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         float* l_ln1 = acts.ln1 + l * B * T * C;
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float* l_qkv = acts.qkv;
         float* l_qkvr = acts.qkvr + l * B * T * 3*C;
         float* l_atty = acts.atty + l * B * T * C;
         float* l_att = acts.att + l * B * NH * T * T;
@@ -1403,13 +1417,12 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         float* l_residual3 = acts.residual3 + l * B * T * C;
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
-        float* l_preatt = acts.preatt;
         float* scratch = acts.scratch;
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward(l_atty, scratch, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH);
+        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
         matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
