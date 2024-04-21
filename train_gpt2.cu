@@ -1150,14 +1150,9 @@ typedef struct {
     float* lnf; // (B, T, C)
     float* lnf_mean; // (B, T)
     float* lnf_rstd; // (B, T)
-    // this buffer is used for all of these three tensors. We never require them at the same
-    // time, so we can safely reuse that memory. The union exists so the code is more self-documenting,
-    // because each access shows the current interpretation of the buffer.
-    union {
-        float* dlogits;
-        float* logits;
-        float* probs;
-    } output; // (B, T, V)
+    // in inference mode, this buffer will store the logits
+    // in training mode, this buffer will contain the *gradients* of the logits.
+    float* output; // (B, T, V)
 
     float* losses; // (B, T)
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
@@ -1207,7 +1202,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
         &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
-        &acts->lnf_mean, &acts->lnf_rstd, &acts->output.logits, &acts->losses,
+        &acts->lnf_mean, &acts->lnf_rstd, &acts->output, &acts->losses,
         &acts->qkvr, &acts->v_accum
     };
     float* acts_memory_iterator = acts_memory;
@@ -1425,13 +1420,13 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_cublas(acts.output.logits, acts.lnf, params.wte, NULL, B, T, C, V);
+    matmul_forward_cublas(acts.output, acts.lnf, params.wte, NULL, B, T, C, V);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         // fused classifier: does the forward pass and first part of the backward pass
         // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
-        fused_classifier3(acts.output.dlogits, acts.losses, NULL, model->targets, B, T, V, V);
+        fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, V);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         // move the (B,T) losses to CPU
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
@@ -1442,7 +1437,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     } else {
         // if we don't have targets, we don't have loss
-        softmax_forward(acts.output.probs, acts.output.logits, B*T, V);
         model->mean_loss = -1.0f;
     }
 }
@@ -1512,7 +1506,7 @@ void gpt2_backward(GPT2 *model) {
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.lnf, grads.wte, NULL, acts.output.dlogits, acts.lnf, params.wte, B, T, C, V);
+    matmul_backward(grads_acts.lnf, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, V);
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass
@@ -1706,12 +1700,18 @@ float random_f32(unsigned long long *state) { // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
-int sample_mult(float* probabilities, int n, float coin) {
-    // sample index from probabilities (they must sum to 1!)
+int sample_softmax(const float* logits, int n, float coin) {
+    // sample index from logits (converted to probabilities using softmax)
     // coin is a random number in [0, 1), usually from random_f32()
+    double norm = 0;
+    for (int i = 0; i < n; i++) {
+        norm += exp(logits[i]);
+    }
+    // instead of dividing all exp(logits), we can just multiply coin.
+    coin *= norm;
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
-        cdf += probabilities[i];
+        cdf += exp(logits[i]);
         if (coin < cdf) {
             return i;
         }
@@ -1942,7 +1942,7 @@ int main(int argc, char *argv[]) {
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
-    float* cpu_probs = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
+    float* cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
     // train
     struct timespec start, end;
@@ -1982,11 +1982,11 @@ int main(int argc, char *argv[]) {
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
                 // get the V-dimensional vector probs[0, t-1, :]
-                float* probs = model.acts.output.probs + (t-1) * model.config.vocab_size;
+                float* logits = model.acts.output + (t-1) * model.config.vocab_size;
                 // move probs back to CPU and sample
-                cudaCheck(cudaMemcpy(cpu_probs, probs, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+                cudaCheck(cudaMemcpy(cpu_logits, logits, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
                 float coin = random_f32(&rng_state);
-                int next_token = sample_mult(cpu_probs, model.config.vocab_size, coin);
+                int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
                 // print the generated token, either using the Tokenizer or a fallback
                 if (tokenizer.init_ok) {
@@ -2029,7 +2029,7 @@ int main(int argc, char *argv[]) {
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
-    free(cpu_probs);
+    free(cpu_logits);
     free(gen_tokens);
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
