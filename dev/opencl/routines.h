@@ -25,8 +25,11 @@ void cl_matmul_forward(GPT2_CL *gcl, float* out,
         exit(1);
     }
 
-    size_t size_global[2] = {B * T, gcl->max_wg_size};
-    size_t size_local[2] = {gcl->max_wg_size, 1};
+    size_t tile_size = MATMUL_TILE_SIZE;
+    size_t bt_round = ((B * T) + tile_size - 1) / tile_size;
+    size_t oc_round = (OC + tile_size - 1) / tile_size;
+    size_t size_global[2] = {((bt_round + tile_size - 1) / tile_size) * tile_size, ((oc_round + tile_size - 1) / tile_size) * tile_size};
+    size_t size_local[2] = {tile_size, tile_size};
     err = clEnqueueNDRangeKernel(gcl->queue, gcl->matmul_forward, 2, NULL, size_global, size_local, 0, NULL, NULL);
     if (err != CL_SUCCESS)
     {

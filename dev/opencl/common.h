@@ -7,6 +7,7 @@
 #include <CL/cl.h>
 #endif
 
+#define MATMUL_TILE_SIZE 8
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MSTRINGIFY(...) #__VA_ARGS__
 
@@ -41,6 +42,7 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     char device_name[1024];
     cl_uint num_devices;
     int selected_device = 0;
+    char build_options_str[1024];
     int size;
     char *env;
     cl_int err;
@@ -116,7 +118,8 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     }
 
     // build program
-    err = clBuildProgram(gcl->program, 1, &gcl->device, build_options, NULL, NULL);
+    sprintf(build_options_str, "%s -D TILE_SIZE=%d", build_options, MATMUL_TILE_SIZE);
+    err = clBuildProgram(gcl->program, 1, &gcl->device, build_options_str, NULL, NULL);
     if (err != CL_SUCCESS) {
         size_t buf_len = 0;
         char *buffer = NULL;

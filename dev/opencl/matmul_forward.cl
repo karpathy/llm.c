@@ -5,20 +5,22 @@ __kernel void matmul_forward(__global float* out, __global float* inp, __global 
 {
     size_t global_id0 = get_global_id(0);
     size_t global_id1 = get_global_id(1);
-    size_t global_size1 = get_global_size(1);
-    size_t b = global_id0 / T;
-    size_t t = global_id0 - (b * T);
+    size_t local_id0 = get_local_id(0);
+    size_t local_id1 = get_local_id(1);
 
-    __global float* out_bt = out + b * T * OC + t * OC;
-    __global float* inp_bt = inp + b * T * C + t * C;
+    int x_tile_end = (global_id0 * TILE_SIZE) + TILE_SIZE;
+    x_tile_end = x_tile_end < (B * T)? x_tile_end: (B * T);
+    int y_tile_end = (global_id1 * TILE_SIZE) + TILE_SIZE;
+    y_tile_end = y_tile_end < OC? y_tile_end: OC;
 
-    for(int o = global_id1; o < OC; o += global_size1) {
-        __global float* wrow = weight + o*C;
-        float val = 0.0f;
-        for (int i = 0; i < C; i++) {
-            val += inp_bt[i] * wrow[i];
+    for(int x=global_id0 * TILE_SIZE; x<x_tile_end; x++) {
+        for(int y=global_id1 * TILE_SIZE; y<y_tile_end; y++) {
+            float val = 0.0f;
+            for(int i=0; i<C; i++) {
+                val += inp[x * C + i] * weight[y * C + i];
+            }
+            out[x * OC + y] = val;
         }
-        out_bt[o] = val;
     }
 }
 
