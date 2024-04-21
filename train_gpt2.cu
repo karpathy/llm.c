@@ -1195,26 +1195,20 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
 // Backward pass is conceptually quite different from forward, because we can discard
 // the activations of a layer as soon as we're done with it. This lets us aggressively
 // reuse memory, so that we need far fewer tensors for backward state.
-#define NUM_BACKWARD_TENSORS 6
+#define NUM_BACKWARD_TENSORS 3
 typedef struct {
-    float* btc; // (B, T, C)
     float* bt4c; // (B, T, 4*C)
     float* preatt; // (B, NH, T, T)
-    float* att; // (B, NH, T, T)
     float* residual3; // (B, T, C)
-    float* qkvr; // (B, T, 3C)
 } GradActTensors;
 
 
 void fill_in_grad_act_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
     size_t NH = config.num_heads;
     size_t C = config.channels;
-    act_sizes[0] = B * T * C;   // btc
-    act_sizes[1] = B * T * 4 * C; // bt4c
-    act_sizes[2] = B * NH * T * T; // preatt
-    act_sizes[3] = B * NH * T * T; // att
-    act_sizes[4] = B * T * C; // residual3
-    act_sizes[5] = B * T * 3 * C; // qkvr
+    act_sizes[0] = B * T * 4 * C; // bt4c
+    act_sizes[1] = B * NH * T * T; // preatt
+    act_sizes[2] = B * T * C; // residual3
 }
 
 
@@ -1245,8 +1239,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
 
 float* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) {
     float** ptrs[] = {
-        &acts->btc, &acts->bt4c, &acts->preatt, &acts->att,
-        &acts->residual3, &acts->qkvr
+        &acts->bt4c, &acts->preatt, &acts->residual3
     };
     return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
@@ -1531,11 +1524,11 @@ void gpt2_backward(GPT2 *model) {
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.btc, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, V);
+    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, V);
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.btc, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
 
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
@@ -1577,11 +1570,12 @@ void gpt2_backward(GPT2 *model) {
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
-        float* dl_btc = grads_acts.btc;
+
+        // we need a B x T x C buffer; thankfully, the forward activation for lnf isn't needed anymore,
+        // so we can co-opt it here.
+        float* dl_btc = acts.lnf;
         float* dl_bt4c = grads_acts.bt4c;
-        float* dl_qkvr = grads_acts.qkvr;
         float* dl_preatt = grads_acts.preatt;
-        float* dl_att = grads_acts.att;
 
         // re-use scratch buffer of the forward pass
         float* scratch = acts.output;
@@ -1593,7 +1587,11 @@ void gpt2_backward(GPT2 *model) {
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
-        attention_backward(dl_bt4c, dl_qkvr, dl_preatt, dl_att, scratch, dl_btc, l_qkvr, l_att, B, T, C, NH);
+        // we more B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
+        float* buffer_a = l_atty;
+        float* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
+
+        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
