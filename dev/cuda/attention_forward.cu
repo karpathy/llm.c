@@ -40,18 +40,22 @@ https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Attention.md
 version 11 is kernel 10 skipping FP16/FP32 conversions (requires fully FP16 network)
 ./attention_forward 11
 */
-#define ENABLE_CUDNN
+//#define ENABLE_CUDNN
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <float.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include "common.h"
 
 typedef half lowp_float; // or __nv_bfloat16
+#define CUBLAS_LOWP CUDA_R_16F
+#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+//#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F // 32F compute is as fast as 16F on A100/H100
 
 #ifdef ENABLE_CUDNN
 #include <cudnn_frontend.h>
@@ -857,6 +861,21 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     // batched matrix multiply with cuBLAS
     const float alpha = 1.0f;
     const float beta = 0.0f;
+
+    /*cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
+                                     CUBLAS_OP_T, CUBLAS_OP_N,
+                                     T, T, HS,
+                                     &alpha,
+                                     k, CUDA_R_32F, HS, T * HS,
+                                     q, CUDA_R_32F, HS, T * HS,
+                                     &beta,
+                                     preatt, CUDA_R_32F, T, T * T,
+                                     B * NH,
+                                     CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT));*/
+    
+    //cudaCheck(cudaMemset(preatt, 0, B * NH * T * T * sizeof(float)));
+
     cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                                      CUBLAS_OP_T, CUBLAS_OP_N,
                                      T, T, HS,
@@ -875,6 +894,18 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+/*cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
+                                     CUBLAS_OP_N, CUBLAS_OP_N,
+                                     HS, T, T,
+                                     &alpha,
+                                     v, CUDA_R_32F, HS, T * HS,
+                                     att, CUDA_R_32F, T, T * T,
+                                     &beta,
+                                     vaccum, CUDA_R_32F, HS, T * HS,
+                                     B * NH,
+                                     CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT));*/
+
     cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                                      CUBLAS_OP_N, CUBLAS_OP_N,
                                      HS, T, T,
@@ -1018,9 +1049,65 @@ void attention_forward5(float* out, lowp_float* vaccum, lowp_float* qkvr, lowp_f
         permute_kernel_lowp<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
     }
 
+/*
+cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle,
+                            cublasOperation_t transa,
+                            cublasOperation_t transb,
+                            int m,
+                            int n,
+                            int k,
+                            const void    *alpha,
+                            const void     *A,
+                            cudaDataType_t Atype,
+                            int lda,
+                            long long int strideA,
+                            const void     *B,
+                            cudaDataType_t Btype,
+                            int ldb,
+                            long long int strideB,
+                            const void    *beta,
+                            void           *C,
+                            cudaDataType_t Ctype,
+                            int ldc,
+                            long long int strideC,
+                            int batchCount,
+                            cublasComputeType_t computeType,
+                            cublasGemmAlgo_t algo)
+
+cublasStatus_t cublasHgemmStridedBatched(cublasHandle_t handle,
+                                  cublasOperation_t transa,
+                                  cublasOperation_t transb,
+                                  int m, int n, int k,
+                                  const __half           *alpha,
+                                  const __half           *A, int lda,
+                                  long long int          strideA,
+                                  const __half           *B, int ldb,
+                                  long long int          strideB,
+                                  const __half           *beta,
+                                  __half                 *C, int ldc,
+                                  long long int          strideC,
+                                  int batchCount)
+*/
+
     // batched matrix multiply with cuBLAS
     const lowp_float alpha = (lowp_float)1.0f;
     const lowp_float beta = (lowp_float)0.0f;
+
+    /*cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
+                                     CUBLAS_OP_T, CUBLAS_OP_N,
+                                     T, T, HS,
+                                     &alpha,
+                                     k, CUBLAS_LOWP, HS, T * HS,
+                                     q, CUBLAS_LOWP, HS, T * HS,
+                                     &beta,
+                                     preatt, CUBLAS_LOWP, T, T * T,
+                                     B * NH,
+                                     CUBLAS_LOWP_COMPUTE,
+                                     CUBLAS_GEMM_DEFAULT));*/
+
+    // memset preatt - things don't break as much as they should...
+    //cudaCheck(cudaMemset(preatt, 0, B * NH * T * T * sizeof(lowp_float)));
+
     cublasCheck(cublasHgemmStridedBatched(cublas_handle,
                                      CUBLAS_OP_T, CUBLAS_OP_N,
                                      T, T, HS,
@@ -1031,6 +1118,7 @@ void attention_forward5(float* out, lowp_float* vaccum, lowp_float* qkvr, lowp_f
                                      preatt, T, T * T,
                                      B * NH));
 
+    
     // multiply all elements of preatt elementwise by scale
     lowp_float scale = 1.0 / sqrtf(HS);
     int softmax_block_size = 256;
@@ -1039,6 +1127,19 @@ void attention_forward5(float* out, lowp_float* vaccum, lowp_float* qkvr, lowp_f
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+
+    /*cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
+                                     CUBLAS_OP_N, CUBLAS_OP_N,
+                                     HS, T, T,
+                                     &alpha,
+                                     v, CUBLAS_LOWP, HS, T * HS,
+                                     att, CUBLAS_LOWP, T, T * T,
+                                     &beta,
+                                     vaccum, CUBLAS_LOWP, HS, T * HS,
+                                     B * NH,
+                                     CUBLAS_LOWP_COMPUTE,
+                                     CUBLAS_GEMM_DEFAULT));*/
+
     cublasCheck(cublasHgemmStridedBatched(cublas_handle,
                                      CUBLAS_OP_N, CUBLAS_OP_N,
                                      HS, T, T,
@@ -1053,7 +1154,7 @@ void attention_forward5(float* out, lowp_float* vaccum, lowp_float* qkvr, lowp_f
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = ceil_div(B * T * C, block_size);
     if(!skip_permute || first_run_validation) {
-        unpermute_kernel_lowp<<<num_blocks, block_size>>>((lowp_float*)vaccum, out, B, T, NH, HS);
+        unpermute_kernel_lowp<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
     }
 }
 
@@ -1251,6 +1352,7 @@ int main(int argc, char **argv) {
     float* out = (float*)malloc(B * T * C * sizeof(float));
     float* preatt = (float*)malloc(B * NH * T * T * sizeof(float));
     float* att = (float*)malloc(B * NH * T * T * sizeof(float));
+    //float* inp = make_random_float(B * T * 3 * C, 10.0f);
     float* inp = make_random_float(B * T * 3 * C);
 
     // move to GPU
