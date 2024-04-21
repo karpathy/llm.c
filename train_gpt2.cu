@@ -556,7 +556,7 @@ __global__ void matmul_backward_bias_kernel2(float* dbias, const float* dout, in
     }
 }
 
-__global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* dbias,
+__global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* dbias,
                                            const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                                            int B, int T, int C) {
     cg::thread_block block = cg::this_thread_block();
