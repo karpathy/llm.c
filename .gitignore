@@ -2,3 +2,8 @@
 data/
 gpt2_124M.bin
 gpt2_124M_debug_state.bin
+
+test_gpt2
+test_gpt2cu
+train_gpt2
+train_gpt2cu
