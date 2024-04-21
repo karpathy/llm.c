@@ -1281,18 +1281,11 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     if (model_header[1] != 1) { printf("Bad version in model file"); exit(EXIT_FAILURE); }
 
     // read in hyperparameters
-    int maxT, V, L, NH, C;
-    model->config.max_seq_len = maxT = model_header[2];
-    model->config.vocab_size = V = model_header[3];
-    model->config.num_layers = L = model_header[4];
-    model->config.num_heads = NH = model_header[5];
-    model->config.channels = C = model_header[6];
-    printf("[GPT-2]\n");
-    printf("max_seq_len: %d\n", maxT);
-    printf("vocab_size: %d\n", V);
-    printf("num_layers: %d\n", L);
-    printf("num_heads: %d\n", NH);
-    printf("channels: %d\n", C);
+    model->config.max_seq_len = model_header[2];
+    model->config.vocab_size = model_header[3];
+    model->config.num_layers = model_header[4];
+    model->config.num_heads = model_header[5];
+    model->config.channels = model_header[6];
 
     // allocate space for all the parameters and read them in
     fill_in_parameter_sizes(model->param_sizes, model->config);
@@ -1302,12 +1295,10 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += model->param_sizes[i];
     }
-    printf("num_parameters: %zu\n", num_parameters);
     model->num_parameters = num_parameters;
 
     // create memory for model parameters on the device
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
-    printf("allocated %d MiB for model parameters\n", (int)round(num_parameters * sizeof(float) / (1024 * 1024)));
 
     // read in all the parameters from file and copy them to device
     float* params_memory_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
@@ -1898,57 +1889,69 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
         else { error_usage(); }
     }
-    printf("input dataset prefix: %s\n", input_dataset_prefix);
-    printf("output log file: %s\n", output_log_file == NULL ? "NULL" : output_log_file);
-    printf("batch size B: %d\n", B);
-    printf("sequence length T: %d\n", T);
-    printf("learning rate: %f\n", learning_rate);
-    printf("val_loss_every: %d\n", val_loss_every);
-    printf("val_max_batches: %d\n", val_max_batches);
-    printf("sample_every: %d\n", sample_every);
-    printf("genT: %d\n", genT);
+    printf("+-----------------------+----------------------------------------------------+\n");
+    printf("| Parameter             | Value                                              |\n");
+    printf("+-----------------------+----------------------------------------------------+\n");
+    printf("| input dataset prefix  | %-50s |\n", input_dataset_prefix);
+    printf("| output log file       | %-50s |\n", output_log_file == NULL ? "NULL" : output_log_file);
+    printf("| batch size B          | %-50d |\n", B);
+    printf("| sequence length T     | %-50d |\n", T);
+    printf("| learning rate         | %-50f |\n", learning_rate);
+    printf("| val_loss_every        | %-50d |\n", val_loss_every);
+    printf("| val_max_batches       | %-50d |\n", val_max_batches);
+    printf("| sample_every          | %-50d |\n", sample_every);
+    printf("| genT                  | %-50d |\n", genT);
+    printf("+-----------------------+----------------------------------------------------+\n");
 
     // set up the device
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
-    printf("[System]\n");
-    printf("Device %d: %s\n", deviceIdx, deviceProp.name);
-
     // setup cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
-    printf("enable_tf32: %d\n", enable_tf32);
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
+    printf("| device                | %-50s |\n", deviceProp.name);
+    printf("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
+    printf("+-----------------------+----------------------------------------------------+\n");
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    printf("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
+    printf("| vocab_size V          | %-50d |\n", model.config.vocab_size);
+    printf("| num_layers L          | %-50d |\n", model.config.num_layers);
+    printf("| num_heads NH          | %-50d |\n", model.config.num_heads);
+    printf("| channels C            | %-50d |\n", model.config.channels);
+    printf("| num_parameters        | %-50zu |\n", model.num_parameters);
+    printf("+-----------------------+----------------------------------------------------+\n");
 
-    // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
+    // build DataLoaders for both train and val
     char train_tokens_filename[128];
     char val_tokens_filename[128];
     assert(strlen(input_dataset_prefix) < 100); // being bit lazy here, make sure we don't overflow
     sprintf(train_tokens_filename, "%s_train.bin", input_dataset_prefix);
     sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
-
-    // set up the dataloaders
     DataLoader train_loader;
     dataloader_init(&train_loader, train_tokens_filename, B, T);
     DataLoader val_loader;
     dataloader_init(&val_loader, val_tokens_filename, B, T);
-    int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default
+    int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default for now
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
-    printf("train dataset num_batches: %d\n", train_loader.num_batches);
-    printf("val dataset num_batches: %d\n", val_loader.num_batches);
+    printf("| train_num_batches     | %-50d |\n", train_num_batches);
+    printf("| val_num_batches       | %-50d |\n", val_num_batches);
+    printf("+-----------------------+----------------------------------------------------+\n");
 
-    // set up the logfile
+    // print model parameter allocations from gpt2_build_from_checkpoint down here to not mess up our table above
+    printf("allocated %d MiB for model parameters\n", (int)round(model.num_parameters * sizeof(float) / (1024 * 1024)));
+
+    // set up the Logger
     Logger logger;
     logger_init(&logger, output_log_file);
 
