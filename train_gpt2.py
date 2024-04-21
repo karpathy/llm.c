@@ -312,6 +312,7 @@ if __name__ == "__main__":
     import time
     import argparse
     import tiktoken
+    print(f"Running pytorch {torch.version.__version__}")
 
     # default settings will overfit a tiny batch of data
     # and save model weights and debug state to disk on the first iteration
@@ -396,6 +397,7 @@ if __name__ == "__main__":
     x, y = next(data_iter) # we'll overfit this batch below
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     timings = []
+    torch.cuda.reset_peak_memory_stats()
     for i in range(args.num_iterations):
         t0 = time.time()
         logits, loss = model(x, y)
@@ -417,6 +419,8 @@ if __name__ == "__main__":
         print(f"iteration {i}, loss: {loss.item()}, time: {(t1-t0)*1000:.3f}ms")
     if len(timings) > 0:
         print(f"final 20 iters avg: {np.mean(timings)*1000:.3f}ms")
+
+    print(f"Peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
     # before we end, let's also do one round of inference
     # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
