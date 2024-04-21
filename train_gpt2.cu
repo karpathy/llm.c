@@ -1722,13 +1722,13 @@ int sample_softmax(const float* logits, int n, float coin) {
     // coin is a random number in [0, 1), usually from random_f32()
     double norm = 0;
     for (int i = 0; i < n; i++) {
-        norm += exp(logits[i]);
+        norm += expf(logits[i]);
     }
     // instead of dividing all exp(logits), we can just multiply coin.
     coin *= norm;
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
-        cdf += exp(logits[i]);
+        cdf += expf(logits[i]);
         if (coin < cdf) {
             return i;
         }
@@ -1860,7 +1860,7 @@ void error_usage() {
     fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
     fprintf(stderr, "  -b <int>    batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
-    fprintf(stderr, "  -l <float>  learning rate (default = 1e-4f)\n");
+    fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
     fprintf(stderr, "  -m <int>    val_max_batches, up to how many val batches to estimate val loss? (default = 20)\n");
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
@@ -1877,7 +1877,7 @@ int main(int argc, char *argv[]) {
     const char* output_log_file = NULL;
     int B = 4; // batch size
     int T = 1024; // sequence length max
-    float learning_rate = 1e-4f;
+    float learning_rate = 3e-4f;
     int val_loss_every = 20; // every how many steps do we eval validation loss?
     int val_max_batches = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
@@ -2035,7 +2035,8 @@ int main(int argc, char *argv[]) {
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
         total_sum_iteration_time_s += time_elapsed_s;
-        printf("step %d/%d: train loss %f (%f ms)\n", step + 1, train_num_batches, model.mean_loss, time_elapsed_s * 1000);
+        int tokens_per_second = (B * T) / time_elapsed_s;
+        printf("step %d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, time_elapsed_s * 1000, tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
     }
     // add a total average, for optimizations that are only mild improvements
