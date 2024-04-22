@@ -842,6 +842,25 @@ __global__ void adamw_kernel2(float* params_memory, float* grads_memory, float* 
    params_memory[i] -= learning_rate * (m / (sqrtf(v) + eps) + weight_decay * params_memory[i]);
 }
 
+__global__ void adamw_kernel3_lowp(floatX* params_memory, floatX* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+   int i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= num_parameters) return;  // guard
+   float grad = (float)grads_memory[i];
+   float m = m_memory[i];
+   float v = v_memory[i];
+   // update the first moment (momentum)
+   m = lerp(grad, m, beta1);
+   m_memory[i] = m;
+   // update the second moment (RMSprop)
+   v = lerp(grad * grad, v, beta2);
+   v_memory[i] = v;
+   m /= beta1_correction;  // m_hat
+   v /= beta2_correction;  // v_hat
+   params_memory[i] = (floatX)((float)params_memory[i] - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * (float)params_memory[i])));
+}
+
+
 struct SoftmaxParams {
     float Scale;
     float Offset;
@@ -1884,15 +1903,33 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     }
 
     int block_size = 512;
-    int num_blocks = CEIL_DIV(model->num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
-    /*
-    // TODO
-    adamw_kernel2<<<num_blocks, block_size>>>(model->params_memory, model->grads_memory, model->m_memory, model->v_memory,
-                                              model->num_parameters,
-                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
-    */
+
+    // Do adam per set of parameters
+    // TODO - this is a horrible hack, need to fix this...
+    // possibly OK approach if we do it with independent CUDA streams and/or merge consecutive same-type adams together
+    size_t offset_so_far = 0;
+    size_t current_element = 0;
+    char* params_mem = (char*)model->params_memory;
+    char* grads_mem = (char*)model->grads_memory;
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        int num_blocks = CEIL_DIV(model->param_elements[i], block_size);
+        if (model->param_sizeof[i] == sizeof(float)) {
+            adamw_kernel2<<<num_blocks, block_size>>>((float*)params_mem, (float*)grads_mem,
+                                                    &model->m_memory[current_element], &model->v_memory[current_element],
+                                                    model->param_elements[i],
+                                                    learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+        } else {
+            adamw_kernel3_lowp<<<num_blocks, block_size>>>((floatX*)params_mem, (floatX*)grads_mem,
+                                                    &model->m_memory[current_element], &model->v_memory[current_element],
+                                                    model->param_elements[i],
+                                                    learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+        }
+        params_mem += model->param_elements[i] * model->param_sizeof[i];
+        grads_mem += model->param_elements[i] * model->param_sizeof[i];
+        current_element += model->param_elements[i];
+    }
     cudaCheck(cudaGetLastError());
 }
 
