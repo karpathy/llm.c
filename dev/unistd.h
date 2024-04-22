@@ -10,7 +10,7 @@
 #include <time.h>
 
 #define CLOCK_MONOTONIC 0
-int clock_gettime(int ignore_variable, struct timespec* tv)
+static inline int clock_gettime(int ignore_variable, struct timespec* tv)
 {
     return timespec_get(tv, TIME_UTC); // TODO: not sure this is the best solution. Need to review.
 }
