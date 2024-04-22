@@ -6,7 +6,7 @@ You need cuDNN from: https://developer.nvidia.com/cudnn
 And the cuDNN front-end from: https://github.com/NVIDIA/cudnn-frontend/tree/main
 
 Compile example:
-nvcc -I/path/to/cudnn-frontend/include -O3 --use_fast_math -lcublas -lcudnn attention_forward.cu -o attention_forward
+nvcc -I/path/to/cudnn-frontend/include -DENABLE_CUDNN -O3 --use_fast_math -lcublas -lcudnn attention_forward.cu -o attention_forward
 
 version 1 is naive port from CPU code to kernel, parallelize over batch, time, heads only
 ./attention_forward 1
@@ -40,7 +40,7 @@ https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Attention.md
 version 11 is kernel 10 skipping FP16/FP32 conversions (requires fully FP16 network)
 ./attention_forward 11
 */
-//#define ENABLE_CUDNN
+//#define ENABLE_CUDNN // can be enabled via nvcc "-DENABLE_CUDNN"
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -52,15 +52,15 @@ version 11 is kernel 10 skipping FP16/FP32 conversions (requires fully FP16 netw
 #include <cooperative_groups/reduce.h>
 #include "common.h"
 
-typedef half lowp_float; // or __nv_bfloat16
-#define CUBLAS_LOWP CUDA_R_16F
+// Class that wraps __nv_fp8_e4m3 and returns __nv_fp8_storage_t on demand
+typedef __nv_bfloat16 lowp_float; // or __nv_bfloat16
+#define CUBLAS_LOWP CUDA_R_16BF
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
-//#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F // 32F compute is as fast as 16F on A100/H100
 
 #ifdef ENABLE_CUDNN
 #include <cudnn_frontend.h>
 namespace fe = cudnn_frontend;
-#define CUDNN_16BIT fe::DataType_t::HALF // or BFLOAT16 (cuDNN kernels only)
+#define CUDNN_16BIT fe::DataType_t::BFLOAT16 // or BFLOAT16 (cuDNN kernels only)
 
 static cudnnHandle_t cudnn_handle;
 static size_t cudnn_workspace_size = 32 * 1024 * 1024;
@@ -862,20 +862,6 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    /*cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
-                                     CUBLAS_OP_T, CUBLAS_OP_N,
-                                     T, T, HS,
-                                     &alpha,
-                                     k, CUDA_R_32F, HS, T * HS,
-                                     q, CUDA_R_32F, HS, T * HS,
-                                     &beta,
-                                     preatt, CUDA_R_32F, T, T * T,
-                                     B * NH,
-                                     CUBLAS_COMPUTE_32F,
-                                     CUBLAS_GEMM_DEFAULT));*/
-    
-    //cudaCheck(cudaMemset(preatt, 0, B * NH * T * T * sizeof(float)));
-
     cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                                      CUBLAS_OP_T, CUBLAS_OP_N,
                                      T, T, HS,
@@ -894,18 +880,6 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-/*cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
-                                     CUBLAS_OP_N, CUBLAS_OP_N,
-                                     HS, T, T,
-                                     &alpha,
-                                     v, CUDA_R_32F, HS, T * HS,
-                                     att, CUDA_R_32F, T, T * T,
-                                     &beta,
-                                     vaccum, CUDA_R_32F, HS, T * HS,
-                                     B * NH,
-                                     CUBLAS_COMPUTE_32F,
-                                     CUBLAS_GEMM_DEFAULT));*/
-
     cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                                      CUBLAS_OP_N, CUBLAS_OP_N,
                                      HS, T, T,
@@ -961,7 +935,7 @@ __global__ void softmax_forward_kernel5_lowp(lowp_float* out, float inv_temperat
 
     if(4*pos_by_4 + warp.thread_rank() <= own_pos) {
         float old_maxval = maxval;
-        maxval = fmaxf(maxval, x[4*pos_by_4 + warp.thread_rank()]);
+        maxval = fmaxf(maxval, (float)x[4*pos_by_4 + warp.thread_rank()]);
         sumval *= expf(inv_temperature * (old_maxval - maxval));
         sumval += expf(inv_temperature * ((float)x[4*pos_by_4 + warp.thread_rank()] - maxval));
     }
@@ -1049,78 +1023,30 @@ void attention_forward5(float* out, lowp_float* vaccum, lowp_float* qkvr, lowp_f
         permute_kernel_lowp<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
     }
 
-/*
-cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle,
-                            cublasOperation_t transa,
-                            cublasOperation_t transb,
-                            int m,
-                            int n,
-                            int k,
-                            const void    *alpha,
-                            const void     *A,
-                            cudaDataType_t Atype,
-                            int lda,
-                            long long int strideA,
-                            const void     *B,
-                            cudaDataType_t Btype,
-                            int ldb,
-                            long long int strideB,
-                            const void    *beta,
-                            void           *C,
-                            cudaDataType_t Ctype,
-                            int ldc,
-                            long long int strideC,
-                            int batchCount,
-                            cublasComputeType_t computeType,
-                            cublasGemmAlgo_t algo)
-
-cublasStatus_t cublasHgemmStridedBatched(cublasHandle_t handle,
-                                  cublasOperation_t transa,
-                                  cublasOperation_t transb,
-                                  int m, int n, int k,
-                                  const __half           *alpha,
-                                  const __half           *A, int lda,
-                                  long long int          strideA,
-                                  const __half           *B, int ldb,
-                                  long long int          strideB,
-                                  const __half           *beta,
-                                  __half                 *C, int ldc,
-                                  long long int          strideC,
-                                  int batchCount)
-*/
+    // IMPORTANT: alpha/beta are FP32 for CUBLAS_COMPUTE_32F even if FP16 inputs/outputs
+    // But need FP16 scale for CUBLAS_COMPUTE_16F (no errors if you get it wrong *sigh*)
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const lowp_float alpha_lowp = (lowp_float)alpha;
+    const lowp_float beta_lowp = (lowp_float)beta;
+    void* alpha_ptr = CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F ? (void*)&alpha_lowp : (void*)&alpha;
+    void* beta_ptr = CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F ? (void*)&beta_lowp : (void*)&beta;
 
     // batched matrix multiply with cuBLAS
-    const lowp_float alpha = (lowp_float)1.0f;
-    const lowp_float beta = (lowp_float)0.0f;
-
-    /*cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
+    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
                                      CUBLAS_OP_T, CUBLAS_OP_N,
                                      T, T, HS,
-                                     &alpha,
+                                     alpha_ptr,
                                      k, CUBLAS_LOWP, HS, T * HS,
                                      q, CUBLAS_LOWP, HS, T * HS,
-                                     &beta,
+                                     beta_ptr,
                                      preatt, CUBLAS_LOWP, T, T * T,
                                      B * NH,
                                      CUBLAS_LOWP_COMPUTE,
-                                     CUBLAS_GEMM_DEFAULT));*/
-
-    // memset preatt - things don't break as much as they should...
-    //cudaCheck(cudaMemset(preatt, 0, B * NH * T * T * sizeof(lowp_float)));
-
-    cublasCheck(cublasHgemmStridedBatched(cublas_handle,
-                                     CUBLAS_OP_T, CUBLAS_OP_N,
-                                     T, T, HS,
-                                     &alpha,
-                                     k, HS, T * HS,
-                                     q, HS, T * HS,
-                                     &beta,
-                                     preatt, T, T * T,
-                                     B * NH));
-
+                                     CUBLAS_GEMM_DEFAULT));
     
     // multiply all elements of preatt elementwise by scale
-    lowp_float scale = 1.0 / sqrtf(HS);
+    float scale = 1.0f / sqrtf(HS);
     int softmax_block_size = 256;
     int grid_size = ceil_div(B * NH * T * 32, softmax_block_size);
     softmax_forward_kernel5_lowp<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
@@ -1128,27 +1054,17 @@ cublasStatus_t cublasHgemmStridedBatched(cublasHandle_t handle,
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
 
-    /*cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
+    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
                                      CUBLAS_OP_N, CUBLAS_OP_N,
                                      HS, T, T,
-                                     &alpha,
+                                     alpha_ptr,
                                      v, CUBLAS_LOWP, HS, T * HS,
                                      att, CUBLAS_LOWP, T, T * T,
-                                     &beta,
+                                     beta_ptr,
                                      vaccum, CUBLAS_LOWP, HS, T * HS,
                                      B * NH,
                                      CUBLAS_LOWP_COMPUTE,
-                                     CUBLAS_GEMM_DEFAULT));*/
-
-    cublasCheck(cublasHgemmStridedBatched(cublas_handle,
-                                     CUBLAS_OP_N, CUBLAS_OP_N,
-                                     HS, T, T,
-                                     &alpha,
-                                     v, HS, T * HS,
-                                     att, T, T * T,
-                                     &beta,
-                                     vaccum, HS, T * HS,
-                                     B * NH));
+                                     CUBLAS_GEMM_DEFAULT));
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -1342,7 +1258,16 @@ int main(int argc, char **argv) {
 
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, deviceIdx);
+
+    // setup cuBLAS (and cuDNN if needed)
     cublasCreate(&cublas_handle);
+    int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
+    printf("enable_tf32: %d\n", enable_tf32);
+    cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
+    cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
+
     #ifdef ENABLE_CUDNN
     checkCudnnErr(cudnnCreate(&cudnn_handle));
     cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
@@ -1387,18 +1312,19 @@ int main(int argc, char **argv) {
         printf("Checking block size %d.\n", block_size);
         attention_forward(kernel_num, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
         // all kernels should produce the correct output out
-        validate_result(d_out, out, "out", B * T * C, 1e-3f);
+        // todo - make accuracy threshold dynamic and depend on FP16 vs FP32?
+        validate_result(d_out, out, "out", B * T * C, 1e-2f);
         // but as for preatt and att, things get a bit more complicated:
         if (kernel_num != 2 && kernel_num < 5) {
             // kernel 2 (knowingly) fails att/preatt because it uses a different algorithm
             // that estimates the softmax online and never materializes preatt/att
-            validate_result(d_att, att, "att", B * NH * T * T, 1e-3f);
+            validate_result(d_att, att, "att", B * NH * T * T, 1e-2f);
         }
         if (kernel_num != 2 && kernel_num < 4) {
             // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
             // into the softmax, so preatt is off by 1.0f / sqrt(HS)
             // but att and out (checked below) should match.
-            validate_result(d_preatt, preatt, "preatt", B * NH * T * T, 1e-3f);
+            validate_result(d_preatt, preatt, "preatt", B * NH * T * T, 1e-2f);
         }
     }
     printf("All results match. Starting benchmarks.\n\n");
