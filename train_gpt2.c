@@ -565,7 +565,7 @@ typedef struct {
     // gradients of the weights
     ParameterTensors grads;
     float* grads_memory;
-    // buffers for the AdamW optimizer
+        // buffers for the AdamW optimizer
     float* m_memory;
     float* v_memory;
     // the activations of the model, and their sizes
@@ -642,7 +642,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
     // other inits
     model->acts_memory = NULL;
     model->grads_memory = NULL;
-    model->m_memory = NULL;
+        model->m_memory = NULL;
     model->v_memory = NULL;
     model->grads_acts_memory = NULL;
     model->inputs = NULL;
@@ -824,10 +824,10 @@ void gpt2_accumulate_grad(GPT2 *model) {
         accum_buff[i] = model->grads_memory[i];
     }
 
-    int left = (world_rank - 1 + world_size) % world_size;
+int left = (world_rank - 1 + world_size) % world_size;
     int right = (world_rank + 1) % world_size;
     MPI_Request send_req, recv_req;
-    MPI_Status status;
+MPI_Status status;
 
     for (int i = 0; i < world_size - 1; i++) {
         if (i % 2 == 0) {
@@ -838,7 +838,7 @@ void gpt2_accumulate_grad(GPT2 *model) {
             // Alternate the buffers for send and receive
             MPI_Isend(recv_buff, model->num_parameters, MPI_FLOAT, right, 0, MPI_COMM_WORLD, &send_req);
             MPI_Irecv(send_buff, model->num_parameters, MPI_FLOAT, left, 0, MPI_COMM_WORLD, &recv_req);
-        }
+}
 
         // Wait for the async comms to complete
         MPI_Wait(&recv_req, &status);
@@ -852,9 +852,9 @@ void gpt2_accumulate_grad(GPT2 *model) {
 
     // Update the final gradients back to model
     for (int i = 0; i < model->num_parameters; i++) {
-        model->grads_memory[i] = accum_buff[i];
-    }
-
+            model->grads_memory[i] = accum_buff[i];
+        }
+    
     free(send_buff);
     free(recv_buff);
     free(accum_buff);
@@ -999,7 +999,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 void gpt2_free(GPT2 *model) {
     free(model->params_memory);
     free(model->grads_memory);
-    free(model->m_memory);
+        free(model->m_memory);
     free(model->v_memory);
     free(model->acts_memory);
     free(model->grads_acts_memory);
@@ -1028,11 +1028,16 @@ typedef struct {
     int* targets;
     // convenience variables
     int num_batches;
+    // process related
+    int R; //world rank
+    int S; //world size
 } DataLoader;
 
-void dataloader_init(DataLoader *loader, char* filename, int B, int T) {
+void dataloader_init(DataLoader *loader, char* filename, int B, int T, int R, int S) {
     loader->B = B;
     loader->T = T;
+    loader->R = R;
+    loader->S = S;
 
     // open the input file for reading
     loader->tokens_file = fopen(filename, "rb");
@@ -1049,31 +1054,33 @@ void dataloader_init(DataLoader *loader, char* filename, int B, int T) {
         printf("Error: file size is too small for the batch size and sequence length\n");
         exit(1);
     }
-    loader->current_position = 0; // start at the beginning
+    loader->current_position = B*T*R * sizeof(int); // start at the offset to proc rank
 
     // allocate space for B*T + 1 integers to store the inputs and targets
     loader->batch = (int*) malloc((B * T + 1) * sizeof(int));
     loader->inputs = loader->batch;
     loader->targets = loader->batch + 1; // targets are shifted by one
-    loader->num_batches = loader->file_size / (B * T * sizeof(int));
+    loader->num_batches = loader->file_size / (B * T * S * sizeof(int));
 }
 
 void dataloader_reset(DataLoader *loader) {
-    loader->current_position = 0;
+    loader->current_position = loader->B * loader->T * loader->R * sizeof(int);
 }
 
 void dataloader_next_batch(DataLoader *loader) {
     int B = loader->B;
     int T = loader->T;
+    int R = loader->R;
+    int S = loader->S;
     // if we are at the end of the file, loop back to the beginning
-    if (loader->current_position + (B*T+1) * sizeof(int) > loader->file_size) {
-        loader->current_position = 0;
+    if (loader->current_position + (B*T*S+1) * sizeof(int) > loader->file_size) {
+        loader->current_position = B*T*R * sizeof(int);
     }
     // read the B*T+1 integers from the file into batch
     fseek(loader->tokens_file, loader->current_position, SEEK_SET);
     fread(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
-    // advance the current position by B*T integers
-    loader->current_position += B*T * sizeof(int);
+    // advance the current position by B*T*S integers
+    loader->current_position += B*T*S * sizeof(int);
 }
 
 void dataloader_free(DataLoader *loader) {
@@ -1197,16 +1204,16 @@ int main(int argc, char** argv) {
 
     MPI_Init(&argc, &argv);
     int world_rank;
+    int world_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
-    char* tiny_stories_base = "data/TinyStories_train";
-    char tiny_stories_train[50];
-    sprintf(tiny_stories_train, "%s%d.bin", tiny_stories_base, world_rank);
+    char* tiny_stories_train = "data/TinyStories_train.bin";
     char* tiny_stories_val = "data/TinyStories_val.bin";
     char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
     char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
@@ -1215,10 +1222,10 @@ int main(int argc, char** argv) {
     int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
     int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader;
-    dataloader_init(&train_loader, train_tokens, B, T);
+    dataloader_init(&train_loader, train_tokens, B, T, world_rank, world_size);
     printf("train dataset num_batches: %d\n", train_loader.num_batches);
     DataLoader val_loader;
-    dataloader_init(&val_loader, val_tokens, B, T);
+    dataloader_init(&val_loader, val_tokens, B, T, 0, 1);
     printf("val dataset num_batches: %d\n", val_loader.num_batches);
     int val_num_batches = 5;
 
