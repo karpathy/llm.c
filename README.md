@@ -182,7 +182,7 @@ Keep on with me, my
 
 This runs on my A100 in about ~10 seconds. This training loop in the PyTorch script is about 80ms/iteration, so we are slightly better than PyTorch here. However, this is measured with PyTorch that is a bit stale (I'm on 2.1.0) and we're not yet including FlashAttention or the PyTorch scaled_dot_product_attention fused operation.
 
-For DDP training with CUDA aware MPI for TinyStories dataset
+For DDP training with CUDA aware MPI
 
 ```bash
 OMP_NUM_THREADS=8 mpirun -np 4 ./train_gpt2cu

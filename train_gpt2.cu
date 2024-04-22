@@ -26,7 +26,9 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#ifdef OMPI
 #include <mpi.h>
+#endif
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -781,8 +783,6 @@ __global__ void grad_accumulate_kernel(float *dest, const float *src, int n) {
     }
 }
 
-
-
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -1054,11 +1054,11 @@ void fused_classifier3(float* logits, float* losses,
     cudaCheck(cudaGetLastError());
 }
 
-void grad_accumulate(float *acc_src, float *accum_buff, int P)
+void grad_accumulate(float *buffer, float *delta, int P)
 {
     const int blockSize = 256;
     const int numBlocks = (P + blockSize - 1) / blockSize;
-    grad_accumulate_kernel<<<numBlocks, blockSize>>>(accum_buff, acc_src, P);
+    grad_accumulate_kernel<<<numBlocks, blockSize>>>(buffer, delta, P);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1268,6 +1268,7 @@ typedef struct {
     // gradients of the weights
     ParameterTensors grads;
     float* grads_memory;
+    float* grads_memory_recv;
     // buffers for the AdamW optimizer
     float* m_memory;
     float* v_memory;
@@ -1328,6 +1329,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     // other inits
     model->acts_memory = NULL;
     model->grads_memory = NULL;
+    model->grads_memory_recv = NULL;
     model->m_memory = NULL;
     model->v_memory = NULL;
     model->grads_acts_memory = NULL;
@@ -1480,54 +1482,35 @@ void gpt2_zero_grad(GPT2 *model) {
     if (model->grads_memory != NULL) { cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(float))); }
 }
 
-void gpt2_accumulate_grad(GPT2 *model) {
+#ifdef OMPI
+void gpt2_accumulate_grad(GPT2 *model, int world_rank, int world_size) {
     if (model->grads_memory == NULL) return;
 
-    int world_rank, world_size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-
-    // Allocate temp buffers on device
-    float *send_buff, *recv_buff, *accum_buff;
-    cudaMalloc((void**)&send_buff, model->num_parameters * sizeof(float));
-    cudaMalloc((void**)&recv_buff, model->num_parameters * sizeof(float));
-    cudaMalloc((void**)&accum_buff, model->num_parameters * sizeof(float));
-
-    // Initialize buffers
-    cudaMemcpy(send_buff, model->grads_memory, model->num_parameters * sizeof(float), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(recv_buff, model->grads_memory, model->num_parameters * sizeof(float), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(accum_buff, model->grads_memory, model->num_parameters * sizeof(float), cudaMemcpyDeviceToDevice);
-
-    int left = (world_rank - 1 + world_size) % world_size;
-    int right = (world_rank + 1) % world_size;
-    MPI_Request send_req, recv_req;
-
-    for (int i = 0; i < world_size - 1; i++) {
-        if (i % 2 == 0) {
-            // Initiate non-blocking send and receive
-            MPI_Isend(send_buff, model->num_parameters, MPI_FLOAT, right, 0, MPI_COMM_WORLD, &send_req);
-            MPI_Irecv(recv_buff, model->num_parameters, MPI_FLOAT, left, 0, MPI_COMM_WORLD, &recv_req);
-        } else {
-            MPI_Isend(recv_buff, model->num_parameters, MPI_FLOAT, right, 0, MPI_COMM_WORLD, &send_req);
-            MPI_Irecv(send_buff, model->num_parameters, MPI_FLOAT, left, 0, MPI_COMM_WORLD, &recv_req);
-        }
-
-        // Wait for async communication to complete
-        MPI_Wait(&recv_req, MPI_STATUS_IGNORE);
-        MPI_Wait(&send_req, MPI_STATUS_IGNORE);
-
-        // Accumulate received gradients
-        float *acc_src = (i % 2 == 0) ? recv_buff : send_buff;
-        grad_accumulate(acc_src, accum_buff, model->num_parameters);
+    if (model->grads_memory_recv == NULL) {
+        cudaCheck(cudaMalloc((void**)&model->grads_memory_recv, model->num_parameters * sizeof(float)));
     }
 
-    // Update the final gradients back to model
-    cudaMemcpy(model->grads_memory, accum_buff, model->num_parameters * sizeof(float), cudaMemcpyDeviceToDevice);
+    // Copy local gradient to the receive buffer initially
+    cudaCheck(cudaMemcpy(model->grads_memory_recv, model->grads_memory, model->num_parameters * sizeof(float), cudaMemcpyDeviceToDevice));
 
-    cudaFree(send_buff);
-    cudaFree(recv_buff);
-    cudaFree(accum_buff);
+    MPI_Request send_req, recv_req;
+
+    int next = (world_rank + 1) % world_size;
+    int prev = (world_rank - 1 + world_size) % world_size;
+
+    for (int i = 0; i < world_size - 1; i++) {
+        MPI_Irecv(model->grads_memory_recv, model->num_parameters, MPI_FLOAT, prev, 0, MPI_COMM_WORLD, &recv_req);
+        MPI_Isend(model->grads_memory, model->num_parameters, MPI_FLOAT, next, 0, MPI_COMM_WORLD, &send_req);
+
+        // Wait for asynchronous send and receive to complete
+        MPI_Wait(&send_req, MPI_STATUS_IGNORE);
+        MPI_Wait(&recv_req, MPI_STATUS_IGNORE);
+
+        // Accumulate received gradients
+        grad_accumulate(model->grads_memory, model->grads_memory_recv, model->num_parameters);
+    }
 }
+#endif
 
 void gpt2_backward(GPT2 *model) {
 
@@ -1679,6 +1662,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->params_memory));
     cudaCheck(cudaFree(model->grads_memory));
+    cudaCheck(cudaFree(model->grads_memory_recv));
     cudaCheck(cudaFree(model->m_memory));
     cudaCheck(cudaFree(model->v_memory));
     cudaCheck(cudaFree(model->acts_memory));
@@ -1708,11 +1692,16 @@ typedef struct {
     int* targets;
     // convenience variables
     long num_batches;
+    // process related
+    int R; //world rank
+    int S; //world size    
 } DataLoader;
 
-void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
+void dataloader_init(DataLoader *loader, const char* filename, int B, int T, int R, int S) {
     loader->B = B;
     loader->T = T;
+    loader->R = R;
+    loader->S = S;
 
     // open the input file for reading
     loader->tokens_file = fopenCheck(filename, "rb");
@@ -1725,7 +1714,7 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
         printf("Error: file size is too small for the batch size and sequence length\n");
         exit(EXIT_FAILURE);
     }
-    loader->current_position = 0; // start at the beginning
+    loader->current_position = B*T*R * sizeof(int); // start at the offset to proc rank
 
     // allocate space for B*T + 1 integers to store the inputs and targets
     // Using CUDA CPU pinned memory for faster PCI Express transfers to GPU
@@ -1733,25 +1722,27 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     cudaMallocHost((void**)&loader->batch, (B * T + 1) * sizeof(int));
     loader->inputs = loader->batch;
     loader->targets = loader->batch + 1; // targets are shifted by one
-    loader->num_batches = loader->file_size / (B * T * sizeof(int));
+    loader->num_batches = loader->file_size / (B * T * S * sizeof(int));
 }
 
 void dataloader_reset(DataLoader *loader) {
-    loader->current_position = 0;
+    loader->current_position = loader->B * loader->T * loader->R * sizeof(int);
 }
 
 void dataloader_next_batch(DataLoader *loader) {
     int B = loader->B;
     int T = loader->T;
+    int R = loader->R;
+    int S = loader->S;    
     // if we are at the end of the file, loop back to the beginning
-    if (loader->current_position + (B*T+1) * sizeof(int) > loader->file_size) {
-        loader->current_position = 0;
+    if (loader->current_position + (B*T*S+1) * sizeof(int) > loader->file_size) {
+        loader->current_position = B*T*R * sizeof(int);
     }
     // read the B*T+1 integers from the file into batch
     fseek(loader->tokens_file, loader->current_position, SEEK_SET);
     freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
-    // advance the current position by B*T integers
-    loader->current_position += B*T * sizeof(int);
+    // advance the current position by B*T*S integers
+    loader->current_position += B*T*S * sizeof(int);
 }
 
 void dataloader_free(DataLoader *loader) {
@@ -1930,6 +1921,15 @@ void error_usage() {
 // main training loop
 int main(int argc, char *argv[]) {
 
+    int world_rank = 0;
+    int world_size = 1;
+
+    #ifdef OMPI
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    #endif
+
     // read in the (optional) command line arguments
     const char* input_dataset_prefix = "data/tiny_shakespeare"; // or e.g. data/TinyStories
     const char* output_log_file = NULL;
@@ -2006,9 +2006,9 @@ int main(int argc, char *argv[]) {
     sprintf(train_tokens_filename, "%s_train.bin", input_dataset_prefix);
     sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
     DataLoader train_loader;
-    dataloader_init(&train_loader, train_tokens_filename, B, T);
+    dataloader_init(&train_loader, train_tokens_filename, B, T, world_rank, world_size);
     DataLoader val_loader;
-    dataloader_init(&val_loader, val_tokens_filename, B, T);
+    dataloader_init(&val_loader, val_tokens_filename, B, T, 0, 1);
     int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default for now
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
     printf("| train_num_batches     | %-50d |\n", train_num_batches);
@@ -2075,15 +2075,17 @@ int main(int argc, char *argv[]) {
                 float coin = random_f32(&rng_state);
                 int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
-                if (tokenizer.init_ok) {
-                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
-                    safe_printf(token_str);
-                } else {
-                    // fall back to printing the token id
-                    printf("%d ", next_token);
+                if (world_rank == 0) {                
+                    // print the generated token, either using the Tokenizer or a fallback
+                    if (tokenizer.init_ok) {
+                        const char* token_str = tokenizer_decode(&tokenizer, next_token);
+                        safe_printf(token_str);
+                    } else {
+                        // fall back to printing the token id
+                        printf("%d ", next_token);
+                    }
+                    fflush(stdout);
                 }
-                fflush(stdout);
             }
             printf("\n---\n");
         }
@@ -2100,7 +2102,9 @@ int main(int argc, char *argv[]) {
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
-        gpt2_accumulate_grad(&model);
+        #ifdef OMPI
+        gpt2_accumulate_grad(&model, world_rank, world_size);
+        #endif
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
@@ -2125,7 +2129,9 @@ int main(int argc, char *argv[]) {
     cublasCheck(cublasLtDestroy(cublaslt_handle));
     logger_free(&logger);
 
+    #ifdef OMPI
     MPI_Finalize();
+    #endif
 
     return 0;
 }
