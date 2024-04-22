@@ -7,6 +7,7 @@ nvcc -O3 matmul_backward_bias.cu -lineinfo -o matmul_backward_bias
 ./matmul_backward_bias 1
 ./matmul_backward_bias 2
 ./matmul_backward_bias 3
+./matmul_backward_bias 4
 
 ncu:
 sudo ncu --set full --import-source yes -o bias -f ./matmul_backward_bias 1
@@ -14,6 +15,7 @@ sudo ncu --set full --import-source yes -o bias -f ./matmul_backward_bias 1
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <omp.h>
@@ -124,44 +126,43 @@ __global__ void matmul_backward_bias_kernel3(float* dbias, const float* dout, in
     }
 }
 
-// this kernel essentially performs a column-wise reduction over dout,
-// which in pytorch would simply look like: dbias = dout.sum((0,1))
-// the philosophy of this kernel is to employ one block to reduce along 
-// several columns, whereby each block has a "width" of 32 columns to ensure 
-// coalesced access. near the end of the column-wise reduction, we accumulate 
-// the reductions performed by the warps in each block via shared memory
+// this kernel performs a column-wise reduction over dout, in PyTorch equivalent to:
+// dbias = dout.sum((0,1))
+// the idea is to employ one block to reduce along several columns,
+// where each block has a width of 32 columns to ensure coalesced access.
+// at the end we accumulate the reductions performed by the warps in each block via shared memory
 __global__ void matmul_backward_bias_kernel4(float* dbias, const float* dout, int B, int T, int OC) {
-    
-    const int vstep = blockDim.x / warpSize;
-    const int row = threadIdx.x >> 5; // basically warp_id
-    const int tl = blockIdx.x * warpSize;
-    const int lane = threadIdx.x & (warpSize - 1);
-    
-    const float* dout_col = dout + tl + lane;
-    
-    extern __shared__ float smem[];
-    
+    // this kernel is launched with 1D grid_dim of OC/32
+    // for example let's say block_size is 128
+    extern __shared__ float smem[]; // of size block_size (128)
+    const int warp_id = threadIdx.x / warpSize; // warp index in the block, 0,1,2,3
+    const int lane_id = threadIdx.x % warpSize; // thread index in the warp, 0,1,2,...,31
+    const int tl = blockIdx.x * warpSize; // pointer to the start column for this block
+    const int vstep = blockDim.x / warpSize; // number of warps in a block, e.g. 4
+
+    // pointer to the start of the column for one lane of threads
+    // so e.g. 4 threads (of the same lane_id) will reduce this one column
+    const float* dout_col = dout + tl + lane_id;
+
+    // column reductions by looping through the rows
+    // each of the 4 threads offsets by its warp_id and then skips by vstep
+    // together these 4 threads cover all B*T rows of this (lane_id) column
+    // importantly, consecutive threads (in threadId) are processing adjacent columns,
+    // leading to a coalesced memory access pattern
     float dout_sum = 0.0f;
-    // column reductions by looping through the rows:
-    // the loop should not exceed B * T rows
-    for (int j = row; j < B * T; j += vstep) {
-        dout_sum += dout_col[j * OC];
+    for (int row = warp_id; row < B * T; row += vstep) {
+        dout_sum += dout_col[row * OC];
     }
-    
-    smem[lane + row * warpSize] = dout_sum;
-    
-    // our kernel assures that entire blocks are running
-    // inside the loop, so we can safely call sync I believe
-    __syncthreads(); 
-    
+    smem[lane_id + warp_id * warpSize] = dout_sum;
+    __syncthreads();
+
+    // warp_id 0 reduces the shared memory column-wise, linearly
     dout_sum = 0.0f;
-    
-    if (row == 0) {
+    if (warp_id == 0) {
         for (int j = 0; j < vstep; j++) {
-            dout_sum += smem[lane + j * warpSize];
+            dout_sum += smem[lane_id + j * warpSize];
         }
-        
-        dbias[tl + lane] += dout_sum;
+        dbias[tl + lane_id] += dout_sum;
     }
 }
 
@@ -196,7 +197,8 @@ void matmul_backward_bias3(float* dinp, float* dweight, float* dbias,
 void matmul_backward_bias4(float* dinp, float* dweight, float* dbias,
                       float* dout, float* inp, float* weight, float* ones,
                       int B, int T, int C, int OC, int block_size) {
-    const int grid_size = OC / 32; // for now, OC must be divisible by 32 for this kernel to work
+    assert(OC % 32 == 0); // OC must be divisible by 32 for this kernel
+    const int grid_size = OC / 32;
     matmul_backward_bias_kernel4<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
 }
 
