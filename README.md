@@ -255,6 +255,9 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 
 - C#
   - [llm.cs](https://github.com/azret/llm.cs) by @[azret](https://github.com/azret): a C# port of this project
+ 
+- Rust
+  -  [llm.rs](https://github.com/ToJen/llm.rs) by @[ToJen](https://github.com/ToJen): a Rust port of this project
 
 ## discussions
 

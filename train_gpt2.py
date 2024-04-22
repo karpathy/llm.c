@@ -403,7 +403,7 @@ if __name__ == "__main__":
         write_model(model, "gpt2_124M.bin")
         write_state(model, x, y, logits, loss, "gpt2_124M_debug_state.bin")
 
-    use_fused = True if device == "cuda" else False
+    use_fused = device == "cuda" # only works on CUDA (?)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, fused=use_fused)
     timings = []
     if device == "cuda":
