@@ -532,10 +532,12 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
     }
 }
 
-// this kernel essentially performs a column-wise reduction over dout
-// the philosophy of the kernel is to employ one block to reduce 
-// along several columns and then to share and accumulate the
-// reductions performed by different warps via shared memory
+// this kernel essentially performs a column-wise reduction over dout,
+// which in pytorch would simply look like: dbias = dout.sum((0,1))
+// the philosophy of this kernel is to employ one block to reduce along 
+// several columns, whereby each block has a "width" of 32 columns to ensure 
+// coalesced access. near the end of the column-wise reduction, we accumulate 
+// the reductions performed by the warps in each block via shared memory
 __global__ void matmul_backward_bias_kernel4(float* dbias, const float* dout, int B, int T, int OC) {
     
     const int vstep = blockDim.x / warpSize;
