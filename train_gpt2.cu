@@ -1901,8 +1901,8 @@ int main(int argc, char *argv[]) {
     // read in the (optional) command line arguments
     const char* input_dataset_prefix = "data/tiny_shakespeare"; // or e.g. data/TinyStories
     const char* output_log_file = NULL;
-    int B = 4; // batch size
-    int T = 1024; // sequence length max
+    const int B = 4; // batch size
+    const int T = 1024; // sequence length max
     float learning_rate = 3e-4f;
     int val_loss_every = 20; // every how many steps do we eval validation loss?
     int val_max_batches = 20; // how many batches max do we eval for validation loss?
@@ -1996,7 +1996,7 @@ int main(int argc, char *argv[]) {
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
+    int gen_tokens[B * T];
     float* cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
     // train
@@ -2086,7 +2086,6 @@ int main(int argc, char *argv[]) {
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
     free(cpu_logits);
-    free(gen_tokens);
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));

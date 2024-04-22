@@ -77,7 +77,7 @@ int main(int argc, char *argv[]) {
     int* x = (int*)mallocCheck(B * T * sizeof(int));
     int* y = (int*)mallocCheck(B * T * sizeof(int));
     float* expected_logits = (float*) mallocCheck(B * T * V * sizeof(float));
-    float* expected_loss = (float*) mallocCheck(1 * sizeof(float));
+    float expected_loss[1];
 
     // read reference information from Python
     freadCheck(x, sizeof(int), B*T, state_file);
@@ -214,7 +214,6 @@ int main(int argc, char *argv[]) {
     free(x);
     free(y);
     free(expected_logits);
-    free(expected_loss);
     free(expected_grads_memory);
     free(calculated_grads_memory);
     gpt2_free(&model);

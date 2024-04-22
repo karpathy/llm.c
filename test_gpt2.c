@@ -67,7 +67,7 @@ int main(int argc, char *argv[]) {
     int* x = (int*) malloc(B * T * sizeof(int));
     int* y = (int*) malloc(B * T * sizeof(int));
     float* expected_logits = (float*) malloc(B * T * V * sizeof(float));
-    float* expected_loss = (float*) malloc(1 * sizeof(float));
+    float expected_loss[1];
 
     // read reference information from Python
     fread(x, sizeof(int), B*T, state_file);
@@ -176,7 +176,6 @@ int main(int argc, char *argv[]) {
     free(x);
     free(y);
     free(expected_logits);
-    free(expected_loss);
     free(expected_grads_memory);
     gpt2_free(&model);
     return 0;

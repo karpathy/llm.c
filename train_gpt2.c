@@ -1157,8 +1157,8 @@ int main() {
     const char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
-    int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
-    int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
+    const int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
+    const int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader;
     dataloader_init(&train_loader, train_tokens, B, T);
     printf("train dataset num_batches: %d\n", train_loader.num_batches);
@@ -1173,7 +1173,7 @@ int main() {
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    int* gen_tokens = (int*)malloc(B * T * sizeof(int));
+    int gen_tokens[B * T];
     const int genT = 64; // number of steps of inference we will do
 
     // train
@@ -1245,7 +1245,6 @@ int main() {
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
-    free(gen_tokens);
     return 0;
 }
 #endif
