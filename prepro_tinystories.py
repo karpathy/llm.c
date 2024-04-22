@@ -97,17 +97,7 @@ def tokenize():
     shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
     val_shards = [shard_filenames[0]]
     train_shards = shard_filenames[1:]
-    
-    train_val_shards = [("val", val_shards)]
-    
-    proc_count = 4
-    num_shards = len(train_shards) // proc_count
-    for i in range(proc_count):
-        start = i*num_shards
-        end = (i+1)*num_shards
-        train_val_shards.append((f"train{i}", train_shards[start:end]))
-    
-    for split_name, split_shards in train_val_shards:
+    for split_name, split_shards in [("val", val_shards), ("train", train_shards)]:
 
         print(f"Tokenizing {split_name} split...")
         all_tokens = []
