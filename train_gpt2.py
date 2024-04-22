@@ -214,7 +214,7 @@ class GPT(nn.Module):
 
 # a few utilities for saving params/grads/activations to files for loading in C
 def write_fp32(tensor, file):
-    file.write(tensor.detach().numpy().astype("float32").tobytes())
+    file.write(tensor.detach().cpu().numpy().astype("float32").tobytes())
 
 def write_tensors(model_tensors, L, file):
     write_fp32(model_tensors["transformer.wte.weight"], file) # (V, C)
@@ -399,12 +399,15 @@ if __name__ == "__main__":
     # do one forward pass to generate ground truth for our C tests
     if not args.inference_only and args.write_tensors:
         logits, loss = model(x, y)
+        loss.backward()
         write_model(model, "gpt2_124M.bin")
         write_state(model, x, y, logits, loss, "gpt2_124M_debug_state.bin")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, fused=True)
+    use_fused = True if device == "cuda" else False
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, fused=use_fused)
     timings = []
-    torch.cuda.reset_peak_memory_stats()
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     for i in range(args.num_iterations):
         t0 = time.time()
         logits, loss = model(x, y)
