@@ -6,6 +6,9 @@ nvcc -O3 --use_fast_math layernorm_backward.cu -o layernorm_backward
 
 version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
 ./layernorm_backward 1
+
+version 2 moves a lot of reduction to shared memory over global memory
+./layernorm_backward 2
 */
 
 #include <stdio.h>
@@ -152,19 +155,18 @@ __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* d
     }
 }
 
-
-// super naive kernel that just parallelizes over B,T and loops over C
+// uses shared memory instead for the reduces
 __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* dbias,
                                            const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                                            int B, int T, int C) {
+    extern __shared__ float shared[]; // size = 2 * C
+
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
     int N = B * T;
-    if(idx >= N) {
-        return;
-    }
+    if(idx >= N) { return; } // thread guards
 
     int b = idx / T;
     int t = idx % T;
@@ -175,6 +177,18 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
     const float mean_bt = mean[b * T + t];
     const float rstd_bt = rstd[b * T + t];
 
+    // the first half of shared memory is bias, second is weight
+    float* dbias_shared = shared;
+    float* dweight_shared = shared + C;
+
+    // init shared memory to zero
+    #pragma unroll
+	for(int i = threadIdx.x; i < C; i+= blockDim.x){
+       dbias_shared[i] = 0.0f;
+       dweight_shared[i] = 0.0f;
+    }
+    __syncthreads();
+
     // first: two reduce operations
     float dnorm_mean = 0.0f;
     float dnorm_norm_mean = 0.0f;
@@ -184,10 +198,8 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
         dnorm_mean += dnorm_i;
         dnorm_norm_mean += dnorm_i * norm_bti;
     }
-
     dnorm_mean = cg::reduce(warp, dnorm_mean, cg::plus<float>{});
     dnorm_norm_mean = cg::reduce(warp, dnorm_norm_mean, cg::plus<float>{});
-
     dnorm_mean = dnorm_mean / C;
     dnorm_norm_mean = dnorm_norm_mean / C;
 
@@ -196,9 +208,9 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
         float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
         float dnorm_i = weight[i] * dout_bt[i];
         // gradient contribution to bias
-        atomicAdd(&dbias[i], dout_bt[i]);
+        atomicAdd(&dbias_shared[i], dout_bt[i]);
         // gradient contribution to weight
-        atomicAdd(&dweight[i], norm_bti * dout_bt[i]);
+        atomicAdd(&dweight_shared[i], norm_bti * dout_bt[i]);
         // gradient contribution to input
         float dval = 0.0f;
         dval += dnorm_i; // term 1
@@ -207,6 +219,13 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
         dval *= rstd_bt; // final scale
         dinp_bt[i] += dval;
     }
+    __syncthreads();
+
+    // write to global memory
+	for(int i = threadIdx.x; i < C; i+= blockDim.x){
+        atomicAdd(&dbias[i], dbias_shared[i]);
+        atomicAdd(&dweight[i], dweight_shared[i]);
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -225,7 +244,8 @@ void layernorm_backward2(float* dinp, float* dweight, float* dbias,
                         int B, int T, int C, const int block_size) {
     const int N = B * T;
     const int grid_size = ceil_div(32*N, block_size);
-    layernorm_backward_kernel2<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+    size_t shared_mem_size = 2 * C * sizeof(float);
+    layernorm_backward_kernel2<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
 }
 
 // kernel version dispatch
