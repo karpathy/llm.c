@@ -52,27 +52,34 @@ version 11 is kernel 10 skipping FP16/FP32 conversions (requires fully FP16 netw
 #include <cooperative_groups/reduce.h>
 #include "common.h"
 
-// Class that wraps __nv_fp8_e4m3 and returns __nv_fp8_storage_t on demand
-typedef __nv_bfloat16 lowp_float; // or __nv_bfloat16
-#define CUBLAS_LOWP CUDA_R_16BF
+// ----------------------------------------------------------------------------
+// Floating point precision setup
+typedef __nv_bfloat16 lowp_float; // half or __nv_bfloat16 (or float)
+#define CUBLAS_LOWP CUDA_R_16BF // CUDA_R_16F or CUDA_R_16BF (or CUDA_R_32F)
+// CUBLAS_COMPUTE_32F or CUBLAS_COMPUTE_16F (for CUDA_R_16F only, potentially slower?!)
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+
+// ----------------------------------------------------------------------------
+// CUDA & cuDNN setup
+static cublasHandle_t cublas_handle;
+static bool first_run_validation = true; // always run e.g. permute on 1st run
 
 #ifdef ENABLE_CUDNN
 #include <cudnn_frontend.h>
 namespace fe = cudnn_frontend;
-#define CUDNN_16BIT fe::DataType_t::BFLOAT16 // or BFLOAT16 (cuDNN kernels only)
+#if CUBLAS_LOWP == CUDA_R_16BF
+#define CUDNN_16BIT fe::DataType_t::BFLOAT16
+#else
+#define CUDNN_16BIT fe::DataType_t::HALF
+#endif
 
 static cudnnHandle_t cudnn_handle;
-static size_t cudnn_workspace_size = 32 * 1024 * 1024;
+static size_t cudnn_workspace_size = 32 * 1024 * 1024; // TODO is this only for backward?
 static void* cudnn_workspace = NULL;
 
 #define checkCudaErr(err) assert((int)err == 0);
 #define checkCudnnErr(err) assert((int)err == 0);
 #endif // ENABLE_CUDNN
-// ----------------------------------------------------------------------------
-// CUDA setup
-static cublasHandle_t cublas_handle;
-static bool first_run_validation = true; // always run e.g. permute on 1st run
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -1024,7 +1031,7 @@ void attention_forward5(float* out, lowp_float* vaccum, lowp_float* qkvr, lowp_f
     }
 
     // IMPORTANT: alpha/beta are FP32 for CUBLAS_COMPUTE_32F even if FP16 inputs/outputs
-    // But need FP16 scale for CUBLAS_COMPUTE_16F (no errors if you get it wrong *sigh*)
+    // But need FP16 scale for CUBLAS_COMPUTE_16F (no errors otherwise, just garbage results *sigh*)
     const float alpha = 1.0f;
     const float beta = 0.0f;
     const lowp_float alpha_lowp = (lowp_float)alpha;
@@ -1053,7 +1060,6 @@ void attention_forward5(float* out, lowp_float* vaccum, lowp_float* qkvr, lowp_f
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-
     cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
                                      CUBLAS_OP_N, CUBLAS_OP_N,
                                      HS, T, T,
@@ -1082,8 +1088,11 @@ using graph_and_tensors = std::tuple<std::shared_ptr<fe::graph::Graph>,
                                      std::shared_ptr<fe::graph::Tensor_attributes>,  // Attn_scale,
                                      std::shared_ptr<fe::graph::Tensor_attributes>,  // O
                                      std::shared_ptr<fe::graph::Tensor_attributes>>; // Stats
+
+// Need a cache because graph->build_operation_graph() is slow but everything else seems fast
 using cache_type = std::unordered_map<std::size_t, graph_and_tensors>;
 
+// Loosely based on cuDNN frontend samples functions and massively simplified
 template <typename... Args>
 auto lookup_cache_or_build_graph(Args... args) {
     static cache_type user_maintained_cache;
@@ -1094,7 +1103,7 @@ auto lookup_cache_or_build_graph(Args... args) {
           .set_intermediate_data_type(fe::DataType_t::FLOAT)
           .set_compute_data_type(fe::DataType_t::FLOAT);
 
-    // (B, N, 3, NH, d)
+    // QKV is (B, N, 3, NH, d) which cuDNN can handle directly without an external permute
     auto Q = graph->tensor(fe::graph::Tensor_attributes()
                                .set_name("Q")
                                .set_dim({b, h, s_qkv, d})
@@ -1121,6 +1130,7 @@ auto lookup_cache_or_build_graph(Args... args) {
 
     auto [O, stats] = graph->sdpa(Q, K, V, sdpa_options);
 
+    // Output is (B, N, NH, d) BF16/FP16 and stats for backward pass is (B, NH, N) FP32
     O->set_output(true).set_dim({b, h, s_qkv, d}).set_stride({h * d * s_qkv, d, h * d, 1});
     assert(stats == nullptr || is_inference == false);    
     if (!is_inference) {
@@ -1164,11 +1174,11 @@ void attention_forward10(float* out, // output: (B, T, NH, HS)
     bool is_inference = stats != NULL;
     float attn_scale_cpu = 1.0 / sqrtf(HS);
 
-    const int block_size = 64;
+    // Optionally convert from FP32 to FP16/BF16 (always on 1st run to get correct results)
+    const int block_size = 64; // smallest full occupancy block size on modern GPUs
     int total_threads = B * T * C * 3;
     assert(total_threads % block_size == 0);
     int num_blocks = total_threads / block_size;
-    
     if (!skip_conversion || first_run_validation) {
         fp32_to_lowp_kernel<<<num_blocks, block_size>>>(qkvr, inp);
     }
@@ -1181,16 +1191,17 @@ void attention_forward10(float* out, // output: (B, T, NH, HS)
     void* devPtrK = (qkvr + NH * HS);
     void* devPtrV = (qkvr + 2 * NH * HS);
     void* devPtrO = (void*)vaccum;
-
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
         {Q, devPtrQ}, {K, devPtrK}, {V, devPtrV}, {attn_scale, &attn_scale_cpu}, {O, devPtrO}};
     if (is_inference == false) {
         variant_pack[softmax_stats] = (void*)stats;
     }
     
-    assert(graph->get_workspace_size() <= cudnn_workspace_size);
+    // Execute graph
+    assert(graph->get_workspace_size() <= cudnn_workspace_size); // TODO - not needed for forward?
     assert(graph->execute(cudnn_handle, variant_pack, cudnn_workspace).is_good());
 
+    // Optionally convert back from FP16/BF16 to FP32
     total_threads = B * T * C;
     assert(total_threads % block_size == 0);
     num_blocks = total_threads / block_size;
@@ -1304,6 +1315,9 @@ int main(int argc, char **argv) {
     }
     printf("Using kernel %d\n", kernel_num);
     int block_sizes[] = {32, 64, 128, 256, 512};
+    
+    // Lower accuracy requirements for FP16 (1e-4f also too much for TF32 on kernels 3 & 4)
+    float accuracy_threshold = (kernel_num <= 4) ? 1e-3f : 1e-2f;
 
     // first check the correctness of the kernel
     attention_forward_cpu(out, preatt, att, inp, B, T, C, NH);
@@ -1313,18 +1327,18 @@ int main(int argc, char **argv) {
         attention_forward(kernel_num, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
         // all kernels should produce the correct output out
         // todo - make accuracy threshold dynamic and depend on FP16 vs FP32?
-        validate_result(d_out, out, "out", B * T * C, 1e-2f);
+        validate_result(d_out, out, "out", B * T * C, accuracy_threshold);
         // but as for preatt and att, things get a bit more complicated:
         if (kernel_num != 2 && kernel_num < 5) {
             // kernel 2 (knowingly) fails att/preatt because it uses a different algorithm
             // that estimates the softmax online and never materializes preatt/att
-            validate_result(d_att, att, "att", B * NH * T * T, 1e-2f);
+            validate_result(d_att, att, "att", B * NH * T * T, accuracy_threshold);
         }
         if (kernel_num != 2 && kernel_num < 4) {
             // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
             // into the softmax, so preatt is off by 1.0f / sqrt(HS)
             // but att and out (checked below) should match.
-            validate_result(d_preatt, preatt, "preatt", B * NH * T * T, 1e-2f);
+            validate_result(d_preatt, preatt, "preatt", B * NH * T * T, accuracy_threshold);
         }
     }
     printf("All results match. Starting benchmarks.\n\n");
