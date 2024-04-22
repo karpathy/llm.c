@@ -325,7 +325,7 @@ if __name__ == "__main__":
     parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
     parser.add_argument("--batch_size", type=int, default=4, help="batch size")
-    parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
+    parser.add_argument("--sequence_length", type=int, default=128, help="sequence length")
     args = parser.parse_args()
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024

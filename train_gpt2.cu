@@ -384,6 +384,148 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     }
 }
 
+
+__device__ float4 ld_vec(const float* address) {
+    return *reinterpret_cast<const float4*>(address);
+}
+
+__device__ void st_vec(float* address, float4 val) {
+    *reinterpret_cast<float4*>(address) = val;
+}
+
+__device__ void matmul_tri(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
+    int i_base = 128 * blockIdx.x + 8 * threadIdx.x;
+    int j_base = 128 * blockIdx.y + 8 * threadIdx.y;
+
+    if (blockIdx.y > blockIdx.x)
+        return;
+
+    k += 128 * blockIdx.x * ks;
+    q += 128 * blockIdx.y * qs;
+
+    __shared__ float lhs_s[128][32];
+    __shared__ float rhs_s[128][32];
+
+    float vals[8][8] = {};
+    for (int so = 0; so < hs; so += 32) {
+        __syncthreads();
+        for(int y = threadIdx.y / 2; y < 128; y += 8) {
+            int xo = (threadIdx.y % 2) * 16;
+            lhs_s[y][threadIdx.x + xo] = k[y * ks + so + threadIdx.x + xo];
+            rhs_s[y][threadIdx.x + xo] = q[y * qs + so + threadIdx.x + xo];
+        }
+        __syncthreads();
+
+        for (int si = 0; si < 32; ++si) {
+            float rhs[8];
+            for (int u = 0; u < 8; ++u) {
+                rhs[u] = rhs_s[u + 8 * threadIdx.y][(si + threadIdx.x) % 32];
+            }
+
+            for (int ii = 0; ii < 8; ++ii) {
+                float lhs = lhs_s[ii + 8 * threadIdx.x][(si + threadIdx.x) % 32];
+                for (int ji = 0; ji < 8; ++ji) {
+                    vals[ii][ji] += lhs * rhs[ji];
+                }
+            }
+        }
+    }
+
+    if (j_base > i_base)
+        return;
+
+    for (int ii = 0; ii < 8; ++ii) {
+        for (int ji = 0; ji < 8; ji += 4) {
+            int i = i_base + ii;
+            int j = j_base + ji;
+            float4 result;
+            result.x = vals[ii][ji + 0] * alpha;
+            result.y = vals[ii][ji + 1] * alpha;
+            result.z = vals[ii][ji + 2] * alpha;
+            result.w = vals[ii][ji + 3] * alpha;
+            st_vec(p + i * ps + j, result);
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256, 2) trimul_global(float* out, const float* inp, int T, int C, int NH) {
+    // skip above the diagonal
+    if(blockIdx.y > blockIdx.x)
+        return;
+
+    // set up indices
+    int C3 = C*3;
+    int hs = C / NH; // head size
+    float scale = 1.0 / sqrtf(hs);
+
+    // we put the "batch x head" dimension into the z block index.
+    int h = blockIdx.z % NH;
+    int b = blockIdx.z / NH;
+
+    // Get the base address for the current batch and head
+    const float* q = inp + b * T * C3 + h * hs;
+    const float* k = inp + b * T * C3 + h * hs + C;
+    float* r = out + (b*NH + h)*T*T;
+
+    // start the multiplication
+    matmul_tri(r, T, q, C3, k, C3, T, hs, scale);
+}
+
+__device__ void att_out_register(float* o, int os, const float* a, int as, const float* v, int vs, int T) {
+    // get coordinates of our block
+    int i_base = 128 * blockIdx.y + 8 * threadIdx.y;
+    int j_base = 64 * blockIdx.x + 4 * threadIdx.x;
+    int i_max = i_base + 8;
+
+    // calculate 8x4 results in one thread, loading all the required inputs just once
+    float vals[8][4] = {};
+    for (int s = 0; s < i_max ; ++s) {
+        float ai[8];
+        for (int io = 0; io < 8; ++io) {
+            int i = i_base + io;
+            ai[io] = a[i * as + s];
+        }
+        for (int jo = 0; jo < 4; ++jo) {
+            int j = j_base + jo;
+            float vj = v[j + vs * s];
+            for (int io = 0; io < 8; ++io) {
+                vals[io][jo] += ai[io] * vj;
+            }
+        }
+    }
+
+    for (int io = 0; io < 8; ++io) {
+        int i = i_base + io;
+        for (int jo = 0; jo < 4; ++jo) {
+            int j = j_base + jo;
+            o[i * os + j] = vals[io][jo];
+        }
+    }
+}
+
+
+__global__ void __launch_bounds__(256, 2) att_out_global(float* out, const float* att, const float* inp, int T, int C, int NH) {
+    // att: (B, NH, T, T), inp: (B, T, 3C), out: (B, T, C)
+    // set up indices
+    int C3 = C*3;
+    int hs = C / NH; // head size
+
+    // we put the "batch x head" dimension into the z block index.
+    int h = blockIdx.z % NH;
+    int b = blockIdx.z / NH;
+
+    // Get the base address for the current batch and head
+    // (B, nh, T, hs)
+    const float* a = att + b * NH * T * T + h * T * T;
+    const float* v = inp + b * T * C3 + h * hs + 2*C;
+    float* r = out + b*T*C + h * hs;
+    //float* rend = out + B;
+
+    // start the multiplication
+    att_out_register(r, C, a, T, v, C3, T);
+}
+
+
 __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
@@ -886,50 +1028,31 @@ void matmul_forward_cublaslt(float* out,
     cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
 }
 
-void attention_forward(float* out, float* qkvr, float* att,
-                       float* inp,
+void attention_forward(float* out, float* preatt, float* att,
+                       const float* inp,
                        int B, int T, int C, int NH) {
-    // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
-    // Its contents will be overwritten by this function.
-    const int block_size = 256;
-    const int softmax_block_size = 256;
-
     // inp is (B, T, 3C) QKV
     // preatt, att are (B, NH, T, T)
     // output is (B, T, C)
-    int HS = C / NH; // head size
-
-    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
-    float *q, *k, *v;
-    q = qkvr + 0 * B * T * C;
-    k = qkvr + 1 * B * T * C;
-    v = qkvr + 2 * B * T * C;
-    int total_threads = B * NH * T * HS;
-    int num_blocks = CEIL_DIV(total_threads, block_size);
-    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+    assert(T % 128 == 0);
+    assert(C % 32 == 0);
+    trimul_global<<<dim3(T / 128, T / 128, NH * B), dim3(16, 16)>>>(preatt, inp, T, C, NH);
     cudaCheck(cudaGetLastError());
 
-    // batched matrix multiply with cuBLAS
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    float* preatt = inp;
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha, k, HS, T * HS, q, HS, T * HS, &beta, preatt, T, T * T, B * NH));
-
     // multiply all elements of preatt elementwise by scale
-    float scale = 1.0 / sqrtf(HS);
+    float scale = 1.0;
+    int softmax_block_size = 256;
     int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
     softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
     cudaCheck(cudaGetLastError());
 
-    // new approach: first cuBLAS another batched matmul
-    float* vaccum = inp;
-    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha, v, HS, T * HS, att, T, T * T, &beta, vaccum, HS, T * HS, B * NH));
-
-    // now unpermute
-    // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-    num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+    // we assume nice shapes here. Let's not make the code a mess by supporting weird shapes that you
+    // wouldn't want to use anyway.
+    assert(T % 128 == 0);
+    assert(C % 128 == 0);
+    assert((C / NH) % 64 == 0);
+    // No need to ceil_div, if it's not a multiple of 128, we would get wrong results anyway.
+    att_out_global<<<dim3(C / NH / 64, T / 128, NH * B), dim3(16, 16)>>>(out, att, inp, T, C, NH);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1151,7 +1274,7 @@ typedef struct {
 
     float* losses; // (B, T)
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
-    float* qkvr; // (L, B, T, 3*C)
+    float* qkv; // (L, B, T, 3*C)
     // in inference mode, this buffer will store the logits
     // in training mode, this buffer will contain the *gradients* of the logits.
     // during the processing of transformer blocks, we will also use this as a
@@ -1228,7 +1351,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->atty,
         &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
-        &acts->lnf_mean, &acts->lnf_rstd, &acts->losses, &acts->qkvr, &acts->output
+        &acts->lnf_mean, &acts->lnf_rstd, &acts->losses, &acts->qkv, &acts->output
     };
     return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
 }
@@ -1405,7 +1528,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         float* l_ln1 = acts.ln1 + l * B * T * C;
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float* l_qkvr = acts.qkvr + l * B * T * 3*C;
+        float* l_qkv = acts.qkv + l * B * T * 3 * C;
         float* l_atty = acts.atty + l * B * T * C;
         float* l_att = acts.att + l * B * NH * T * T;
         float* l_attproj = acts.attproj + l * B * T * C;
@@ -1425,6 +1548,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
+        matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3 * C);
+        attention_forward(l_atty, scratch, l_att, l_qkv, B, T, C, NH);
         matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
@@ -1545,7 +1670,7 @@ void gpt2_backward(GPT2 *model) {
         float* l_ln1 = acts.ln1 + l * B * T * C;
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float* l_qkvr = acts.qkvr + l * B * T * 3*C;
+        float* l_qkv = acts.qkv + l * B * T * 3 * C;
         float* l_atty = acts.atty + l * B * T * C;
         float* l_att = acts.att + l * B * NH * T * T;
         float* l_residual2 = acts.residual2 + l * B * T * C;
@@ -1578,7 +1703,7 @@ void gpt2_backward(GPT2 *model) {
         float* buffer_a = l_atty;
         float* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
 
-        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
+        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkv, l_att, B, T, C, NH);
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
