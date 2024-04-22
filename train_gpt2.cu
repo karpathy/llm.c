@@ -1117,7 +1117,7 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
 void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, float* scratch,
-                        const float* dout,
+                        float* dout,  float* scratch2,
                         const float* qkvr, const float* att,
                         int B, int T, int C, int NH) {
     const int block_size = 256;
@@ -1125,16 +1125,24 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     const float one = 1.0f;
     const float zero = 0.0f; // note beta = 1.0f so that we accumulate gradients (+=)
     // unpack convenience pointers into q, k, v
-    const float *q, *k, *v;
-    q = qkvr + 0 * B * T * C;
-    k = qkvr + 1 * B * T * C;
-    v = qkvr + 2 * B * T * C;
+    float *q, *k, *v;
+    q = scratch2 + 0 * B * T * C;
+    k = scratch2 + 1 * B * T * C;
+    v = scratch2 + 2 * B * T * C;
     float *dq, *dk, *dv;
     dq = dqkvr + 0 * B * T * C;
     dk = dqkvr + 1 * B * T * C;
     dv = dqkvr + 2 * B * T * C;
     // backward through the unpermute operation
     int num_blocks = CEIL_DIV(B * T * C, block_size);
+
+    {
+        int total_threads = B * NH * T * HS;
+        int num_blocks = CEIL_DIV(total_threads, block_size);
+        permute_kernel<<<num_blocks, block_size>>>(q, k, v, qkvr, B, T, NH, HS);
+        cudaCheck(cudaGetLastError());
+    }
+
     unpermute_kernel_backward<<<num_blocks, block_size>>>(scratch, dout, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
     // backward into datt
@@ -1314,11 +1322,12 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
 // Backward pass is conceptually quite different from forward, because we can discard
 // the activations of a layer as soon as we're done with it. This lets us aggressively
 // reuse memory, so that we need far fewer tensors for backward state.
-#define NUM_BACKWARD_TENSORS 3
+#define NUM_BACKWARD_TENSORS 4
 typedef struct {
     float* bt4c; // (B, T, 4*C)
     float* preatt; // (B, NH, T, T)
     float* residual3; // (B, T, C)
+    float* transpose; // (B, T, 3C)
 } GradActTensors;
 
 
@@ -1328,6 +1337,7 @@ void fill_in_grad_act_sizes(size_t* act_sizes, int B, int T, GPT2Config config) 
     act_sizes[0] = B * T * 4 * C; // bt4c
     act_sizes[1] = B * NH * T * T; // preatt
     act_sizes[2] = B * T * C; // residual3
+    act_sizes[3] = B * T * 3*C; // residual3
 }
 
 
@@ -1358,7 +1368,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
 
 float* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) {
     float** ptrs[] = {
-        &acts->bt4c, &acts->preatt, &acts->residual3
+        &acts->bt4c, &acts->preatt, &acts->residual3, &acts->transpose
     };
     return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
@@ -1546,8 +1556,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
         matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3 * C);
         attention_forward(l_atty, scratch, l_att, l_qkv, B, T, C, NH);
         matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
@@ -1703,7 +1711,8 @@ void gpt2_backward(GPT2 *model) {
         float* buffer_a = l_atty;
         float* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
 
-        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkv, l_att, B, T, C, NH);
+        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, grads_acts.transpose,
+                           l_qkv, l_att, B, T, C, NH);
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
