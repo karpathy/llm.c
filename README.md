@@ -84,7 +84,7 @@ Once `train_gpt2` is compiled, you can run it:
 OMP_NUM_THREADS=8 ./train_gpt2
 ```
 
-For DDP training with MPI for TinyStories dataset
+For DDP training with OpenMPI
 
 ```bash
 OMP_NUM_THREADS=8 mpirun -np 4 ./train_gpt2

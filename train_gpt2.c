@@ -17,9 +17,11 @@ There will be other versions of this code that specialize it and make it fast.
 #include <time.h>
 #include <string.h>
 #include <unistd.h>
-#include <mpi.h>
 #ifdef OMP
 #include <omp.h>
+#endif
+#ifdef OMPI
+#include <mpi.h>
 #endif
 
 // ----------------------------------------------------------------------------
@@ -812,6 +814,7 @@ void gpt2_zero_grad(GPT2 *model) {
     if(model->grads_acts_memory != NULL) { memset(model->grads_acts_memory, 0, model->num_activations * sizeof(float)); }
 }
 
+#ifdef OMPI
 void gpt2_accumulate_grad(GPT2 *model, int world_rank, int world_size) {
     if (model->grads_memory == NULL) return;
 
@@ -845,6 +848,7 @@ void gpt2_accumulate_grad(GPT2 *model, int world_rank, int world_size) {
         }
     }
 }
+#endif
 
 void gpt2_backward(GPT2 *model) {
 
@@ -1189,11 +1193,14 @@ void tokenizer_free(Tokenizer *tokenizer) {
 // main training loop
 int main(int argc, char** argv) {
 
+    int world_rank = 0;
+    int world_size = 1;
+
+    #ifdef OMPI
     MPI_Init(&argc, &argv);
-    int world_rank;
-    int world_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    #endif
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
@@ -1264,15 +1271,17 @@ int main(int argc, char** argv) {
                 float coin = random_f32(&rng_state);
                 int next_token = sample_mult(probs, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
-                if (tokenizer.init_ok) {
-                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
-                    safe_printf(token_str);
-                } else {
-                    // fall back to printing the token id
-                    printf("%d ", next_token);
+                if (world_rank == 0) {
+                    // print the generated token, either using the Tokenizer or a fallback
+                    if (tokenizer.init_ok) {
+                        const char* token_str = tokenizer_decode(&tokenizer, next_token);
+                        safe_printf(token_str);
+                    } else {
+                        // fall back to printing the token id
+                        printf("%d ", next_token);
+                    }
+                    fflush(stdout);
                 }
-                fflush(stdout);
             }
             printf("\n---\n");
         }
@@ -1283,7 +1292,9 @@ int main(int argc, char** argv) {
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
+        #ifdef OMPI
         gpt2_accumulate_grad(&model, world_rank, world_size);
+        #endif
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
@@ -1297,7 +1308,9 @@ int main(int argc, char** argv) {
     gpt2_free(&model);
     free(gen_tokens);
 
+    #ifdef OMPI
     MPI_Finalize();
+    #endif
     
     return 0;
 }

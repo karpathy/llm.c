@@ -23,14 +23,6 @@ endef
 # Check each flag and add it if supported
 $(foreach flag,$(CFLAGS_COND),$(eval $(call check_and_add_flag,$(flag))))
 
-MPI_LDFLAGS = -L/usr/lib/x86_64-linux-gnu/openmpi/lib
-MPI_LDLIBS = -lmpi
-MPI_INCLUDES = -I/usr/lib/x86_64-linux-gnu/openmpi/include/ -I/usr/lib/x86_64-linux-gnu/openmpi/include/openmpi/
-
-LDFLAGS += $(MPI_LDFLAGS)
-LDLIBS += $(MPI_LDLIBS) 
-INCLUDES += $(MPI_INCLUDES)
-
 # Check if OpenMP is available
 # This is done by attempting to compile an empty file with OpenMP flags
 # OpenMP makes the code a lot faster so I advise installing it
@@ -69,6 +61,40 @@ else
       $(info OpenMP found, compiling with OpenMP support)
     else
       $(warning OpenMP not found, skipping OpenMP support)
+    endif
+  endif
+endif
+
+# Check if OpenMPI is available
+# OpenMPI enables DDP training strategy
+# e.g. on MacOS: brew install open-mpi
+# e.g. on Ubuntu: sudo apt-get install openmpi-bin openmpi-common libopenmpi-dev
+# later, run the program with number of processes required, e.g.: mpirun -np 4 ./gpt2
+ifeq ($(NO_MPI), 1)
+  $(info OpenMPI is manually disabled)
+else
+  UNAME_S := $(shell uname -s)
+  ifeq ($(UNAME_S), Darwin)
+    ifeq ($(shell [ -d /opt/homebrew/opt/open-mpi/lib ] && echo "exists"), exists)
+      # macOS with Homebrew on ARM (Apple Silicon)
+      CFLAGS += -DOMPI
+      LDFLAGS += -L/opt/homebrew/opt/open-mpi/lib
+      LDLIBS += -lmpi
+      INCLUDES += -I/opt/homebrew/opt/open-mpi/include
+      $(info OpenMPI found, compiling with OpenMPI support)
+    else
+      $(warning OpenMPI not found, skipping OpenMPI support)
+    endif
+  else ifeq ($(UNAME_S), Linux)
+    ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib ] && echo "exists"), exists)
+      # Linux with apt-get installed OpenMPI
+      CFLAGS += -DOMPI
+      LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib
+      LDLIBS += -lmpi
+      INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
+      $(info OpenMPI found, compiling with OpenMPI support)
+    else
+      $(warning OpenMPI not found, skipping OpenMPI support)
     endif
   endif
 endif
