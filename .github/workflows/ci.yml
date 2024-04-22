@@ -1,0 +1,62 @@
+name: Build and test
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  build-and-test-cpu:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install OpenMP
+        run: |
+          if [ "${{ runner.os }}" == "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y libomp-dev
+          elif [ "${{ runner.os }}" == "macOS" ]; then
+            brew install libomp
+          fi
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run preprocessing
+        run: python prepro_tinyshakespeare.py
+
+      - name: Train model
+        run: python train_gpt2.py
+
+      - name: Compile training and testing program
+        run: make test_gpt2 train_gpt2
+
+      - name: Execute testing program (With OpenMP)
+        run: OMP_NUM_THREADS=8 ./test_gpt2
+
+      - name: Compile training and testing program without OpenMP
+        run: NO_OMP=1 make test_gpt2 train_gpt2
+
+      - name: Execute testing program (No OpenMP)
+        run: ./test_gpt2
+
+  build-with-cuda:
+    runs-on: ubuntu-latest  # Host OS, Docker will run on top of this
+    container:
+      image: nvidia/cuda:11.2.2-devel-ubuntu20.04  # Example CUDA development image with nvcc
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Build project
+        run: make train_gpt2cu test_gpt2cu
