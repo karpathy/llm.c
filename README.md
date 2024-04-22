@@ -259,6 +259,8 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 - Rust
   -  [llm.rs](https://github.com/ToJen/llm.rs) by @[ToJen](https://github.com/ToJen): a Rust port of this project
 
+- Metal
+  - [llm.metal](https://github.com/regrettable-username/llm.metal) by @[regrettable-username](https://github.com/regrettable-username): LLM training in simple, raw C/Metal Shading Language
 ## discussions
 
 Ways of organizing development:
