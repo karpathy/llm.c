@@ -1,5 +1,27 @@
-// Triangular matrix multiplication as in autoregressive attention. A short story.
-//
+/*
+Triangular matrix multiplication as in autoregressive attention. A short story.
+by @ngc92
+
+Compile:
+nvcc -O3 --use_fast_math trimat_forward.cu -o trimat_forward -lcublas
+
+Run:
+
+cuBLAS baseline kernel
+./trimat_forward 0
+
+naive
+./trimat_forward 1
+
+registers
+./trimat_forward 2
+
+tri3
+./trimat_forward 3
+
+tri4
+./trimat_forward 4
+*/
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +35,6 @@
 
 static cublasHandle_t cublas_handle;
 static float* d_qkvr;   // scratch for the cublas kernel
-
 
 /*                    ** Chapter I - Introduction **
  *
@@ -152,7 +173,10 @@ void trimul_cublas(float* preatt,
  *  Let's observe how we're doing.
  */
 
-template<auto matmul_tri>
+// using creates an alias for a function pointer
+using matmul_fn_ptr = void(*)(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha);
+
+template<matmul_fn_ptr matmul_tri>
 __global__ void __launch_bounds__(256, 2) trimul_global(float* out, const float* inp, int T, int C, int NH) {
     // skip above the diagonal
     if(blockIdx.y > blockIdx.x)
@@ -176,9 +200,8 @@ __global__ void __launch_bounds__(256, 2) trimul_global(float* out, const float*
     matmul_tri(r, T, q, C3, k, C3, T, hs, scale);
 }
 
-template<auto matmul_tri>
-void trimul_launcher(float* out, const float* inp,
-                   int B, int T, int C, int NH) {
+template<matmul_fn_ptr matmul_tri>
+void trimul_launcher(float* out, const float* inp, int B, int T, int C, int NH) {
     // we assume nice shapes here. Let's not make the code a mess by supporting weird shapes that you
     // wouldn't want to use anyway.
     assert(T % 128 == 0);
@@ -239,7 +262,6 @@ __device__ void matmul_tri_naive(float* p, int ps, const float* k, int ks, const
         }
     }
 }
-
 
 /*                     ** Chapter IV - ... **
  *
@@ -387,8 +409,6 @@ __device__ void matmul_tri3(float* p, int ps, const float* k, int ks, const floa
     }
 }
 
-
-
 /*                     ** Chapter V - Sharing is Caring **
  *
  *  You take a look around the shed, and see that there are 32 shelves there. They are much larger than the workbenches,
@@ -470,19 +490,18 @@ __device__ void matmul_tri4(float* p, int ps, const float* k, int ks, const floa
     }
 }
 
-
 /*                     ** Chapter VI - Competition Day **
  *
  * Finally, you feel ready to take on Cublas. You hand out tickets to the event for you friends to see.
- * 
- *                  -----------------------------------------------------------------
- *                  |           CuBLAS vs TriMul - Fight of the Century             |
- *                  |                                                               |
- *                  |   Ticket code:                                                |
- *                  |   > nvcc -O3 --use_fast_math trimat.cu -o trimat -lcublas     |
- *                  |   > ./trimat 4                                                |
- *                  |                                                               |
- *                  -----------------------------------------------------------------
+ *
+ *    ---------------------------------------------------------------------------------
+ *    |           CuBLAS vs TriMul - Fight of the Century                             |
+ *    |                                                                               |
+ *    |   Ticket code:                                                                |
+ *    |   > nvcc -O3 --use_fast_math trimat_forward.cu -o trimat_forward -lcublas     |
+ *    |   > ./trimat 4                                                                |
+ *    |                                                                               |
+ *    ---------------------------------------------------------------------------------
  */
 
 void trimul_gpu(int kernel_num,
