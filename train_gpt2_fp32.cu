@@ -27,6 +27,11 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
+#ifdef MULTI_GPU
+#include <mpi.h>
+#include <nccl.h>
+#endif
+
 // ----------------------------------------------------------------------------
 // CUDA utils
 
@@ -52,6 +57,27 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
     }
 }
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
+
+#ifdef MULTI_GPU
+void nccl_check(ncclResult_t status, const char *file, int line) {
+    if (status != ncclSuccess) {
+        printf("[NCCL ERROR] at file %s:%d:\n%s\n", file, line, ncclGetErrorString(status));
+        exit(EXIT_FAILURE);
+    }
+}
+#define ncclCheck(err) (nccl_check(err, __FILE__, __LINE__))
+
+void mpi_check(int status, const char *file, int line) {
+    if (status != MPI_SUCCESS) {
+        char mpi_error[4096];
+        int mpi_error_len = 0;
+        assert(MPI_Error_string(status, &mpi_error[0], &mpi_error_len) == MPI_SUCCESS);
+        printf("[MPI ERROR] at file %s:%d:\n%.*s\n", file, line, mpi_error_len, mpi_error);
+        exit(EXIT_FAILURE);
+    }
+}
+#define mpiCheck(err) (mpi_check(err, __FILE__, __LINE__))
+#endif
 
 // cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
 static size_t cublaslt_workspace_size = 32 * 1024 * 1024;
@@ -1275,6 +1301,89 @@ float* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) 
     return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
 
+// Parameters specific to training on multiple GPUs.
+typedef struct {
+    int process_rank;      // Rank of this process among all MPI processes on all hosts. 0 if no multi-GPU.
+    int num_processes;     // Total number of processes. 1 if no multi-GPU.
+    int local_device_idx;  // This process GPU index on current machine. 0 if no multi-GPU.
+#ifdef MULTI_GPU
+    ncclComm_t nccl_comm;  // NCCL communication primitive, used for collective mutli-GPU work.
+#endif
+} MultiGpuConfig;
+
+#ifdef MULTI_GPU
+// Determine which GPU this process should use.
+// Processes on the same machines use different GPU indicies. Processes on other machines don't.
+// Copied from NCCL examples: https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/examples.html#example-2-one-device-per-process-or-thread
+int multi_gpu_get_local_device_idx(int process_rank, int num_processes) {
+  char hostname[1024];
+  hostname[1023] = '\0';
+  // All processes on the same machine will share the same hostname.
+  gethostname(hostname, 1023);
+  for (int i=0; i < 1024; i++) {
+    if (hostname[i] == '.') {
+        hostname[i] = '\0';
+        break;
+    }
+  }
+  uint64_t hostname_hash = 5381;
+  for (int c = 0; hostname[c] != '\0'; c++){ hostname_hash = ((hostname_hash << 5) + hostname_hash) ^ hostname[c]; }
+
+  // Distribute all hostname hashes to all processes.
+  uint64_t* all_hostsname_hashes = (uint64_t*)malloc(num_processes * sizeof(uint64_t));
+  mpiCheck(MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, all_hostsname_hashes, sizeof(uint64_t), MPI_BYTE, MPI_COMM_WORLD));
+
+  // Identify which GPU we need to use.
+  int local_device_idx = 0;
+  for (int current_process = 0; current_process < num_processes; ++current_process) {
+     if (current_process == process_rank) {
+      // Found my gpu, local_device_idx now has my target GPU index.
+      break;
+     }
+     if (all_hostsname_hashes[current_process] == all_hostsname_hashes[process_rank]) {
+      // This process ID runs on the same machine, but it's not me, skip this GPU
+      local_device_idx++;
+     }
+  }
+
+  free(all_hostsname_hashes);
+  return local_device_idx;
+}
+#endif
+
+MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
+#ifdef MULTI_GPU
+    // Initialize MPI.
+    MultiGpuConfig result;
+    mpiCheck(MPI_Init(argc, argv));
+    mpiCheck(MPI_Comm_rank(MPI_COMM_WORLD, &result.process_rank));
+    mpiCheck(MPI_Comm_size(MPI_COMM_WORLD, &result.num_processes));
+    result.local_device_idx = multi_gpu_get_local_device_idx(result.process_rank, result.num_processes);
+    cudaCheck(cudaSetDevice(result.local_device_idx));
+    ncclUniqueId nccl_id;
+    if (result.process_rank == 0) {
+        ncclCheck(ncclGetUniqueId(&nccl_id));
+    }
+    mpiCheck(MPI_Bcast((void *)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD));
+    ncclCheck(ncclCommInitRank(&result.nccl_comm, result.num_processes, nccl_id, result.process_rank));
+    return result;
+#else
+    printf("Multi-GPU support is disabled. Using a single GPU.");
+    return MultiGpuConfig{
+        .process_rank = 0,
+        .num_processes = 1,
+        .local_device_idx = 0,
+    };
+#endif
+}
+
+void multi_gpu_config_free(const MultiGpuConfig* multi_gpu_config) {
+#ifdef MULTI_GPU
+    ncclCheck(ncclCommDestroy(multi_gpu_config->nccl_comm));
+    mpiCheck(MPI_Finalize());
+#endif
+}
+
 typedef struct {
     GPT2Config config;
     // the weights of the model, and their sizes
@@ -1304,6 +1413,7 @@ typedef struct {
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
+    float accumulated_mean_loss; // Mean loss after aggregating it on all GPUs
 } GPT2;
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -1621,6 +1731,33 @@ void gpt2_backward(GPT2 *model) {
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
 }
 
+// Compute a mean of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
+float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_config) {
+#ifdef MULTI_GPU
+    // MPI doesn't support all reduce with mean, so we sum up, then divide.
+    float result;
+    mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
+    return result / multi_gpu_config->num_processes;
+#else
+    return value;
+#endif
+}
+
+// Averages out the loss and gradients across all GPUs. No-op when multi-GPU is disabled.
+void gpt2_mutli_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
+    // Average all losses.
+    model->accumulated_mean_loss = multi_gpu_cpu_float_mean(model->mean_loss, multi_gpu_config);
+#ifdef MULTI_GPU
+    // Average all gradients.
+    ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
+        model->num_parameters,
+        ncclFloat, ncclAvg,
+        multi_gpu_config->nccl_comm,
+        // use 0 for default stream (all other computations use this stream)
+        /*stream=*/0));
+#endif
+}
+
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
     // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
 
@@ -1663,6 +1800,10 @@ void gpt2_free(GPT2 *model) {
 // data loader lite: returns random batches of data from a file of integers
 
 typedef struct {
+    // Distributed data parallel specifics.
+    // Each worker loads it's own chunk of data.
+    int process_rank;
+    int num_processes;
     // hyperparameters
     int B;
     int T;
@@ -1678,7 +1819,9 @@ typedef struct {
     long num_batches;
 } DataLoader;
 
-void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
+void dataloader_init(DataLoader *loader, const MultiGpuConfig* multi_gpu_config, const char* filename, int B, int T) {
+    loader->process_rank = multi_gpu_config->process_rank;
+    loader->num_processes = multi_gpu_config->num_processes;
     loader->B = B;
     loader->T = T;
 
@@ -1693,7 +1836,7 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
         printf("Error: file size is too small for the batch size and sequence length\n");
         exit(EXIT_FAILURE);
     }
-    loader->current_position = 0; // start at the beginning
+    loader->current_position = loader->process_rank * B * T * sizeof(int); // start at the beginning
 
     // allocate space for B*T + 1 integers to store the inputs and targets
     // Using CUDA CPU pinned memory for faster PCI Express transfers to GPU
@@ -1701,25 +1844,24 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     cudaMallocHost((void**)&loader->batch, (B * T + 1) * sizeof(int));
     loader->inputs = loader->batch;
     loader->targets = loader->batch + 1; // targets are shifted by one
-    loader->num_batches = loader->file_size / (B * T * sizeof(int));
+    loader->num_batches = loader->file_size / (loader->num_processes * B * T * sizeof(int));
 }
 
 void dataloader_reset(DataLoader *loader) {
-    loader->current_position = 0;
+    loader->current_position = loader->process_rank * loader->B * loader->T * sizeof(int);
 }
 
 void dataloader_next_batch(DataLoader *loader) {
     int B = loader->B;
     int T = loader->T;
     // if we are at the end of the file, loop back to the beginning
-    if (loader->current_position + (B*T+1) * sizeof(int) > loader->file_size) {
-        loader->current_position = 0;
+    if (loader->current_position + (loader->num_processes * B * T + 1) * sizeof(int) > loader->file_size) {
+        loader->current_position = loader->process_rank * B * T * sizeof(int);
     }
     // read the B*T+1 integers from the file into batch
     fseek(loader->tokens_file, loader->current_position, SEEK_SET);
     freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
-    // advance the current position by B*T integers
-    loader->current_position += B*T * sizeof(int);
+    loader->current_position += loader->num_processes * B * T * sizeof(int);
 }
 
 void dataloader_free(DataLoader *loader) {
@@ -1897,6 +2039,7 @@ void error_usage() {
 // ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
+    MultiGpuConfig multi_gpu_config = multi_gpu_config_init(&argc, &argv);
 
     // read in the (optional) command line arguments
     const char* input_dataset_prefix = "data/tiny_shakespeare"; // or e.g. data/TinyStories
@@ -1915,7 +2058,7 @@ int main(int argc, char *argv[]) {
         // read in the args
         if (argv[i][1] == 'i') { input_dataset_prefix = argv[i+1]; }
         else if (argv[i][1] == 'o') { output_log_file = argv[i+1]; }
-        else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
         else if (argv[i][1] == 'l') { learning_rate = atof(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
@@ -1938,11 +2081,8 @@ int main(int argc, char *argv[]) {
     printf("| genT                  | %-50d |\n", genT);
     printf("+-----------------------+----------------------------------------------------+\n");
 
-    // set up the device
-    int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
     cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, deviceIdx);
+    cudaGetDeviceProperties(&deviceProp, multi_gpu_config.local_device_idx);
     // setup cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
@@ -1952,6 +2092,9 @@ int main(int argc, char *argv[]) {
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
+    printf("| process rank          | %-50d |\n", multi_gpu_config.process_rank);
+    printf("| number of processes   | %-50d |\n", multi_gpu_config.num_processes);
+    printf("| local device index    | %-50d |\n", multi_gpu_config.local_device_idx);
     printf("| device                | %-50s |\n", deviceProp.name);
     printf("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
     printf("+-----------------------+----------------------------------------------------+\n");
@@ -1974,9 +2117,9 @@ int main(int argc, char *argv[]) {
     sprintf(train_tokens_filename, "%s_train.bin", input_dataset_prefix);
     sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
     DataLoader train_loader;
-    dataloader_init(&train_loader, train_tokens_filename, B, T);
+    dataloader_init(&train_loader, &multi_gpu_config, train_tokens_filename, B, T);
     DataLoader val_loader;
-    dataloader_init(&val_loader, val_tokens_filename, B, T);
+    dataloader_init(&val_loader, &multi_gpu_config, val_tokens_filename, B, T);
     int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default for now
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
     printf("| train_num_batches     | %-50d |\n", train_num_batches);
@@ -2015,12 +2158,13 @@ int main(int argc, char *argv[]) {
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
+            val_loss = multi_gpu_cpu_float_mean(val_loss, &multi_gpu_config);
             printf("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
         }
 
         // once in a while do model inference to print generated text
-        if (step > 0 && step % sample_every == 0 || last_step) {
+        if (multi_gpu_config.process_rank == 0 && step > 0 && step % sample_every == 0 || last_step) {
             // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
             for(int i = 0; i < B * T; ++i) {
                 gen_tokens[i] = GPT2_EOT;
@@ -2068,13 +2212,14 @@ int main(int argc, char *argv[]) {
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
+        gpt2_mutli_gpu_accumulate(&model, &multi_gpu_config);
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
         total_sum_iteration_time_s += time_elapsed_s;
         int tokens_per_second = (B * T) / time_elapsed_s;
-        printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, time_elapsed_s * 1000, tokens_per_second);
+        printf("step %4d/%d: train loss %f (acc %f) (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, model.accumulated_mean_loss, time_elapsed_s * 1000, tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
     }
     // add a total average, for optimizations that are only mild improvements
@@ -2091,6 +2236,7 @@ int main(int argc, char *argv[]) {
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
     logger_free(&logger);
+    multi_gpu_config_free(&multi_gpu_config);
 
     return 0;
 }
