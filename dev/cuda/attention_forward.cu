@@ -735,6 +735,60 @@ __global__ void __launch_bounds__(256, 2) trimul_global(float* out, const float*
     matmul_tri(r, T, q, C3, k, C3, T, hs, scale);
 }
 
+__device__ void att_out_register(float* o, int os, const float* a, int as, const float* v, int vs, int T) {
+    // get coordinates of our block
+    int i_base = 128 * blockIdx.y + 8 * threadIdx.y;
+    int j_base = 64 * blockIdx.x + 4 * threadIdx.x;
+    int i_max = i_base + 8;
+
+    // calculate 8x4 results in one thread, loading all the required inputs just once
+    float vals[8][4] = {};
+    for (int s = 0; s < i_max ; ++s) {
+        float ai[8];
+        for (int io = 0; io < 8; ++io) {
+            int i = i_base + io;
+            ai[io] = a[i * as + s];
+        }
+        for (int jo = 0; jo < 4; ++jo) {
+            int j = j_base + jo;
+            float vj = v[j + vs * s];
+            for (int io = 0; io < 8; ++io) {
+                vals[io][jo] += ai[io] * vj;
+            }
+        }
+    }
+
+    for (int io = 0; io < 8; ++io) {
+        int i = i_base + io;
+        for (int jo = 0; jo < 4; ++jo) {
+            int j = j_base + jo;
+            o[i * os + j] = vals[io][jo];
+        }
+    }
+}
+
+
+__global__ void __launch_bounds__(256, 2) att_out_global(float* out, const float* att, const float* inp, int T, int C, int NH) {
+    // att: (B, NH, T, T), inp: (B, T, 3C), out: (B, T, C)
+    // set up indices
+    int C3 = C*3;
+    int hs = C / NH; // head size
+
+    // we put the "batch x head" dimension into the z block index.
+    int h = blockIdx.z % NH;
+    int b = blockIdx.z / NH;
+
+    // Get the base address for the current batch and head
+    // (B, nh, T, hs)
+    const float* a = att + b * NH * T * T + h * T * T;
+    const float* v = inp + b * T * C3 + h * hs + 2*C;
+    float* r = out + b*T*C + h * hs;
+    //float* rend = out + B;
+
+    // start the multiplication
+    att_out_register(r, C, a, T, v, C3, T);
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -971,20 +1025,8 @@ void attention_forward6(float* out, float* vaccum, float* qkvr, float* preatt, f
     // inp is (B, T, 3C) QKV
     // preatt, att are (B, NH, T, T)
     // output is (B, T, C)
-    int HS = C / NH; // head size
-
-    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
-    // TODO we don't need q and k anymore, but v is still needed later.
-    float *q, *k, *v;
-    q = qkvr + 0 * B * T * C;
-    k = qkvr + 1 * B * T * C;
-    v = qkvr + 2 * B * T * C;
-    int total_threads = B * NH * T * HS;
-    int num_blocks = ceil_div(total_threads, block_size);
-    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
-    cudaCheck(cudaGetLastError());
-
-
+    assert(T % 128 == 0);
+    assert(C % 32 == 0);
     trimul_global<<<dim3(T / 128, T / 128, NH * B), dim3(16, 16)>>>(preatt, inp, T, C, NH);
     cudaCheck(cudaGetLastError());
 
@@ -995,24 +1037,13 @@ void attention_forward6(float* out, float* vaccum, float* qkvr, float* preatt, f
     softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
     cudaCheck(cudaGetLastError());
 
-    // new approach: first cuBLAS another batched matmul
-    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
-                                          CUBLAS_OP_N, CUBLAS_OP_N,
-                                          HS, T, T,
-                                          &alpha,
-                                          v, HS, T * HS,
-                                          att, T, T * T,
-                                          &beta,
-                                          vaccum, HS, T * HS,
-                                          B * NH));
-
-    // now unpermute
-    // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-    num_blocks = ceil_div(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+    // we assume nice shapes here. Let's not make the code a mess by supporting weird shapes that you
+    // wouldn't want to use anyway.
+    assert(T % 128 == 0);
+    assert(C % 128 == 0);
+    assert((C / NH) % 64 == 0);
+    // No need to ceil_div, if it's not a multiple of 128, we would get wrong results anyway.
+    att_out_global<<<dim3(C / NH / 64, T / 128, NH * B), dim3(16, 16)>>>(out, att, inp, T, C, NH);
     cudaCheck(cudaGetLastError());
 }
 
