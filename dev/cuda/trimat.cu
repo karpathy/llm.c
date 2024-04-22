@@ -69,7 +69,7 @@ void trimul_cpu(float* out, const float* inp,
                     out_bth[t2] = val;
                 }
                 for(int t2 = t + 1; t2 < T; ++t2) {
-                    out_bth[t2] = INFINITY;
+                    out_bth[t2] = NAN;
                 }
             }
         }
