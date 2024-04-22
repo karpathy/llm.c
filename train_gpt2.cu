@@ -572,16 +572,18 @@ __global__ void matmul_backward_bias_kernel4(float* dbias, const float* dout, in
     }
 }
 
-__global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* dbias,
+// uses shared memory instead for the reduces
+__global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* dbias,
                                            const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                                            int B, int T, int C) {
+    extern __shared__ float shared[]; // size = 2 * C
+
+    namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
     int N = B * T;
-    if(idx >= N) {
-        return;
-    }
+    if(idx >= N) { return; } // thread guards
 
     int b = idx / T;
     int t = idx % T;
@@ -592,18 +594,16 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
     const float mean_bt = mean[b * T + t];
     const float rstd_bt = rstd[b * T + t];
 
-    extern __shared__ float shared[];
-
+    // the first half of shared memory is bias, second is weight
     float* dbias_shared = shared;
-    float* dweight_shared = &shared[C];
+    float* dweight_shared = shared + C;
 
-    // pragma add unrolling if not in compiler
+    // init shared memory to zero
     #pragma unroll
 	for(int i = threadIdx.x; i < C; i+= blockDim.x){
        dbias_shared[i] = 0.0f;
        dweight_shared[i] = 0.0f;
     }
-
     __syncthreads();
 
     // first: two reduce operations
@@ -615,10 +615,8 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
         dnorm_mean += dnorm_i;
         dnorm_norm_mean += dnorm_i * norm_bti;
     }
-
     dnorm_mean = cg::reduce(warp, dnorm_mean, cg::plus<float>{});
     dnorm_norm_mean = cg::reduce(warp, dnorm_norm_mean, cg::plus<float>{});
-
     dnorm_mean = dnorm_mean / C;
     dnorm_norm_mean = dnorm_norm_mean / C;
 
@@ -640,6 +638,7 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
     }
     __syncthreads();
 
+    // write to global memory
 	for(int i = threadIdx.x; i < C; i+= blockDim.x){
         atomicAdd(&dbias[i], dbias_shared[i]);
         atomicAdd(&dweight[i], dweight_shared[i]);
@@ -1019,12 +1018,11 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
 void layernorm_backward(float* dinp, float* dweight, float* dbias,
                         const float* dout, const float* inp, const  float* weight, const float* mean, const float* rstd,
                         int B, int T, int C) {
-    const int block_size = 256;
+    const int block_size = 512;
     const int N = B * T;
-    // one warp per token, so we need to divide by 32 here.
-    const int grid_size = CEIL_DIV(N, block_size / 32);
+    const int grid_size = CEIL_DIV(32*N, block_size);
     size_t shared_mem_size = 2 * C * sizeof(float);
-    layernorm_backward_kernel<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+    layernorm_backward_kernel2<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
