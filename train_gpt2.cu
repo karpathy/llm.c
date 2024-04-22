@@ -28,6 +28,16 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <cooperative_groups/reduce.h>
 
 // ----------------------------------------------------------------------------
+// CUDA precision settings
+typedef float floatX; // linear layer weights and activations
+// CUDA_R_32F or CUDA_R_16BF or CUDA_R_16F
+#define CUBLAS_LOWP CUDA_R_16BF
+// if CUDA_R_16F  then CUBLAS_COMPUTE_32F or CUBLAS_COMPUTE_16F
+// if CUDA_R_16BF then CUBLAS_COMPUTE_32F only
+// if CUDA_R_32F  then CUBLAS_COMPUTE_32F(_FAST_TF32 or _FAST_16BF or _FAST_16F)
+#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+
+// ----------------------------------------------------------------------------
 // CUDA utils
 
 // convenience macro for calculating grid/block dimensions for kernels
@@ -245,8 +255,58 @@ __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __rest
     }
 }
 
+// reads FP32, outputs floatX(FP16/BF16/FP8)
+__global__ void layernorm_forward_kernel4_mixedp(floatX* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+                                    const float*  __restrict__ inp, const float*  __restrict__ weight,
+                                    const float* __restrict__ bias, int N, int C) {
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if(idx >= N) {
+        return;
+    }
+
+    // the row of input that this group of threads is responsible for
+    const float* x = inp + idx * C;
+
+    // mean
+    float sum = 0.0f;
+    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+        sum += (float)x[i];
+    }
+    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    float m = sum / C;
+    if(warp.thread_rank() == 0 && mean != nullptr) {
+        __stcs(mean + idx, m);
+    }
+
+    // rstd
+    sum = 0.0f;
+    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+        float diff = (float)x[i] - m;
+        sum += diff * diff;
+    }
+    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    float s = rsqrtf(sum / C + 1e-5f);
+    if(warp.thread_rank() == 0 && rstd != nullptr) {
+        __stcs(rstd + idx, s);
+    }
+
+    // final normalization and scaling by weight/bias
+    floatX* o = out + idx * C;
+    for (int c = warp.thread_rank(); c < C; c += warp.size()) {
+        // load and store using the .cs "streaming" hint to the compiler,
+        // indicating that this data will not be reused soon, and can be streamed through the caches
+        // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
+        float n = s * ((float)__ldcs(x+c) - m);
+        __stcs(o+c, (floatX)(n * weight[c] + bias[c]));
+    }
+}
+
+
+// inputs floatX, outputs FP32 (for current FP32-only activation path for this WIP)
 __global__ void permute_kernel(float* q, float* k, float* v,
-                               const float* inp,
+                               const floatX* inp,
                                int B, int N, int NH, int d) {
     // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
     // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
@@ -260,9 +320,9 @@ __global__ void permute_kernel(float* q, float* k, float* v,
         int n = rest / d;
         int d_ = rest % d;
         int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-        q[idx] = __ldcs(&inp[inp_idx]);
-        k[idx] = __ldcs(&inp[inp_idx + NH * d]);
-        v[idx] = __ldcs(&inp[inp_idx + 2 * (NH * d)]);
+        q[idx] = (float)__ldcs(&inp[inp_idx]);
+        k[idx] = (float)__ldcs(&inp[inp_idx + NH * d]);
+        v[idx] = (float)__ldcs(&inp[inp_idx + 2 * (NH * d)]);
     }
 }
 
@@ -285,7 +345,7 @@ __global__ void permute_kernel_backward(float* dinp,
     }
 }
 
-__global__ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, int d) {
+__global__ void unpermute_kernel(float* inp, floatX *out, int B, int N, int NH, int d) {
    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
@@ -297,7 +357,7 @@ __global__ void unpermute_kernel(float* inp, float *out, int B, int N, int NH, i
         int n = rest / d;
         int d_ = rest % d;
         int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-        out[other_idx] = __ldcs(&inp[idx]);
+        out[other_idx] = (floatX)__ldcs(&inp[idx]);
     }
 }
 
@@ -391,13 +451,21 @@ __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, in
     }
 }
 
+// residuals are kept as FP32 for now, but input from the matmul is floatX
+__global__ void residual_forward_kernel_mixedp(float* out, float* inp1, floatX* inp2, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        out[idx] = __ldcs(&inp1[idx]) + (float)__ldcs(&inp2[idx]);
+    }
+}
+
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__global__ void gelu_forward_kernel(float* out, const float* inp, int N) {
+__global__ void gelu_forward_kernel(floatX* out, const floatX* inp, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) {
-        float xi = inp[i];
+        float xi = (float)inp[i];
         float cube = 0.044715f * xi * xi * xi;
-        out[i] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
+        out[i] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
     }
 }
 
@@ -806,6 +874,16 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
+void layernorm_forward_mixedp(floatX* out, float* mean, float* rstd,
+                       float* inp, float* weight, float* bias,
+                       int B, int T, int C) {
+    const int block_size = 512;
+    const int N = B * T;
+    const int grid_size = CEIL_DIV(N * 32, block_size);
+    layernorm_forward_kernel4_mixedp<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // uses cuBLAS
 void matmul_forward_cublas(float* out,
                     float* inp, float* weight, float* bias,
@@ -819,8 +897,8 @@ void matmul_forward_cublas(float* out,
 // uses cuBLASLt to fuse the bias and gelu. does not work with OC = 50257 (last layer)
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
 // https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtSgemm/sample_cublasLt_LtSgemm.cu
-void matmul_forward_cublaslt(float* out,
-                     float* inp, float* weight, float* bias,
+void matmul_forward_cublaslt(floatX* out,
+                     floatX* inp, floatX* weight, float* bias,
                      int B, int T, int C, int OC) {
     int has_bias = (bias != NULL);
 
@@ -829,6 +907,14 @@ void matmul_forward_cublaslt(float* out,
         printf("Bias pointer is not aligned (cuBLASLt requirement)!\n");
         exit(EXIT_FAILURE);
     }
+
+    // FP16 alpha/beta need to be used if and only if CUBLAS_COMPUTE_16F
+    const float alpha = 1.0f, beta = 0.0f;
+    const half alpha_fp16 = (half)alpha, beta_fp16 = (half)beta;
+    const void* alpha_ptr = (CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F) ?
+                            (const void*)&alpha_fp16 : (const void*)&alpha;
+    const void* beta_ptr =  (CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F) ?
+                            (const void*)&beta_fp16 : (const void*)&beta;
 
     int returnedResults = 0;
     cublasLtMatmulDesc_t operationDesc;
@@ -843,16 +929,18 @@ void matmul_forward_cublaslt(float* out,
     cublasOperation_t opNoTranspose = CUBLAS_OP_N;
     cublasOperation_t opTranspose = CUBLAS_OP_T;
     cublasLtEpilogue_t epilogueBias = CUBLASLT_EPILOGUE_BIAS;
-    cublasCheck(cublasLtMatmulDescCreate(&operationDesc, cublas_compute_type, CUDA_R_32F));
+
+    cudaDataType_t scale_type = (CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F) ? CUDA_R_16F : CUDA_R_32F;
+    cublasCheck(cublasLtMatmulDescCreate(&operationDesc, CUBLAS_LOWP_COMPUTE, scale_type));
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opNoTranspose, sizeof(opNoTranspose)));
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias, sizeof(epilogueBias)));
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
 
     // define matrix layouts
-    cublasCheck(cublasLtMatrixLayoutCreate(&weightLayout, CUDA_R_32F, C, OC, C));
-    cublasCheck(cublasLtMatrixLayoutCreate(&inputLayout, CUDA_R_32F, C, B*T, C));
-    cublasCheck(cublasLtMatrixLayoutCreate(&outputLayout, CUDA_R_32F, OC, B*T, OC));
+    cublasCheck(cublasLtMatrixLayoutCreate(&weightLayout, CUBLAS_LOWP, C, OC, C));
+    cublasCheck(cublasLtMatrixLayoutCreate(&inputLayout, CUBLAS_LOWP, C, B*T, C));
+    cublasCheck(cublasLtMatrixLayoutCreate(&outputLayout, CUBLAS_LOWP, OC, B*T, OC));
     cublasCheck(cublasLtMatrixLayoutCreate(&biasLayout, CUDA_R_32F, OC, 1, OC));
 
     // create a preference handle with specified max workspace
@@ -871,9 +959,8 @@ void matmul_forward_cublaslt(float* out,
     }
 
     // call the matmul
-    const float alpha = 1.0f, beta = 0.0f;
     cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
-        &alpha, weight, weightLayout, inp, inputLayout, &beta,
+        alpha_ptr, weight, weightLayout, inp, inputLayout, beta_ptr,
         out, outputLayout, out, outputLayout, &heuristic.algo,
         cublaslt_workspace, cublaslt_workspace_size, 0));
 
@@ -886,8 +973,8 @@ void matmul_forward_cublaslt(float* out,
     cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
 }
 
-void attention_forward(float* out, float* qkvr, float* att,
-                       float* inp,
+void attention_forward(floatX* out, float* qkvr, float* att,
+                       floatX* inp,
                        int B, int T, int C, int NH) {
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
     // Its contents will be overwritten by this function.
@@ -912,7 +999,7 @@ void attention_forward(float* out, float* qkvr, float* att,
     // batched matrix multiply with cuBLAS
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    float* preatt = inp;
+    float* preatt = (float*)inp;
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha, k, HS, T * HS, q, HS, T * HS, &beta, preatt, T, T * T, B * NH));
 
     // multiply all elements of preatt elementwise by scale
@@ -922,7 +1009,7 @@ void attention_forward(float* out, float* qkvr, float* att,
     cudaCheck(cudaGetLastError());
 
     // new approach: first cuBLAS another batched matmul
-    float* vaccum = inp;
+    float* vaccum = (float*)inp;
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha, v, HS, T * HS, att, T, T * T, &beta, vaccum, HS, T * HS, B * NH));
 
@@ -940,7 +1027,14 @@ void residual_forward(float* out, float* inp1, float* inp2, int N) {
     cudaCheck(cudaGetLastError());
 }
 
-void gelu_forward(float* out, const float* inp, int N) {
+void residual_forward_mixedp(float* out, float* inp1, floatX* inp2, int N) {
+    const int block_size = 256;
+    const int grid_size = CEIL_DIV(N, block_size);
+    residual_forward_kernel_mixedp<<<grid_size, block_size>>>(out, inp1, inp2, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void gelu_forward(floatX* out, const floatX* inp, int N) {
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N, block_size);
     gelu_forward_kernel<<<grid_size, block_size>>>(out, inp, N);
@@ -1058,22 +1152,22 @@ typedef struct {
 // the parameters of the model
 #define NUM_PARAMETER_TENSORS 16
 typedef struct {
-    float* wte; // (V, C)
-    float* wpe; // (maxT, C)
-    float* ln1w; // (L, C)
-    float* ln1b; // (L, C)
-    float* qkvw; // (L, 3*C, C)
+    float*  wte; // (V, C)
+    float*  wpe; // (maxT, C)
+    float*  ln1w; // (L, C)
+    float*  ln1b; // (L, C)
+    floatX* qkvw; // (L, 3*C, C)
     float* qkvb; // (L, 3*C)
-    float* attprojw; // (L, C, C)
+    floatX* attprojw; // (L, C, C)
     float* attprojb; // (L, C)
-    float* ln2w; // (L, C)
-    float* ln2b; // (L, C)
-    float* fcw; // (L, 4*C, C)
+    float*  ln2w; // (L, C)
+    float*  ln2b; // (L, C)
+    floatX* fcw; // (L, 4*C, C)
     float* fcb; // (L, 4*C)
-    float* fcprojw; // (L, C, 4*C)
+    floatX* fcprojw; // (L, C, 4*C)
     float* fcprojb; // (L, C)
-    float* lnfw; // (C)
-    float* lnfb; // (C)
+    float*  lnfw; // (C)
+    float*  lnfb; // (C)
 } ParameterTensors;
 
 void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
@@ -1100,14 +1194,14 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
-float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes, int on_device) {
-    // on_device: 0 = CPU, 1 = GPU
+float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof, int on_device) {
     // calculate the number of parameters
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        num_parameters += param_sizes[i];
+        num_parameters += param_elements[i] * param_sizeof[i];
     }
     // malloc all parameters all at once on the device
+    // on_device: 0 = CPU, 1 = GPU
     float* params_memory;
     if (on_device) {
         cudaCheck(cudaMalloc((void**)&params_memory, num_parameters * sizeof(float)));
@@ -1115,15 +1209,15 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
         params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
     }
     // assign all the tensors their place in the array
-    float** ptrs[] = {
-        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
-        &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
+    void** ptrs[] = {
+        (void**)&params->wte, (void**)&params->wpe, (void**)&params->ln1w, (void**)&params->ln1b, (void**)&params->qkvw, (void**)&params->qkvb,
+        (void**)&params->attprojw, (void**)&params->attprojb, (void**)&params->ln2w, (void**)&params->ln2b, (void**)&params->fcw, (void**)&params->fcb,
+        (void**)&params->fcprojw, (void**)&params->fcprojb, (void**)&params->lnfw, (void**)&params->lnfb
     };
-    float* params_memory_iterator = params_memory;
+    char* params_memory_iterator = (char*)params_memory;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        *(ptrs[i]) = params_memory_iterator;
-        params_memory_iterator += param_sizes[i];
+        *(ptrs[i]) = (void*)params_memory_iterator;
+        params_memory_iterator += param_elements[i] * param_sizeof[i];
     }
     return params_memory;
 }
@@ -1131,19 +1225,19 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
 #define NUM_ACTIVATION_TENSORS 21
 typedef struct {
     float* encoded; // (B, T, C)
-    float* ln1; // (L, B, T, C)
+    floatX* ln1; // (L, B, T, C)
     float* ln1_mean; // (L, B, T)
     float* ln1_rstd; // (L, B, T)
-    float* atty; // (L, B, T, C)
+    floatX* atty; // (L, B, T, C)
     float* att; // (L, B, NH, T, T)
-    float* attproj; // (L, B, T, C)
+    floatX* attproj; // (L, B, T, C)
     float* residual2; // (L, B, T, C)
-    float* ln2; // (L, B, T, C)
+    floatX* ln2; // (L, B, T, C)
     float* ln2_mean; // (L, B, T)
     float* ln2_rstd; // (L, B, T)
-    float* fch; // (L, B, T, 4*C)
-    float* fch_gelu; // (L, B, T, 4*C)
-    float* fcproj; // (L, B, T, C)
+    floatX* fch; // (L, B, T, 4*C)
+    floatX* fch_gelu; // (L, B, T, 4*C)
+    floatX* fcproj; // (L, B, T, C)
     float* residual3; // (L, B, T, C)
     float* lnf; // (B, T, C)
     float* lnf_mean; // (B, T)
@@ -1208,60 +1302,64 @@ void fill_in_grad_act_sizes(size_t* act_sizes, int B, int T, GPT2Config config) 
 }
 
 
-float* malloc_and_point(float** targets[], const size_t* act_sizes, int n) {
-    size_t num_activations = 0;
+void* malloc_and_point(void** targets[], const size_t* act_elements, const size_t* act_sizeof, int n) {
+    size_t num_activations_bytes = 0;
     for (size_t i = 0; i < n; i++) {
-        num_activations += act_sizes[i];
+        num_activations_bytes += act_elements[i] * act_sizeof[i];
     }
-    float* acts_memory;
-    cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
-    float* acts_memory_iterator = acts_memory;
+    void* acts_memory;
+    cudaCheck(cudaMalloc((void**)&acts_memory, num_activations_bytes));
+    char* acts_memory_iterator = (char*)acts_memory;
     for (size_t i = 0; i < n; i++) {
-        *(targets[i]) = acts_memory_iterator;
-        acts_memory_iterator += act_sizes[i];
+        *(targets[i]) = (void*)acts_memory_iterator;
+        acts_memory_iterator += act_elements[i] * act_sizeof[i];
     }
     return acts_memory;
 }
 
-float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
-    float** ptrs[] = {
-        &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->atty,
-        &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
-        &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
-        &acts->lnf_mean, &acts->lnf_rstd, &acts->losses, &acts->qkvr, &acts->output
+void* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_elements, const size_t* act_sizeof) {
+    void** ptrs[] = {
+        (void**)&acts->encoded, (void**)&acts->ln1, (void**)&acts->ln1_mean, (void**)&acts->ln1_rstd, (void**)&acts->atty,
+        (void**)&acts->att, (void**)&acts->attproj, (void**)&acts->residual2, (void**)&acts->ln2, (void**)&acts->ln2_mean,
+        (void**)&acts->ln2_rstd, (void**)&acts->fch, (void**)&acts->fch_gelu, (void**)&acts->fcproj, (void**)&acts->residual3, (void**)&acts->lnf,
+        (void**)&acts->lnf_mean, (void**)&acts->lnf_rstd, (void**)&acts->losses, (void**)&acts->qkvr, (void**)&acts->output
     };
-    return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
+    return malloc_and_point(ptrs, act_elements, act_sizeof, NUM_ACTIVATION_TENSORS);
 }
 
-float* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) {
-    float** ptrs[] = {
-        &acts->bt4c, &acts->preatt, &acts->residual3
+void* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) {
+    void** ptrs[] = {
+        (void**)&acts->bt4c, (void**)&acts->preatt, (void**)&acts->residual3
     };
-    return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
+    size_t act_sizeof[] = {sizeof(float), sizeof(float), sizeof(float)};
+    return malloc_and_point(ptrs, act_sizes, act_sizeof, NUM_BACKWARD_TENSORS);
 }
 
 typedef struct {
     GPT2Config config;
     // the weights of the model, and their sizes
     ParameterTensors params;
-    size_t param_sizes[NUM_PARAMETER_TENSORS];
-    float* params_memory;
+    size_t param_elements[NUM_PARAMETER_TENSORS];
+    size_t param_sizeof[NUM_PARAMETER_TENSORS];
+    void* params_memory;
     size_t num_parameters;
+    size_t num_parameters_bytes;
     // gradients of the weights
     ParameterTensors grads;
-    float* grads_memory;
+    void* grads_memory;
     // buffers for the AdamW optimizer
     float* m_memory;
     float* v_memory;
     // the activations of the model, and their sizes
     ActivationTensors acts;
-    size_t act_sizes[NUM_ACTIVATION_TENSORS];
-    float* acts_memory;
+    size_t act_elements[NUM_ACTIVATION_TENSORS];
+    size_t act_sizeof[NUM_ACTIVATION_TENSORS];
+    void* acts_memory;
     size_t num_activations;
     // gradients of the activations
     GradActTensors grads_acts;
     size_t num_grad_acts;
-    float* grads_acts_memory;
+    void* grads_acts_memory;
     // other run state configuration
     int batch_size; // the batch size (B) of current forward pass
     int seq_len; // the sequence length (T) of current forward pass
@@ -1281,29 +1379,73 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     if (model_header[1] != 1) { printf("Bad version in model file"); exit(EXIT_FAILURE); }
 
     // read in hyperparameters
-    model->config.max_seq_len = model_header[2];
-    model->config.vocab_size = model_header[3];
-    model->config.num_layers = model_header[4];
-    model->config.num_heads = model_header[5];
-    model->config.channels = model_header[6];
+    int maxT, V, L, NH, C;
+    model->config.max_seq_len = maxT = model_header[2];
+    model->config.vocab_size = V = model_header[3];
+    model->config.num_layers = L = model_header[4];
+    model->config.num_heads = NH = model_header[5];
+    model->config.channels = C = model_header[6];
+    printf("[GPT-2]\n");
+    printf("max_seq_len: %d\n", maxT);
+    printf("vocab_size: %d\n", V);
+    printf("num_layers: %d\n", L);
+    printf("num_heads: %d\n", NH);
+    printf("channels: %d\n", C);
 
     // allocate space for all the parameters and read them in
-    fill_in_parameter_sizes(model->param_sizes, model->config);
+    fill_in_parameter_sizes(model->param_elements, model->config);
 
     // count the number of parameters
-    size_t num_parameters = 0;
+    // TODO - assuming the model we read is all FP32 and we need to convert some of it to FP16/BF16
+    // Setup param_sizeof for FP32 vs FP16 parameters etc.
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        num_parameters += model->param_sizes[i];
+        // qkvw, attprojw, fcw, fcprojw are floatX
+        if(i == 4 || i == 6 || i == 10 || i == 12) {
+            model->param_sizeof[i] = sizeof(floatX);
+        } else {
+            model->param_sizeof[i] = sizeof(float);
+        }
     }
-    model->num_parameters = num_parameters;
+
+    model->num_parameters = 0;
+    model->num_parameters_bytes = 0;
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        model->num_parameters += model->param_elements[i];
+        model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
+    }
+    size_t input_model_bytes = model->num_parameters * sizeof(float);
+    printf("num_parameters: %zu ==> bytes: %zu\n", model->num_parameters, model->num_parameters_bytes);
 
     // create memory for model parameters on the device
-    model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof, 1);
+    printf("allocated %d MiB for model parameters\n", (int)round(model->num_parameters_bytes / (1024 * 1024)));
 
     // read in all the parameters from file and copy them to device
-    float* params_memory_cpu = (float*)mallocCheck(num_parameters * sizeof(float));
-    freadCheck(params_memory_cpu, sizeof(float), num_parameters, model_file);
-    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+    float* params_memory_cpu = (float*)mallocCheck(input_model_bytes);
+    freadCheck(params_memory_cpu, 1, input_model_bytes, model_file);
+
+    float* params_cpu_iterator = (float*)params_memory_cpu;
+    char* params_gpu_iterator = (char*)model->params_memory;
+
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        if (model->param_sizeof[i] == sizeof(float)) {
+            cudaCheck(cudaMemcpy(params_gpu_iterator, params_cpu_iterator,
+                                 model->param_elements[i] * sizeof(float), cudaMemcpyHostToDevice));
+        } else {
+            // TODO: Currently only support float or floatX (cannot mix and match FP16/BF16 etc...)
+            assert(model->param_sizeof[i] == sizeof(floatX));
+            floatX* conversion_scratchpad = (floatX*)mallocCheck(model->param_elements[i] * sizeof(floatX));
+            for (size_t j = 0; j < model->param_elements[i]; j++) {
+                conversion_scratchpad[j] = (floatX)params_cpu_iterator[j];
+            }
+            cudaCheck(cudaMemcpy(params_gpu_iterator, conversion_scratchpad,
+                                 model->param_elements[i] * sizeof(floatX), cudaMemcpyHostToDevice));
+            free(conversion_scratchpad);
+        }
+
+        params_cpu_iterator += model->param_elements[i];
+        params_gpu_iterator += model->param_elements[i] * model->param_sizeof[i];
+    }
     free(params_memory_cpu);
     fcloseCheck(model_file);
 
@@ -1321,7 +1463,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
+void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {    
     // targets are optional and could be NULL
 
     // ensure the model was initialized or error out
@@ -1349,15 +1491,25 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         // record the current B,T as well
         model->batch_size = B;
         model->seq_len = T;
+
+        // Setup param_sizeof for FP32 vs FP16 parameters etc.
+        for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+            // ln1/ln2/atty/attproj/fch/fch_gelu/fcproj/qkvr/scratch
+            if(i == 1 || i == 4 || i == 6 || i == 8 || i == 11 || i == 12 || i == 13 /*|| i == 19 || i == 20*/) {
+                model->act_sizeof[i] = sizeof(floatX);
+            } else {
+                model->act_sizeof[i] = sizeof(float);
+            }
+        }
         // and now allocate the space
-        fill_in_activation_sizes(model->act_sizes, B, T, model->config);
+        fill_in_activation_sizes(model->act_elements, B, T, model->config);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-            num_activations += model->act_sizes[i];
+            num_activations += model->act_elements[i] * model->act_sizeof[i];
         }
         model->num_activations = num_activations;
-        model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
-        printf("allocated %zu MiB for activations\n", (num_activations * sizeof(float)) >> 20); // >> 20 is /(1024*1024)
+        model->acts_memory = malloc_and_point_activations(&model->acts, model->act_elements, model->act_sizeof);
+        printf("allocated %d MiB for activations\n", (int)round(num_activations * sizeof(float) / (1024 * 1024)));
         // also create memory for caching inputs and targets
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
@@ -1390,48 +1542,48 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         // get the pointers of the weights for this layer
         float* l_ln1w = params.ln1w + l * C;
         float* l_ln1b = params.ln1b + l * C;
-        float* l_qkvw = params.qkvw + l * 3*C * C;
+        floatX* l_qkvw = params.qkvw + l * 3*C * C;
         float* l_qkvb = params.qkvb + l * 3*C;
-        float* l_attprojw = params.attprojw + l * C * C;
+        floatX* l_attprojw = params.attprojw + l * C * C;
         float* l_attprojb = params.attprojb + l * C;
         float* l_ln2w = params.ln2w + l * C;
         float* l_ln2b = params.ln2b + l * C;
-        float* l_fcw = params.fcw + l * 4*C * C;
+        floatX* l_fcw = params.fcw + l * 4*C * C;
         float* l_fcb = params.fcb + l * 4*C;
-        float* l_fcprojw = params.fcprojw + l * C * 4*C;
+        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         float* l_fcprojb = params.fcprojb + l * C;
 
         // get the pointers of the activations for this layer
-        float* l_ln1 = acts.ln1 + l * B * T * C;
+        floatX* l_ln1 = acts.ln1 + l * B * T * C;
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         float* l_qkvr = acts.qkvr + l * B * T * 3*C;
-        float* l_atty = acts.atty + l * B * T * C;
+        floatX* l_atty = acts.atty + l * B * T * C;
         float* l_att = acts.att + l * B * NH * T * T;
-        float* l_attproj = acts.attproj + l * B * T * C;
+        floatX* l_attproj = acts.attproj + l * B * T * C;
         float* l_residual2 = acts.residual2 + l * B * T * C;
-        float* l_ln2 = acts.ln2 + l * B * T * C;
+        floatX* l_ln2 = acts.ln2 + l * B * T * C;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        float* l_fch = acts.fch + l * B * T * 4*C;
-        float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
-        float* l_fcproj = acts.fcproj + l * B * T * C;
+        floatX* l_fch = acts.fch + l * B * T * 4*C;
+        floatX* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
+        floatX* l_fcproj = acts.fcproj + l * B * T * C;
         float* l_residual3 = acts.residual3 + l * B * T * C;
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
-        float* scratch = acts.output;
+        floatX* scratch = (floatX*)acts.output;
 
         // now do the forward pass
-        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+        layernorm_forward_mixedp(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
         matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-        residual_forward(l_residual2, residual, l_attproj, B*T*C);
-        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        residual_forward_mixedp(l_residual2, residual, l_attproj, B*T*C);
+        layernorm_forward_mixedp(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
         matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
         matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
-        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+        residual_forward_mixedp(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
@@ -1463,6 +1615,8 @@ void gpt2_zero_grad(GPT2 *model) {
 }
 
 void gpt2_backward(GPT2 *model) {
+    // TODO
+    /*
 
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
@@ -1473,8 +1627,8 @@ void gpt2_backward(GPT2 *model) {
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
         // allocate buffers for weight gradients
-        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes, 1);
-        printf("allocated %zu MiB for parameter gradients\n", (model->num_parameters * sizeof(float)) >> 20);
+        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof, 1);
+        printf("allocated %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(float) / (1024 * 1024)));
         // we're going to be clever for the activations backward pass. we don't need to exactly
         // mirror the forward pass acrtivations and we will save memory.
         size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
@@ -1484,10 +1638,10 @@ void gpt2_backward(GPT2 *model) {
         // count up and allocate the space
         model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
         model->num_grad_acts = 0;
-        for (int i = 0; i < NUM_BACKWARD_TENSORS; i++) {
+        for (size_t i = 0; i < NUM_BACKWARD_TENSORS; i++) {
             model->num_grad_acts += bw_act_sizes[i];
         }
-        printf("allocated %zu MiB for activation gradients\n", (model->num_grad_acts * sizeof(float)) >> 20);
+        printf("allocated %d MiB for activation gradients\n", (int)round(model->num_grad_acts * sizeof(float) / (1024 * 1024)));
         // init gradients of parameters and activations to zero
         gpt2_zero_grad(model);
     }
@@ -1584,6 +1738,7 @@ void gpt2_backward(GPT2 *model) {
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
+    */
 }
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
@@ -1595,17 +1750,20 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         cudaCheck(cudaMalloc((void**)&model->v_memory, model->num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->m_memory, 0, model->num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->v_memory, 0, model->num_parameters * sizeof(float)));
-        printf("allocated %zu MiB for AdamW optimizer state m\n", (model->num_parameters * sizeof(float)) >> 20);
-        printf("allocated %zu MiB for AdamW optimizer state v\n", (model->num_parameters * sizeof(float)) >> 20);
+        printf("allocated %d MiB for AdamW optimizer state m\n", (int)round(model->num_parameters * sizeof(float) / (1024 * 1024)));
+        printf("allocated %d MiB for AdamW optimizer state v\n", (int)round(model->num_parameters * sizeof(float) / (1024 * 1024)));
     }
 
     int block_size = 512;
     int num_blocks = CEIL_DIV(model->num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
+    /*
+    // TODO
     adamw_kernel2<<<num_blocks, block_size>>>(model->params_memory, model->grads_memory, model->m_memory, model->v_memory,
                                               model->num_parameters,
                                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+    */
     cudaCheck(cudaGetLastError());
 }
 
@@ -1640,7 +1798,7 @@ typedef struct {
     int* inputs;
     int* targets;
     // convenience variables
-    long num_batches;
+    int num_batches;
 } DataLoader;
 
 void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
@@ -1949,7 +2107,7 @@ int main(int argc, char *argv[]) {
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // print model parameter allocations from gpt2_build_from_checkpoint down here to not mess up our table above
-    printf("allocated %d MiB for model parameters\n", (int)round(model.num_parameters * sizeof(float) / (1024 * 1024)));
+    printf("allocated %d MiB for model parameters\n", (int)round(model.num_parameters_bytes / (1024 * 1024)));
 
     // set up the Logger
     Logger logger;
