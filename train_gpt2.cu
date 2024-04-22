@@ -532,27 +532,43 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
     }
 }
 
-// cooperative groups solution, one warp per output channel
-__global__ void matmul_backward_bias_kernel2(float* dbias, const float* dout, int B, int T, int OC) {
-    // dout is (B, T, OC), dbias is (OC)
-    // e.g. if block_size = 128, then we have 4 warps per block, each in charge of one output channel
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    // meta_group_size is the number of warps in a block (e.g. 4), meta_group_rank is the warp index (0,1,2,3)
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    if(idx >= OC) { return; }
-    int BT = B * T; // number of elements to reduce in total, per channel
-    // first, thread coarsening to sum reduce the problem size from B*T to 32
-    float sum = 0.0f;
-    for(int i = warp.thread_rank(); i < BT; i += warp.size()) {
-        sum += dout[i * OC + idx];
+// this kernel performs a column-wise reduction over dout, in PyTorch equivalent to:
+// dbias = dout.sum((0,1))
+// the idea is to employ one block to reduce along several columns,
+// where each block has a width of 32 columns to ensure coalesced access.
+// at the end we accumulate the reductions performed by the warps in each block via shared memory
+__global__ void matmul_backward_bias_kernel4(float* dbias, const float* dout, int B, int T, int OC) {
+    // this kernel is launched with 1D grid_dim of OC/32
+    // for example let's say block_size is 128
+    extern __shared__ float smem[]; // of size block_size (128)
+    const int warp_id = threadIdx.x / warpSize; // warp index in the block, 0,1,2,3
+    const int lane_id = threadIdx.x % warpSize; // thread index in the warp, 0,1,2,...,31
+    const int tl = blockIdx.x * warpSize; // pointer to the start column for this block
+    const int vstep = blockDim.x / warpSize; // number of warps in a block, e.g. 4
+
+    // pointer to the start of the column for one lane of threads
+    // so e.g. 4 threads (of the same lane_id) will reduce this one column
+    const float* dout_col = dout + tl + lane_id;
+
+    // column reductions by looping through the rows
+    // each of the 4 threads offsets by its warp_id and then skips by vstep
+    // together these 4 threads cover all B*T rows of this (lane_id) column
+    // importantly, consecutive threads (in threadId) are processing adjacent columns,
+    // leading to a coalesced memory access pattern
+    float dout_sum = 0.0f;
+    for (int row = warp_id; row < B * T; row += vstep) {
+        dout_sum += dout_col[row * OC];
     }
-    // now do a warp-level reduce to get the sum across the 32 threads in this warp
-    sum = cg::reduce(warp, sum, cg::plus<float>{});
-    // write the result to output (global memory)
-    if(warp.thread_rank() == 0) {
-        dbias[idx] += sum;
+    smem[lane_id + warp_id * warpSize] = dout_sum;
+    __syncthreads();
+
+    // warp_id 0 reduces the shared memory column-wise, linearly
+    dout_sum = 0.0f;
+    if (warp_id == 0) {
+        for (int j = 0; j < vstep; j++) {
+            dout_sum += smem[lane_id + j * warpSize];
+        }
+        dbias[tl + lane_id] += dout_sum;
     }
 }
 
@@ -973,9 +989,9 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &one, inp, C, dout, OC, &one, dweight, C));
     // backward to bias, if given, does a +=
     if (dbias != NULL) {
-        const int block_size = 512;
-        const int grid_size = CEIL_DIV(OC * 32, block_size);
-        matmul_backward_bias_kernel2<<<grid_size, block_size>>>(dbias, dout, B, T, OC);
+        const int block_size = 1024;
+        const int grid_size = OC / 32; // for now, OC must be divisible by 32 for this kernel to work
+        matmul_backward_bias_kernel4<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
         cudaCheck(cudaGetLastError());
     }
 }
