@@ -565,7 +565,8 @@ typedef struct {
     // gradients of the weights
     ParameterTensors grads;
     float* grads_memory;
-        // buffers for the AdamW optimizer
+    float* grads_memory_recv;
+    // buffers for the AdamW optimizer
     float* m_memory;
     float* v_memory;
     // the activations of the model, and their sizes
@@ -642,7 +643,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
     // other inits
     model->acts_memory = NULL;
     model->grads_memory = NULL;
-        model->m_memory = NULL;
+    model->grads_memory_recv = NULL;
+    model->m_memory = NULL;
     model->v_memory = NULL;
     model->grads_acts_memory = NULL;
     model->inputs = NULL;
@@ -806,58 +808,39 @@ void gpt2_zero_grad(GPT2 *model) {
     if(model->grads_acts_memory != NULL) { memset(model->grads_acts_memory, 0, model->num_activations * sizeof(float)); }
 }
 
-void gpt2_accumulate_grad(GPT2 *model) {
+void gpt2_accumulate_grad(GPT2 *model, int world_rank, int world_size) {
     if (model->grads_memory == NULL) return;
 
-    int world_rank, world_size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-
-    float* send_buff = (float*)malloc(model->num_parameters * sizeof(float));
-    float* recv_buff = (float*)malloc(model->num_parameters * sizeof(float));
-    float* accum_buff = (float*)malloc(model->num_parameters * sizeof(float));
-
-    // Initialize buffers
-    for (int i = 0; i < model->num_parameters; i++) {
-        send_buff[i] = model->grads_memory[i];
-        recv_buff[i] = model->grads_memory[i];
-        accum_buff[i] = model->grads_memory[i];
+    if (model->grads_memory_recv == NULL) {
+        model->grads_memory_recv = (float*)malloc(model->num_parameters * sizeof(float));
     }
 
-int left = (world_rank - 1 + world_size) % world_size;
-    int right = (world_rank + 1) % world_size;
+    // Copy local gradient to the receive buffer initially
+    #pragma omp parallel for
+    for (int i = 0; i < model->num_parameters; i++) {
+        model->grads_memory_recv[i] = model->grads_memory[i];
+    }
+
     MPI_Request send_req, recv_req;
-MPI_Status status;
+
+    int next = (world_rank + 1) % world_size;
+    int prev = (world_rank - 1 + world_size) % world_size;
+
 
     for (int i = 0; i < world_size - 1; i++) {
-        if (i % 2 == 0) {
-            // Initiate non-blocking send and receive
-            MPI_Isend(send_buff, model->num_parameters, MPI_FLOAT, right, 0, MPI_COMM_WORLD, &send_req);
-            MPI_Irecv(recv_buff, model->num_parameters, MPI_FLOAT, left, 0, MPI_COMM_WORLD, &recv_req);
-        } else {
-            // Alternate the buffers for send and receive
-            MPI_Isend(recv_buff, model->num_parameters, MPI_FLOAT, right, 0, MPI_COMM_WORLD, &send_req);
-            MPI_Irecv(send_buff, model->num_parameters, MPI_FLOAT, left, 0, MPI_COMM_WORLD, &recv_req);
-}
+        MPI_Irecv(model->grads_memory_recv, model->num_parameters, MPI_FLOAT, prev, 0, MPI_COMM_WORLD, &recv_req);
+        MPI_Isend(model->grads_memory, model->num_parameters, MPI_FLOAT, next, 0, MPI_COMM_WORLD, &send_req);
 
-        // Wait for the async comms to complete
-        MPI_Wait(&recv_req, &status);
-        MPI_Wait(&send_req, &status);
+        // Wait for asynchronous send and receive to complete
+        MPI_Wait(&send_req, MPI_STATUS_IGNORE);
+        MPI_Wait(&recv_req, MPI_STATUS_IGNORE);
 
         // Accumulate received gradients
-        for (int j = 0; j < model->num_parameters; j++) {
-            accum_buff[j] += (i % 2 == 0) ? recv_buff[j] : send_buff[j];
+        #pragma omp parallel for
+        for (int i = 0; i < model->num_parameters; i++) {
+            model->grads_memory[i] += model->grads_memory_recv[i];
         }
     }
-
-    // Update the final gradients back to model
-    for (int i = 0; i < model->num_parameters; i++) {
-            model->grads_memory[i] = accum_buff[i];
-        }
-    
-    free(send_buff);
-    free(recv_buff);
-    free(accum_buff);
 }
 
 void gpt2_backward(GPT2 *model) {
@@ -999,7 +982,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 void gpt2_free(GPT2 *model) {
     free(model->params_memory);
     free(model->grads_memory);
-        free(model->m_memory);
+    free(model->grads_memory_recv);
+    free(model->m_memory);
     free(model->v_memory);
     free(model->acts_memory);
     free(model->grads_acts_memory);
@@ -1296,7 +1280,7 @@ int main(int argc, char** argv) {
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
-        gpt2_accumulate_grad(&model);
+        gpt2_accumulate_grad(&model, world_rank, world_size);
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
