@@ -196,6 +196,52 @@ python train_gpt2.py --write_tensors 0 --sequence_length 1024 --batch_size 4 --c
 
 The compilation (first iteration) is ~27 seconds, but after that on my A100 this currently runs at ~80ms/iteration.
 
+## experiments / sweeps
+
+Now that the basic argparse and logging functionality is there in the .cu script, we can do our first learning rate sweeps. This is fairly manual right now, but just to document one example process to sweep learning rates on a machine with 4 GPUs on TinyStories. Run a shell script `sweep.sh` (after you of course `chmod u+x sweep.sh`):
+
+```bash
+#!/bin/bash
+
+learning_rates=(3e-5 1e-4 3e-4 1e-3)
+
+for i in {0..3}; do
+    export CUDA_VISIBLE_DEVICES=$i
+    screen -dmS "tr$i" bash -c "./train_gpt2cu -i data/TinyStories -v 250 -s 250 -g 144 -l ${learning_rates[$i]} -o stories$i.log"
+done
+
+# you can bring these down with
+# screen -ls | grep -E "tr[0-3]" | cut -d. -f1 | xargs -I {} screen -X -S {} quit
+```
+
+This example opens up 4 screen sessions and runs the four commands with different LRs. This writes the log files `stories$i.log` with all the losses, which you can plot as you wish in Python. Here's a quick example script to plot the losses in a Jupyter notebook, obviously can become more sophisticated later:
+
+```python
+import matplotlib.pyplot as plt
+%matplotlib inline
+
+def parse_log(logfile):
+  # look for lines like e.g. "s:100 tel:1.6952", step 100, val 1.6952
+    val_steps, val_losses = [], []
+    with open(logfile, "r") as f:
+        lines = f.readlines()
+    for line in lines:
+        if "tel" in line:
+            parts = line.split()
+            step = parts[0].split(":")[1]
+            loss = parts[1].split(":")[1]
+            val_steps.append(int(step))
+            val_losses.append(float(loss))
+    return val_steps, val_losses
+
+results = [parse_log(f"stories{i}.log") for i in range(0, 4)]
+for i, (val_steps, val_losses) in enumerate(results):
+    plt.plot(val_steps, val_losses, label="run {}".format(i))
+plt.xlabel("steps")
+plt.ylabel("loss")
+plt.legend()
+```
+
 ## repo philosophy
 
 A few more words on what I want this repo to be:
@@ -215,6 +261,9 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 
 - C#
   - [llm.cs](https://github.com/azret/llm.cs) by @[azret](https://github.com/azret): a C# port of this project
+ 
+- Rust
+  -  [llm.rs](https://github.com/ToJen/llm.rs) by @[ToJen](https://github.com/ToJen): a Rust port of this project
 
 ## discussions
 
