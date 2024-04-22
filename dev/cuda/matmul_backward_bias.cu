@@ -194,7 +194,7 @@ void matmul_backward_bias3(float* dinp, float* dweight, float* dbias,
 void matmul_backward_bias4(float* dinp, float* dweight, float* dbias,
                       float* dout, float* inp, float* weight, float* ones,
                       int B, int T, int C, int OC, int block_size) {
-    const int grid_size = OC / 32;
+    const int grid_size = OC / 32; // for now, OC must be divisible by 32 for this kernel to work
     matmul_backward_bias_kernel4<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
 }
 
