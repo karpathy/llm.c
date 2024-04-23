@@ -33,14 +33,17 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 
 #if defined(ENABLE_BF16)
 typedef __nv_bfloat16 floatX;
+typedef float floatN;
 #define CUBLAS_LOWP CUDA_R_16BF
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
 #elif defined(ENABLE_FP16)
 typedef half floatX;
+typedef float floatN;
 #define CUBLAS_LOWP CUDA_R_16F
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
 #else
 typedef float floatX;
+typedef float floatN;
 #define CUBLAS_LOWP CUDA_R_32F
 #define CUBLAS_LOWP_COMPUTE cublas_compute_type // auto-select FP32 vs TF32
 #endif
@@ -271,9 +274,9 @@ __device__ float warpReduceSum(float val) {
     return val;
 }
 
-template <typename Type>
-__global__ void encoder_forward_kernel2(Type* out,
-                               int* inp, Type* wte, Type* wpe,
+template <typename TOut, typename Tw>
+__global__ void encoder_forward_kernel2(TOut* out,
+                               int* inp, Tw* wte, Tw* wpe,
                                int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * T * C;
@@ -286,10 +289,10 @@ __global__ void encoder_forward_kernel2(Type* out,
 
         int ix = inp[b * T + t];
 
-        Type* out_btc = out + b * T * C + t * C + c;
-        Type* wte_ix = wte + ix * C + c;
-        Type* wpe_tc = wpe + t * C + c;
-        *out_btc = (Type)((float)*wte_ix + (float)*wpe_tc);
+        TOut* out_btc = out + b * T * C + t * C + c;
+        Tw* wte_ix = wte + ix * C + c;
+        Tw* wpe_tc = wpe + t * C + c;
+        *out_btc = (TOut)((float)*wte_ix + (float)*wpe_tc);
     }
 }
 
@@ -313,18 +316,16 @@ __global__ void encoder_backward_kernel(Type* dwte, Type* dwpe,
         Type* dwte_ix = dwte + ix * C + c;
         Type* dwpe_tc = dwpe + t * C + c;
 
-        // TODO: handle atomic properly
-
         atomicAddX(dwte_ix, (Type)*dout_btc);
         atomicAddX(dwpe_tc, (Type)*dout_btc);
     }
 }
 
 // currently reads FP32, outputs floatX(FP16/BF16/FP8)
-template <typename Type, typename TOut>
+template <typename Type, typename TOut, typename TParam>
 __global__ void layernorm_forward_kernel3(TOut* __restrict__ out, Type* __restrict__ mean, Type* __restrict__ rstd,
-                                    const Type*  __restrict__ inp, const Type*  __restrict__ weight,
-                                    const Type* __restrict__ bias, int N, int C) {
+                                    const Type*  __restrict__ inp, const TParam*  __restrict__ weight,
+                                    const TParam* __restrict__ bias, int N, int C) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
@@ -690,7 +691,7 @@ __global__ void matmul_backward_bias_kernel2(Td* dbias, const Td* dout, int B, i
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 __global__ void layernorm_backward_kernel(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
-                        const Tdout* dout, const Trest* inp, const Trest* weight, const Trest* mean, const Trest* rstd,
+                        const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
@@ -918,9 +919,9 @@ __global__ void fused_classifier_kernel3(Type* logits, Type* losses, Type* probs
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-template <typename Type>
-void encoder_forward(Type* out,
-                     int* inp, Type* wte, Type* wpe,
+template <typename TOut, typename Tw>
+void encoder_forward(TOut* out,
+                     int* inp, Tw* wte, Tw* wpe,
                      int B, int T, int C) {
     const int N = B * T * C;
     const int block_size = 256;
@@ -940,9 +941,9 @@ void encoder_backward(Type* dwte, Type* dwpe,
     cudaCheck(cudaGetLastError());
 }
 
-template <typename TOut, typename Type>
+template <typename TOut, typename Type, typename Tparam>
 void layernorm_forward(TOut* out, Type* mean, Type* rstd,
-                       Type* inp, Type* weight, Type* bias,
+                       Type* inp, Tparam* weight, Tparam* bias,
                        int B, int T, int C) {
     const int block_size = 512;
     const int N = B * T;
@@ -1190,7 +1191,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 void layernorm_backward(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
-                        const Tdout* dout, const Trest* inp, const Trest* weight, const Trest* mean, const Trest* rstd,
+                        const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C) {
     const int block_size = 256;
     const int N = B * T;
@@ -1287,22 +1288,22 @@ typedef struct {
 // the parameters of the model
 #define NUM_PARAMETER_TENSORS 16
 typedef struct {
-    floatX*  wte; // (V, C)
-    floatX*  wpe; // (maxT, C)
-    floatX*  ln1w; // (L, C)
-    floatX*  ln1b; // (L, C)
+    floatX*   wte; // (V, C)
+    floatX*   wpe; // (maxT, C)
+    floatN*  ln1w; // (L, C)
+    floatN*  ln1b; // (L, C)
     floatX* qkvw; // (L, 3*C, C)
     floatX* qkvb; // (L, 3*C)
     floatX* attprojw; // (L, C, C)
     floatX* attprojb; // (L, C)
-    floatX*  ln2w; // (L, C)
-    floatX*  ln2b; // (L, C)
+    floatN*  ln2w; // (L, C)
+    floatN*  ln2b; // (L, C)
     floatX* fcw; // (L, 4*C, C)
     floatX* fcb; // (L, 4*C)
     floatX* fcprojw; // (L, C, 4*C)
     floatX* fcprojb; // (L, C)
-    floatX*  lnfw; // (C)
-    floatX*  lnfb; // (C)
+    floatN*  lnfw; // (C)
+    floatN*  lnfb; // (C)
 } ParameterTensors;
 
 void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
@@ -1340,15 +1341,15 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_eleme
     // on_device: 0 = CPU, 1 = GPU
     float* params_memory;
     if (on_device) {
-        cudaCheck(cudaMalloc((void**)&params_memory, num_parameters * sizeof(floatX)));
+        cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
     } else {
         params_memory = (float*)mallocCheck(num_parameters * sizeof(float)); // keep FP32 here
     }
     // assign all the tensors their place in the array
     floatX** ptrs[] = {
-        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
-        &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
+        &params->wte, &params->wpe, (floatX**)&params->ln1w, (floatX**)&params->ln1b, &params->qkvw, &params->qkvb,
+        &params->attprojw, &params->attprojb, (floatX**)&params->ln2w, (floatX**)&params->ln2b, &params->fcw, &params->fcb,
+        &params->fcprojw, &params->fcprojb, (floatX**)&params->lnfw, (floatX**)&params->lnfb
     };
     char* params_memory_iterator = (char*)params_memory;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -1438,37 +1439,36 @@ void fill_in_grad_act_sizes(size_t* act_sizes, int B, int T, GPT2Config config) 
 }
 
 
-void* malloc_and_point(floatX** targets[], const size_t* act_elements, const size_t* act_sizeof, int n) {
-    size_t num_activations_bytes = 0;
+void* malloc_and_point(floatX** targets[], const size_t* act_sizes, int n) {
+    size_t num_activations = 0;
     for (size_t i = 0; i < n; i++) {
-        num_activations_bytes += act_elements[i] * act_sizeof[i];
+        num_activations += act_sizes[i];
     }
     void* acts_memory;
-    cudaCheck(cudaMalloc((void**)&acts_memory, num_activations_bytes));
+    cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(floatX)));
     char* acts_memory_iterator = (char*)acts_memory;
     for (size_t i = 0; i < n; i++) {
         *(targets[i]) = (floatX*)acts_memory_iterator;
-        acts_memory_iterator += act_elements[i] * act_sizeof[i];
+        acts_memory_iterator += act_sizes[i] * sizeof(floatX);
     }
     return acts_memory;
 }
 
-void* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_elements, const size_t* act_sizeof) {
+void* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
     floatX** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->atty,
         &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
         &acts->lnf_mean, &acts->lnf_rstd, &acts->losses, &acts->qkvr, &acts->output
     };
-    return malloc_and_point(ptrs, act_elements, act_sizeof, NUM_ACTIVATION_TENSORS);
+    return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
 }
 
 void* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) {
     floatX** ptrs[] = {
         &acts->bt4c, &acts->preatt, &acts->residual3
     };
-    size_t act_sizeof[] = {sizeof(floatX), sizeof(floatX), sizeof(floatX)};
-    return malloc_and_point(ptrs, act_sizes, act_sizeof, NUM_BACKWARD_TENSORS);
+    return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
 
 typedef struct {
@@ -1488,8 +1488,7 @@ typedef struct {
     float* v_memory;
     // the activations of the model, and their sizes
     ActivationTensors acts;
-    size_t act_elements[NUM_ACTIVATION_TENSORS];
-    size_t act_sizeof[NUM_ACTIVATION_TENSORS];
+    size_t act_sizes[NUM_ACTIVATION_TENSORS];
     void* acts_memory;
     size_t num_activations;
     // gradients of the activations
@@ -1536,12 +1535,13 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     // TODO - assuming the model we read is all FP32 and we need to convert some of it to FP16/BF16
     // Setup param_sizeof for FP32 vs FP16 parameters etc.
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        // qkvw, attprojw, fcw, fcprojw are floatX
-        //if((i >= 4 && i <= 7) || (i >= 10 && i <= 13)) {
-            model->param_sizeof[i] = sizeof(floatX);
-        //} else {
-        //    model->param_sizeof[i] = sizeof(float);
-        //}
+        model->param_sizeof[i] = sizeof(floatX);
+
+        if (sizeof(floatN) == sizeof(float)) {
+            if (i == 2 || i == 3 || i == 8 || i == 9 || i == 14 || i == 15) {
+                model->param_sizeof[i] = sizeof(float);
+            }
+        }
     }
 
     model->num_parameters = 0;
@@ -1630,25 +1630,15 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         model->batch_size = B;
         model->seq_len = T;
 
-        // Setup param_sizeof for FP32 vs FP16 parameters etc.
-        for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-            // ln1/ln2/atty/attproj/fch/fch_gelu/fcproj/qkvr/scratch
-            // not atty(4) and fch(11) for now as reused as scratch, TODO
-            //if(i == 1 || /*i == 4 ||*/ i == 6 || i == 8 || /*i == 11 ||*/ i == 12 || i == 13 /*|| i == 19 || i == 20*/) {
-                model->act_sizeof[i] = sizeof(floatX);
-            //} else {
-            //    model->act_sizeof[i] = sizeof(float);
-            //}
-        }
         // and now allocate the space
-        fill_in_activation_sizes(model->act_elements, B, T, model->config);
+        fill_in_activation_sizes(model->act_sizes, B, T, model->config);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-            num_activations += model->act_elements[i] * model->act_sizeof[i];
+            num_activations += model->act_sizes[i] * sizeof(floatX);
         }
         model->num_activations = num_activations;
-        model->acts_memory = malloc_and_point_activations(&model->acts, model->act_elements, model->act_sizeof);
-        printf("allocated %d MiB for activations\n", (int)round(num_activations * sizeof(float) / (1024 * 1024)));
+        model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
+        printf("allocated %d MiB for activations\n", (int)round(num_activations * sizeof(floatX) / (1024 * 1024)));
         // also create memory for caching inputs and targets
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
@@ -1679,14 +1669,14 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
-        floatX* l_ln1w = params.ln1w + l * C;
-        floatX* l_ln1b = params.ln1b + l * C;
+        floatN* l_ln1w = params.ln1w + l * C;
+        floatN* l_ln1b = params.ln1b + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
         floatX* l_qkvb = params.qkvb + l * 3*C;
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_attprojb = params.attprojb + l * C;
-        floatX* l_ln2w = params.ln2w + l * C;
-        floatX* l_ln2b = params.ln2b + l * C;
+        floatN* l_ln2w = params.ln2w + l * C;
+        floatN* l_ln2b = params.ln2b + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcb = params.fcb + l * 4*C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
@@ -1812,21 +1802,21 @@ void gpt2_backward(GPT2 *model) {
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
-        floatX* l_ln1w = params.ln1w + l * C;
+        floatN* l_ln1w = params.ln1w + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
         floatX* l_attprojw = params.attprojw + l * C * C;
-        floatX* l_ln2w = params.ln2w + l * C;
+        floatN* l_ln2w = params.ln2w + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
-        floatX* dl_ln1w = grads.ln1w + l * C;
-        floatX* dl_ln1b = grads.ln1b + l * C;
+        floatN* dl_ln1w = grads.ln1w + l * C;
+        floatN* dl_ln1b = grads.ln1b + l * C;
         floatX* dl_qkvw = grads.qkvw + l * 3*C * C;
         floatX* dl_qkvb = grads.qkvb + l * 3*C;
         floatX* dl_attprojw = grads.attprojw + l * C * C;
         floatX* dl_attprojb = grads.attprojb + l * C;
-        floatX* dl_ln2w = grads.ln2w + l * C;
-        floatX* dl_ln2b = grads.ln2b + l * C;
+        floatN* dl_ln2w = grads.ln2w + l * C;
+        floatN* dl_ln2b = grads.ln2b + l * C;
         floatX* dl_fcw = grads.fcw + l * 4*C * C;
         floatX* dl_fcb = grads.fcb + l * 4*C;
         floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
