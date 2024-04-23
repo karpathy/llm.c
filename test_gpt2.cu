@@ -1,12 +1,24 @@
 #define TESTING
 #include "train_gpt2.cu"
 
-#define VERBOSITY_LEVEL_NONE 0
-#define VERBOSITY_LEVEL_ERROR 1
-#define VERBOSITY_LEVEL_DEBUG 2
+#define VERBOSITY_LEVEL_NONE 0 // only print OK or NOT OK
+#define VERBOSITY_LEVEL_ERROR 1 // if NOT OK print a few mismataches
+#define VERBOSITY_LEVEL_DEBUG 2 // if OK print a few values
 #define VERBOSITY_LEVEL VERBOSITY_LEVEL_ERROR
-// poor man's tensor checker. duplicate of test_gpt2.c
+
 int check_tensor(float *a, float *b, int n, const char* label, float tolerance) {
+// poor man's tensor checker. (Note: duplicate of test_gpt2.c)
+#ifndef _NO_COLORS
+#define FMT_PARAM_NOT_OK_DIFF_S "%s - \033[41mNOT OK\033[0m w/ tol = \033[33m%e\033[0m, faults = \033[41m%llu\033[0m, maxdiff=\033[33m%e\033[0m\n"
+#define FMT_PARAM_OK_DIFF_S "%s - \033[42mOK\033[0m w/ tol = \033[36m%e\033[0m, maxdiff=%e\n"
+#define FMT_TENSOR_NOT_OK_S "%s[%d] \033[31m%f8 %f8\033[0m, diff=\033[33m%e\033[0m\n"
+#define FMT_TENSOR_OK_S "%s[%d] %f8 %f8\n"
+#else
+#define FMT_PARAM_NOT_OK_DIFF_S "%s - NOT OK w/ tol = %e, faults = %llu, maxdiff=%e\n"
+#define FMT_PARAM_OK_DIFF_S "%s - OK w/ tol = %e, maxdiff=%e\n"
+#define FMT_TENSOR_NOT_OK_S "%s[%d] %f8 %f8, diff=%e\n"
+#define FMT_TENSOR_OK_S "%s[%d] %f8 %f8\n"
+#endif
     unsigned long long faults = 0;
     float maxdiff = 0.0f;
     // check the entire tensor without printing anything
@@ -17,22 +29,23 @@ int check_tensor(float *a, float *b, int n, const char* label, float tolerance) 
     }
     const int PRINT_UP_TO = 5;
     int num_printed = 0;
-    // print the final result
+    // print the final OK or NOT OK result
     if (VERBOSITY_LEVEL > VERBOSITY_LEVEL_NONE) {
         if (faults > 0) {
-            printf("%s - \033[41mNOT OK\033[0m w/ \033[33m%e\033[0m, faults = \033[41m%llu\033[0m, maxdiff=\033[33m%e\033[0m\n", label, tolerance, faults, maxdiff);
+            printf(FMT_PARAM_NOT_OK_DIFF_S, label, tolerance, faults, maxdiff);
         } else {
-            printf("%s - \033[42mOK\033[0m w/ \033[36m%e\033[0m, maxdiff=%e\n", label, tolerance, maxdiff);
+            printf(FMT_PARAM_OK_DIFF_S, label, tolerance, maxdiff);
         }
     }
+    // print a few values for visual comparison
     for (int i = 0; i < n; i++) {
         if (num_printed > PRINT_UP_TO) break;
         float diff = fabsf(a[i] - b[i]);
         if (diff > tolerance && VERBOSITY_LEVEL >= VERBOSITY_LEVEL_ERROR) {
-            printf("%s[%d] \033[31m%f8 %f8\033[0m, diff=\033[33m%e\033[0m\n", label, i, a[i], b[i], diff);
+            printf(FMT_TENSOR_NOT_OK_S, label, i, a[i], b[i], diff);
             num_printed++;
         } else if (faults == 0 && VERBOSITY_LEVEL >= VERBOSITY_LEVEL_DEBUG) {
-            printf("%s[%d] %f8 %f8\n", label, i, a[i], b[i]);
+            printf(FMT_TENSOR_OK_S, label, i, a[i], b[i]);
             num_printed++;
         }
     }
