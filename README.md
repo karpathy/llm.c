@@ -2,13 +2,7 @@
 
 LLM training in simple, pure C/CUDA. There is no need for 245MB of PyTorch or 107MB of cPython. Training GPT-2 (CPU, fp32) is ~1,000 lines of clean code in the single file [train_gpt2.c](train_gpt2.c), and training it on GPU is ~2,000 lines (adds CUDA kernels) in [train_gpt2.cu](train_gpt2.cu). The code compiles and runs instantly, it exactly matches the PyTorch reference implementation, and it ~matches the speed of (compiled) PyTorch (fp32, no flash attention). I chose GPT-2 as the first working example because it is the grand-daddy of LLMs, the first time the modern stack was put together.
 
-Currently, we are working on:
-
-- optimize the CUDA implementation further to match/exceed PyTorch speed
-- lower the precision from fp32 to mixed precision training
-- add multi-gpu training, starting with DDP
-- reproduce the GPT-2 training run (add data, evals)
-- more modern architectures, Llama 2, Gemma, Mistral, etc.
+Our current goal is to reproduce GPT-2 with a multi-node, mixed-precision, efficient implementation. For an overview of current ongoing work, see the latest [State of the Union](https://github.com/karpathy/llm.c/discussions/224) post.
 
 I'd like this repo to only maintain C and CUDA code. Ports of this repo to other languages are very welcome, but should be done in separate repos, and then I am happy to link to them below in the "notable forks" section, just like I did in [llama2.c notable forks](https://github.com/karpathy/llama2.c/tree/master?tab=readme-ov-file#notable-forks).
 
@@ -255,10 +249,12 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 
 - C#
   - [llm.cs](https://github.com/azret/llm.cs) by @[azret](https://github.com/azret): a C# port of this project
- 
+
 - Rust
   -  [llm.rs](https://github.com/ToJen/llm.rs) by @[ToJen](https://github.com/ToJen): a Rust port of this project
 
+- Metal
+  - [llm.metal](https://github.com/regrettable-username/llm.metal) by @[regrettable-username](https://github.com/regrettable-username): LLM training in simple, raw C/Metal Shading Language
 ## discussions
 
 Ways of organizing development:
