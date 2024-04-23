@@ -2,15 +2,15 @@
 #include "train_gpt2.cu"
 
 // poor man's tensor checker
-int check_tensor(float *a, float *b, int n, const char* label) {
+int check_tensor(float *a, float *b, int n, const char* label, float threshold=1e-1) {
     int print_upto = 5;
     int ok = 1;
     printf("%s\n", label);
     for (int i = 0; i < n; i++) {
-        if (fabsf(a[i] - b[i]) <= 1e-1) {
-            if (i < print_upto) { printf("OK %d ", i); }
+        if (fabsf(a[i] - b[i]) <= threshold) {
+            if (i < print_upto) { printf("OK "); }
         } else {
-            if (i < print_upto) { printf("NOT OK %d ", i); }
+            if (i < print_upto) { printf("NOT OK "); }
             ok = 0;
         }
         if (i < print_upto) { printf("%f %f\n", a[i], b[i]); }
@@ -99,9 +99,9 @@ int main(int argc, char *argv[]) {
     cudaMemcpy(logits_cpu, model.acts.output, B * T * V * sizeof(float), cudaMemcpyDeviceToHost);
     int logits_ok = 1;
 
-    // FP16 and lower require very high tolerance
+    // FP16 and lower require very high tolerances unfortunately
     float accuracy_threshold = 1e-2;
-    #if CUBLAS_LOWP != CUDA_R_32F
+    #if defined(ENABLE_BF16) || defined(ENABLE_F16)
     accuracy_threshold = 10;
     #endif
 
@@ -179,27 +179,23 @@ int main(int argc, char *argv[]) {
             // check_tensor(calculated_grads.wte, expected_grads.wte, V * C, "wte");
             // check_tensor(calculated_grads.wpe, expected_grads.wpe, maxT * C, "wpe");
 
-            // compare the gradients ona the parameters all at once
-            
-            // Convert gradients back to FP32 for comparison
+            // get gradients from GPU and convert all non-FP32 gradients back to FP32 for check_tensor
             cudaMemcpy(calculated_grads_memory, model.grads_memory, model.num_parameters * sizeof(float), cudaMemcpyDeviceToHost);
-
-            char* calculated_iterator = (char*)calculated_grads_memory;
-            float* converted_iterator = (float*)converted_grads_memory;
-
+            char* src_iterator = (char*)calculated_grads_memory;
+            float* dst_iterator = (float*)converted_grads_memory;
             for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
                 if (model.param_sizeof[i] == sizeof(float)) {
-                    memcpy(converted_iterator, calculated_iterator, model.param_elements[i] * sizeof(float));
+                    memcpy(dst_iterator, src_iterator, model.param_elements[i] * sizeof(float));
                 } else {
-                    // TODO: Currently only support float or floatX (cannot mix and match FP16/BF16 etc...)
                     assert(model.param_sizeof[i] == sizeof(floatX));
                     for (size_t j = 0; j < model.param_elements[i]; j++) {
-                        converted_iterator[j] = ((floatX*)calculated_iterator)[j];
+                        dst_iterator[j] = ((floatX*)src_iterator)[j];
                     }
                 }
-                calculated_iterator += model.param_elements[i] * model.param_sizeof[i];
-                converted_iterator += model.param_elements[i];
+                src_iterator += model.param_elements[i] * model.param_sizeof[i];
+                dst_iterator += model.param_elements[i];
             }
+            // compare the gradients ona the parameters all at once
             check_tensor(converted_grads_memory, expected_grads_memory, model.num_parameters, "grads");
         }
 

@@ -29,13 +29,21 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 
 // ----------------------------------------------------------------------------
 // CUDA precision settings
-typedef __nv_bfloat16 floatX; // linear layer weights and activations
-// CUDA_R_32F or CUDA_R_16BF or CUDA_R_16F
+#define ENABLE_BF16
+
+#ifdef ENABLE_BF16
+typedef __nv_bfloat16 floatX;
 #define CUBLAS_LOWP CUDA_R_16BF
-// if CUDA_R_16F  then CUBLAS_COMPUTE_32F or CUBLAS_COMPUTE_16F
-// if CUDA_R_16BF then CUBLAS_COMPUTE_32F only
-// if CUDA_R_32F  then CUBLAS_COMPUTE_32F(_FAST_TF32 or _FAST_16BF or _FAST_16F)
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+#elif ENABLE_FP16
+typedef half floatX;
+#define CUBLAS_LOWP CUDA_R_16F
+#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+#else
+typedef float floatX;
+#define CUBLAS_LOWP CUDA_R_32F
+#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+#endif
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -72,21 +80,6 @@ cublasLtHandle_t cublaslt_handle;
 
 namespace cg = cooperative_groups;
 
-// ----------------------------------------------------------------------------
-template <typename T>
-__global__ void print_tensorT(T* tensor, int N) {
-    for (int i = 0; i < N; i++) {
-        printf("%f\n", (float)tensor[i]);
-    }
-}
-
-// Function that calls print_tensorT, sychronises, and prints message
-template <typename T>
-void print_tensor(T* tensor, int N=1000, const char* message="-----------------") {
-    print_tensorT<<<1, 1>>>(tensor, N);
-    cudaCheck(cudaDeviceSynchronize());
-    printf("\n\n\n %s \n\n\n\n\n\n", message);
-}
 // ----------------------------------------------------------------------------
 // fread convenience utils, with nice handling of error checking using macros
 // simple replace fopen, fread, fclose with fopenCheck, freadCheck, fcloseCheck
@@ -223,55 +216,9 @@ __global__ void encoder_backward_kernel(float* dwte, float* dwpe,
     }
 }
 
-__global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
-                                    const float*  __restrict__ inp, const float*  __restrict__ weight,
-                                    const float* __restrict__ bias, int N, int C) {
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    if(idx >= N) {
-        return;
-    }
-
-    // the row of input that this group of threads is responsible for
-    const float* x = inp + idx * C;
-
-    // mean
-    float sum = 0.0f;
-    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
-        sum += x[i];
-    }
-    sum = cg::reduce(warp, sum, cg::plus<float>{});
-    float m = sum / C;
-    if(warp.thread_rank() == 0 && mean != nullptr) {
-        __stcs(mean + idx, m);
-    }
-
-    // rstd
-    sum = 0.0f;
-    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
-        float diff = x[i] - m;
-        sum += diff * diff;
-    }
-    sum = cg::reduce(warp, sum, cg::plus<float>{});
-    float s = rsqrtf(sum / C + 1e-5f);
-    if(warp.thread_rank() == 0 && rstd != nullptr) {
-        __stcs(rstd + idx, s);
-    }
-
-    // final normalization and scaling by weight/bias
-    float* o = out + idx * C;
-    for (int c = warp.thread_rank(); c < C; c += warp.size()) {
-        // load and store using the .cs "streaming" hint to the compiler,
-        // indicating that this data will not be reused soon, and can be streamed through the caches
-        // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
-        float n = s * (__ldcs(x+c) - m);
-        __stcs(o+c, n * weight[c] + bias[c]);
-    }
-}
-
-// reads FP32, outputs floatX(FP16/BF16/FP8)
-__global__ void layernorm_forward_kernel4_mixedp(floatX* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+// currently reads FP32, outputs floatX(FP16/BF16/FP8)
+template <typename TOut>
+__global__ void layernorm_forward_kernel3(TOut* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const float*  __restrict__ inp, const float*  __restrict__ weight,
                                     const float* __restrict__ bias, int N, int C) {
     cg::thread_block block = cg::this_thread_block();
@@ -308,16 +255,15 @@ __global__ void layernorm_forward_kernel4_mixedp(floatX* __restrict__ out, float
     }
 
     // final normalization and scaling by weight/bias
-    floatX* o = out + idx * C;
+    TOut* o = out + idx * C;
     for (int c = warp.thread_rank(); c < C; c += warp.size()) {
         // load and store using the .cs "streaming" hint to the compiler,
         // indicating that this data will not be reused soon, and can be streamed through the caches
         // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
         float n = s * ((float)__ldcs(x+c) - m);
-        __stcs(o+c, (floatX)(n * weight[c] + bias[c]));
+        __stcs(o+c, (TOut)(n * weight[c] + bias[c]));
     }
 }
-
 
 // inputs floatX, outputs FP32 (for current FP32-only activation path for this WIP)
 __global__ void permute_kernel(float* q, float* k, float* v,
@@ -459,18 +405,11 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     }
 }
 
-__global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, int N) {
+template <typename TOut, typename T1, typename T2>
+__global__ void residual_forward_kernel(TOut* out, T1* inp1, T2* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
-        out[idx] = __ldcs(&inp1[idx]) + __ldcs(&inp2[idx]);
-    }
-}
-
-// residuals are kept as FP32 for now, but input from the matmul is floatX
-__global__ void residual_forward_kernel_mixedp(float* out, float* inp1, floatX* inp2, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        out[idx] = __ldcs(&inp1[idx]) + (float)__ldcs(&inp2[idx]);
+        out[idx] = (TOut)((float)__ldcs(&inp1[idx]) + (float)__ldcs(&inp2[idx]));
     }
 }
 
@@ -616,7 +555,8 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
 }
 
 // cooperative groups solution, one warp per output channel
-__global__ void matmul_backward_bias_kernel2(float* dbias, const float* dout, int B, int T, int OC) {
+template <typename Td>
+__global__ void matmul_backward_bias_kernel2(Td* dbias, const Td* dout, int B, int T, int OC) {
     // dout is (B, T, OC), dbias is (OC)
     // e.g. if block_size = 128, then we have 4 warps per block, each in charge of one output channel
     namespace cg = cooperative_groups;
@@ -635,37 +575,13 @@ __global__ void matmul_backward_bias_kernel2(float* dbias, const float* dout, in
     sum = cg::reduce(warp, sum, cg::plus<float>{});
     // write the result to output (global memory)
     if(warp.thread_rank() == 0) {
-        dbias[idx] = (float)((float)dbias[idx] + sum);
+        dbias[idx] = (Td)((float)dbias[idx] + sum);
     }
 }
 
-// cooperative groups solution, one warp per output channel
-__global__ void matmul_backward_bias_kernel3_lowp(floatX* dbias, const floatX* dout, int B, int T, int OC) {
-    // dout is (B, T, OC), dbias is (OC)
-    // e.g. if block_size = 128, then we have 4 warps per block, each in charge of one output channel
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    // meta_group_size is the number of warps in a block (e.g. 4), meta_group_rank is the warp index (0,1,2,3)
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    if(idx >= OC) { return; }
-    int BT = B * T; // number of elements to reduce in total, per channel
-    // first, thread coarsening to sum reduce the problem size from B*T to 32
-    float sum = 0.0f;
-    for(int i = warp.thread_rank(); i < BT; i += warp.size()) {
-        sum += (float)dout[i * OC + idx];
-    }
-    // now do a warp-level reduce to get the sum across the 32 threads in this warp
-    sum = cg::reduce(warp, sum, cg::plus<float>{});
-    // write the result to output (global memory)
-    if(warp.thread_rank() == 0) {
-        dbias[idx] = (floatX)((float)dbias[idx] + sum);
-    }
-}
-
-
-__global__ void layernorm_backward_kernel(floatX* dinp, float* dweight, float* dbias,
-                        const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
+template <typename Tdinp, typename Tdout>
+__global__ void layernorm_backward_kernel(Tdinp* dinp, float* dweight, float* dbias,
+                        const Tdout* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                         int B, int T, int C) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
@@ -678,63 +594,9 @@ __global__ void layernorm_backward_kernel(floatX* dinp, float* dweight, float* d
     int b = idx / T;
     int t = idx % T;
 
-    const float* dout_bt = dout + b * T * C + t * C;
+    const Tdout* dout_bt = dout + b * T * C + t * C;
     const float* inp_bt = inp + b * T * C + t * C;
-    floatX* dinp_bt = dinp + b * T * C + t * C;
-    float mean_bt = mean[b * T + t];
-    float rstd_bt = rstd[b * T + t];
-
-    // first: two reduce operations
-    float dnorm_mean = 0.0f;
-    float dnorm_norm_mean = 0.0f;
-    for (int i = warp.thread_rank(); i < C; i  += warp.size()) {
-        float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
-        float dnorm_i = weight[i] * dout_bt[i];
-        dnorm_mean += dnorm_i;
-        dnorm_norm_mean += dnorm_i * norm_bti;
-    }
-
-    dnorm_mean = cg::reduce(warp, dnorm_mean, cg::plus<float>{});
-    dnorm_norm_mean = cg::reduce(warp, dnorm_norm_mean, cg::plus<float>{});
-
-    dnorm_mean = dnorm_mean / C;
-    dnorm_norm_mean = dnorm_norm_mean / C;
-
-    // now iterate again and accumulate all the gradients
-    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
-        float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
-        float dnorm_i = weight[i] * dout_bt[i];
-        // gradient contribution to bias
-        atomicAdd(&dbias[i], dout_bt[i]);
-        // gradient contribution to weight
-        atomicAdd(&dweight[i], norm_bti * dout_bt[i]);
-        // gradient contribution to input
-        float dval = 0.0f;
-        dval += dnorm_i; // term 1
-        dval -= dnorm_mean; // term 2
-        dval -= norm_bti * dnorm_norm_mean; // term 3
-        dval *= rstd_bt; // final scale
-        dinp_bt[i] = (floatX)((float)dinp_bt[i] + dval);
-    }
-}
-
-__global__ void layernorm_backward_kernel_mixedp(floatX* dinp, float* dweight, float* dbias,
-                        const floatX* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
-                        int B, int T, int C) {
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    int N = B * T;
-    if(idx >= N) {
-        return;
-    }
-
-    int b = idx / T;
-    int t = idx % T;
-
-    const floatX* dout_bt = dout + b * T * C + t * C;
-    const float* inp_bt = inp + b * T * C + t * C;
-    floatX* dinp_bt = dinp + b * T * C + t * C;
+    Tdinp* dinp_bt = dinp + b * T * C + t * C;
     float mean_bt = mean[b * T + t];
     float rstd_bt = rstd[b * T + t];
 
@@ -768,7 +630,7 @@ __global__ void layernorm_backward_kernel_mixedp(floatX* dinp, float* dweight, f
         dval -= dnorm_mean; // term 2
         dval -= norm_bti * dnorm_norm_mean; // term 3
         dval *= rstd_bt; // final scale
-        dinp_bt[i] = (floatX)((float)dinp_bt[i] + dval);
+        dinp_bt[i] = (Tdinp)((float)dinp_bt[i] + dval);
     }
 }
 
@@ -818,32 +680,89 @@ __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const flo
     }
 }
 
+// Simple xorshift RNG
+__device__ __host__ unsigned int random_u32(unsigned long long *state) {
+    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
+}
+__device__ __host__ float random_f32(unsigned long long *state) { // random float32 in [0,1)
+    return (random_u32(state) >> 8) / 16777216.0f;
+}
+
+// SquirrelNoise5 - Squirrel's Raw Noise utilities (version 5)
+// This gives us a random number from threadIdx/blockIdx + a single seed for the entire GPU
+// http://eiserloh.net/noise/SquirrelNoise5.hpp
+__device__ __host__ constexpr unsigned int SquirrelNoise5( int positionX, unsigned int seed )
+{
+	constexpr unsigned int SQ5_BIT_NOISE1 = 0xd2a80a3f;	// 11010010101010000000101000111111
+	constexpr unsigned int SQ5_BIT_NOISE2 = 0xa884f197;	// 10101000100001001111000110010111
+	constexpr unsigned int SQ5_BIT_NOISE3 = 0x6C736F4B; // 01101100011100110110111101001011
+	constexpr unsigned int SQ5_BIT_NOISE4 = 0xB79F3ABB;	// 10110111100111110011101010111011
+	constexpr unsigned int SQ5_BIT_NOISE5 = 0x1b56c4f5;	// 00011011010101101100010011110101
+	unsigned int mangledBits = (unsigned int) positionX;
+	mangledBits *= SQ5_BIT_NOISE1;
+	mangledBits += seed;
+	mangledBits ^= (mangledBits >> 9);
+	mangledBits += SQ5_BIT_NOISE2;
+	mangledBits ^= (mangledBits >> 11);
+	mangledBits *= SQ5_BIT_NOISE3;
+	mangledBits ^= (mangledBits >> 13);
+	mangledBits += SQ5_BIT_NOISE4;
+	mangledBits ^= (mangledBits >> 15);
+	mangledBits *= SQ5_BIT_NOISE5;
+	mangledBits ^= (mangledBits >> 17);
+	return mangledBits;
+}
+__device__ __host__ constexpr unsigned int Get1dNoiseUint( int positionX, unsigned int seed )
+{
+	return SquirrelNoise5( positionX, seed );
+}
+__device__ __host__ constexpr unsigned int Get2dNoiseUint( int indexX, int indexY, unsigned int seed )
+{
+	constexpr int PRIME_NUMBER = 198491317; // Large prime number with non-boring bits
+	return SquirrelNoise5( indexX + (PRIME_NUMBER * indexY), seed );
+}
+__device__ __host__ constexpr float Get1dNoiseZeroToOne( int index, unsigned int seed )
+{
+	constexpr double ONE_OVER_MAX_UINT = (1.0 / (double) 0xFFFFFFFF);
+	return (float)( ONE_OVER_MAX_UINT * (double) SquirrelNoise5( index, seed ) );
+}
+__device__ __host__ constexpr float Get2dNoiseZeroToOne( int indexX, int indexY, unsigned int seed )
+{
+	constexpr double ONE_OVER_MAX_UINT = (1.0 / (double) 0xFFFFFFFF);
+	return (float)( ONE_OVER_MAX_UINT * (double) Get2dNoiseUint( indexX, indexY, seed ) );
+}
+// Stochastic rounding built on top of Squirel Noise above (with seed updated per step via xorshift)
+__device__ __forceinline__ void stochastic_rounding(float in, __nv_bfloat16 *out, unsigned int seed) {
+    // todo - is this stochastic rounding *too good*? can we cut any more corners?
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+    unsigned int threshold = random & 0xFFFF;
+    unsigned int float_bits = __float_as_uint(in);
+    unsigned int rounded_bits = float_bits & 0x0000FFFF;
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
+    *out = __float2bfloat16_rn(__uint_as_float(float_bits));
+}
+__device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigned int random) {
+    *out = (float)in; // todo - implement this...
+}
+__device__ __forceinline__ void stochastic_rounding(float in, float *out, unsigned int random) {
+    *out = in; // dummy function for when floatX is float (FP32 mode)
+}
+
 // Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
 // Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
 __device__ inline float lerp(float start, float end, float weight) {
     return fma(weight, end, fma(-weight, start, start));
 }
 
-__global__ void adamw_kernel2(float* params_memory, float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
-                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
-   int i = blockIdx.x * blockDim.x + threadIdx.x;
-   if (i >= num_parameters) return;  // guard
-   float grad = grads_memory[i];
-   float m = m_memory[i];
-   float v = v_memory[i];
-   // update the first moment (momentum)
-   m = lerp(grad, m, beta1);
-   m_memory[i] = m;
-   // update the second moment (RMSprop)
-   v = lerp(grad * grad, v, beta2);
-   v_memory[i] = v;
-   m /= beta1_correction;  // m_hat
-   v /= beta2_correction;  // v_hat
-   params_memory[i] -= learning_rate * (m / (sqrtf(v) + eps) + weight_decay * params_memory[i]);
-}
-
-__global__ void adamw_kernel3_lowp(floatX* params_memory, floatX* grads_memory, float* m_memory, float* v_memory, long num_parameters,
-                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+// Termplate type T instead of floatx
+template <typename Tp, typename Tg>
+__global__ void adamw_kernel3(Tp* params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
+                              unsigned int seed) {
    int i = blockIdx.x * blockDim.x + threadIdx.x;
    if (i >= num_parameters) return;  // guard
    float grad = (float)grads_memory[i];
@@ -857,15 +776,17 @@ __global__ void adamw_kernel3_lowp(floatX* params_memory, floatX* grads_memory, 
    v_memory[i] = v;
    m /= beta1_correction;  // m_hat
    v /= beta2_correction;  // v_hat
-   params_memory[i] = (floatX)((float)params_memory[i] - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * (float)params_memory[i])));
+   // update the parameters (weight/bias)
+   float param = (float)params_memory[i] - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * (float)params_memory[i]));
+   unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+   // todo - explain stochastic rounding here
+   stochastic_rounding(param, &params_memory[i], random);
 }
-
 
 struct SoftmaxParams {
     float Scale;
     float Offset;
 };
-
 
 __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_tile<32>& warp,
                                                    int idx, const float* inp, int V, int P) {
@@ -988,13 +909,13 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
-void layernorm_forward_mixedp(floatX* out, float* mean, float* rstd,
+void layernorm_forward(floatX* out, float* mean, float* rstd,
                        float* inp, float* weight, float* bias,
                        int B, int T, int C) {
     const int block_size = 512;
     const int N = B * T;
     const int grid_size = CEIL_DIV(N * 32, block_size);
-    layernorm_forward_kernel4_mixedp<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
+    layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1141,10 +1062,10 @@ void residual_forward(float* out, float* inp1, float* inp2, int N) {
     cudaCheck(cudaGetLastError());
 }
 
-void residual_forward_mixedp(float* out, float* inp1, floatX* inp2, int N) {
+void residual_forward(float* out, float* inp1, floatX* inp2, int N) {
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
-    residual_forward_kernel_mixedp<<<grid_size, block_size>>>(out, inp1, inp2, N);
+    residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1189,26 +1110,19 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
 }
 
 void matmul_backward_lowp(floatX* dinp, floatX* dweight, floatX* dbias,
-                     floatX* dout, floatX* inp, floatX* weight,
-                     int B, int T, int C, int OC) {
+                          floatX* dout, floatX* inp, floatX* weight,
+                          int B, int T, int C, int OC) {
     float one = 1.0f;
     float zero = 0.0f;
     // backward to input, uses = in the backward pass (set the gradient)
-    // TODO
-
-    //cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &one, weight, C, dout, OC, &zero, dinp, C));
-
     cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &one, weight, CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &zero, dinp, CUBLAS_LOWP, C, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-
     // backward to weight, uses += in the backward pass (accumulate the gradient)
     cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &one, inp, CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &one, dweight, CUBLAS_LOWP, C, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-
-    //cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &one, inp, C, dout, OC, &one, dweight, C));
     // backward to bias, if given, does a +=
     if (dbias != NULL) {
         const int block_size = 512;
         const int grid_size = CEIL_DIV(OC * 32, block_size);
-        matmul_backward_bias_kernel3_lowp<<<grid_size, block_size>>>(dbias, dout, B, T, OC);
+        matmul_backward_bias_kernel2<<<grid_size, block_size>>>(dbias, dout, B, T, OC);
         cudaCheck(cudaGetLastError());
     }
 }
@@ -1231,7 +1145,7 @@ void layernorm_backward_mixedp(floatX* dinp, float* dweight, float* dbias,
     const int N = B * T;
     // one warp per token, so we need to divide by 32 here.
     const int grid_size = CEIL_DIV(N, block_size / 32);
-    layernorm_backward_kernel_mixedp<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+    layernorm_backward_kernel<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1518,6 +1432,7 @@ typedef struct {
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
+    unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
 } GPT2;
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -1612,6 +1527,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
+    model->rng_state = 13371337;
 }
 
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {    
@@ -1726,16 +1642,16 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         floatX* scratch = (floatX*)acts.output;
 
         // now do the forward pass
-        layernorm_forward_mixedp(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
         matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-        residual_forward_mixedp(l_residual2, residual, l_attproj, B*T*C);
-        layernorm_forward_mixedp(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        residual_forward(l_residual2, residual, l_attproj, B*T*C);
+        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
         matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
         matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
-        residual_forward_mixedp(l_residual3, l_residual2, l_fcproj, B*T*C);
+        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
@@ -1907,28 +1823,37 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     float beta2_correction = 1.0f - powf(beta2, t);
 
     // Do adam per set of parameters
-    // TODO - this is a horrible hack, need to fix this...
-    // possibly OK approach if we do it with independent CUDA streams and/or merge consecutive same-type adams together
-    size_t offset_so_far = 0;
-    size_t current_element = 0;
+    // We need to know the parameter types (float or floatX) to process consecutive chunks
+    // TODO - optimise this to require fewer kernel launches and/or independent via CUDA streams
     char* params_mem = (char*)model->params_memory;
     char* grads_mem = (char*)model->grads_memory;
-    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        int num_blocks = CEIL_DIV(model->param_elements[i], block_size);
-        if (model->param_sizeof[i] == sizeof(float)) {
-            adamw_kernel2<<<num_blocks, block_size>>>((float*)params_mem, (float*)grads_mem,
-                                                    &model->m_memory[current_element], &model->v_memory[current_element],
-                                                    model->param_elements[i],
-                                                    learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
-        } else {
-            adamw_kernel3_lowp<<<num_blocks, block_size>>>((floatX*)params_mem, (floatX*)grads_mem,
-                                                    &model->m_memory[current_element], &model->v_memory[current_element],
-                                                    model->param_elements[i],
-                                                    learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+    size_t num_elements = model->param_elements[0];
+    size_t last_sizeof = model->param_sizeof[0];
+    size_t current_element = 0;
+
+    for (size_t i = 1; i <= NUM_PARAMETER_TENSORS; i++) {
+        if (i == NUM_PARAMETER_TENSORS || model->param_sizeof[i] != last_sizeof) {
+            unsigned int seed = random_u32(&model->rng_state); // seed for stochastic rounding
+            int num_blocks = CEIL_DIV(num_elements, block_size);
+
+            if (last_sizeof == sizeof(floatX)) {
+                adamw_kernel3<<<num_blocks, block_size>>>((floatX*)params_mem, (floatX*)grads_mem,
+                            &model->m_memory[current_element], &model->v_memory[current_element], num_elements,
+                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
+            } else {
+                adamw_kernel3<<<num_blocks, block_size>>>((float*)params_mem, (float*)grads_mem,
+                            &model->m_memory[current_element], &model->v_memory[current_element], num_elements,
+                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
+            }
+            params_mem += num_elements * last_sizeof;
+            grads_mem += num_elements * last_sizeof;
+            current_element += num_elements;
+            num_elements = 0;
         }
-        params_mem += model->param_elements[i] * model->param_sizeof[i];
-        grads_mem += model->param_elements[i] * model->param_sizeof[i];
-        current_element += model->param_elements[i];
+        if (i != NUM_PARAMETER_TENSORS) {
+            num_elements += model->param_elements[i];
+            last_sizeof = model->param_sizeof[i];
+        }
     }
     cudaCheck(cudaGetLastError());
 }
@@ -2020,17 +1945,6 @@ void dataloader_free(DataLoader *loader) {
 // sampler: takes probabilities and samples integers from them
 
 #define GPT2_EOT 50256
-
-unsigned int random_u32(unsigned long long *state) {
-    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-    *state ^= *state >> 12;
-    *state ^= *state << 25;
-    *state ^= *state >> 27;
-    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
-}
-float random_f32(unsigned long long *state) { // random float32 in [0,1)
-    return (random_u32(state) >> 8) / 16777216.0f;
-}
 
 int sample_softmax(const float* logits, int n, float coin) {
     // sample index from logits (converted to probabilities using softmax)
