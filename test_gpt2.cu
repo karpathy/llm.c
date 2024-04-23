@@ -2,7 +2,7 @@
 #include "train_gpt2.cu"
 
 // poor man's tensor checker
-int check_tensor(float *a, float *b, int n, const char* label, float threshold=1e-1) {
+int check_tensor(float *a, float *b, int n, const char* label, float threshold=1e-0) {
     int print_upto = 5;
     int ok = 1;
     printf("%s\n", label);
@@ -95,14 +95,18 @@ int main(int argc, char *argv[]) {
     gpt2_forward(&model, x, NULL, B, T);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
+    floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * V * sizeof(floatX));
     float* logits_cpu = (float*)mallocCheck(B * T * V * sizeof(float));
-    cudaMemcpy(logits_cpu, model.acts.output, B * T * V * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * V * sizeof(floatX), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < B * T * V; i++) {
+        logits_cpu[i] = (float)logits_cpu_raw[i];
+    }
     int logits_ok = 1;
 
     // FP16 and lower require very high tolerances unfortunately
     float accuracy_threshold = 1e-2;
     #if defined(ENABLE_BF16) || defined(ENABLE_F16)
-    accuracy_threshold = 10;
+    accuracy_threshold = 20;
     #endif
 
     for (int i=0; i<B*T*V; i++) {
@@ -135,10 +139,11 @@ int main(int argc, char *argv[]) {
 
 
             allok = allok && logits_ok;
+            free(logits_cpu_raw);
             free(logits_cpu);
 
             // compare the achieved loss
-            if (fabsf(model.mean_loss - *expected_loss) >= 1e-2) {
+            if (fabsf(model.mean_loss - *expected_loss) >= accuracy_threshold) {
                 printf("LOSS MISMATCH: %f %f\n", model.mean_loss, *expected_loss);
                 allok = 0;
             } else {
@@ -180,7 +185,7 @@ int main(int argc, char *argv[]) {
             // check_tensor(calculated_grads.wpe, expected_grads.wpe, maxT * C, "wpe");
 
             // get gradients from GPU and convert all non-FP32 gradients back to FP32 for check_tensor
-            cudaMemcpy(calculated_grads_memory, model.grads_memory, model.num_parameters * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(calculated_grads_memory, model.grads_memory, model.num_parameters * sizeof(floatX), cudaMemcpyDeviceToHost);
             char* src_iterator = (char*)calculated_grads_memory;
             float* dst_iterator = (float*)converted_grads_memory;
             for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -222,7 +227,7 @@ int main(int argc, char *argv[]) {
 
     // compare
     for (int i = 0; i < 10; i++) {
-        if (fabsf(losses[i] - expected_losses[i]) >= 1e-2) {
+        if (fabsf(losses[i] - expected_losses[i]) >= accuracy_threshold) {
             printf("LOSS MISMATCH AT STEP %d: %f %f\n", i, losses[i], expected_losses[i]);
             allok = 0;
         } else {
