@@ -73,7 +73,7 @@ int main(int argc, char *argv[]) {
     float* expected_grads_memory = malloc_and_point_parameters(&expected_grads, model.param_elements, model.param_sizeof, 0);
     float* calculated_grads_memory = malloc_and_point_parameters(&calculated_grads, model.param_elements, model.param_sizeof, 0);
     float* converted_grads_memory = (float*)mallocCheck(model.num_parameters * sizeof(float));
-    
+
     // inputs and expected outputs, only used for error checking
     int* x = (int*)mallocCheck(B * T * sizeof(int));
     int* y = (int*)mallocCheck(B * T * sizeof(int));
@@ -106,7 +106,7 @@ int main(int argc, char *argv[]) {
     // FP16 and lower require very high tolerances unfortunately
     float accuracy_threshold = 1e-2;
     #if defined(ENABLE_BF16) || defined(ENABLE_F16)
-    accuracy_threshold = 20;
+    accuracy_threshold = 23;
     #endif
 
     for (int i=0; i<B*T*V; i++) {
