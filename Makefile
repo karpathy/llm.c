@@ -66,7 +66,7 @@ else
 endif
 
 # PHONY means these targets will always be executed
-.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu
+.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu
 
 # Add targets
 TARGETS = train_gpt2 test_gpt2
@@ -87,8 +87,10 @@ train_gpt2: train_gpt2.c
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
 
-# possibly may want to disable warnings? e.g. append -Xcompiler -Wno-unused-result
 train_gpt2cu: train_gpt2.cu
+	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
+
+train_gpt2fp32cu: train_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
 
 test_gpt2cu: test_gpt2.cu
@@ -98,5 +100,4 @@ profile_gpt2cu: profile_gpt2.cu
 	$(NVCC) $(NVCC_FLAGS) -lineinfo $< $(NVCC_LDFLAGS) -o $@
 
 clean:
-	rm -f train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu
-
+	rm -f train_gpt2 test_gpt2 train_gpt2cu train_gpt2fp32cu test_gpt2cu
