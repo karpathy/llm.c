@@ -496,7 +496,7 @@ __global__ void softmax_forward_kernel5(Type* out, float inv_temperature, const 
 
     if(4*pos_by_4 + warp.thread_rank() <= own_pos) {
         float old_maxval = maxval;
-        maxval = fmaxf(maxval, x[4*pos_by_4 + warp.thread_rank()]);
+        maxval = fmaxf(maxval, (float)x[4*pos_by_4 + warp.thread_rank()]);
         sumval *= expf(inv_temperature * (old_maxval - maxval));
         sumval += expf(inv_temperature * ((float)x[4*pos_by_4 + warp.thread_rank()] - maxval));
     }
@@ -820,7 +820,7 @@ __global__ void softmax_autoregressive_backward_kernel(floatX* dpreatt, const fl
             // don't touch the cache. Some parts will still be here from the previous loop, and
             // we want to exploit those.
             float acc = (float)__ldcs(att_bth + t3) * ((float)__ldcs(datt_bth + t3) - local_sum);
-            __stcs(dpreatt_bth + t3, scale * acc);
+            __stcs(dpreatt_bth + t3, (floatX)(scale * acc));
         }
     }
 }
