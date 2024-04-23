@@ -1354,12 +1354,12 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         param_sizeof[i] = sizeof(floatX);
     }
-    param_sizes[2] = sizeof(floatN); // ln1w
-    param_sizes[3] = sizeof(floatN); // ln1b
-    param_sizes[8] = sizeof(floatN); // ln2w
-    param_sizes[9] = sizeof(floatN); // ln2b
-    param_sizes[14] = sizeof(floatN); // lnfw
-    param_sizes[15] = sizeof(floatN); // lnfb
+    param_sizeof[2] = sizeof(floatN); // ln1w
+    param_sizeof[3] = sizeof(floatN); // ln1b
+    param_sizeof[8] = sizeof(floatN); // ln2w
+    param_sizeof[9] = sizeof(floatN); // ln2b
+    param_sizeof[14] = sizeof(floatN); // lnfw
+    param_sizeof[15] = sizeof(floatN); // lnfb
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
