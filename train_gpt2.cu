@@ -1327,7 +1327,7 @@ typedef struct {
     floatN*  lnfb; // (C)
 } ParameterTensors;
 
-void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
+void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
     int V = config.vocab_size;
     int C = config.channels;
     int maxT = config.max_seq_len;
@@ -1348,6 +1348,18 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
     param_sizes[13] = L * C; // fcprojb
     param_sizes[14] = C; // lnfw
     param_sizes[15] = C; // lnfb
+    
+    // Set parameter sizes
+    // floatN gives us an option to keep layernorm params in FP32 if we want to
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        param_sizeof[i] = sizeof(floatX);
+    }
+    param_sizes[2] = sizeof(floatN); // ln1w
+    param_sizes[3] = sizeof(floatN); // ln1b
+    param_sizes[8] = sizeof(floatN); // ln2w
+    param_sizes[9] = sizeof(floatN); // ln2b
+    param_sizes[14] = sizeof(floatN); // lnfw
+    param_sizes[15] = sizeof(floatN); // lnfb
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
@@ -1550,20 +1562,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     printf("channels: %d\n", C);
 
     // allocate space for all the parameters and read them in
-    fill_in_parameter_sizes(model->param_elements, model->config);
-
-    // count the number of parameters
-    // TODO - assuming the model we read is all FP32 and we need to convert some of it to FP16/BF16
-    // Setup param_sizeof for FP32 vs FP16 parameters etc.
-    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        model->param_sizeof[i] = sizeof(floatX);
-
-        if (sizeof(floatN) == sizeof(float)) {
-            if (i == 2 || i == 3 || i == 8 || i == 9 || i == 14 || i == 15) {
-                model->param_sizeof[i] = sizeof(float);
-            }
-        }
-    }
+    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
 
     model->num_parameters = 0;
     model->num_parameters_bytes = 0;
