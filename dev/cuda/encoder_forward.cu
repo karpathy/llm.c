@@ -2,13 +2,13 @@
 Kernels for the positional encoder forward pass in GPT-2.
 
 Compile example:
-nvcc -O3 --use_fast_math positional_forward.cu -o positional_forward
+nvcc -O3 --use_fast_math encoder_forward.cu -o encoder_forward
 
 version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
-./positional_forward 1
+./encoder_forward 1
 
 version 2 is more optimized, parallelizes over all of B,T,C
-./positional_forward 2
+./encoder_forward 2
 */
 
 #include <stdio.h>
