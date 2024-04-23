@@ -669,7 +669,8 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
 // the idea is to employ one block to reduce along several columns,
 // where each block has a width of 32 columns to ensure coalesced access.
 // at the end we accumulate the reductions performed by the warps in each block via shared memory
-__global__ void matmul_backward_bias_kernel4(float* dbias, const float* dout, int B, int T, int OC) {
+template <typename Td>
+__global__ void matmul_backward_bias_kernel4(Td* dbias, const Td* dout, int B, int T, int OC) {
     // this kernel is launched with 1D grid_dim of OC/32
     // for example let's say block_size is 128
     extern __shared__ float smem[]; // of size block_size (128)
@@ -680,7 +681,7 @@ __global__ void matmul_backward_bias_kernel4(float* dbias, const float* dout, in
 
     // pointer to the start of the column for one lane of threads
     // so e.g. 4 threads (of the same lane_id) will reduce this one column
-    const float* dout_col = dout + tl + lane_id;
+    const Td* dout_col = dout + tl + lane_id;
 
     // column reductions by looping through the rows
     // each of the 4 threads offsets by its warp_id and then skips by vstep
@@ -689,7 +690,7 @@ __global__ void matmul_backward_bias_kernel4(float* dbias, const float* dout, in
     // leading to a coalesced memory access pattern
     float dout_sum = 0.0f;
     for (int row = warp_id; row < B * T; row += vstep) {
-        dout_sum += dout_col[row * OC];
+        dout_sum += (float)dout_col[row * OC];
     }
     smem[lane_id + warp_id * warpSize] = dout_sum;
     __syncthreads();
@@ -700,14 +701,15 @@ __global__ void matmul_backward_bias_kernel4(float* dbias, const float* dout, in
         for (int j = 0; j < vstep; j++) {
             dout_sum += smem[lane_id + j * warpSize];
         }
-        dbias[tl + lane_id] += dout_sum;
+        dbias[tl + lane_id] = (Td)dout_sum;
     }
 }
 
 // uses shared memory instead for the reduces
-__global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* dbias,
-                                           const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
-                                           int B, int T, int C) {
+template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
+__global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
+                        const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+                        int B, int T, int C) {
     extern __shared__ float shared[]; // size = 2 * C
 
     namespace cg = cooperative_groups;
@@ -720,11 +722,11 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
     int b = idx / T;
     int t = idx % T;
 
-    const float* dout_bt = dout + b * T * C + t * C;
-    const float* inp_bt = inp + b * T * C + t * C;
-    float* dinp_bt = dinp + b * T * C + t * C;
-    const float mean_bt = mean[b * T + t];
-    const float rstd_bt = rstd[b * T + t];
+    const Tdout* dout_bt = dout + b * T * C + t * C;
+    const Trest* inp_bt = inp + b * T * C + t * C;
+    Tdinp* dinp_bt = dinp + b * T * C + t * C;
+    const float mean_bt = (float)mean[b * T + t];
+    const float rstd_bt = (float)rstd[b * T + t];
 
     // the first half of shared memory is bias, second is weight
     float* dbias_shared = shared;
@@ -732,7 +734,7 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
 
     // init shared memory to zero
     #pragma unroll
-	for(int i = threadIdx.x; i < C; i+= blockDim.x){
+    for(int i = threadIdx.x; i < C; i+= blockDim.x){
        dbias_shared[i] = 0.0f;
        dweight_shared[i] = 0.0f;
     }
@@ -757,9 +759,9 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
         float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
         float dnorm_i = (float)weight[i] * (float)dout_bt[i];
         // gradient contribution to bias
-        atomicAdd(&dbias_shared[i], dout_bt[i]);
+        atomicAdd(&dbias_shared[i], (float)dout_bt[i]);
         // gradient contribution to weight
-        atomicAdd(&dweight_shared[i], norm_bti * dout_bt[i]);
+        atomicAdd(&dweight_shared[i], norm_bti * (float)dout_bt[i]);
         // gradient contribution to input
         float dval = 0.0f;
         dval += dnorm_i; // term 1
@@ -771,10 +773,10 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
     __syncthreads();
 
     // write to global memory
-	for(int i = threadIdx.x; i < C; i+= blockDim.x){
-        atomicAdd(&dbias[i], dbias_shared[i]);
-        atomicAdd(&dweight[i], dweight_shared[i]);
-	}
+    for(int i = threadIdx.x; i < C; i+= blockDim.x) {
+        atomicAddX(&dbias[i], (Tparams)dbias_shared[i]);
+        atomicAddX(&dweight[i], (Tparams)dweight_shared[i]);
+    }
 }
 
 
@@ -1186,38 +1188,24 @@ void softmax_forward(float* out, float* inp, int N, int C) {
     cudaCheck(cudaGetLastError());
 }
 
-void matmul_backward_fp32(float* dinp, float* dweight, float* dbias,
-                          float* dout, float* inp, float* weight,
-                          int B, int T, int C, int OC) {
-    float one = 1.0f;
-    float zero = 0.0f;
-    // backward to input, uses = in the backward pass (set the gradient)
-    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &one, weight, C, dout, OC, &zero, dinp, C));
-    // backward to weight, uses += in the backward pass (accumulate the gradient)
-    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &one, inp, C, dout, OC, &one, dweight, C));
-    // backward to bias, if given, does a +=
-    if (dbias != NULL) {
-        const int block_size = 1024;
-        const int grid_size = OC / 32; // for now, OC must be divisible by 32 for this kernel to work
-        matmul_backward_bias_kernel4<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
-        cudaCheck(cudaGetLastError());
-    }
-}
-
 void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
                      floatX* dout, floatX* inp, floatX* weight,
                      int B, int T, int C, int OC) {
     float one = 1.0f;
     float zero = 0.0f;
     // backward to input, uses = in the backward pass (set the gradient)
-    cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &one, weight, CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &zero, dinp, CUBLAS_LOWP, C, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &one, 
+                             weight, CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &zero,
+                             dinp, CUBLAS_LOWP, C, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     // backward to weight, uses += in the backward pass (accumulate the gradient)
-    cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &one, inp, CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &one, dweight, CUBLAS_LOWP, C, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &one,
+                             inp, CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &one,
+                             dweight, CUBLAS_LOWP, C, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     // backward to bias, if given, does a +=
     if (dbias != NULL) {
-        const int block_size = 512;
-        const int grid_size = CEIL_DIV(OC * 32, block_size);
-        matmul_backward_bias_kernel2<<<grid_size, block_size>>>(dbias, dout, B, T, OC);
+        const int block_size = 1024;
+        const int grid_size = OC / 32; // for now, OC must be divisible by 32 for this kernel to work
+        matmul_backward_bias_kernel4<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
         cudaCheck(cudaGetLastError());
     }
 }
