@@ -186,7 +186,7 @@ python train_gpt2.py --write_tensors 0 --sequence_length 1024 --batch_size 4 --c
 
 The compilation (first iteration) is ~27 seconds, but after that on my A100 this currently runs at ~80ms/iteration.
 
-**Mixed preicision**. The new CUDA mixed precision version, where most of the development will happen going forward, is [train_gpt2.cu](train_gpt2.cu), along with its test [test_gpt2.cu](test_gpt2.cu). Here, a lot of the calculations happen in lower-precision formats (fp16 or bf16), which allows us to run really fast (~2X of the TF32 performance above). Note that I describe the baseline implementation as `fp32` but, to be more accurate, it is actually a `tf32` (TensorFloat32). To train and test, it's the same commands just drop the fp32 parts:
+**Mixed precision**. The new CUDA mixed precision version, where most of the development will happen going forward, is [train_gpt2.cu](train_gpt2.cu), along with its test [test_gpt2.cu](test_gpt2.cu). Here, a lot of the calculations happen in lower-precision formats (fp16 or bf16), which allows us to run really fast (~2X of the TF32 performance above). Note that I describe the baseline implementation as `fp32` but, to be more accurate, it is actually a `tf32` (TensorFloat32). To train and test, it's the same commands just drop the fp32 parts:
 
 ```bash
 make train_gpt2cu
