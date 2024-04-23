@@ -11,6 +11,7 @@ NVCC := $(shell which nvcc 2>/dev/null)
 # NVCC flags
 NVCC_FLAGS = -O3 --use_fast_math
 NVCC_LDFLAGS = -lcublas -lcublasLt
+NVCC_BFLOAT16_ARGS = -gencode arch=compute_80,code=sm_80
 
 # Function to test if the compiler accepts a given flag.
 define check_and_add_flag
@@ -88,19 +89,19 @@ test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
 
 train_gpt2cu: train_gpt2.cu
-	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $(NVCC_BFLOAT16_ARGS)  $< $(NVCC_LDFLAGS) -o $@
 
 train_gpt2fp32cu: train_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
 
 test_gpt2cu: test_gpt2.cu
-	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $(NVCC_BFLOAT16_ARGS) $< $(NVCC_LDFLAGS) -o $@
 
 test_gpt2fp32cu: test_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
 
 profile_gpt2cu: profile_gpt2.cu
-	$(NVCC) $(NVCC_FLAGS) -lineinfo $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $(NVCC_BFLOAT16_ARGS) -lineinfo $< $(NVCC_LDFLAGS) -o $@
 
 clean:
 	rm -f train_gpt2 test_gpt2 train_gpt2cu train_gpt2fp32cu test_gpt2cu test_gpt2fp32cu
