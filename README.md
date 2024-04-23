@@ -14,11 +14,11 @@ The "I don't care about anything I just want to train and I have a GPU" section.
 pip install -r requirements.txt
 python prepro_tinyshakespeare.py
 python train_gpt2.py
-make train_gpt2cu
-./train_gpt2cu
+make train_gpt2fp32cu
+./train_gpt2fp32cu
 ```
 
-The above lines (1) download the [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset, tokenize it with the GPT-2 Tokenizer, (2) download and save the GPT-2 (124M) weights, (3) init from them in C/CUDA and train for one epoch on tineshakespeare with AdamW (using batch size 4, context length 1024, total of 74 steps), evaluate validation loss, and sample some text.
+The above lines (1) download the [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset, tokenize it with the GPT-2 Tokenizer, (2) download and save the GPT-2 (124M) weights, (3) init from them in C/CUDA and train for one epoch on tineshakespeare with AdamW (using batch size 4, context length 1024, total of 74 steps), evaluate validation loss, and sample some text. Note that in this quickstart we are using the fp32 version [train_gpt2_fp32.cu](train_gpt2_fp32.cu) of the CUDA code. Below in the CUDA section we document the current "mainline" [train_gpt2.cu](train_gpt2.cu), which is still being very actively developed, uses mixed precision, and runs ~2X faster.
 
 ## quick start (CPU)
 
@@ -135,11 +135,13 @@ I attached a very small tutorial here, in [doc/layernorm/layernorm.md](doc/layer
 
 The full training loop is also implemented in pure CUDA in one file, but optimizations of the kernels are ongoing. Currently, we roughly match the speed of PyTorch. The way we organize code is that we have a growing collection of kernels of increasing complexity in the `dev/cuda` folder, see [dev/cuda/README.md](dev/cuda/README.md). We then copy paste the best kernels into the main training loop in the single training file `train_gpt2cu.cu`.
 
+**WIP alert, April 23**. We merged the first version of mixed precision training code. I checkpointed the fp32 version to separate files that include `_fp32` in their filename, and would like to preserve this version in the root of the repo because it 1) doesn't require the most up to date CUDA and will a lot more likely compile and is more portable, 2) it is a lot simpler and acts as reference. The "mainline" development of the CUDA version will from here on move mostly to the [train_gpt2.cu](train_gpt2.cu) file, which includes mixed precision. In the descriptions below I will default to using the fp32 version for now because it is currently more portable and stable, then at the end I will cover to the new mixed precision version.
+
 **Correctness**. First, we can do 10 iterations of training and verify that our code exactly matches and preproduces the numbers from PyTorch:
 
 ```bash
-make test_gpt2cu
-./test_gpt2cu
+make test_gpt2fp32cu
+./test_gpt2fp32cu
 ```
 
 This prints `overall okay: 1`. So the forward activations, backward gradients, and the individual loss values for 10 iterations all match exactly.
@@ -147,8 +149,8 @@ This prints `overall okay: 1`. So the forward activations, backward gradients, a
 **Training**. To train GPT-2 in a single file of CUDA, run the train script:
 
 ```bash
-make train_gpt2cu
-./train_gpt2cu
+make train_gpt2fp32cu
+./train_gpt2fp32cu
 ```
 
 This will load the tiny_shakespeare dataset validation and training splits. At the default settings of B=4, T=1024, there are 8 validation batches and 74 training batches. The script is currently configured to do a single epoch of finetuning with learning rate 1e-4, and along the way it evaluates the validation performance and generates samples, e.g.:
@@ -183,6 +185,18 @@ python train_gpt2.py --write_tensors 0 --sequence_length 1024 --batch_size 4 --c
 ```
 
 The compilation (first iteration) is ~27 seconds, but after that on my A100 this currently runs at ~80ms/iteration.
+
+**Mixed preicision**. The new CUDA mixed precision version, where most of the development will happen going forward, is [train_gpt2.cu](train_gpt2.cu), along with its test [test_gpt2.cu](test_gpt2.cu). Here, a lot of the calculations happen in lower-precision formats (fp16 or bf16), which allows us to run really fast (~2X of the TF32 performance above). Note that I describe the baseline implementation as `fp32` but, to be more accurate, it is actually a `tf32` (TensorFloat32). To train and test, it's the same commands just drop the fp32 parts:
+
+```bash
+make train_gpt2cu
+./train_gpt2cu
+
+make test_gpt2cu
+./test_gpt2cu
+```
+
+If you have the latest CUDA you should expect this to compile OK, and you should see ~2X improved speed (~1.86X to be precise).
 
 ## experiments / sweeps
 

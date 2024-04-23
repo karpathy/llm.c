@@ -66,7 +66,7 @@ else
 endif
 
 # PHONY means these targets will always be executed
-.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu
+.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu
 
 # Add targets
 TARGETS = train_gpt2 test_gpt2
@@ -76,7 +76,7 @@ ifeq ($(NVCC),)
     $(info nvcc not found, skipping CUDA builds)
 else
     $(info nvcc found, including CUDA builds)
-    TARGETS += train_gpt2cu test_gpt2cu
+    TARGETS += train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu
 endif
 
 all: $(TARGETS)
@@ -96,8 +96,11 @@ train_gpt2fp32cu: train_gpt2_fp32.cu
 test_gpt2cu: test_gpt2.cu
 	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
 
+test_gpt2fp32cu: test_gpt2_fp32.cu
+	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
+
 profile_gpt2cu: profile_gpt2.cu
 	$(NVCC) $(NVCC_FLAGS) -lineinfo $< $(NVCC_LDFLAGS) -o $@
 
 clean:
-	rm -f train_gpt2 test_gpt2 train_gpt2cu train_gpt2fp32cu test_gpt2cu
+	rm -f train_gpt2 test_gpt2 train_gpt2cu train_gpt2fp32cu test_gpt2cu test_gpt2fp32cu
