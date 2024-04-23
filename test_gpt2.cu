@@ -102,8 +102,9 @@ int main(int argc, char *argv[]) {
 
     ParameterTensors expected_grads; // will be read from file (from PyTorch)
     ParameterTensors calculated_grads; // will be calculated by us
-    float* expected_grads_memory = malloc_and_point_parameters(&expected_grads, model.param_sizes, 0);
-    float* calculated_grads_memory = malloc_and_point_parameters(&calculated_grads, model.param_sizes, 0);
+    float* expected_grads_memory = malloc_and_point_parameters(&expected_grads, model.param_elements, model.param_sizeof, 0);
+    float* calculated_grads_memory = malloc_and_point_parameters(&calculated_grads, model.param_elements, model.param_sizeof, 0);
+    float* converted_grads_memory = (float*)mallocCheck(model.num_parameters * sizeof(float));
 
     // inputs and expected outputs, only used for error checking
     int* x = (int*)mallocCheck(B * T * sizeof(int));
@@ -126,8 +127,21 @@ int main(int argc, char *argv[]) {
     gpt2_forward(&model, x, NULL, B, T);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
+    floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * V * sizeof(floatX));
     float* logits_cpu = (float*)mallocCheck(B * T * V * sizeof(float));
-    cudaMemcpy(logits_cpu, model.acts.output, B * T * V * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * V * sizeof(floatX), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < B * T * V; i++) {
+        logits_cpu[i] = (float)logits_cpu_raw[i];
+    }
+    int logits_ok = 1;
+
+    // FP16 and lower require very high tolerances unfortunately
+    float accuracy_threshold = 1e-2;
+    #if defined(ENABLE_BF16) || defined(ENABLE_F16)
+    accuracy_threshold = 23;
+    #endif
+
     // let's do 10 training iterations, following the pytorch code
     float losses[10];
     for (int step = 0; step < 10; step++) {
@@ -141,7 +155,6 @@ int main(int argc, char *argv[]) {
 
         if (step == 0) {
             // error checking at step 0 for reference activations
-
             int logits_ok = check_tensor(logits_cpu, expected_logits, B * T * V, "LOGITS", 8.6e-04f);
             allok = allok & logits_ok;
 
@@ -232,11 +245,11 @@ int main(int argc, char *argv[]) {
     free(expected_loss);
     free(expected_grads_memory);
     free(calculated_grads_memory);
+    free(converted_grads_memory);
     gpt2_free(&model);
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
 
-    getchar();
     return 0;
 }

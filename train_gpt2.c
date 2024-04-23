@@ -364,8 +364,10 @@ void gelu_forward(float* out, float* inp, int N) {
 }
 
 // we want to use -Ofast optimization, but sadly GeLU breaks, so disable this flag just for it (#168)
-#pragma float_control(precise, on, push) // On msvc /fp:fast is a lot faster, but the expf inside coshf breaks the model
-__attribute__((optimize("no-finite-math-only"))) // same for gcc -Ofast
+#pragma float_control(precise, on, push)
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-finite-math-only")))
+#endif
 void gelu_backward(float* dinp, float* inp, float* dout, int N) {
     for (int i = 0; i < N; i++) {
         float x = inp[i];
