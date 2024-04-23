@@ -42,7 +42,7 @@ typedef half floatX;
 #else
 typedef float floatX;
 #define CUBLAS_LOWP CUDA_R_32F
-#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+#define CUBLAS_LOWP_COMPUTE cublas_compute_type // auto-select FP32 vs TF32
 #endif
 
 // ----------------------------------------------------------------------------
@@ -266,7 +266,7 @@ __global__ void layernorm_forward_kernel3(TOut* __restrict__ out, float* __restr
 }
 
 // inputs floatX, outputs FP32 (for current FP32-only activation path for this WIP)
-__global__ void permute_kernel(float* q, float* k, float* v,
+__global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
                                const floatX* inp,
                                int B, int N, int NH, int d) {
     // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
@@ -281,14 +281,14 @@ __global__ void permute_kernel(float* q, float* k, float* v,
         int n = rest / d;
         int d_ = rest % d;
         int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-        q[idx] = (float)__ldcs(&inp[inp_idx]);
-        k[idx] = (float)__ldcs(&inp[inp_idx + NH * d]);
-        v[idx] = (float)__ldcs(&inp[inp_idx + 2 * (NH * d)]);
+        q[idx] = __ldcs(&inp[inp_idx]);
+        k[idx] = __ldcs(&inp[inp_idx + NH * d]);
+        v[idx] = __ldcs(&inp[inp_idx + 2 * (NH * d)]);
     }
 }
 
 __global__ void permute_kernel_backward(floatX* dinp,
-                                        const float* dq, const float* dk, const float* dv,
+                                        const floatX* dq, const floatX* dk, const floatX* dv,
                                         int B, int N, int NH, int d) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < B * NH * N * d) {
@@ -300,13 +300,13 @@ __global__ void permute_kernel_backward(floatX* dinp,
         int d_ = rest % d;
 
         int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-        dinp[inp_idx] = (floatX)dq[idx];
-        dinp[inp_idx + NH * d] = (floatX)dk[idx];
-        dinp[inp_idx + 2 * (NH * d)] = (floatX)dv[idx];
+        dinp[inp_idx] = dq[idx];
+        dinp[inp_idx + NH * d] = dk[idx];
+        dinp[inp_idx + 2 * (NH * d)] = dv[idx];
     }
 }
 
-__global__ void unpermute_kernel(float* inp, floatX *out, int B, int N, int NH, int d) {
+__global__ void unpermute_kernel(floatX* inp, floatX *out, int B, int N, int NH, int d) {
    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
@@ -318,11 +318,11 @@ __global__ void unpermute_kernel(float* inp, floatX *out, int B, int N, int NH, 
         int n = rest / d;
         int d_ = rest % d;
         int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-        out[other_idx] = (floatX)__ldcs(&inp[idx]);
+        out[other_idx] = __ldcs(&inp[idx]);
     }
 }
 
-__global__ void unpermute_kernel_backward(float* dinp, const floatX *dout, int B, int N, int NH, int d) {
+__global__ void unpermute_kernel_backward(floatX* dinp, const floatX *dout, int B, int N, int NH, int d) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < B * NH * N * d) {
         int b = idx / (NH * N * d);
@@ -332,7 +332,7 @@ __global__ void unpermute_kernel_backward(float* dinp, const floatX *dout, int B
         int n = rest / d;
         int d_ = rest % d;
         int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-        dinp[idx] = (float)dout[other_idx];
+        dinp[idx] = (floatX)dout[other_idx];
     }
 }
 
@@ -344,7 +344,8 @@ __device__ float vec_at(const float4& vec, int index) {
     return reinterpret_cast<const float*>(&vec)[index];
 }
 
-__global__ void softmax_forward_kernel5(float* out, float inv_temperature, const float* inp, int N, int T) {
+template <typename Type>
+__global__ void softmax_forward_kernel5(Type* out, float inv_temperature, const Type* inp, int N, int T) {
     // inp, out shape: (N, T, T), where N = B * NH
     // fuses the multiplication by scale inside attention
     // directly autoregressive, so we only compute the lower triangular part
@@ -365,22 +366,26 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     int pos_by_4 = own_pos / 4;
 
     // one row of inp, i.e. inp[idx, :] of shape (T,)
-    const float* x = inp + idx * T;
+    const Type* x = inp + idx * T;
 
     // not INF, so we don't get NaNs accidentally when subtracting two values.
     float maxval = -FLT_MAX;
     float sumval = 0.0f;
 
-    const float4* x_vec = reinterpret_cast<const float4*>(x);
+    const Type* x_aligned = reinterpret_cast<const Type*>(__builtin_assume_aligned(x, 16));
     for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
-        float4 v = x_vec[i];
+        float regarray[4];
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            regarray[k] = (float)x_aligned[4*i + k];
+        }
         float old_maxval = maxval;
         for(int k = 0; k < 4; ++k) {
-            maxval = fmaxf(maxval, vec_at(v, k));
+            maxval = fmaxf(maxval, regarray[k]);
         }
         sumval *= expf(inv_temperature * (old_maxval - maxval));
         for(int k = 0; k < 4; ++k) {
-            sumval += expf(inv_temperature * (vec_at(v, k) - maxval));
+            sumval += expf(inv_temperature * (regarray[k] - maxval));
         }
     }
 
@@ -388,7 +393,7 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
         float old_maxval = maxval;
         maxval = fmaxf(maxval, x[4*pos_by_4 + warp.thread_rank()]);
         sumval *= expf(inv_temperature * (old_maxval - maxval));
-        sumval += expf(inv_temperature * (x[4*pos_by_4 + warp.thread_rank()] - maxval));
+        sumval += expf(inv_temperature * ((float)x[4*pos_by_4 + warp.thread_rank()] - maxval));
     }
 
     float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
@@ -400,8 +405,8 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     // divide the whole row by the sum
     for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
         // recalculation is faster than doing the round-trip through memory.
-        float ev = expf(inv_temperature * (__ldcs(x + i) - global_maxval));
-        __stcs(out + idx * T + i, ev * norm);
+        float ev = expf(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
+        __stcs(out + idx * T + i, (Type)(ev * norm));
     }
 }
 
@@ -635,7 +640,7 @@ __global__ void layernorm_backward_kernel(Tdinp* dinp, float* dweight, float* db
 }
 
 
-__global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
+__global__ void softmax_autoregressive_backward_kernel(floatX* dpreatt, const floatX* datt, const floatX* att,
                                                        int B, int T, int C, float scale) {
     constexpr const int BlockSize = 256;
     constexpr int T_per_block = 4;
@@ -658,13 +663,13 @@ __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const flo
     for(int to = 0; to < T_per_block; ++to) {
         int t = t0 - to;
         if(t < 0) return;
-        const float* att_bth = att + t * T;
-        const float* datt_bth = datt + t * T;
-        float* dpreatt_bth = dpreatt + t * T;
+        const floatX* att_bth = att + t * T;
+        const floatX* datt_bth = datt + t * T;
+        floatX* dpreatt_bth = dpreatt + t * T;
 
         float local_sum = 0;
         for (int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
-            local_sum += att_bth[t2] * datt_bth[t2];
+            local_sum += (float)att_bth[t2] * (float)datt_bth[t2];
         }
 
         block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
@@ -674,7 +679,7 @@ __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const flo
         for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
             // don't touch the cache. Some parts will still be here from the previous loop, and
             // we want to exploit those.
-            float acc = __ldcs(att_bth + t3) * (__ldcs(datt_bth + t3) - local_sum);
+            float acc = (float)__ldcs(att_bth + t3) * ((float)__ldcs(datt_bth + t3) - local_sum);
             __stcs(dpreatt_bth + t3, scale * acc);
         }
     }
@@ -899,17 +904,8 @@ void encoder_backward(float* dwte, float* dwpe,
     cudaCheck(cudaGetLastError());
 }
 
-void layernorm_forward(float* out, float* mean, float* rstd,
-                       float* inp, float* weight, float* bias,
-                       int B, int T, int C) {
-    const int block_size = 512;
-    const int N = B * T;
-    const int grid_size = CEIL_DIV(N * 32, block_size);
-    layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
-    cudaCheck(cudaGetLastError());
-}
-
-void layernorm_forward(floatX* out, float* mean, float* rstd,
+template <typename TOut>
+void layernorm_forward(TOut* out, float* mean, float* rstd,
                        float* inp, float* weight, float* bias,
                        int B, int T, int C) {
     const int block_size = 512;
@@ -1008,7 +1004,7 @@ void matmul_forward_cublaslt(floatX* out,
     cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
 }
 
-void attention_forward(floatX* out, float* qkvr, float* att,
+void attention_forward(floatX* out, floatX* qkvr, floatX* att,
                        floatX* inp,
                        int B, int T, int C, int NH) {
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
@@ -1022,7 +1018,7 @@ void attention_forward(floatX* out, float* qkvr, float* att,
     int HS = C / NH; // head size
 
     // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
-    float *q, *k, *v;
+    floatX *q, *k, *v;
     q = qkvr + 0 * B * T * C;
     k = qkvr + 1 * B * T * C;
     v = qkvr + 2 * B * T * C;
@@ -1031,11 +1027,27 @@ void attention_forward(floatX* out, float* qkvr, float* att,
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 
-    // batched matrix multiply with cuBLAS
+    // IMPORTANT: alpha/beta are FP32 for CUBLAS_COMPUTE_32F even if FP16 inputs/outputs
+    // But need FP16 scale for CUBLAS_COMPUTE_16F (no errors otherwise, just garbage results *sigh*)
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    float* preatt = (float*)inp;
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha, k, HS, T * HS, q, HS, T * HS, &beta, preatt, T, T * T, B * NH));
+    const floatX alpha_lowp = (floatX)alpha;
+    const floatX beta_lowp = (floatX)beta;
+    void* alpha_ptr = (CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F) ? (void*)&alpha_lowp : (void*)&alpha;
+    void* beta_ptr = (CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F) ? (void*)&beta_lowp : (void*)&beta;
+    
+    floatX* preatt = inp;
+    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
+                                     CUBLAS_OP_T, CUBLAS_OP_N,
+                                     T, T, HS,
+                                     alpha_ptr,
+                                     k, CUBLAS_LOWP, HS, T * HS,
+                                     q, CUBLAS_LOWP, HS, T * HS,
+                                     beta_ptr,
+                                     preatt, CUBLAS_LOWP, T, T * T,
+                                     B * NH,
+                                     CUBLAS_LOWP_COMPUTE,
+                                     CUBLAS_GEMM_DEFAULT));
 
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
@@ -1044,10 +1056,20 @@ void attention_forward(floatX* out, float* qkvr, float* att,
     cudaCheck(cudaGetLastError());
 
     // new approach: first cuBLAS another batched matmul
-    float* vaccum = (float*)inp;
+    floatX* vaccum = inp;
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha, v, HS, T * HS, att, T, T * T, &beta, vaccum, HS, T * HS, B * NH));
-
+    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
+                                     CUBLAS_OP_N, CUBLAS_OP_N,
+                                     HS, T, T,
+                                     alpha_ptr,
+                                     v, CUBLAS_LOWP, HS, T * HS,
+                                     att, CUBLAS_LOWP, T, T * T,
+                                     beta_ptr,
+                                     vaccum, CUBLAS_LOWP, HS, T * HS,
+                                     B * NH,
+                                     CUBLAS_LOWP_COMPUTE,
+                                     CUBLAS_GEMM_DEFAULT));
+    
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
@@ -1055,14 +1077,8 @@ void attention_forward(floatX* out, float* qkvr, float* att,
     cudaCheck(cudaGetLastError());
 }
 
-void residual_forward(float* out, float* inp1, float* inp2, int N) {
-    const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
-    residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
-    cudaCheck(cudaGetLastError());
-}
-
-void residual_forward(float* out, float* inp1, floatX* inp2, int N) {
+template <typename TOut, typename T1, typename T2>
+void residual_forward(TOut* out, T1* inp1, T2* inp2, int N) {
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
     residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
@@ -1127,8 +1143,9 @@ void matmul_backward_lowp(floatX* dinp, floatX* dweight, floatX* dbias,
     }
 }
 
-void layernorm_backward(floatX* dinp, float* dweight, float* dbias,
-                        const float* dout, const float* inp, const  float* weight, const float* mean, const float* rstd,
+template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
+void layernorm_backward(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
+                        const Tdout* dout, const Trest* inp, const Trest* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C) {
     const int block_size = 256;
     const int N = B * T;
@@ -1137,55 +1154,62 @@ void layernorm_backward(floatX* dinp, float* dweight, float* dbias,
     layernorm_backward_kernel<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
-
-void layernorm_backward_mixedp(floatX* dinp, float* dweight, float* dbias,
-                        const floatX* dout, const float* inp, const  float* weight, const float* mean, const float* rstd,
-                        int B, int T, int C) {
-    const int block_size = 256;
-    const int N = B * T;
-    // one warp per token, so we need to divide by 32 here.
-    const int grid_size = CEIL_DIV(N, block_size / 32);
-    layernorm_backward_kernel<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
-    cudaCheck(cudaGetLastError());
-}
-
 
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
-void attention_backward(floatX* dinp, float* dqkvr, float* dpreatt, float* datt, float* scratch,
+void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* datt, floatX* scratch,
                         const floatX* dout,
-                        const float* qkvr, const float* att,
+                        const floatX* qkvr, const floatX* att,
                         int B, int T, int C, int NH) {
     const int block_size = 256;
     int HS = C / NH; // head size
-    const float one = 1.0f;
-    const float zero = 0.0f; // note beta = 1.0f so that we accumulate gradients (+=)
+
+    // FP16 alpha/beta need to be used if and only if CUBLAS_COMPUTE_16F
+    const float alpha = 1.0f, beta = 0.0f;
+    const half alpha_fp16 = (half)alpha, beta_fp16 = (half)beta;
+    const void* alpha_ptr = (CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F) ?
+                            (const void*)&alpha_fp16 : (const void*)&alpha;
+    const void* beta_ptr =  (CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F) ?
+                            (const void*)&beta_fp16 : (const void*)&beta;
+
     // unpack convenience pointers into q, k, v
-    const float *q, *k, *v;
+    const floatX *q, *k, *v;
     q = qkvr + 0 * B * T * C;
     k = qkvr + 1 * B * T * C;
     v = qkvr + 2 * B * T * C;
-    float *dq, *dk, *dv;
+    floatX *dq, *dk, *dv;
     dq = dqkvr + 0 * B * T * C;
     dk = dqkvr + 1 * B * T * C;
     dv = dqkvr + 2 * B * T * C;
+
     // backward through the unpermute operation
     int num_blocks = CEIL_DIV(B * T * C, block_size);
     unpermute_kernel_backward<<<num_blocks, block_size>>>(scratch, dout, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
     // backward into datt
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &one, v, HS, T * HS, scratch, HS, T * HS, &zero, datt, T, T * T, B * NH));
+    
+    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, alpha_ptr,
+                                           v, CUBLAS_LOWP, HS, T * HS, scratch, CUBLAS_LOWP, HS, T * HS, beta_ptr,
+                                           datt, CUBLAS_LOWP, T, T * T, B * NH, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT));
+
     // backward into dv
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, scratch, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH));
+    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, alpha_ptr,
+                                           scratch, CUBLAS_LOWP, HS, T * HS, att, CUBLAS_LOWP, T, T * T, beta_ptr, 
+                                           dv, CUBLAS_LOWP, HS, T * HS, B * NH, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT));
+
     // backward into preatt
     int hs = C / NH; // head size
     float scale = 1.0f / sqrtf(hs);
     softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, C, scale);
     cudaCheck(cudaGetLastError());
     // backward into q
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &one, k, HS, T * HS, dpreatt, T, T * T, &zero, dq, HS, T * HS, B * NH));
+    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, alpha_ptr,
+                                           k, CUBLAS_LOWP, HS, T * HS, dpreatt, CUBLAS_LOWP, T, T * T, beta_ptr,
+                                           dq, CUBLAS_LOWP, HS, T * HS, B * NH, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT));
     // backward into k
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, q, HS, T * HS, dpreatt, T, T * T, &zero, dk, HS, T * HS, B * NH));
+    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, alpha_ptr,
+                                           q, CUBLAS_LOWP, HS, T * HS, dpreatt, CUBLAS_LOWP, T, T * T, beta_ptr,
+                                           dk, CUBLAS_LOWP, HS, T * HS, B * NH, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT));
     // backward into inp
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
     permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
@@ -1294,7 +1318,7 @@ typedef struct {
     float* ln1_mean; // (L, B, T)
     float* ln1_rstd; // (L, B, T)
     floatX* atty; // (L, B, T, C)
-    float* att; // (L, B, NH, T, T)
+    floatX* att; // (L, B, NH, T, T)
     floatX* attproj; // (L, B, T, C)
     float* residual2; // (L, B, T, C)
     floatX* ln2; // (L, B, T, C)
@@ -1310,7 +1334,7 @@ typedef struct {
 
     float* losses; // (B, T)
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
-    float* qkvr; // (L, B, T, 3*C)
+    floatX* qkvr; // (L, B, T, 3*C)
     // in inference mode, this buffer will store the logits
     // in training mode, this buffer will contain the *gradients* of the logits.
     // during the processing of transformer blocks, we will also use this as a
@@ -1625,9 +1649,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         floatX* l_ln1 = acts.ln1 + l * B * T * C;
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float* l_qkvr = acts.qkvr + l * B * T * 3*C;
+        floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
-        float* l_att = acts.att + l * B * NH * T * T;
+        floatX* l_att = acts.att + l * B * NH * T * T;
         floatX* l_attproj = acts.attproj + l * B * T * C;
         float* l_residual2 = acts.residual2 + l * B * T * C;
         floatX* l_ln2 = acts.ln2 + l * B * T * C;
@@ -1764,9 +1788,9 @@ void gpt2_backward(GPT2 *model) {
         floatX* l_ln1 = acts.ln1 + l * B * T * C;
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float* l_qkvr = acts.qkvr + l * B * T * 3*C;
+        floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
-        float* l_att = acts.att + l * B * NH * T * T;
+        floatX* l_att = acts.att + l * B * NH * T * T;
         float* l_residual2 = acts.residual2 + l * B * T * C;
         floatX* l_ln2 = acts.ln2 + l * B * T * C;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
@@ -1781,26 +1805,26 @@ void gpt2_backward(GPT2 *model) {
         // so we can co-opt it here.
         floatX* dl_btc = (floatX*)acts.lnf;
         floatX* dl_bt4c = (floatX*)grads_acts.bt4c;
-        float* dl_preatt = grads_acts.preatt;
+        floatX* dl_preatt = (floatX*)grads_acts.preatt;
 
         // re-use scratch buffer of the forward pass
-        float* scratch = acts.output;
+        floatX* scratch = (floatX*)acts.output;
 
         // backprop this layer
         matmul_backward_lowp(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
         gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C);
         matmul_backward_lowp(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, B, T, C, 4 * C);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
-        layernorm_backward_mixedp(dresidual, dl_ln2w, dl_ln2b, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
+        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
         matmul_backward_lowp(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
         // we more B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
-        float* buffer_a = (float*)l_atty;
-        float* buffer_b = (float*)l_fch;        // this is B x T x 4C, so even larger than what we need
+        floatX* buffer_a = l_atty;
+        floatX* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
 
         attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
         matmul_backward_lowp(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
-        layernorm_backward_mixedp(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
 }
