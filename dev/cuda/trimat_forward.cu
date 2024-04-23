@@ -365,7 +365,7 @@ __device__ void st_vec(float* address, float4 val) {
 }
 
 // vector instructions for coalesced memory access: 1.7 ms
-__device__ void matmul_tri3(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
+__device__ void matmul_tri_vectorized(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
     int i_base = 128 * blockIdx.x + 8 * threadIdx.x;
     int j_base = 128 * blockIdx.y + 8 * threadIdx.y;
 
@@ -440,6 +440,11 @@ __device__ void matmul_tri4(float* p, int ps, const float* k, int ks, const floa
     __shared__ float lhs_s[128][32];
     __shared__ float rhs_s[128][32];
 
+    // The different threads will go through the inner loop not in sync, but with a specific
+    // offset so that shared memory will be accessed conflict-free. Calculating the loop
+    // counter once results in noticeably fewer instructions generated.
+    int si_start = 16 * threadIdx.y + threadIdx.x;
+
     float vals[8][8] = {};
     for (int so = 0; so < hs; so += 32) {
         // Read a large slice of the input, worked on together by all threads.
@@ -457,14 +462,18 @@ __device__ void matmul_tri4(float* p, int ps, const float* k, int ks, const floa
         }
         __syncthreads();
 
-        for (int si = 0; si < 32; ++si) {
+        // Note: This loop-counter deliberately overflows the maximum value of 32.
+        // By doing % 32 inside, we ensure that we warp-around.
+        for (int s = si_start; s < si_start + 32; ++s) {
+            // shuffle the order in which different threads go through this sum to ensure
+            // coalesced access.
             float rhs[8];
             for (int u = 0; u < 8; ++u) {
-                rhs[u] = rhs_s[u + 8 * threadIdx.y][(si + threadIdx.x) % 32];
+                rhs[u] = rhs_s[u + 8 * threadIdx.y][s%32];
             }
 
             for (int ii = 0; ii < 8; ++ii) {
-                float lhs = lhs_s[ii + 8 * threadIdx.x][(si + threadIdx.x) % 32];
+                float lhs = lhs_s[ii + 8 * threadIdx.x][s%32];
                 for (int ji = 0; ji < 8; ++ji) {
                     vals[ii][ji] += lhs * rhs[ji];
                 }
@@ -518,7 +527,7 @@ void trimul_gpu(int kernel_num,
             trimul_launcher<matmul_tri_registers>(out, inp, B, T, C, NH);
             break;
         case 3:
-            trimul_launcher<matmul_tri3>(out, inp, B, T, C, NH);
+            trimul_launcher<matmul_tri_vectorized>(out, inp, B, T, C, NH);
             break;
         case 4:
             trimul_launcher<matmul_tri4>(out, inp, B, T, C, NH);
