@@ -12,16 +12,30 @@ NVCC := $(shell which nvcc 2>/dev/null)
 NVCC_FLAGS = -O3 --use_fast_math
 NVCC_LDFLAGS = -lcublas -lcublasLt
 
+# CUDA precision
+ENABLE_BF16 ?= 1
+ENABLE_FP16 ?= 0
+PRECISION_CHECK_LIST = ENABLE_FP16 ENABLE_BF16
+
 # Function to test if the compiler accepts a given flag.
-define check_and_add_flag
-    $(eval FLAG_SUPPORTED := $(shell printf "int main() { return 0; }\n" | $(CC) $(1) -x c - -o /dev/null 2>/dev/null && echo 'yes'))
+define check_and_add_compiler_flag
+  $(eval FLAG_SUPPORTED := $(shell printf "int main() { return 0; }\n" | $(CC) $(1) -x c - -o /dev/null 2>/dev/null && echo 'yes'))
     ifeq ($(FLAG_SUPPORTED),yes)
-        CFLAGS += $(1)
-    endif
+      CFLAGS += $(1)
+  endif
 endef
 
 # Check each flag and add it if supported
-$(foreach flag,$(CFLAGS_COND),$(eval $(call check_and_add_flag,$(flag))))
+$(foreach flag,$(CFLAGS_COND),$(eval $(call check_and_add_compiler_flag,$(flag))))
+
+# Function to see if an nvcc compiler flag should be added
+define check_and_add_nvcc_compiler_define
+  ifeq ($($(1)), 1)
+    NVCC_FLAGS += -Xcompiler -D$(1)
+  endif
+endef
+
+$(foreach flag,$(PRECISION_CHECK_LIST),$(eval $(call check_and_add_nvcc_compiler_define,$(flag))))
 
 # Check if OpenMP is available
 # This is done by attempting to compile an empty file with OpenMP flags
@@ -76,6 +90,7 @@ ifeq ($(NVCC),)
     $(info nvcc not found, skipping CUDA builds)
 else
     $(info nvcc found, including CUDA builds)
+    $(info CUDA flags: $(NVCC_FLAGS))
     TARGETS += train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu
 endif
 

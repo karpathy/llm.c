@@ -34,9 +34,9 @@ and fp8 (coming soon^TM).
 
 // ----------------------------------------------------------------------------
 // CUDA precision settings
-
-// turn on bf16 as default, done up here for now
-#define ENABLE_BF16
+//
+//#define ENABLE_BF16
+//#define ENABLE_FP16
 
 // use bf16 (bfloat 16)
 #if defined(ENABLE_BF16)
@@ -96,6 +96,7 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
 
 // GPU helper functions for atomicAdd on smaller than 32-bit types
+#if defined(ENABLE_BF16) || defined(ENABLE_FP16)
 __device__ void atomicAddX(__nv_bfloat16* addr, __nv_bfloat16 val) {
     uintptr_t ptr_val = reinterpret_cast<uintptr_t>(addr);
     __nv_bfloat162* ptr_bf16 = reinterpret_cast<__nv_bfloat162*>(ptr_val & ~uintptr_t(0x3));
@@ -114,6 +115,8 @@ __device__ void atomicAddX(half* addr, half val) {
                                     : __halves2half2(val, __ushort_as_half(0));
     atomicAdd(ptr_fp16, add_val);
 }
+#endif
+
 __device__ void atomicAddX(float* addr, float val) {
     atomicAdd(addr, val);
 }
