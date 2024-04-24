@@ -1672,7 +1672,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         fill_in_activation_sizes(model->act_sizes, B, T, model->config);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-            num_activations += model->act_sizes[i] * sizeof(floatX);
+            num_activations += model->act_sizes[i];
         }
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
