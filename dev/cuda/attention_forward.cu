@@ -2,7 +2,7 @@
 Kernels for attention forward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math -I<PATH_TO_CUTLASS>/cutlass/include attention_forward.cu --expt-relaxed-constexpr -o attention_forward -lcublas && ./attention_forward 5
+nvcc -O3 --use_fast_math -I<PATH_TO_CUTLASS>/cutlass/include attention_forward.cu --expt-relaxed-constexpr -o attention_forward -lcublas
 
 version 1 is naive port from CPU code to kernel, parallelize over batch, time, heads only
 ./attention_forward 1
