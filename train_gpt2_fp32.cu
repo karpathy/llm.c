@@ -392,12 +392,21 @@ __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, in
 }
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__global__ void gelu_forward_kernel(float* out, const float* inp, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void gelu_forward_kernel(float4* out, const float4* inp, int N) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x); 
+    int i = idx * 4; // Each thread handles 4 floats
     if (i < N) {
-        float xi = inp[i];
-        float cube = 0.044715f * xi * xi * xi;
-        out[i] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
+        float4 xi = inp[idx];
+        float4 gelu;
+
+        for (int j = 0; j < 4; ++j) {
+            if (i + j < N) { // Check bounds for each element
+                float x = vec_at(xi, j);
+                float cube = 0.044715f * x * x * x;
+                vec_at(gelu, j) = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
+            }
+        }
+        out[idx] = gelu;
     }
 }
 
@@ -977,8 +986,8 @@ void residual_forward(float* out, float* inp1, float* inp2, int N) {
 
 void gelu_forward(float* out, const float* inp, int N) {
     const int block_size = 128;
-    const int grid_size = CEIL_DIV(N, block_size);
-    gelu_forward_kernel<<<grid_size, block_size>>>(out, inp, N);
+    const int grid_size = CEIL_DIV(N/4, block_size);
+    gelu_forward_kernel<<<grid_size, block_size>>>((float4 *)out, (float4 *)inp, N);
     cudaCheck(cudaGetLastError());
 }
 

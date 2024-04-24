@@ -18,6 +18,10 @@ version 1 is naive port from CPU code to kernel
 #include <cuda_runtime.h>
 #include "common.h"
 
+__device__ float& vec_at(float4& vec, int index) {
+    return reinterpret_cast<float*>(&vec)[index];
+}
+
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -44,12 +48,37 @@ __global__ void gelu_kernel(float* out, const float* inp, int N) {
     }
 }
 
+// Optimized GELU kernel using float4
+__global__ void gelu_kernel2(float4* out, const float4* inp, int N) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x); 
+    int i = idx * 4; // Each thread handles 4 floats
+    if (i < N) {
+        float4 xi = inp[idx];
+        float4 gelu;
+
+        for (int j = 0; j < 4; ++j) {
+            if (i + j < N) { // Check bounds for each element
+                float x = vec_at(xi, j);
+                float cube = 0.044715f * x * x * x;
+                vec_at(gelu, j) = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
+            }
+        }
+        out[idx] = gelu;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
 void gelu_forward1(float* out, const float* inp, int N, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
     gelu_kernel<<<grid_size, block_size>>>(out, inp, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void gelu_forward2(float* out, const float* inp, int N, const int block_size) {
+    const int grid_size = ceil_div(N/4, block_size);
+    gelu_kernel2<<<grid_size, block_size>>>((float4 *)out, (float4 *)inp, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -63,6 +92,9 @@ void gelu_forward(int kernel_num,
         case 1:
             gelu_forward1(out, inp, B * T * C, block_size);
             break;
+        case 2:
+            gelu_forward2(out, inp, B * T * C, block_size);
+            break;
         default:
             printf("Invalid kernel number\n");
             exit(1);
@@ -75,7 +107,7 @@ int main(int argc, char **argv) {
     srand(0);
 
     int B = 8;
-    int T = 1024;
+    int T = 1024*64; //Updated value to be a better time comparison to train times
     int C = 768;
 
     int deviceIdx = 0;
