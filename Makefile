@@ -38,7 +38,7 @@ else
   INCLUDES :=
   NVCC_FLAGS += -I"dev"
   WIN_CUDA_RENAME = rename $@.exe $@
-	OUTPUT_FILE = /link /OUT:$@
+  OUTPUT_FILE = /link /OUT:$@
 endif
 
 # Check if OpenMP is available
@@ -85,8 +85,8 @@ else
   endif
 endif
 
-# DEFAULT means these targets will always be executed
-.DEFAULT: all 
+# Force the rebuild of targets - CI relies on this.
+.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu
 
 # Add targets
 TARGETS = train_gpt2 test_gpt2
