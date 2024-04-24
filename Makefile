@@ -85,7 +85,7 @@ else
   endif
 endif
 
-# Force the rebuild of targets - CI relies on this.
+# Force the rebuild of targets
 .PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu
 
 # Add targets
