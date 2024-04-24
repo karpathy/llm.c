@@ -269,6 +269,10 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 
 - Metal
   - [llm.metal](https://github.com/regrettable-username/llm.metal) by @[regrettable-username](https://github.com/regrettable-username): LLM training in simple, raw C/Metal Shading Language
+
+- Zig
+  - [llm.zig]() by @[saimirbaci](https://github.com/Saimirbaci/llm.zig/): a Zig port of this project
+
 ## discussions
 
 Ways of organizing development:
