@@ -323,6 +323,7 @@ if __name__ == "__main__":
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
+    parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
     parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
@@ -333,12 +334,16 @@ if __name__ == "__main__":
     assert 1 <= T <= 1024
     assert args.dtype in {"float32", "float16", "bfloat16"}
 
-    # select a reasonable device to run on
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
+    # select the device
+    if args.device:
+        device = args.device
+    else:
+        # attempt to autodetect the device
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
     print(f"using device: {device}")
 
     # create a context manager following the desired dtype and device
