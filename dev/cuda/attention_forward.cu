@@ -3,6 +3,7 @@ Kernels for attention forward pass.
 
 Compile example:
 nvcc -O3 --use_fast_math -I<PATH_TO_CUTLASS>/cutlass/include attention_forward.cu --expt-relaxed-constexpr -o attention_forward -lcublas
+nvcc -O3 --use_fast_math -I/content/cutlass/include attention_forward.cu --expt-relaxed-constexpr -o attention_forward -lcublas --generate-line-info  && ./attention_forward 6
 
 version 1 is naive port from CPU code to kernel, parallelize over batch, time, heads only
 ./attention_forward 1
@@ -171,8 +172,8 @@ __global__ void attention_query_key_kernel2(float *preatt, const float *inp,
     Layout QK_layout = make_layout(make_shape(B, NH, T, HS), make_stride(T * C3, HS, C3, 1));
     Layout Attn_layout = make_layout(make_shape(B, NH, T, T), make_stride(T * T * NH, T * T, T, 1));
 
-    Layout sQ_layout = make_layout(make_shape(Int<16>{}, Int<64>{}), make_stride(Int<64>{}, Int<1>{}));
-    Layout sK_layout = make_layout(make_shape(Int<16>{}, Int<64>{}), make_stride(Int<64>{}, Int<1>{}));
+    Layout sQ_layout = make_layout(make_shape(Int<32>{}, Int<64>{}), make_stride(Int<64>{}, Int<1>{}));
+    Layout sK_layout = make_layout(make_shape(Int<32>{}, Int<64>{}), make_stride(Int<64>{}, Int<1>{}));
 
     // gmem means global memory
     Tensor mQ = make_tensor(make_gmem_ptr(inp), QK_layout);           // (B, NH, T, HS)
@@ -191,13 +192,13 @@ __global__ void attention_query_key_kernel2(float *preatt, const float *inp,
     Tensor sQ = make_tensor(make_smem_ptr(smemQ), sQ_layout);
     Tensor sK = make_tensor(make_smem_ptr(smemK), sK_layout);
 
-    int t = threadIdx.x / 16;  // <- This should go away when we make gemm work
-    int t2 = threadIdx.x % 16; // <- This should go away when we make gemm work
+    // int t = threadIdx.x;  // <- This should go away when we make gemm work
+    // int t2 = threadIdx.x % 16; // <- This should go away when we make gemm work
 
     // Define the thread layout
-    Layout tQ = make_layout(make_shape(Int<4>{}, Int<64>{}), make_stride(Int<64>{}, Int<1>{}));
-    Layout tK = make_layout(make_shape(Int<4>{}, Int<64>{}), make_stride(Int<64>{}, Int<1>{}));
-    Layout tC = make_layout(make_shape(Int<16>{}, Int<16>{}), make_stride(Int<16>{}, Int<1>{}));
+    Layout tQ = make_layout(make_shape(Int<1>{}, Int<32>{}));
+    Layout tK = make_layout(make_shape(Int<1>{}, Int<32>{}));
+    Layout tC = make_layout(make_shape(Int<4>{}, Int<8>{}));
 
     // Lets assing each thread to 'tile' of items, so every thread participates in the copy
     Tensor tQgQ = local_partition(gQ, tQ, threadIdx.x);
@@ -210,7 +211,7 @@ __global__ void attention_query_key_kernel2(float *preatt, const float *inp,
     {
         // My intuition says this should be outside the loop
         Tensor tKgK = local_partition(gK(make_coord(_, _), k_tile), tK, threadIdx.x);
-        Tensor ggPreatt = zipped_divide(gPreatt, make_tile(Int<16>{}, Int<16>{}))(make_coord(_, _), k_tile);
+        Tensor ggPreatt = zipped_divide(gPreatt, make_tile(Int<32>{}, Int<32>{}))(make_coord(_, _), k_tile);
         
         copy(tKgK, tKsK);
 
@@ -218,11 +219,11 @@ __global__ void attention_query_key_kernel2(float *preatt, const float *inp,
         cp_async_wait<0>(); // Sync on all (potential) cp.async instructions
         __syncthreads();    // Wait for all threads to write to smem
 
-        Tensor tCggPreatt = local_partition(ggPreatt, tC, threadIdx.x, Step<_1,_1>{});
+        Tensor tCggPreatt = local_partition(ggPreatt, tC, threadIdx.x, Step<_1,_1>{}); // This should be a 1x8 or 8x1 tile...
         Tensor tCsQ = local_partition(sQ, tC, threadIdx.x, Step<_1, X>{});   // (THR_M,BLK_K)
         Tensor tCsK = local_partition(sK, tC, threadIdx.x, Step< X,_1>{});   // (THR_M,BLK_K)
         
-        Tensor tCrC = make_tensor_like(tCggPreatt); // (THR_M,THR_N)
+        Tensor tCrC = make_tensor_like(tCggPreatt); // (THR_M,THR_N) 8x4
 
         if (block < k_tile) {
             // No need to matrix multiply, this will be all masked
@@ -232,13 +233,22 @@ __global__ void attention_query_key_kernel2(float *preatt, const float *inp,
             // We know that the diagonal is all -INFINITY
             gemm(tCsQ, tCsK, tCrC); //<- This is not working.
             __syncthreads();
-            if(t < t2) {
-                tCrC(t, t2) = -INFINITY;
-            }
-           
-            __syncthreads();
+
             axpby(softmax_scale, tCrC, 0.0, tCggPreatt);
-            
+                        // apply causal mask
+            __syncthreads();
+
+            for (int t = 0; t < Bc / blockDim.x; ++t)
+            {
+                for (int t2 = 0; t2 < Br; ++t2)
+                {   
+                    auto tt = threadIdx.x * (t + 1);
+                    if(tt > t2) {
+                        ggPreatt(t2, tt) = -INFINITY;
+                    }
+                    
+                }
+            }
         }
         else
         {   
@@ -966,6 +976,7 @@ void attention_forward5(float* out, float* preatt, float* att,
     // attention calculation
     int x_blocks = ceil_div(T, block_size / 32);
     attention_forward_fused1<<<dim3(x_blocks, NH, B), block_size>>>(out, preatt, att, inp, B, T, C, NH);
+}
 
 void attention_forward6(float *out, float *preatt, float *att,
                         const float *inp,
@@ -973,15 +984,15 @@ void attention_forward6(float *out, float *preatt, float *att,
                         const int block_size)
 {
   // attention calculation
-  const int Bc = 16;
-  const int Br = 16;
+  const int Bc = 32;
+  const int Br = 32;
   const int HS = C / NH;
   // more
   const int Tc = ceil((float)T / Bc);
   const int Tr = ceil((float)T / Br);
   const float softmax_scale = 1.0 / sqrt(HS);
   const int sram_size = (Bc + Br) * HS * sizeof(float);
-  int total_threads = Br * Bc;
+  int total_threads = 32;
   int num_blocks = B * NH;
   dim3 dimGrid(Tr, B, NH);
   attention_query_key_kernel2<<<dimGrid, total_threads, sram_size>>>(preatt, inp, B, T, C, NH, HS, Br, Bc, Tr, Tc, softmax_scale);
