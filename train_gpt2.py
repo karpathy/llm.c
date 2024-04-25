@@ -230,10 +230,6 @@ def write_bf16(tensor, file):
 def write_tensors_fp32(model_tensors, L, file):
     write_fp32(model_tensors["transformer.wte.weight"], file) # (V, C)
     write_fp32(model_tensors["transformer.wpe.weight"], file) # (T, C)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
     for i in range(L): # (L, 3C, C)
         write_fp32(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
     for i in range(L): # (L, 3C)
@@ -242,10 +238,6 @@ def write_tensors_fp32(model_tensors, L, file):
         write_fp32(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
     for i in range(L): # (L, C)
         write_fp32(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
     for i in range(L): # (L, 4C, C)
         write_fp32(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
     for i in range(L): # (L, 4C)
@@ -254,6 +246,16 @@ def write_tensors_fp32(model_tensors, L, file):
         write_fp32(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
     for i in range(L): # (L, C)
         write_fp32(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
+
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
+
     write_fp32(model_tensors["transformer.ln_f.weight"], file) # (C, )
     write_fp32(model_tensors["transformer.ln_f.bias"], file) # (C, )
 
