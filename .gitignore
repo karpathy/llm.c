@@ -1,6 +1,6 @@
 # dot files and such
-.*
-!.gitignore
+.vscode/
+.venv/
 
 # data files
 data/
