@@ -328,6 +328,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
     parser.add_argument("--batch_size", type=int, default=4, help="batch size")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
+    parser.add_argument("--device", type=str, default=None, help="device to use (e.g., 'cpu', 'cuda:0')")
+
     args = parser.parse_args()
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
@@ -339,6 +341,9 @@ if __name__ == "__main__":
         device = "cuda"
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = "mps"
+    # Override with device argument if set
+    if args.device:
+        device = args.device
     print(f"using device: {device}")
 
     # create a context manager following the desired dtype and device
