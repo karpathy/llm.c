@@ -275,6 +275,9 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 - Zig
   - [llm.zig]() by @[saimirbaci](https://github.com/Saimirbaci/llm.zig/): a Zig port of this project
 
+- Go
+  - [llm.go](https://github.com/joshcarp/llm.go) by @[joshcarp](https://github.com/joshcarp): a Go port of this project
+
 ## discussions
 
 Ways of organizing development:
