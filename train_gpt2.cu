@@ -96,6 +96,7 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
 
 // GPU helper functions for atomicAdd on smaller than 32-bit types
+#ifdef ENABLE_BF16
 __device__ void atomicAddX(__nv_bfloat16* addr, __nv_bfloat16 val) {
     uintptr_t ptr_val = reinterpret_cast<uintptr_t>(addr);
     __nv_bfloat162* ptr_bf16 = reinterpret_cast<__nv_bfloat162*>(ptr_val & ~uintptr_t(0x3));
@@ -105,6 +106,9 @@ __device__ void atomicAddX(__nv_bfloat16* addr, __nv_bfloat16 val) {
                                              : __halves2bfloat162(val, __ushort_as_bfloat16(0));
     atomicAdd(ptr_bf16, add_val);
 }
+#endif
+
+#ifdef ENABLE_FP16
 __device__ void atomicAddX(half* addr, half val) {
     uintptr_t ptr_val = reinterpret_cast<uintptr_t>(addr);
     half2* ptr_fp16 = reinterpret_cast<half2*>(ptr_val & ~uintptr_t(0x3));
@@ -114,6 +118,8 @@ __device__ void atomicAddX(half* addr, half val) {
                                     : __halves2half2(val, __ushort_as_half(0));
     atomicAdd(ptr_fp16, add_val);
 }
+#endif
+
 __device__ void atomicAddX(float* addr, float val) {
     atomicAdd(addr, val);
 }
@@ -1666,7 +1672,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         fill_in_activation_sizes(model->act_sizes, B, T, model->config);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-            num_activations += model->act_sizes[i] * sizeof(floatX);
+            num_activations += model->act_sizes[i];
         }
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);

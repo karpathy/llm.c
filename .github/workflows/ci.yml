@@ -35,7 +35,7 @@ jobs:
         run: python prepro_tinyshakespeare.py
 
       - name: Train model
-        run: python train_gpt2.py
+        run: python train_gpt2.py --device=cpu
 
       - name: Compile training and testing program
         run: make test_gpt2 train_gpt2

@@ -12,6 +12,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import os
 import math
 import struct
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import numpy as np
@@ -214,9 +215,19 @@ class GPT(nn.Module):
 
 # a few utilities for saving params/grads/activations to files for loading in C
 def write_fp32(tensor, file):
-    file.write(tensor.detach().cpu().numpy().astype("float32").tobytes())
+    t = tensor.detach().cpu().to(torch.float32)
+    b = t.numpy().tobytes()
+    file.write(b)
 
-def write_tensors(model_tensors, L, file):
+def write_bf16(tensor, file):
+    t = tensor.detach().cpu().to(torch.bfloat16)
+    # numpy can't convert bf16 to bytes
+    # this way below *i think* works, but is SUPER slow or broken
+    # TODO fix :'(
+    b = bytes(t.untyped_storage())
+    file.write(b)
+
+def write_tensors_fp32(model_tensors, L, file):
     write_fp32(model_tensors["transformer.wte.weight"], file) # (V, C)
     write_fp32(model_tensors["transformer.wpe.weight"], file) # (T, C)
     for i in range(L): # (L, C)
@@ -246,25 +257,65 @@ def write_tensors(model_tensors, L, file):
     write_fp32(model_tensors["transformer.ln_f.weight"], file) # (C, )
     write_fp32(model_tensors["transformer.ln_f.bias"], file) # (C, )
 
-def write_model(model, filename):
+def write_tensors_bf16(model_tensors, L, file):
+    # same as fp32, but note we will re-order the tensors
+    # because we keep the layernorm in fp32, we place them all at the end
+    write_bf16(model_tensors["transformer.wte.weight"], file) # (V, C)
+    write_bf16(model_tensors["transformer.wpe.weight"], file) # (T, C)
+    for i in range(L): # (L, 3C, C)
+        write_bf16(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
+    for i in range(L): # (L, 3C)
+        write_bf16(model_tensors[f"transformer.h.{i}.attn.c_attn.bias"], file)
+    for i in range(L): # (L, C, C)
+        write_bf16(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
+    for i in range(L): # (L, C)
+        write_bf16(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
+    for i in range(L): # (L, 4C, C)
+        write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
+    for i in range(L): # (L, 4C)
+        write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_fc.bias"], file)
+    for i in range(L): # (L, C, 4C)
+        write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
+    for i in range(L): # (L, C)
+        write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
+    # LayerNorms are at the end and kept in fp32
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
+    write_fp32(model_tensors["transformer.ln_f.weight"], file) # (C, )
+    write_fp32(model_tensors["transformer.ln_f.bias"], file) # (C, )
+
+def write_model(model, filename, dtype):
     # everything we need to instantiate the model
     # 1) header is: version int, GPTConfig ints, padding to 1024 bytes
+    assert dtype in {"float32", "bfloat16"} # float16 todo maybe later
+    version = {
+        "float32": 1,
+        "bfloat16": 2,
+    }[dtype]
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240326 # magic
-    header[1] = 1 # checkpoint version = 1
+    header[1] = version # checkpoint version
     header[2] = model.config.block_size
     header[3] = model.config.vocab_size
     header[4] = model.config.n_layer
     header[5] = model.config.n_head
     header[6] = model.config.n_embd
-    # 2) the parameters on CPU are next
+    # 2) the parameters follow the header
     params = {name: param.cpu() for name, param in model.named_parameters()}
-    # now write
     with open(filename, "wb") as file:
-        # header
+        # write header
         file.write(header.numpy().tobytes())
-        # model parameters
-        write_tensors(params, model.config.n_layer, file)
+        # write params
+        if dtype == "float32":
+            write_tensors_fp32(params, model.config.n_layer, file)
+        elif dtype == "bfloat16":
+            write_tensors_bf16(params, model.config.n_layer, file)
     print(f"wrote {filename}")
 
 def write_state(model, x, y, logits, loss, filename):
@@ -289,7 +340,7 @@ def write_state(model, x, y, logits, loss, filename):
         # loss (single float, result of the cross entropy loss)
         write_fp32(loss.cpu(), file)
         # gradients
-        write_tensors(grads, model.config.n_layer, file)
+        write_tensors_fp32(grads, model.config.n_layer, file)
     print(f"wrote {filename}")
 
 def write_tokenizer(enc, filename):
@@ -321,6 +372,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
+    parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
+    parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
     parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
@@ -329,38 +382,52 @@ if __name__ == "__main__":
     args = parser.parse_args()
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
+    assert args.dtype in {"float32", "float16", "bfloat16"}
 
-    # select a reasonable device to run on
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
+    # select the device
+    if args.device:
+        device = args.device
+    else:
+        # attempt to autodetect the device
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
     print(f"using device: {device}")
+
+    # set up a context manager following the desired dtype and device
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
+    ctx = torch.amp.autocast(device_type="cuda", dtype=ptdtype) if device == "cuda" else nullcontext()
 
     # seed the random number generators
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(42)
 
-    # init the tokenizer
+    # set the torch precision mode to use TensorFloat32 (TF32) for matmuls
+    # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
+    if args.tensorcores:
+        torch.set_float32_matmul_precision('high')
+
+    # init (and write) the tokenizer
     enc = tiktoken.get_encoding("gpt2")
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
-
     write_tokenizer(enc, "gpt2_tokenizer.bin")
-
-    if args.tensorcores:
-        torch.set_float32_matmul_precision('high')
 
     # load the GPT-2 model weights
     model = GPT.from_pretrained("gpt2")
     model.train()
     model.to(device)
     if args.compile:
-        config.coordinate_descent_tuning = True # suggested by @Chillee
+        if hasattr(config, "coordinate_descent_tuning"):
+            config.coordinate_descent_tuning = True # suggested by @Chillee
         print("compiling the model...")
         model = torch.compile(model)
+
+    # -------------------------------------------------------------------------
+    # data loading related: long but it's just to get a single batch of data
 
     # load the tokens
     # prefer to use tiny_shakespeare if it's available, otherwise use tiny_stories
@@ -392,45 +459,62 @@ if __name__ == "__main__":
             if i + B*T + 1 >= len(tokens):
                 i = 0 # in prod we'd want to randomize the start point a bit
 
-    # forward backward for a few iterations
+    # fetch one batch of data, which we will overfit to
     data_iter = iter(get_batch())
     x, y = next(data_iter) # we'll overfit this batch below
+
+    # -------------------------------------------------------------------------
+    # STAGE 1: weights / state logging for C to load later
 
     # do one forward pass to generate ground truth for our C tests
     if not args.inference_only and args.write_tensors:
         logits, loss = model(x, y)
         loss.backward()
-        write_model(model, "gpt2_124M.bin")
+        # save model params, in both float32 and bfloat16
+        write_model(model, "gpt2_124M.bin", dtype="float32")
+        # write_model(model, "gpt2_124M_bf16.bin", dtype="bfloat16")
+        # save x, y, logits, loss, and parameter gradients, for debugging C
+        # always store these in fp32 to have an accurate reference (?)
         write_state(model, x, y, logits, loss, "gpt2_124M_debug_state.bin")
 
-    use_fused = device == "cuda" # only works on CUDA (?)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, fused=use_fused)
-    timings = []
+    # -------------------------------------------------------------------------
+    # STAGE 2: training loop to get timings
+
+    # init the optimizer
+    adam_use_fused = device == "cuda" # only works on CUDA (?)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, fused=adam_use_fused)
+
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
+    timings = []
     for i in range(args.num_iterations):
         t0 = time.time()
-        logits, loss = model(x, y)
-        if not args.inference_only:
-            optimizer.zero_grad()
+        with ctx:
+            logits, loss = model(x, y)
             del logits
-            loss.backward()
-            optimizer.step()
+            if not args.inference_only:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+        # wait on the CPU for all device work to end so we get accurate per-iteration timings below
         if device == "mps":
             torch.mps.synchronize()
         elif device == "cuda":
             torch.cuda.synchronize()
+        # time and print
         t1 = time.time()
-        if i > args.num_iterations - 20:
+        # the 0th iteration is often an outlier (much slower) => skip logging it
+        if i > 0 and i > args.num_iterations - 20:
             timings.append(t1-t0)
         print(f"iteration {i}, loss: {loss.item()}, time: {(t1-t0)*1000:.3f}ms")
 
-    if len(timings) > 20:
-        print(f"final 20 iters avg: {np.mean(timings[-20:])*1000:.3f}ms")
-    else:
-        print(f"final {len(timings)-1} iters avg: {np.mean(timings[1:])*1000:.3f}ms")
+    # print the average of the last 20 timings, to get something smooth-ish
+    timings = timings[-20:]
+    print(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
+    print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
-    print(f"Peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    # -------------------------------------------------------------------------
+    # STAGE 3: Few steps of inference
 
     # before we end, let's also do one round of inference
     # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
