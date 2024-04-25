@@ -12,6 +12,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import os
 import math
 import struct
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import numpy as np
@@ -321,6 +322,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
+    parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
+    parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
     parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
@@ -329,14 +332,23 @@ if __name__ == "__main__":
     args = parser.parse_args()
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
+    assert args.dtype in {"float32", "float16", "bfloat16"}
 
-    # select a reasonable device to run on
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
+    # select the device
+    if args.device:
+        device = args.device
+    else:
+        # attempt to autodetect the device
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
     print(f"using device: {device}")
+
+    # create a context manager following the desired dtype and device
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
+    ctx = torch.amp.autocast(device_type="cuda", dtype=ptdtype) if device == "cuda" else nullcontext()
 
     # seed the random number generators
     torch.manual_seed(42)
@@ -358,7 +370,8 @@ if __name__ == "__main__":
     model.train()
     model.to(device)
     if args.compile:
-        config.coordinate_descent_tuning = True # suggested by @Chillee
+        if hasattr(config, "coordinate_descent_tuning"):
+            config.coordinate_descent_tuning = True # suggested by @Chillee
         print("compiling the model...")
         model = torch.compile(model)
 
@@ -398,6 +411,7 @@ if __name__ == "__main__":
 
     # do one forward pass to generate ground truth for our C tests
     if not args.inference_only and args.write_tensors:
+        assert args.dtype == "float32", "right now can only write tensors in float32"
         logits, loss = model(x, y)
         loss.backward()
         write_model(model, "gpt2_124M.bin")
@@ -410,7 +424,8 @@ if __name__ == "__main__":
         torch.cuda.reset_peak_memory_stats()
     for i in range(args.num_iterations):
         t0 = time.time()
-        logits, loss = model(x, y)
+        with ctx:
+            logits, loss = model(x, y)
         if not args.inference_only:
             optimizer.zero_grad()
             del logits
