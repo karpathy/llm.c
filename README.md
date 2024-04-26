@@ -34,6 +34,21 @@ OMP_NUM_THREADS=8 ./train_gpt2
 
 The above lines (1) download the [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset, tokenize it with the GPT-2 Tokenizer, (2) download and save the GPT-2 (124M) weights, (3) init from them in C and train for 40 steps on tineshakespeare with AdamW (using batch size 4, context length only 64), evaluate validation loss, and sample some text. Honestly, unless you have a beefy CPU (and can crank up the number of OMP threads in the launch command), you're not going to get that far on CPU training LLMs, but it might be a good demo/reference.
 
+## quick start (multiple GPUs)
+
+You'll be using the (more bleeding edge) mixed precision version of the code:
+
+```
+sudo apt install openmpi-bin openmpi-doc libopenmpi-dev
+pip install -r requirements.txt
+python prepro_tinyshakespeare.py
+python train_gpt2.py
+make train_gpt2cu
+mpirun -np <number of GPUs on your machine> ./train_gpt2cu
+```
+
+Sub in the number of GPUs you'd like to run on in the last command.
+
 ## training: more detail
 
 Download and tokenize a dataset. The [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset is the fastest to download and tokenize:
@@ -199,6 +214,21 @@ make test_gpt2cu
 ```
 
 If you have the latest CUDA you should expect this to compile OK, and you should see ~2X improved speed (~1.86X to be precise).
+
+**Multi-GPU training**. As of April 26, 2024 there is now also support for multi-GPU training using MPI and NCCL. Make sure you install MPI, e.g. on Linux:
+
+```bash
+sudo apt install openmpi-bin openmpi-doc libopenmpi-dev
+```
+
+and then:
+
+```bash
+make train_gpt2cu
+mpirun -np <number of GPUs> ./train_gpt2cu
+```
+
+The fp32 version of the code does not support multi-GPU. This is because we want the GPT-2 fp32 version to become a nice educational endpoint of a CUDA optimization course. The mixed precision version is where we are doing the cutting edge development, so this is the version that supports multi-GPU training.
 
 ## experiments / sweeps
 

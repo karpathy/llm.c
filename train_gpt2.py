@@ -221,10 +221,9 @@ def write_fp32(tensor, file):
 
 def write_bf16(tensor, file):
     t = tensor.detach().cpu().to(torch.bfloat16)
-    # numpy can't convert bf16 to bytes
-    # this way below *i think* works, but is SUPER slow or broken
-    # TODO fix :'(
-    b = bytes(t.untyped_storage())
+    # numpy doesn't have bf16 datatype so we have to trick it
+    t = t.view(torch.int16) # trick: reinterpret as int16
+    b = t.numpy().tobytes()
     file.write(b)
 
 def write_tensors_fp32(model_tensors, L, file):
@@ -472,7 +471,7 @@ if __name__ == "__main__":
         loss.backward()
         # save model params, in both float32 and bfloat16
         write_model(model, "gpt2_124M.bin", dtype="float32")
-        # write_model(model, "gpt2_124M_bf16.bin", dtype="bfloat16")
+        write_model(model, "gpt2_124M_bf16.bin", dtype="bfloat16")
         # save x, y, logits, loss, and parameter gradients, for debugging C
         # always store these in fp32 to have an accurate reference (?)
         write_state(model, x, y, logits, loss, "gpt2_124M_debug_state.bin")
