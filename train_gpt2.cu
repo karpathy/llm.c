@@ -1573,7 +1573,6 @@ typedef struct {
     floatX* lnf; // (B, T, C)
     floatX* lnf_mean; // (B, T)
     floatX* lnf_rstd; // (B, T)
-
     floatX* losses; // (B, T)
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
     floatX* qkvr; // (L, B, T, 3*C)
@@ -1623,8 +1622,7 @@ typedef struct {
     floatX* residual3; // (B, T, C)
 } GradActTensors;
 
-
-void fill_in_grad_act_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
+void fill_in_grad_act_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config) {
     size_t NH = config.num_heads;
     size_t C = config.channels;
     act_sizes[0] = B * T * 4 * C; // bt4c
@@ -1632,8 +1630,7 @@ void fill_in_grad_act_sizes(size_t* act_sizes, int B, int T, GPT2Config config) 
     act_sizes[2] = B * T * C; // residual3
 }
 
-
-void* malloc_and_point(floatX** targets[], const size_t* act_sizes, int n) {
+void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n) {
     size_t num_activations = 0;
     for (size_t i = 0; i < n; i++) {
         num_activations += act_sizes[i];
@@ -1774,8 +1771,10 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->rng_state = 13371337;
 }
 
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
+void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     // targets are optional and could be NULL
+    // in this function we must be careful and use size_t instead of int, otherwise
+    // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
 
     // ensure the model was initialized or error out
     if (model->params_memory == NULL) {
@@ -1784,10 +1783,10 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     }
 
     // convenience parameters
-    int V = model->config.vocab_size;
-    int L = model->config.num_layers;
-    int NH = model->config.num_heads;
-    int C = model->config.channels;
+    size_t V = model->config.vocab_size;
+    size_t L = model->config.num_layers;
+    size_t NH = model->config.num_heads;
+    size_t C = model->config.channels;
 
     // validate inputs, all indices must be in the range [0, V)
     for(int i = 0; i < B * T; i++) {
@@ -1820,7 +1819,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
         if (B != model->batch_size || T != model->seq_len) {
-            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
+            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, (int)B, (int)T);
             exit(EXIT_FAILURE);
         }
     }
@@ -1945,13 +1944,13 @@ void gpt2_backward(GPT2 *model) {
         gpt2_zero_grad(model);
     }
 
-    // convenience shortcuts
-    int B = model->batch_size;
-    int T = model->seq_len;
-    int V = model->config.vocab_size;
-    int L = model->config.num_layers;
-    int NH = model->config.num_heads;
-    int C = model->config.channels;
+    // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
+    size_t B = model->batch_size;
+    size_t T = model->seq_len;
+    size_t V = model->config.vocab_size;
+    size_t L = model->config.num_layers;
+    size_t NH = model->config.num_heads;
+    size_t C = model->config.channels;
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
     ParameterTensors params = model->params; // for brevity
