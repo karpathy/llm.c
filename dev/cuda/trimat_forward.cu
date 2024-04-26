@@ -531,10 +531,12 @@ __device__ void matmul_tri5(float* p, int ps, const float* k, int ks, const floa
         // note: threads may read data here that they don't need themselves.
         //       this really is a block-level operation.
         __syncthreads();
-        for(int y = threadIdx.y / 2; y < 128; y += 8) {
-            int xo = (threadIdx.y % 2) * 16;
-            lhs_s[y][threadIdx.x + xo] = k[y * ks + so + threadIdx.x + xo];
-            rhs_s[y][threadIdx.x + xo] = q[y * qs + so + threadIdx.x + xo];
+        // vectoriezd loading of inputs.
+        int ty = threadIdx.x / 8;
+        for(int y = ty + 2 * threadIdx.y; y < 128; y += 32) {
+            int tx = threadIdx.x % 8;
+            st_vec(lhs_s[y] + 4*tx, ld_vec(k + y * ks + so + 4 * tx));
+            st_vec(rhs_s[y] + 4*tx, ld_vec(q + y * ks + so + 4 * tx));
         }
         __syncthreads();
 
