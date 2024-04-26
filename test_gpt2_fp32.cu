@@ -187,8 +187,8 @@ int main(int argc, char *argv[]) {
             }
 
             // compare the gradients ona the parameters all at once
-            // cudaMemcpy(calculated_grads_memory, model.grads_memory, model.num_parameters * sizeof(float), cudaMemcpyDeviceToHost);
-            // check_tensor(calculated_grads_memory, expected_grads_memory, model.num_parameters, "grads");
+            cudaMemcpy(calculated_grads_memory, model.grads_memory, model.num_parameters * sizeof(float), cudaMemcpyDeviceToHost);
+            check_tensor(calculated_grads_memory, expected_grads_memory, model.num_parameters, "all grads", 1.3e-04);
         }
 
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1);
