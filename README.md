@@ -36,15 +36,18 @@ The above lines (1) download the [tinyshakespeare](https://raw.githubusercontent
 
 ## quick start (multiple GPUs)
 
-The "Maybe I'm GPU poor, but at least I have a couple". No worries, run:
+You'll be using the (more bleeding edge) mixed precision version of the code:
+
 ```
 sudo apt install openmpi-bin openmpi-doc libopenmpi-dev
 pip install -r requirements.txt
 python prepro_tinyshakespeare.py
 python train_gpt2.py
-make train_gpt2fp32cu
-mpirun -np <Number of GPUs on your machine> ./train_gpt2fp32cu
+make train_gpt2cu
+mpirun -np <number of GPUs on your machine> ./train_gpt2cu
 ```
+
+Sub in the number of GPUs you'd like to run on in the last command.
 
 ## training: more detail
 
@@ -211,6 +214,21 @@ make test_gpt2cu
 ```
 
 If you have the latest CUDA you should expect this to compile OK, and you should see ~2X improved speed (~1.86X to be precise).
+
+**Multi-GPU training**. As of April 26, 2024 there is now also support for multi-GPU training using MPI and NCCL. Make sure you install MPI, e.g. on Linux:
+
+```bash
+sudo apt install openmpi-bin openmpi-doc libopenmpi-dev
+```
+
+and then:
+
+```bash
+make train_gpt2cu
+mpirun -np <number of GPUs> ./train_gpt2cu
+```
+
+The fp32 version of the code does not support multi-GPU. This is because we want the GPT-2 fp32 version to become a nice educational endpoint of a CUDA optimization course. The mixed precision version is where we are doing the cutting edge development, so this is the version that supports multi-GPU training.
 
 ## experiments / sweeps
 
