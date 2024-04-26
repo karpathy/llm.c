@@ -11,7 +11,7 @@ NVCC := $(shell which nvcc 2>/dev/null)
 # NVCC flags
 NVCC_FLAGS = -O3 --use_fast_math
 NVCC_LDFLAGS = -lcublas -lcublasLt
-NCLL_INCLUDES = 
+NCLL_INCLUDES =
 NVCC_LDLIBS =
 
 # Function to test if the compiler accepts a given flag.
@@ -73,7 +73,7 @@ else
   # Detect if running on macOS or Linux
   ifeq ($(shell uname), Darwin)
     $(warning Multi-GPU on CUDA on Darwin is not supported, skipping OpenMPI + NCCL support)
-  else ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && echo "exists"), exists)
+  else ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && [ -d /usr/lib/x86_64-linux-gnu/openmpi/include/ ] && echo "exists"), exists)
     $(info Adding OpenMPI support)
     NVCC_INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
     NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
@@ -81,6 +81,7 @@ else
     NVCC_FLAGS += -DMULTI_GPU
   else
     $(warning OpenMPI is not found, disabling multi-GPU support)
+    $(warning On Linux you can try install OpenMPI with `sudo apt install openmpi-bin openmpi-doc libopenmpi-dev`)
   endif
 endif
 
