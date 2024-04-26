@@ -34,6 +34,21 @@ OMP_NUM_THREADS=8 ./train_gpt2
 
 The above lines (1) download the [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset, tokenize it with the GPT-2 Tokenizer, (2) download and save the GPT-2 (124M) weights, (3) init from them in C and train for 40 steps on tineshakespeare with AdamW (using batch size 4, context length only 64), evaluate validation loss, and sample some text. Honestly, unless you have a beefy CPU (and can crank up the number of OMP threads in the launch command), you're not going to get that far on CPU training LLMs, but it might be a good demo/reference.
 
+## quick start (multiple GPUs)
+
+You'll be using the (more bleeding edge) mixed precision version of the code:
+
+```
+sudo apt install openmpi-bin openmpi-doc libopenmpi-dev
+pip install -r requirements.txt
+python prepro_tinyshakespeare.py
+python train_gpt2.py
+make train_gpt2cu
+mpirun -np <number of GPUs on your machine> ./train_gpt2cu
+```
+
+Sub in the number of GPUs you'd like to run on in the last command.
+
 ## training: more detail
 
 Download and tokenize a dataset. The [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset is the fastest to download and tokenize:
@@ -135,7 +150,9 @@ I attached a very small tutorial here, in [doc/layernorm/layernorm.md](doc/layer
 
 The full training loop is also implemented in pure CUDA in one file, but optimizations of the kernels are ongoing. Currently, we roughly match the speed of PyTorch. The way we organize code is that we have a growing collection of kernels of increasing complexity in the `dev/cuda` folder, see [dev/cuda/README.md](dev/cuda/README.md). We then copy paste the best kernels into the main training loop in the single training file `train_gpt2cu.cu`.
 
-**WIP alert, April 23**. We merged the first version of mixed precision training code. I checkpointed the fp32 version to separate files that include `_fp32` in their filename, and would like to preserve this version in the root of the repo because it 1) doesn't require the most up to date CUDA and will a lot more likely compile and is more portable, 2) it is a lot simpler and acts as reference. The "mainline" development of the CUDA version will from here on move mostly to the [train_gpt2.cu](train_gpt2.cu) file, which includes mixed precision. In the descriptions below I will default to using the fp32 version for now because it is currently more portable and stable, then at the end I will cover to the new mixed precision version.
+**WIP alert, April 23**. We merged the first version of mixed precision training code. I checkpointed the fp32 version to separate files that include `_fp32` in their filename, and would like to preserve this version in the root of the repo because it 1) doesn't require the most up to date CUDA and will a lot more likely compile and is more portable, 2) it is a lot simpler and acts as reference. In fact, we'd like to diverge the fp32 version in the direction of being pure CUDA (e.g. do not even call cuBLAS by default), to be used as an educational reference, maybe even a kernel of a course on CUDA. The "mainline" development concerned with speed will from there on move to the [train_gpt2.cu](train_gpt2.cu) file, which includes mixed precision training.
+
+In the descriptions below I will default to using the fp32 version for now because it is currently more portable and stable, then at the end I will cover to the new mixed precision version.
 
 **Correctness**. First, we can do 10 iterations of training and verify that our code exactly matches and preproduces the numbers from PyTorch:
 
@@ -197,6 +214,21 @@ make test_gpt2cu
 ```
 
 If you have the latest CUDA you should expect this to compile OK, and you should see ~2X improved speed (~1.86X to be precise).
+
+**Multi-GPU training**. As of April 26, 2024 there is now also support for multi-GPU training using MPI and NCCL. Make sure you install MPI, e.g. on Linux:
+
+```bash
+sudo apt install openmpi-bin openmpi-doc libopenmpi-dev
+```
+
+and then:
+
+```bash
+make train_gpt2cu
+mpirun -np <number of GPUs> ./train_gpt2cu
+```
+
+The fp32 version of the code does not support multi-GPU. This is because we want the GPT-2 fp32 version to become a nice educational endpoint of a CUDA optimization course. The mixed precision version is where we are doing the cutting edge development, so this is the version that supports multi-GPU training.
 
 ## experiments / sweeps
 
@@ -269,6 +301,13 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 
 - Metal
   - [llm.metal](https://github.com/regrettable-username/llm.metal) by @[regrettable-username](https://github.com/regrettable-username): LLM training in simple, raw C/Metal Shading Language
+
+- Zig
+  - [llm.zig]() by @[saimirbaci](https://github.com/Saimirbaci/llm.zig/): a Zig port of this project
+
+- Go
+  - [llm.go](https://github.com/joshcarp/llm.go) by @[joshcarp](https://github.com/joshcarp): a Go port of this project
+
 ## discussions
 
 Ways of organizing development:
