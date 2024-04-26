@@ -7,6 +7,10 @@ CFLAGS_COND = -march=native
 
 # Find nvcc
 NVCC := $(shell which nvcc 2>/dev/null)
+SHELL_UNAME = $(shell uname)
+REMOVE_FILES = rm -f
+OUTPUT_FILE = -o $@
+CUDA_OUTPUT_FILE = -o $@
 
 # NVCC flags
 # -t=0 is short for --threads, 0 = number of CPUs on the machine
@@ -15,16 +19,45 @@ NVCC_LDFLAGS = -lcublas -lcublasLt
 NCLL_INCLUDES =
 NVCC_LDLIBS =
 
-# Function to test if the compiler accepts a given flag.
-define check_and_add_flag
+ifneq ($(OS), Windows_NT)
+  NVCC := $(shell which nvcc 2>/dev/null)
+
+  # Function to test if the compiler accepts a given flag.
+  define check_and_add_flag
     $(eval FLAG_SUPPORTED := $(shell printf "int main() { return 0; }\n" | $(CC) $(1) -x c - -o /dev/null 2>/dev/null && echo 'yes'))
     ifeq ($(FLAG_SUPPORTED),yes)
         CFLAGS += $(1)
     endif
-endef
+  endef
 
-# Check each flag and add it if supported
-$(foreach flag,$(CFLAGS_COND),$(eval $(call check_and_add_flag,$(flag))))
+  # Check each flag and add it if supported
+  $(foreach flag,$(CFLAGS_COND),$(eval $(call check_and_add_flag,$(flag))))
+else
+  CFLAGS :=
+  REMOVE_FILES = del *.exe,*.obj,*.lib,*.exp,*.pdb && del
+  SHELL_UNAME := Windows
+  ifneq ($(shell where nvcc 2> nul),"")
+    NVCC := nvcc
+  else
+    NVCC := 
+  endif
+  CC := cl
+  CFLAGS = /Idev /Zi /nologo /Wall /WX- /diagnostics:column /sdl /O2 /Oi /Ot /GL /D _DEBUG /D _CONSOLE /D _UNICODE /D UNICODE /Gm- /EHsc /MD /GS /Gy /fp:fast /Zc:wchar_t /Zc:forScope /Zc:inline /permissive- \
+   /external:W3 /Gd /TP /wd4996 /FC /openmp:llvm
+  LDFLAGS :=
+  LDLIBS :=
+  INCLUDES :=
+  NVCC_FLAGS += -I"dev"
+  ifeq ($(WIN_CI_BUILD),1)
+    $(info Windows CI build)
+    OUTPUT_FILE = /link /OUT:$@
+    CUDA_OUTPUT_FILE = -o $@
+  else
+    $(info Windows local build)
+    OUTPUT_FILE = /link /OUT:$@ && copy /Y $@ $@.exe
+    CUDA_OUTPUT_FILE = -o $@ && copy /Y $@.exe $@
+  endif
+endif
 
 # Check if OpenMP is available
 # This is done by attempting to compile an empty file with OpenMP flags
@@ -37,7 +70,7 @@ ifeq ($(NO_OMP), 1)
   $(info OpenMP is manually disabled)
 else
   # Detect if running on macOS or Linux
-  ifeq ($(shell uname), Darwin)
+  ifeq ($(SHELL_UNAME), Darwin)
     # Check for Homebrew's libomp installation in different common directories
     ifeq ($(shell [ -d /opt/homebrew/opt/libomp/lib ] && echo "exists"), exists)
       # macOS with Homebrew on ARM (Apple Silicon)
@@ -57,13 +90,15 @@ else
       $(warning OpenMP not found, skipping OpenMP support)
     endif
   else
-    # Check for OpenMP support in GCC or Clang on Linux
-    ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
-      CFLAGS += -fopenmp -DOMP
-      LDLIBS += -lgomp
-      $(info OpenMP found, compiling with OpenMP support)
-    else
-      $(warning OpenMP not found, skipping OpenMP support)
+    ifneq ($(OS), Windows_NT)
+      # Check for OpenMP support in GCC or Clang on Linux
+      ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
+        CFLAGS += -fopenmp -DOMP
+        LDLIBS += -lgomp
+        $(info OpenMP found, compiling with OpenMP support)
+      else
+        $(warning OpenMP not found, skipping OpenMP support)
+      endif
     endif
   endif
 endif
@@ -117,10 +152,10 @@ endif
 all: $(TARGETS)
 
 train_gpt2: train_gpt2.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) $(OUTPUT_FILE)
 
 test_gpt2: test_gpt2.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) $(OUTPUT_FILE)
 
 train_gpt2cu: train_gpt2.cu
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) -o $@
@@ -135,7 +170,7 @@ test_gpt2fp32cu: test_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) -o $@
 
 profile_gpt2cu: profile_gpt2.cu
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) -lineinfo $< $(NVCC_LDFLAGS) $(CUDA_OUTPUT_FILE)
 
 clean:
-	rm -f train_gpt2 test_gpt2 train_gpt2cu train_gpt2fp32cu test_gpt2cu test_gpt2fp32cu
+	$(REMOVE_FILES) $(TARGETS)
