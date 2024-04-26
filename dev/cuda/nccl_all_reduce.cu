@@ -83,6 +83,7 @@ int multi_gpu_get_local_device_idx(int process_rank, int num_processes) {
 
   // Distribute all hostname hashes to all processes.
   uint64_t* all_hostsname_hashes = (uint64_t*)malloc(num_processes * sizeof(uint64_t));
+  all_hostsname_hashes[process_rank] = hostname_hash;
   mpiCheck(MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, all_hostsname_hashes, sizeof(uint64_t), MPI_BYTE, MPI_COMM_WORLD));
 
   // Identify which GPU we need to use.

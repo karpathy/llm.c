@@ -74,7 +74,7 @@ else
   ifeq ($(shell uname), Darwin)
     $(warning Multi-GPU on CUDA on Darwin is not supported, skipping OpenMPI + NCCL support)
   else ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && [ -d /usr/lib/x86_64-linux-gnu/openmpi/include/ ] && echo "exists"), exists)
-    $(info Adding OpenMPI support)
+    $(info OpenMPI found, adding support)
     NVCC_INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
     NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
     NVCC_LDLIBS += -lmpi -lnccl
