@@ -14,6 +14,16 @@ In this file we are using Mixed Precision training, so different activations,
 paramaters, grads and buffers may be kept at different precisions, to take
 advantage of the fast low-precision hardware in the latest GPUs (bf16/fp16),
 and fp8 (coming soon^TM).
+
+Compile:
+make train_gpt2cu
+
+Example launch using bfloat16 on 1 GPU batch size 8, sample/eval every 200 steps:
+Also we're using TinyStories here for example as it is a bigger dataset
+./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
+
+Example launch using bfloat16 on 4 GPUs, same as above:
+mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 */
 
 #include <stdio.h>
@@ -490,9 +500,7 @@ __global__ void layernorm_forward_kernel3(TOut* __restrict__ out, Type* __restri
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    if(idx >= N) {
-        return;
-    }
+    if(idx >= N) { return; } // guard
 
     // the row of input that this group of threads is responsible for
     const Type* x = inp + idx * C;
@@ -1489,10 +1497,10 @@ typedef struct {
 } ParameterTensors;
 
 void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
-    int V = config.vocab_size;
-    int C = config.channels;
-    int maxT = config.max_seq_len;
-    int L = config.num_layers;
+    size_t V = config.vocab_size;
+    size_t C = config.channels;
+    size_t maxT = config.max_seq_len;
+    size_t L = config.num_layers;
     param_sizes[0] = V * C; // wte
     param_sizes[1] = maxT * C; // wpe
     param_sizes[2] = L * C; // ln1w
@@ -1526,8 +1534,9 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
 // allocate memory for the parameters and point the individual tensors to the right places
 float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof, int on_device) {
     // calculate the number of parameters
-    size_t num_parameters = 0, num_parameters_bytes = 0;
-    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+    size_t num_parameters = 0;
+    size_t num_parameters_bytes = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += param_elements[i];
         num_parameters_bytes += param_elements[i] * param_sizeof[i];
     }
@@ -1546,7 +1555,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_eleme
         &params->fcprojw, &params->fcprojb, (floatX**)&params->lnfw, (floatX**)&params->lnfb
     };
     char* params_memory_iterator = (char*)params_memory;
-    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         *(ptrs[i]) = (floatX*)params_memory_iterator;
         params_memory_iterator += param_elements[i] * param_sizeof[i];
     }
@@ -1584,7 +1593,7 @@ typedef struct {
     floatX* output;
 } ActivationTensors;
 
-void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
+void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config) {
     size_t V = config.vocab_size;
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
@@ -1718,7 +1727,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     model->num_parameters = 0;
     model->num_parameters_bytes = 0;
-    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         model->num_parameters += model->param_elements[i];
         model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
     }
@@ -1734,10 +1743,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     float* params_cpu_iterator = (float*)params_memory_cpu;
     char* params_gpu_iterator = (char*)model->params_memory;
 
-    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         if (model->param_sizeof[i] == sizeof(float)) {
-            cudaCheck(cudaMemcpy(params_gpu_iterator, params_cpu_iterator,
-                                 model->param_elements[i] * sizeof(float), cudaMemcpyHostToDevice));
+            cudaCheck(cudaMemcpy(params_gpu_iterator, params_cpu_iterator, model->param_elements[i] * sizeof(float), cudaMemcpyHostToDevice));
         } else {
             // TODO: Currently only support float or floatX (cannot mix and match FP16/BF16 etc...)
             assert(model->param_sizeof[i] == sizeof(floatX));
@@ -1745,11 +1753,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
             for (size_t j = 0; j < model->param_elements[i]; j++) {
                 conversion_scratchpad[j] = (floatX)params_cpu_iterator[j];
             }
-            cudaCheck(cudaMemcpy(params_gpu_iterator, conversion_scratchpad,
-                                 model->param_elements[i] * sizeof(floatX), cudaMemcpyHostToDevice));
+            cudaCheck(cudaMemcpy(params_gpu_iterator, conversion_scratchpad, model->param_elements[i] * sizeof(floatX), cudaMemcpyHostToDevice));
             free(conversion_scratchpad);
         }
-
         params_cpu_iterator += model->param_elements[i];
         params_gpu_iterator += model->param_elements[i] * model->param_sizeof[i];
     }
@@ -1801,8 +1807,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         // record the current B,T as well
         model->batch_size = B;
         model->seq_len = T;
-
-        // and now allocate the space
+        // allocate the space
         fill_in_activation_sizes(model->act_sizes, B, T, model->config);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
@@ -2099,11 +2104,11 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     size_t last_sizeof = model->param_sizeof[0];
     size_t current_element = 0;
 
-    for (size_t i = 1; i <= NUM_PARAMETER_TENSORS; i++) {
+    for (int i = 1; i <= NUM_PARAMETER_TENSORS; i++) {
         if (i == NUM_PARAMETER_TENSORS || model->param_sizeof[i] != last_sizeof) {
             unsigned int seed = random_u32(&model->rng_state); // seed for stochastic rounding
             int num_blocks = CEIL_DIV(num_elements, block_size);
-
+            // atm some params are in low precision (floatX) and some are in high precision (float)
             if (last_sizeof == sizeof(floatX)) {
                 adamw_kernel3<<<num_blocks, block_size>>>((floatX*)params_mem, (floatX*)grads_mem,
                             &model->m_memory[current_element], &model->v_memory[current_element], num_elements,
@@ -2149,9 +2154,9 @@ typedef struct {
     // Each worker loads it's own chunk of data.
     int process_rank;
     int num_processes;
-    // hyperparameters
-    int B;
-    int T;
+    // hyperparameters. use size_t to prevent overflow
+    size_t B;
+    size_t T;
     // input handling and its state
     FILE* tokens_file;
     long file_size;
@@ -2161,10 +2166,10 @@ typedef struct {
     int* inputs;
     int* targets;
     // convenience variables
-    int num_batches;
+    size_t num_batches;
 } DataLoader;
 
-void dataloader_init(DataLoader *loader, const MultiGpuConfig* multi_gpu_config, const char* filename, int B, int T) {
+void dataloader_init(DataLoader *loader, const MultiGpuConfig* multi_gpu_config, const char* filename, size_t B, size_t T) {
     loader->process_rank = multi_gpu_config->process_rank;
     loader->num_processes = multi_gpu_config->num_processes;
     loader->B = B;
@@ -2197,8 +2202,8 @@ void dataloader_reset(DataLoader *loader) {
 }
 
 void dataloader_next_batch(DataLoader *loader) {
-    int B = loader->B;
-    int T = loader->T;
+    size_t B = loader->B;
+    size_t T = loader->T;
     // if we are at the end of the file, loop back to the beginning
     if (loader->current_position + (loader->num_processes * B * T + 1) * sizeof(int) > loader->file_size) {
         loader->current_position = loader->process_rank * B * T * sizeof(int);
