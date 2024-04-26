@@ -49,7 +49,7 @@ void encoder_forward(float* out,
             // seek to the output position in out[b,t,:]
             float* out_bt = &outBTC[b][t][0];
             // get the index of the token at inp[b, t]
-            const int ix= inpBT[b][t];
+            int ix= inpBT[b][t];
             // seek to the position in wte corresponding to the token
             const float* wte_ix = wteVC[ix];
             // seek to the position in wpe corresponding to the position
@@ -76,7 +76,7 @@ void encoder_backward(float* dwte, float* dwpe,
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             float* dout_bt = &doutBTC[b][t][0];
-            const int ix = inpBT[b][t];
+            int ix = inpBT[b][t];
             float* dwte_ix = dwteVC[ix];
             float* dwpe_t = &dwpeTC[t][0];
             for (int i = 0; i < C; i++) {
@@ -186,14 +186,14 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
 }
 
 void matmul_forward(float* out,
-                    float* inp, const float* weight, const float* bias,
+                    const float* inp, const float* weight, const float* bias,
                     int B, int T, int C, int OC) {
     // most of the running time is spent here and in matmul_backward
     // OC is short for "output channels"
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
     // out will be (B,T,OC)
 
-    DECL_ARRAYPTR3(float, inpBTC,B,T,C, inp);
+    DECL_ARRAYPTR3(const float, inpBTC,B,T,C, inp);
     DECL_ARRAYPTR2(const float, weightOCC,OC,C, weight);
     DECL_ARRAYPTR3(float, outBTOC,B,T,OC, out);
 
@@ -201,7 +201,7 @@ void matmul_forward(float* out,
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             float* out_bt = &outBTOC[b][t][0];
-            float* inp_bt = &inpBTC[b][t][0];
+            const float* inp_bt = &inpBTC[b][t][0];
             for (int o = 0; o < OC; o++) {
                 float val = (bias != NULL) ? bias[o] : 0.0f;
                 const float* wrow = &weightOCC[o][0];
