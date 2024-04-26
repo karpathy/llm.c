@@ -349,6 +349,8 @@ void attention_backward(float* dinp, float* dpreatt, float* datt,
     int hs = C / NH; // head size
     float scale = 1.0 / sqrtf(hs);
 
+    DECL_ARRAYPTR3(float, inpBTC3,B,T,C3, inp);
+    DECL_ARRAYPTR3(float, dinpBTC3,B,T,C3, dinp);
     DECL_ARRAYPTR4(const float, attBNHTT,B,NH,T,T, att);
     DECL_ARRAYPTR4(float, dattBNHTT,B,NH,T,T, datt);
     DECL_ARRAYPTR4(float, dpreattBNHTT,B,NH,T,T, dpreatt);
@@ -359,8 +361,8 @@ void attention_backward(float* dinp, float* dpreatt, float* datt,
                 const float* att_bth = &attBNHTT[b][h][t][0];
                 float* datt_bth = &dattBNHTT[b][h][t][0];
                 float* dpreatt_bth = &dpreattBNHTT[b][h][t][0];
-                float* dquery_t = dinp + b * T * C3 + t * C3 + h * hs;
-                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
+                float* dquery_t = &dinpBTC3[b][t][h*hs];
+                float* query_t = &inpBTC3[b][t][h*hs];
 
                 // backward pass 4, through the value accumulation
                 float* dout_bth = dout + b * T * C + t * C + h * hs;
