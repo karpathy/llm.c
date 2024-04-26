@@ -992,31 +992,6 @@ __device__ inline float lerp(float start, float end, float weight) {
     return fma(weight, end, fma(-weight, start, start));
 }
 
-// Termplate type T instead of floatx
-template <typename Tp, typename Tg>
-__global__ void adamw_kernel3(Tp* params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
-                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
-                              unsigned int seed) {
-   int i = blockIdx.x * blockDim.x + threadIdx.x;
-   if (i >= num_parameters) return;  // guard
-   float grad = (float)grads_memory[i];
-   float m = m_memory[i];
-   float v = v_memory[i];
-   // update the first moment (momentum)
-   m = lerp(grad, m, beta1);
-   m_memory[i] = m;
-   // update the second moment (RMSprop)
-   v = lerp(grad * grad, v, beta2);
-   v_memory[i] = v;
-   m /= beta1_correction;  // m_hat
-   v /= beta2_correction;  // v_hat
-   // update the parameters (weight/bias)
-   float param = (float)params_memory[i] - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * (float)params_memory[i]));
-   unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
-   // todo - explain stochastic rounding here
-   stochastic_rounding(param, &params_memory[i], random);
-}
-
 struct SoftmaxParams {
     float Scale;
     float Offset;
@@ -1488,6 +1463,116 @@ typedef struct {
     floatN*  lnfb; // (C)
 } ParameterTensors;
 
+enum EDType {
+    FLOAT32,
+    FLOAT16,
+    BFLOAT16
+};
+
+// Adam update is handled in two functions. The first is given a description of how the parameter/weight buffers
+// are partitioned into separate tensors, and which data types and training parameters we use for those. The parameter
+// info contains a prefix sum of parameter counts, so we can easily search that for a thread that is supposed to
+// work on parameter X, we are operating on tensor Y. To ensure that this does not incur too much overhead, the amount
+// of work performed within each thread gets increased. We assume that each tensor is a multiple of 128 elements.
+
+struct ParameterInfo {
+    char* ptr[NUM_PARAMETER_TENSORS];               // pointer into the memory buffer
+    size_t prefix_sum[NUM_PARAMETER_TENSORS];       // how many weight _before_ this one
+    size_t size[NUM_PARAMETER_TENSORS];             // how many weights in this one
+    EDType dtype[NUM_PARAMETER_TENSORS];
+    float learning_rate[NUM_PARAMETER_TENSORS];
+    float weight_decay[NUM_PARAMETER_TENSORS];
+};
+
+template<class T, class M>
+__device__ void adam_update(T* params_memory, const T* grads_memory, size_t offset, size_t end,
+                            M* m_memory, M* v_memory,
+                            float beta1, float beta2,
+                            float inv_beta1_correction, float inv_beta2_correction, float epsilon,
+                            float learning_rate, float weight_decay, unsigned int seed)  {
+    for(size_t i = offset; i < end; ++i) {
+        float grad = (float) grads_memory[i];
+        float m = m_memory[i];
+        float v = v_memory[i];
+        // update the first moment (momentum)
+        m = lerp(grad, m, beta1);
+        m_memory[i] = m;
+        // update the second moment (RMSprop)
+        v = lerp(grad * grad, v, beta2);
+        v_memory[i] = v;
+        m *= inv_beta1_correction;  // m_hat
+        v *= inv_beta2_correction;  // v_hat
+        // update the parameters (weight/bias)
+        float param = (float) params_memory[i] -
+                      (learning_rate * (m / (sqrtf(v) + epsilon) + weight_decay * (float) params_memory[i]));
+        unsigned int random = Get2dNoiseUint(256 * threadIdx.x + i, blockIdx.x, seed);
+        // todo - explain stochastic rounding here
+        stochastic_rounding(param, &params_memory[i], random);
+    }
+}
+
+
+// Termplate type T instead of floatx
+__global__ void adamw_kernel3(ParameterInfo* p_info, char* grads, float* m_memory, float* v_memory,
+                              float beta1, float beta2, float inv_beta1_correction, float inv_beta2_correction, float eps,
+                              unsigned int seed) {
+    // who am I?
+    // give each thread multiple things to do so we can amortize the initial lookups
+    constexpr const int WORK_PER_THREAD = 128;
+
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    size_t b_idx = WORK_PER_THREAD * blockIdx.x * blockDim.x;
+    size_t t_idx = b_idx + threadIdx.x * WORK_PER_THREAD;
+
+    // which parameter am I responsible for?
+    // do a lower-bound computation. This is not based on binary search, but instead
+    // goes linearly through the small array. We can parallelize over the warp
+    // size, though, so really, this loop is quite short.
+    int lower_bound = 0;
+    for(int i = warp.thread_rank(); i < NUM_PARAMETER_TENSORS; i += warp.size()) {
+        if(p_info->prefix_sum[i] <= b_idx) {
+            lower_bound = i;
+        } else {
+            break;
+        }
+    }
+
+    lower_bound = cg::reduce(warp, lower_bound, cg::greater<int>{});
+
+    // OK, we know at which tensor this block starts. Now each thread needs to search
+    for(int i = lower_bound; i < NUM_PARAMETER_TENSORS; ++i) {
+        if(p_info->prefix_sum[i] <= t_idx) {
+            lower_bound = i;
+        } else {
+            break;
+        }
+    }
+
+    // get my info
+    EDType dtype = p_info->dtype[lower_bound];
+    char* ptr = p_info->ptr[lower_bound];
+    char* grd = grads + (ptr - p_info->ptr[0]);
+    size_t size = p_info->size[lower_bound];
+    float lr = p_info->learning_rate[lower_bound];
+    float wd = p_info->weight_decay[lower_bound];
+    size_t offset = t_idx - p_info->prefix_sum[lower_bound];
+    float* m = m_memory + p_info->prefix_sum[lower_bound];
+    float* v = v_memory + p_info->prefix_sum[lower_bound];
+    size_t end = min(offset + WORK_PER_THREAD, offset + size);
+
+    if(dtype == EDType::FLOAT32) {
+        adam_update((float*)ptr, (float*)grd, offset, end, m, v, beta1, beta2, inv_beta1_correction, inv_beta2_correction,
+                    eps, lr, wd, seed);
+    } else {
+        // TODO Fix up to actually use the correct datatype
+        adam_update((floatX*)ptr, (floatX*)grd, offset, end, m, v, beta1, beta2, inv_beta1_correction, inv_beta2_correction,
+                    eps, lr, wd, seed);
+    }
+}
+
+
 void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
     size_t V = config.vocab_size;
     size_t C = config.channels;
@@ -1667,6 +1752,7 @@ typedef struct {
     GPT2Config config;
     // the weights of the model, and their sizes
     ParameterTensors params;
+    ParameterInfo* d_param_info;
     size_t param_elements[NUM_PARAMETER_TENSORS];
     size_t param_sizeof[NUM_PARAMETER_TENSORS];
     void* params_memory;
@@ -1728,6 +1814,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     // create memory for model parameters on the device
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof, 1);
 
+    // prepare parameter info
+    ParameterInfo param_info;
+
     // read in all the parameters from file and copy them to device
     float* params_memory_cpu = (float*)mallocCheck(input_model_bytes);
     freadCheck(params_memory_cpu, 1, input_model_bytes, model_file);
@@ -1735,11 +1824,14 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     float* params_cpu_iterator = (float*)params_memory_cpu;
     char* params_gpu_iterator = (char*)model->params_memory;
 
+    int ps = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         if (model->param_sizeof[i] == sizeof(float)) {
             cudaCheck(cudaMemcpy(params_gpu_iterator, params_cpu_iterator, model->param_elements[i] * sizeof(float), cudaMemcpyHostToDevice));
+            param_info.dtype[i] = EDType::FLOAT32;
         } else {
             // TODO: Currently only support float or floatX (cannot mix and match FP16/BF16 etc...)
+            param_info.dtype[i] = EDType::BFLOAT16;
             assert(model->param_sizeof[i] == sizeof(floatX));
             floatX* conversion_scratchpad = (floatX*)mallocCheck(model->param_elements[i] * sizeof(floatX));
             for (size_t j = 0; j < model->param_elements[i]; j++) {
@@ -1748,14 +1840,29 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
             cudaCheck(cudaMemcpy(params_gpu_iterator, conversion_scratchpad, model->param_elements[i] * sizeof(floatX), cudaMemcpyHostToDevice));
             free(conversion_scratchpad);
         }
+
+        // TODO just dummy values
+        param_info.weight_decay[i] = 0.0;
+        param_info.learning_rate[i] = 3e-4f;
+        param_info.prefix_sum[i] = ps;
+        param_info.size[i] = model->param_elements[i];
+        param_info.ptr[i] = params_gpu_iterator;
+
+        ps += model->param_elements[i];
         params_cpu_iterator += model->param_elements[i];
         params_gpu_iterator += model->param_elements[i] * model->param_sizeof[i];
     }
     free(params_memory_cpu);
     fcloseCheck(model_file);
 
+    // move the metadata over to the gpu
+    ParameterInfo* d_pinfo;
+    cudaCheck(cudaMalloc(&d_pinfo, sizeof(ParameterInfo)));
+    cudaCheck(cudaMemcpy(d_pinfo, &param_info, sizeof(ParameterInfo), cudaMemcpyHostToDevice));
+
     // other inits
     model->acts_memory = NULL;
+    model->d_param_info = d_pinfo;
     model->grads_memory = NULL;
     model->m_memory = NULL;
     model->v_memory = NULL;
@@ -2092,34 +2199,11 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     // TODO - optimise this to require fewer kernel launches and/or independent via CUDA streams
     char* params_mem = (char*)model->params_memory;
     char* grads_mem = (char*)model->grads_memory;
-    size_t num_elements = model->param_elements[0];
-    size_t last_sizeof = model->param_sizeof[0];
-    size_t current_element = 0;
 
-    for (int i = 1; i <= NUM_PARAMETER_TENSORS; i++) {
-        if (i == NUM_PARAMETER_TENSORS || model->param_sizeof[i] != last_sizeof) {
-            unsigned int seed = random_u32(&model->rng_state); // seed for stochastic rounding
-            int num_blocks = CEIL_DIV(num_elements, block_size);
-            // atm some params are in low precision (floatX) and some are in high precision (float)
-            if (last_sizeof == sizeof(floatX)) {
-                adamw_kernel3<<<num_blocks, block_size>>>((floatX*)params_mem, (floatX*)grads_mem,
-                            &model->m_memory[current_element], &model->v_memory[current_element], num_elements,
-                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
-            } else {
-                adamw_kernel3<<<num_blocks, block_size>>>((float*)params_mem, (float*)grads_mem,
-                            &model->m_memory[current_element], &model->v_memory[current_element], num_elements,
-                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
-            }
-            params_mem += num_elements * last_sizeof;
-            grads_mem += num_elements * last_sizeof;
-            current_element += num_elements;
-            num_elements = 0;
-        }
-        if (i != NUM_PARAMETER_TENSORS) {
-            num_elements += model->param_elements[i];
-            last_sizeof = model->param_sizeof[i];
-        }
-    }
+    unsigned int seed = random_u32(&model->rng_state); // seed for stochastic rounding
+    int num_blocks = CEIL_DIV(model->num_parameters, block_size * 128);
+    adamw_kernel3<<<num_blocks, block_size>>>(model->d_param_info, grads_mem, model->m_memory, model->v_memory,
+                                              beta1, beta2, 1.f / beta1_correction, 1.f / beta2_correction, eps, seed);
     cudaCheck(cudaGetLastError());
 }
 
