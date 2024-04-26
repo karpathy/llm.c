@@ -11,6 +11,8 @@ NVCC := $(shell which nvcc 2>/dev/null)
 # NVCC flags
 NVCC_FLAGS = -O3 --use_fast_math
 NVCC_LDFLAGS = -lcublas -lcublasLt
+NCLL_INCLUDES =
+NVCC_LDLIBS =
 
 # Function to test if the compiler accepts a given flag.
 define check_and_add_flag
@@ -65,6 +67,24 @@ else
   endif
 endif
 
+ifeq ($(NO_MULTI_GPU), 1)
+  $(info Multi-GPU (OpenMPI + NCCL) is manually disabled)
+else
+  # Detect if running on macOS or Linux
+  ifeq ($(shell uname), Darwin)
+    $(warning Multi-GPU on CUDA on Darwin is not supported, skipping OpenMPI + NCCL support)
+  else ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && [ -d /usr/lib/x86_64-linux-gnu/openmpi/include/ ] && echo "exists"), exists)
+    $(info OpenMPI found, adding support)
+    NVCC_INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
+    NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
+    NVCC_LDLIBS += -lmpi -lnccl
+    NVCC_FLAGS += -DMULTI_GPU
+  else
+    $(warning OpenMPI is not found, disabling multi-GPU support)
+    $(warning On Linux you can try install OpenMPI with `sudo apt install openmpi-bin openmpi-doc libopenmpi-dev`)
+  endif
+endif
+
 # PHONY means these targets will always be executed
 .PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu
 
@@ -88,16 +108,16 @@ test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
 
 train_gpt2cu: train_gpt2.cu
-	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) -o $@
 
 train_gpt2fp32cu: train_gpt2_fp32.cu
-	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) -o $@
 
 test_gpt2cu: test_gpt2.cu
-	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) -o $@
 
 test_gpt2fp32cu: test_gpt2_fp32.cu
-	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) -o $@
 
 profile_gpt2cu: profile_gpt2.cu
 	$(NVCC) $(NVCC_FLAGS) -lineinfo $< $(NVCC_LDFLAGS) -o $@
