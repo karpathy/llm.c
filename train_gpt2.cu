@@ -602,14 +602,6 @@ __global__ void unpermute_kernel_backward(floatX* dinp, const floatX *dout, int 
     }
 }
 
-__device__ float& vec_at(float4& vec, int index) {
-    return reinterpret_cast<float*>(&vec)[index];
-}
-
-__device__ float vec_at(const float4& vec, int index) {
-    return reinterpret_cast<const float*>(&vec)[index];
-}
-
 template <typename Type>
 __global__ void softmax_forward_kernel5(Type* out, float inv_temperature, const Type* inp, int N, int T) {
     // inp, out shape: (N, T, T), where N = B * NH
