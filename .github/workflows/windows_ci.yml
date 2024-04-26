@@ -1,0 +1,70 @@
+# Windows Build file - note this does not test anything (yet)
+name: LLM.c Windows Build
+
+on: 
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        working-directory: ./dev
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v1
+
+    - name: Install Python
+      uses: actions/setup-python@v3
+      with:
+        python-version: '3.12.3'
+
+    - name: Verify Python installation
+      run: python --version
+      shell: cmd
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install tqdm numpy torch tiktoken transformers requests
+
+# Download CUDA Toolkit - note the hardcoded version number. 
+    - name: Download Cuda file
+      run: |
+        $wc = New-Object System.Net.WebClient
+        $url = 'https://developer.download.nvidia.com/compute/cuda/12.4.1/local_installers/cuda_12.4.1_551.78_windows.exe'
+        $output = './cuda_12.4.1_551.78_windows.exe'
+        $wc.DownloadFile($url, $output)
+
+# Install CUDA Toolkit - note the hardcoded version number. Only install certain packages.
+    - name: Run Cuda executable
+      run: |
+        Start-Process cuda_12.4.1_551.78_windows.exe -ArgumentList ' -s -n cudart_12.4 cuxxfilt_12.4 nvcc_12.4 nvfatbin_12.4 nvjitlink_12.4 nvrtc_12.4 nvrtc_dev_12.4 cublas_12.4 cublas_dev_12.4 visual_studio_integration_12.4' -NoNewWindow -Wait
+
+# Default installation path for CUDA Toolkit is C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4
+    - name: Add Path
+      run: |
+        echo "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.4\\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        echo "CUDA_PATH_V12_4=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+    - name: Check CUDA Toolkit Installation
+      run: |
+        echo "CUDA Toolkit is installed at: ${{ env.CUDA_PATH }}"
+        nvcc -V
+
+    - name: Build solution
+      working-directory: ./dev
+      run: msbuild llm_c.sln -p:Configuration=Release
+
+    - name: Run test_gpt2_c
+      shell: cmd
+      run: |
+        cd .. && dev\\x64\\Release\\test_gpt2_c.exe
