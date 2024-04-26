@@ -47,16 +47,12 @@ void encoder_forward(float* out,
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // seek to the output position in out[b,t,:]
-            // float* out_bt = out + b * T * C + t * C;
             float* out_bt = &outBTC[b][t][0];
             // get the index of the token at inp[b, t]
-            // int ix = inp[b * T + t];
             const int ix= inpBT[b][t];
             // seek to the position in wte corresponding to the token
-            // float* wte_ix = wte + ix * C;
             const float* wte_ix = wteVC[ix];
             // seek to the position in wpe corresponding to the position
-            // float* wpe_t = wpe + t * C;
             const float* wpe_t = wpeTC[t];
             // add the two vectors and store the result in out[b,t,:]
             for (int i = 0; i < C; i++) {
@@ -69,7 +65,9 @@ void encoder_forward(float* out,
 void encoder_backward(float* dwte, float* dwpe,
                       float* dout, const int* inp,
                       int B, int T, int C) {
-
+    // both inp and out are (B,T,C) of the activations
+    // dwte is (V,C) of token embeddings, short for "weight token embeddings"
+    // dwpe is (maxT,C) of position embeddings, short for "weight positional embedding"
     DECL_ARRAYPTR2(const int, inpBT,B,T, inp);
     DECL_ARRAYPTR2(float, dwteVC,V,C, dwte);
     DECL_ARRAYPTR2(float, dwpeTC,T,C, dwpe);
@@ -77,13 +75,9 @@ void encoder_backward(float* dwte, float* dwpe,
 
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            // float* dout_bt = dout + b * T * C + t * C;
             float* dout_bt = &doutBTC[b][t][0];
-            // int ix = inp[b * T + t];
             const int ix = inpBT[b][t];
-            // float* dwte_ix = dwte + ix * C;
             float* dwte_ix = dwteVC[ix];
-            // float* dwpe_t2 = dwpe + t * C;
             float* dwpe_t = &dwpeTC[t][0];
             for (int i = 0; i < C; i++) {
                 float d = dout_bt[i];
@@ -111,7 +105,6 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // seek to the input position inp[b,t,:]
-            // float* x = inp + b * T * C + t * C;
             const float* x = &inpBTC[b][t][0];
             // calculate the mean
             float m = 0.0f;
@@ -129,7 +122,6 @@ void layernorm_forward(float* out, float* mean, float* rstd,
             // calculate the rstd (reciprocal standard deviation)
             float s = 1.0f / sqrtf(v + eps);
             // seek to the output position in out[b,t,:]
-            // float* out_bt = out + b * T * C + t * C;
             float* out_bt = &outBTC[b][t][0];
             for (int i = 0; i < C; i++) {
                 float n = (s * (x[i] - m)); // normalize
@@ -137,9 +129,7 @@ void layernorm_forward(float* out, float* mean, float* rstd,
                 out_bt[i] = o; // write
             }
             // cache the mean and rstd for the backward pass later
-            // mean[b * T + t] = m;
             meanBT[b][t] = m;
-            // rstd[b * T + t] = s;
             rstdBT[b][t] = s;
         }
     }
@@ -157,15 +147,10 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
 
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            // float* dout_bt = dout + b * T * C + t * C;
             float* dout_bt = &doutBTC[b][t][0];
-            // float* inp_bt = inp + b * T * C + t * C;
             const float* inp_bt = &inpBTC[b][t][0];
-            // float* dinp_bt = dinp + b * T * C + t * C;
             float* dinp_bt = &dinpBTC[b][t][0];
-            // float mean_bt = mean[b * T + t];
             const float mean_bt = meanBT[b][t];
-            // float rstd_bt = rstd[b * T + t];
             const float rstd_bt = rstdBT[b][t];
 
             // first: two reduce operations
@@ -215,13 +200,10 @@ void matmul_forward(float* out,
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            // float* out_bt = out + b * T * OC + t * OC;
             float* out_bt = &outBTOC[b][t][0];
-            // float* inp_bt = inp + b * T * C + t * C;
             float* inp_bt = &inpBTC[b][t][0];
             for (int o = 0; o < OC; o++) {
                 float val = (bias != NULL) ? bias[o] : 0.0f;
-                // const float* wrow = weight + o*C;
                 const float* wrow = &weightOCC[o][0];
                 for (int i = 0; i < C; i++) {
                     val += inp_bt[i] * wrow[i];
@@ -248,12 +230,9 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            // float* dout_bt = dout + b * T * OC + t * OC;
             const float* dout_bt = &doutBTOC[b][t][0];
-            // float* dinp_bt = dinp + b * T * C + t * C;
             float* dinp_bt = &dinpBTC[b][t][0];
             for (int o = 0; o < OC; o++) {
-                // float* wrow = weight + o*C;
                 const float* wrow = &weightOCC[o][0];
                 float d = dout_bt[o];
                 for (int i = 0; i < C; i++) {
@@ -267,11 +246,8 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     for (int o = 0; o < OC; o++) {
         for (int b = 0; b < B; b++) {
             for (int t = 0; t < T; t++) {
-                // float* dout_bt = dout + b * T * OC + t * OC;
                 const float* dout_bt = &doutBTOC[b][t][0];
-                // const float* inp_bt = inp + b * T * C + t * C;
                 const float* inp_bt = &inpBTC[b][t][0];
-                // float* dwrow = dweight + o*C;
                 float* dwrow = &dweightOCC[o][0];
                 float d = dout_bt[o];
                 if (dbias != NULL) { dbias[o] += d; }
@@ -297,18 +273,22 @@ void attention_forward(float* out, float* preatt, float* att,
     int hs = C / NH; // head size
     float scale = 1.0 / sqrtf(hs);
 
+    DECL_ARRAYPTR3(float, inpBTC3,B,T,C3, inp);
+    DECL_ARRAYPTR4(float, attBNHTT,B,NH,T,T, att);
+    DECL_ARRAYPTR4(float, preattBNHTT,B,NH,T,T, preatt);
+
     #pragma omp parallel for collapse(3)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
-                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-                float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
-                float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+                float* query_t = &inpBTC3[b][t][h*hs];
+                float* preatt_bth = &preattBNHTT[b][h][t][0];
+                float* att_bth = &attBNHTT[b][h][t][0];
 
                 // pass 1: calculate query dot key and maxval
                 float maxval = -10000.0f; // TODO something better
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                    float* key_t2 = &inpBTC3[b][t2][h*hs+C]; // +C because it's key
 
                     // (query_t) dot (key_t2)
                     float val = 0.0f;
@@ -348,7 +328,7 @@ void attention_forward(float* out, float* preatt, float* att,
                 float* out_bth = out + b * T * C + t * C + h * hs;
                 for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                    float* value_t2 = &inpBTC3[b][t2][h*hs+C*2]; // +C*2 because it's value
                     float att_btht2 = att_bth[t2];
                     for (int i = 0; i < hs; i++) {
                         out_bth[i] += att_btht2 * value_t2[i];
@@ -376,11 +356,8 @@ void attention_backward(float* dinp, float* dpreatt, float* datt,
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
-                // const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
                 const float* att_bth = &attBNHTT[b][h][t][0];
-                // float* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
                 float* datt_bth = &dattBNHTT[b][h][t][0];
-                // float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
                 float* dpreatt_bth = &dpreattBNHTT[b][h][t][0];
                 float* dquery_t = dinp + b * T * C3 + t * C3 + h * hs;
                 float* query_t = inp + b * T * C3 + t * C3 + h * hs;
@@ -474,14 +451,11 @@ void softmax_forward(float* probs, const float* logits, int B, int T, int V) {
     DECL_ARRAYPTR3(const float, logitsBTV,B,T,V, logits);
     DECL_ARRAYPTR3(float, probsBTV,B,T,V, probs);
 
-
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // probs <- softmax(logits)
-            // const float* logits_bt = logits + b * T * V + t * V;
             const float* logits_bt = &logitsBTV[b][t][0];
-            // float* probs_bt = probs + b * T * V + t * V;
             float* probs_bt = &probsBTV[b][t][0];
 
             // maxval is only calculated and subtracted for numerical stability
@@ -516,7 +490,6 @@ void crossentropy_forward(float* losses,
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // loss = -log(probs[target])
-            // const float* probs_bt = probs + b * T * V + t * V;
             const float* probs_bt = &probsBTV[b][t][0];
             int ix = targetsBT[b][t];
             lossesBT[b][t] = -logf(probs_bt[ix]);
@@ -535,13 +508,9 @@ void crossentropy_softmax_backward(float* dlogits,
     // backwards through both softmax and crossentropy
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            // float* dlogits_bt = dlogits + b * T * V + t * V;
             float* dlogits_bt = &dlogitsBTV[b][t][0];
-            // const float* probs_bt = probs + b * T * V + t * V;
             const float* probs_bt = &probsBTV[b][t][0];
-            // float dloss = dlosses[b * T + t];
             float dloss = dlossesBT[b][t];
-            // int ix = targets[b * T + t];
             int ix = targetsBT[b][t];
             for (int i = 0; i < V; i++) {
                 float p = probs_bt[i];
