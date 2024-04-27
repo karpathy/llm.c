@@ -122,7 +122,7 @@ __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* d
     const float* dout_bt = dout + b * T * C + t * C;
     const float* inp_bt = inp + b * T * C + t * C;
     float* dinp_bt = dinp + b * T * C + t * C;
-    const const float mean_bt = mean[b * T + t];
+    const float mean_bt = mean[b * T + t];
     const float rstd_bt = rstd[b * T + t];
 
     // first: two reduce operations

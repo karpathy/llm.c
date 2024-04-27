@@ -20,6 +20,7 @@ dev/cuda/*_backward
 dev/cuda/classifier_fused
 dev/cuda/adamw
 dev/cuda/matmul_backward_bias
+dev/cuda/nccl_all_reduce
 *.obj
 *.exe
 
