@@ -57,13 +57,13 @@ mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 // use bf16 (bfloat 16)
 #if defined(ENABLE_BF16)
 typedef __nv_bfloat16 floatX;
-typedef float floatN;
+typedef __nv_bfloat16 floatN;
 #define CUBLAS_LOWP CUDA_R_16BF
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
 
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclBfloat16;
-const ncclDataType_t ncclFloatN = ncclFloat;
+const ncclDataType_t ncclFloatN = ncclBfloat16;
 #endif
 
 // use fp16 (note: this may require gradient scaler, currently not implemented!)
