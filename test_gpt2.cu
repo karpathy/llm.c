@@ -27,6 +27,51 @@ int check_tensor(float *a, float *b, int n, const char* label, float threshold=1
     return ok;
 }
 
+// the same tensors as in the train file, but in float, which are used as reference
+typedef struct {
+    float*  wte; // (V, C)
+    float*  wpe; // (maxT, C)
+    float*  qkvw; // (L, 3*C, C)
+    float*  qkvb; // (L, 3*C)
+    float*  attprojw; // (L, C, C)
+    float*  attprojb; // (L, C)
+    float*  fcw; // (L, 4*C, C)
+    float*  fcb; // (L, 4*C)
+    float*  fcprojw; // (L, C, 4*C)
+    float*  fcprojb; // (L, C)
+    float*  ln1w; // (L, C)
+    float*  ln1b; // (L, C)
+    float*  ln2w; // (L, C)
+    float*  ln2b; // (L, C)
+    float*  lnfw; // (C)
+    float*  lnfb; // (C)
+} FloatParameterTensors;
+static_assert(sizeof(FloatParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
+
+// malloc_and_point, but in float and on CPU, because we use this data to check correctness on CPU
+float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size_t* param_sizes) {
+    // calculate the total number of parameters and bytes across all tensors
+    size_t num_parameters = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        num_parameters += param_sizes[i];
+    }
+    float* params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
+    float** ptrs[] = {
+        &params->wte, &params->wpe, &params->qkvw, &params->qkvb,
+        &params->attprojw, &params->attprojb,  &params->fcw, &params->fcb,
+        &params->fcprojw, &params->fcprojb,
+        &params->ln1w, &params->ln1b,
+        &params->ln2w, &params->ln2b,
+        &params->lnfw, &params->lnfb
+    };
+    float* params_memory_iterator = params_memory;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        *(ptrs[i]) = params_memory_iterator;
+        params_memory_iterator += param_sizes[i];
+    }
+    return params_memory;
+}
+
 int main(int argc, char *argv[]) {
 
     // set up the device
@@ -62,8 +107,8 @@ int main(int argc, char *argv[]) {
     FILE *state_file = fopenCheck("gpt2_124M_debug_state.bin", "rb");
     int state_header[256];
     freadCheck(state_header, sizeof(int), 256, state_file);
-    if (state_header[0] != 20240327) { printf("Bad magic state file"); exit(1); }
-    if (state_header[1] != 1) { printf("Bad version in state file"); exit(1); }
+    if (state_header[0] != 20240327) { printf("Bad magic state file"); exit(EXIT_FAILURE); }
+    if (state_header[1] != 1) { printf("Bad version in state file"); exit(EXIT_FAILURE); }
     int B = state_header[2]; // batch size, e.g. 4
     int T = state_header[3]; // time / sequence length (e.g. 64, up to maxT)
     assert(0 <= T && T <= maxT);
@@ -71,25 +116,26 @@ int main(int argc, char *argv[]) {
     printf("batch_size: %d\n", B);
     printf("seq_len: %d\n", T);
 
-    ParameterTensors expected_grads; // will be read from file. right now: all in fp32
-    ParameterTensors calculated_grads; // will be calculated by us
-    float* expected_grads_memory = (float*)malloc_and_point_parameters(&expected_grads, model.param_elements, model.param_sizeof, 0);
-    void* calculated_grads_memory = malloc_and_point_parameters(&calculated_grads, model.param_elements, model.param_sizeof, 0);
-    float* converted_grads_memory = (float*)mallocCheck(model.num_parameters * sizeof(float)); // (to fp32)
-
-    // inputs and expected outputs, only used for error checking
+    // read reference information from the file saved from Python/PyTorch side
+    // 1) input x and y
     int* x = (int*)mallocCheck(B * T * sizeof(int));
     int* y = (int*)mallocCheck(B * T * sizeof(int));
-    float* expected_logits = (float*) mallocCheck(B * T * V * sizeof(float));
-    float* expected_loss = (float*) mallocCheck(1 * sizeof(float));
-
-    // read reference information from Python
     freadCheck(x, sizeof(int), B*T, state_file);
     freadCheck(y, sizeof(int), B*T, state_file);
+    // 2) results of forward pass (logits and loss)
+    float* expected_logits = (float*) mallocCheck(B * T * V * sizeof(float));
+    float* expected_loss = (float*) mallocCheck(1 * sizeof(float));
     freadCheck(expected_logits, sizeof(float), B*T*V, state_file);
     freadCheck(expected_loss, sizeof(float), 1, state_file);
+    // 3) results of backward pass (parameter gradients)
+    FloatParameterTensors expected_grads; // will be read from file. right now: all in fp32
+    float* expected_grads_memory = float_cpu_malloc_and_point_parameters(&expected_grads, model.param_elements);
     freadCheck(expected_grads_memory, 1, model.num_parameters_bytes, state_file);
     fcloseCheck(state_file);
+
+    // this memory will be used to do one single copy of all (mixed precision) GPU grads to CPU grads
+    void* grads_memory_cpu = mallocCheck(model.num_parameters_bytes);
+    float* grads_memory_cpu_float = (float*)mallocCheck(model.num_parameters * sizeof(float));
 
     // overall OK signal for the test
     int allok = 1;
@@ -149,46 +195,13 @@ int main(int argc, char *argv[]) {
                 printf("LOSS OK: %f %f\n", model.mean_loss, *expected_loss);
             }
 
-            // and now compare the gradients on the parameters
-            // cudaMemcpy(calculated_grads.lnfw, model.grads.lnfw, C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.lnfb, model.grads.lnfb, C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.fcprojw, model.grads.fcprojw, L * C * 4*C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.fcprojb, model.grads.fcprojb, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.fcw, model.grads.fcw, L * 4*C * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.fcb, model.grads.fcb, L * 4*C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.ln2w, model.grads.ln2w, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.ln2b, model.grads.ln2b, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.attprojw, model.grads.attprojw, L * C * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.attprojb, model.grads.attprojb, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.qkvw, model.grads.qkvw, L * 3*C * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.qkvb, model.grads.qkvb, L * 3*C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.ln1w, model.grads.ln1w, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.ln1b, model.grads.ln1b, L * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.wte, model.grads.wte, V * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // cudaMemcpy(calculated_grads.wpe, model.grads.wpe, maxT * C * sizeof(float), cudaMemcpyDeviceToHost);
-            // check_tensor(calculated_grads.lnfb, expected_grads.lnfb, C, "lnfb");
-            // check_tensor(calculated_grads.lnfw, expected_grads.lnfw, C, "lnfw");
-            // check_tensor(calculated_grads.fcprojw, expected_grads.fcprojw, L * C * 4*C, "fcprojw");
-            // check_tensor(calculated_grads.fcprojb, expected_grads.fcprojb, L * C, "fcprojb");
-            // check_tensor(calculated_grads.fcw, expected_grads.fcw, L * 4*C * C, "fcw");
-            // check_tensor(calculated_grads.fcb, expected_grads.fcb, L * 4*C, "fcb");
-            // check_tensor(calculated_grads.ln2w, expected_grads.ln2w, L * C, "ln2w");
-            // check_tensor(calculated_grads.ln2b, expected_grads.ln2b, L * C, "ln2b");
-            // check_tensor(calculated_grads.attprojw, expected_grads.attprojw, L * C * C, "attprojw");
-            // check_tensor(calculated_grads.attprojb, expected_grads.attprojb, L * C, "attprojb");
-            // check_tensor(calculated_grads.qkvw, expected_grads.qkvw, L * 3*C * C, "qkvw");
-            // check_tensor(calculated_grads.qkvb, expected_grads.qkvb, L * 3*C, "qkvb");
-            // check_tensor(calculated_grads.ln1w, expected_grads.ln1w, L * C, "ln1w");
-            // check_tensor(calculated_grads.ln1b, expected_grads.ln1b, L * C, "ln1b");
-            // check_tensor(calculated_grads.wte, expected_grads.wte, V * C, "wte");
-            // check_tensor(calculated_grads.wpe, expected_grads.wpe, maxT * C, "wpe");
+            // move the (mixed precision) grads from GPU to CPU
+            cudaMemcpy(grads_memory_cpu, model.grads_memory, model.num_parameters_bytes, cudaMemcpyDeviceToHost);
 
-            // get gradients from GPU
-            cudaMemcpy(calculated_grads_memory, model.grads_memory, model.num_parameters_bytes, cudaMemcpyDeviceToHost);
-            // "normalize" all the gradients to be in fp32, for simple comparison
-            char* src_iterator = (char*)calculated_grads_memory; // can be lower precision, so char*
-            float* dst_iterator = (float*)converted_grads_memory; // always sizeof(float) bytes
-            float* exp_iterator = expected_grads_memory; // expected gradients are already in fp32
+            // convert all gradients to float on the CPU
+            char* src_iterator = (char*)grads_memory_cpu; // can be lower precision, so we use char*
+            float* dst_iterator = (float*)grads_memory_cpu_float; // float*
+            float* exp_iterator = expected_grads_memory; // float* of expected gradients from Python
             float* tensors1[NUM_PARAMETER_TENSORS];
             float* tensors2[NUM_PARAMETER_TENSORS];
             for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -197,15 +210,15 @@ int main(int argc, char *argv[]) {
                     memcpy(dst_iterator, src_iterator, model.param_elements[i] * sizeof(float));
                 } else {
                     // low-precision tensor => convert to float
-                    assert(model.param_sizeof[i] == sizeof(floatX));
+                    assert(model.param_sizeof[i] == sizeof(floatX)); // floatX is the single non-float supported atm
                     for (size_t j = 0; j < model.param_elements[i]; j++) {
-                        dst_iterator[j] = ((floatX*)src_iterator)[j];
+                        dst_iterator[j] = ((floatX*)src_iterator)[j]; // convert to float
                     }
                 }
-                // record the position
-                tensors1[i] = dst_iterator;
-                tensors2[i] = exp_iterator;
-                // advance
+                // for convenience record the position of comparison for reality vs. expectation
+                tensors1[i] = dst_iterator; // reality
+                tensors2[i] = exp_iterator; // expectation
+                // advance the iterators
                 src_iterator += model.param_elements[i] * model.param_sizeof[i];
                 dst_iterator += model.param_elements[i];
                 exp_iterator += model.param_elements[i];
@@ -272,8 +285,8 @@ int main(int argc, char *argv[]) {
     free(expected_logits);
     free(expected_loss);
     free(expected_grads_memory);
-    free(calculated_grads_memory);
-    free(converted_grads_memory);
+    free(grads_memory_cpu);
+    free(grads_memory_cpu_float);
     gpt2_free(&model);
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));

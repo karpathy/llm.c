@@ -1521,8 +1521,8 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
-void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof, int on_device) {
-    // calculate the number of parameters
+void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof) {
+    // calculate the total number of parameters and bytes across all tensors
     size_t num_parameters = 0;
     size_t num_parameters_bytes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -1532,15 +1532,7 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     // malloc all parameters all at once on the device
     // on_device: 0 = CPU, 1 = GPU
     void* params_memory;
-    if (on_device) {
-        cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
-    } else {
-        // on_device = 0 is only used for testing inside test_gpt2.cu
-        // when we test, our reference gradients are all in fp32
-        // so we assume all fp32 when going through this code path
-        // and therefore do * sizeof(float)
-        params_memory = mallocCheck(num_parameters * sizeof(float));
-    }
+    cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
     // assign all the tensors their place in the array
     floatX** ptrs[] = {
         &params->wte, &params->wpe, &params->qkvw, &params->qkvb,
@@ -1729,7 +1721,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     }
 
     // create memory for model parameters on the device
-    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof, 1);
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 
     // read in all the parameters from file and copy them to device
     float* params_memory_cpu = (float*)mallocCheck(model->num_parameters_bytes);
@@ -1906,7 +1898,7 @@ void gpt2_backward(GPT2 *model) {
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
         // allocate buffers for weight gradients
-        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof, 1);
+        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
         printf0("allocated %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
         // we're going to be clever for the activations backward pass. we don't need to exactly
         // mirror the forward pass activations and we will save memory.
