@@ -31,6 +31,9 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaSetDevice(deviceIdx));
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
+    cuda_num_SMs = deviceProp.multiProcessorCount;
+    cuda_arch_major = deviceProp.major;
+    cuda_arch_minor = deviceProp.minor;
     printf("[System]\n");
     printf("Device %d: %s\n", deviceIdx, deviceProp.name);
 
@@ -38,7 +41,7 @@ int main(int argc, char *argv[]) {
     cublasCheck(cublasCreate(&cublas_handle));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
-    int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
+    int enable_tf32 = cuda_arch_major >= 8 ? 1 : 0;
     enable_tf32 = 0; // NOTE: disable TF32 for testing!!!
     printf("enable_tf32: %d\n", enable_tf32);
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
