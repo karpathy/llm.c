@@ -53,6 +53,7 @@ mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 
 // turn on bf16 as default, done up here for now
 #define ENABLE_BF16
+// #define ENABLE_FP32
 
 // use bf16 (bfloat 16)
 #if defined(ENABLE_BF16)
@@ -60,6 +61,7 @@ typedef __nv_bfloat16 floatX;
 typedef float floatN;
 #define CUBLAS_LOWP CUDA_R_16BF
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights
 
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclBfloat16;
@@ -72,6 +74,7 @@ typedef half floatX;
 typedef float floatN;
 #define CUBLAS_LOWP CUDA_R_16F
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+const char* load_filename = "gpt2_124M.bin"; // fp32 weights
 
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclHalf;
@@ -84,6 +87,7 @@ typedef float floatX;
 typedef float floatN;
 #define CUBLAS_LOWP CUDA_R_32F
 #define CUBLAS_LOWP_COMPUTE cublas_compute_type // auto-select FP32 vs TF32
+const char* load_filename = "gpt2_124M.bin"; // fp32 weights
 
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclFloat;
@@ -1701,7 +1705,13 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     int model_header[256];
     freadCheck(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(EXIT_FAILURE); }
-    if (model_header[1] != 2) { printf("Bad version in model file"); exit(EXIT_FAILURE); }
+    int version = model_header[1];
+    if (!(version == 2 || version == 3)) {
+        // 2 = fp32, ordered layernorm at the end
+        // 3 = bf16, ordered layernorm at the end
+        printf("Bad version in model file");
+        exit(EXIT_FAILURE);
+    }
 
     // read in hyperparameters
     model->config.max_seq_len = model_header[2];
@@ -2389,7 +2399,8 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
+    gpt2_build_from_checkpoint(&model, load_filename);
+    printf0("| load_filename         | %-50s |\n", load_filename);
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
     printf0("| num_layers L          | %-50d |\n", model.config.num_layers);

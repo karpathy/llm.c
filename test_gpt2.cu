@@ -119,7 +119,7 @@ int main(int argc, char *argv[]) {
     int state_header[256];
     freadCheck(state_header, sizeof(int), 256, state_file);
     if (state_header[0] != 20240327) { printf("Bad magic state file"); exit(EXIT_FAILURE); }
-    if (state_header[1] != 1) { printf("Bad version in state file"); exit(EXIT_FAILURE); }
+    if (state_header[1] != 2) { printf("Bad version in state file"); exit(EXIT_FAILURE); }
     int B = state_header[2]; // batch size, e.g. 4
     int T = state_header[3]; // time / sequence length (e.g. 64, up to maxT)
     assert(0 <= T && T <= maxT);
@@ -164,16 +164,21 @@ int main(int argc, char *argv[]) {
     int logits_ok = 1;
 
     // FP16 and lower require very high tolerances unfortunately. TODO look into more
-    float accuracy_threshold = 1e-2;
+    float logit_accuracy_threshold = 1e-2f;
+    float loss_diff_threshold = 0.05f;
     #if defined(ENABLE_BF16) || defined(ENABLE_F16)
-    accuracy_threshold = 23;
+    logit_accuracy_threshold = 15.0f;
     #endif
 
+
+    float max_diff = 0.0f;
     for (int i=0; i<B*T*V; i++) {
         if(i < 10) {
             printf("%f %f\n", expected_logits[i], logits_cpu[i]);
         }
-        if (fabsf(expected_logits[i] - logits_cpu[i]) >= accuracy_threshold) {
+        float diff = fabsf(expected_logits[i] - logits_cpu[i]);
+        max_diff = fmaxf(max_diff, diff);
+        if (diff >= logit_accuracy_threshold) {
             printf("MISMATCH AT INDEX %d: ", i);
             printf("%f %f\n", expected_logits[i],logits_cpu[i]);
             logits_ok = 0;
@@ -183,6 +188,7 @@ int main(int argc, char *argv[]) {
     allok = allok && logits_ok;
     if(!logits_ok) { printf("NOT "); }
     printf("OK (LOGITS)\n");
+    printf("logit max diff: %f\n", max_diff);
 
     // let's do 10 training iterations, following the pytorch code
     float losses[10];
@@ -199,7 +205,7 @@ int main(int argc, char *argv[]) {
             // error checking at step 0 for reference activations
 
             // compare the achieved loss
-            if (fabsf(model.mean_loss - *expected_loss) >= accuracy_threshold) {
+            if (fabsf(model.mean_loss - *expected_loss) >= loss_diff_threshold) {
                 printf("LOSS MISMATCH: %f %f\n", model.mean_loss, *expected_loss);
                 allok = 0;
             } else {
@@ -241,20 +247,20 @@ int main(int argc, char *argv[]) {
             // Maybe we have bugs, or maybe it is bf16. To be seen I think at this point.
             allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", 6e-1f);
             allok = allok & check_tensor(tensors1[1], tensors2[1], maxT * C, "wpe", 1e-2f);
-            allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", 1.4); // wow...
-            allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", 2e-1f);
-            allok = allok & check_tensor(tensors1[4], tensors2[4], L * C * C, "attprojw", 2e-1f);
-            allok = allok & check_tensor(tensors1[5], tensors2[5], L * C, "attprojb", 1e-1f);
-            allok = allok & check_tensor(tensors1[6], tensors2[6], L * 4*C * C, "fcw", 1.3); // wow...
-            allok = allok & check_tensor(tensors1[7], tensors2[7], L * 4*C, "fcb", 1e-1f);
-            allok = allok & check_tensor(tensors1[8], tensors2[8], L * C * 4*C, "fcprojw", 2e-1f);
-            allok = allok & check_tensor(tensors1[9], tensors2[9], L * C, "fcprojb", 1e-1f);
-            allok = allok & check_tensor(tensors1[10], tensors2[10], L * C, "ln1w", 1.4); // wow
-            allok = allok & check_tensor(tensors1[11], tensors2[11], L * C, "ln1b", 2e-1f);
-            allok = allok & check_tensor(tensors1[12], tensors2[12], L * C, "ln2w", 1.4); // wow
-            allok = allok & check_tensor(tensors1[13], tensors2[13], L * C, "ln2b", 2e-1f);
-            allok = allok & check_tensor(tensors1[14], tensors2[14], C, "lnfw", 2e-1f);
-            allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", 2e-1f);
+            allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", 3e-2);
+            allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", 3e-2f);
+            allok = allok & check_tensor(tensors1[4], tensors2[4], L * C * C, "attprojw", 3e-2f);
+            allok = allok & check_tensor(tensors1[5], tensors2[5], L * C, "attprojb", 3e-2f);
+            allok = allok & check_tensor(tensors1[6], tensors2[6], L * 4*C * C, "fcw", 3e-2f);
+            allok = allok & check_tensor(tensors1[7], tensors2[7], L * 4*C, "fcb", 3e-2f);
+            allok = allok & check_tensor(tensors1[8], tensors2[8], L * C * 4*C, "fcprojw", 3e-2f);
+            allok = allok & check_tensor(tensors1[9], tensors2[9], L * C, "fcprojb", 3e-2f);
+            allok = allok & check_tensor(tensors1[10], tensors2[10], L * C, "ln1w", 0.1f); // hmm bit higher
+            allok = allok & check_tensor(tensors1[11], tensors2[11], L * C, "ln1b", 3e-2f);
+            allok = allok & check_tensor(tensors1[12], tensors2[12], L * C, "ln2w", 0.1f); // hmm bit higher
+            allok = allok & check_tensor(tensors1[13], tensors2[13], L * C, "ln2b", 3e-2f);
+            allok = allok & check_tensor(tensors1[14], tensors2[14], C, "lnfw", 0.12f); // hmm bit higher
+            allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", 3e-2f);
         }
 
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1);
@@ -280,7 +286,7 @@ int main(int argc, char *argv[]) {
 
     // compare
     for (int i = 0; i < 10; i++) {
-        if (fabsf(losses[i] - expected_losses[i]) >= accuracy_threshold) {
+        if (fabsf(losses[i] - expected_losses[i]) >= loss_diff_threshold) {
             printf("LOSS MISMATCH AT STEP %d: %f %f\n", i, losses[i], expected_losses[i]);
             allok = 0;
         } else {
