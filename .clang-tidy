@@ -1,0 +1,1 @@
+Checks: '-*,bugprone-*,-bugprone-easily-swappable-parameters,cert-*-c,misc-confusable-identifiers,misc-const-correctness,performance-*'
