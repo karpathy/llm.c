@@ -1468,25 +1468,28 @@ typedef struct {
 } GPT2Config;
 
 // the parameters of the model
-#define NUM_PARAMETER_TENSORS 16
+constexpr const int NUM_PARAMETER_TENSORS = 16;
 typedef struct {
+    // matrices in lower precision
     floatX*   wte; // (V, C)
     floatX*   wpe; // (maxT, C)
-    floatN*  ln1w; // (L, C)
-    floatN*  ln1b; // (L, C)
     floatX* qkvw; // (L, 3*C, C)
     floatX* qkvb; // (L, 3*C)
     floatX* attprojw; // (L, C, C)
     floatX* attprojb; // (L, C)
-    floatN*  ln2w; // (L, C)
-    floatN*  ln2b; // (L, C)
     floatX* fcw; // (L, 4*C, C)
     floatX* fcb; // (L, 4*C)
     floatX* fcprojw; // (L, C, 4*C)
     floatX* fcprojb; // (L, C)
+    // layernorm parameters in higher precision
+    floatN*  ln1w; // (L, C)
+    floatN*  ln1b; // (L, C)
+    floatN*  ln2w; // (L, C)
+    floatN*  ln2b; // (L, C)
     floatN*  lnfw; // (C)
     floatN*  lnfb; // (C)
 } ParameterTensors;
+static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
 void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
     size_t V = config.vocab_size;
@@ -1495,36 +1498,30 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     size_t L = config.num_layers;
     param_sizes[0] = V * C; // wte
     param_sizes[1] = maxT * C; // wpe
-    param_sizes[2] = L * C; // ln1w
-    param_sizes[3] = L * C; // ln1b
-    param_sizes[4] = L * (3 * C) * C; // qkvw
-    param_sizes[5] = L * (3 * C); // qkvb
-    param_sizes[6] = L * C * C; // attprojw
-    param_sizes[7] = L * C; // attprojb
-    param_sizes[8] = L * C; // ln2w
-    param_sizes[9] = L * C; // ln2b
-    param_sizes[10] = L * (4 * C) * C; // fcw
-    param_sizes[11] = L * (4 * C); // fcb
-    param_sizes[12] = L * C * (4 * C); // fcprojw
-    param_sizes[13] = L * C; // fcprojb
+    param_sizes[2] = L * (3 * C) * C; // qkvw
+    param_sizes[3] = L * (3 * C); // qkvb
+    param_sizes[4] = L * C * C; // attprojw
+    param_sizes[5] = L * C; // attprojb
+    param_sizes[6] = L * (4 * C) * C; // fcw
+    param_sizes[7] = L * (4 * C); // fcb
+    param_sizes[8] = L * C * (4 * C); // fcprojw
+    param_sizes[9] = L * C; // fcprojb
+    param_sizes[10] = L * C; // ln1w
+    param_sizes[11] = L * C; // ln1b
+    param_sizes[12] = L * C; // ln2w
+    param_sizes[13] = L * C; // ln2b
     param_sizes[14] = C; // lnfw
     param_sizes[15] = C; // lnfb
 
     // Set parameter sizes
     // floatN gives us an option to keep layernorm params in FP32 if we want to
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        param_sizeof[i] = sizeof(floatX);
+        param_sizeof[i] = (i < 10) ? sizeof(floatX) : sizeof(floatN);
     }
-    param_sizeof[2] = sizeof(floatN); // ln1w
-    param_sizeof[3] = sizeof(floatN); // ln1b
-    param_sizeof[8] = sizeof(floatN); // ln2w
-    param_sizeof[9] = sizeof(floatN); // ln2b
-    param_sizeof[14] = sizeof(floatN); // lnfw
-    param_sizeof[15] = sizeof(floatN); // lnfb
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
-float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof, int on_device) {
+void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof, int on_device) {
     // calculate the number of parameters
     size_t num_parameters = 0;
     size_t num_parameters_bytes = 0;
@@ -1534,17 +1531,24 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_eleme
     }
     // malloc all parameters all at once on the device
     // on_device: 0 = CPU, 1 = GPU
-    float* params_memory;
+    void* params_memory;
     if (on_device) {
         cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
     } else {
-        params_memory = (float*)mallocCheck(num_parameters * sizeof(float)); // keep FP32 here
+        // on_device = 0 is only used for testing inside test_gpt2.cu
+        // when we test, our reference gradients are all in fp32
+        // so we assume all fp32 when going through this code path
+        // and therefore do * sizeof(float)
+        params_memory = mallocCheck(num_parameters * sizeof(float));
     }
     // assign all the tensors their place in the array
     floatX** ptrs[] = {
-        &params->wte, &params->wpe, (floatX**)&params->ln1w, (floatX**)&params->ln1b, &params->qkvw, &params->qkvb,
-        &params->attprojw, &params->attprojb, (floatX**)&params->ln2w, (floatX**)&params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, (floatX**)&params->lnfw, (floatX**)&params->lnfb
+        &params->wte, &params->wpe, &params->qkvw, &params->qkvb,
+        &params->attprojw, &params->attprojb,  &params->fcw, &params->fcb,
+        &params->fcprojw, &params->fcprojb,
+        (floatX**)&params->ln1w, (floatX**)&params->ln1b,
+        (floatX**)&params->ln2w, (floatX**)&params->ln2b,
+        (floatX**)&params->lnfw, (floatX**)&params->lnfb
     };
     char* params_memory_iterator = (char*)params_memory;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -1705,7 +1709,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     int model_header[256];
     freadCheck(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(EXIT_FAILURE); }
-    if (model_header[1] != 1) { printf("Bad version in model file"); exit(EXIT_FAILURE); }
+    if (model_header[1] != 2) { printf("Bad version in model file"); exit(EXIT_FAILURE); }
 
     // read in hyperparameters
     model->config.max_seq_len = model_header[2];
@@ -1723,34 +1727,14 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
         model->num_parameters += model->param_elements[i];
         model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
     }
-    size_t input_model_bytes = model->num_parameters * sizeof(float);
 
     // create memory for model parameters on the device
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof, 1);
 
     // read in all the parameters from file and copy them to device
-    float* params_memory_cpu = (float*)mallocCheck(input_model_bytes);
-    freadCheck(params_memory_cpu, 1, input_model_bytes, model_file);
-
-    float* params_cpu_iterator = (float*)params_memory_cpu;
-    char* params_gpu_iterator = (char*)model->params_memory;
-
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        if (model->param_sizeof[i] == sizeof(float)) {
-            cudaCheck(cudaMemcpy(params_gpu_iterator, params_cpu_iterator, model->param_elements[i] * sizeof(float), cudaMemcpyHostToDevice));
-        } else {
-            // TODO: Currently only support float or floatX (cannot mix and match FP16/BF16 etc...)
-            assert(model->param_sizeof[i] == sizeof(floatX));
-            floatX* conversion_scratchpad = (floatX*)mallocCheck(model->param_elements[i] * sizeof(floatX));
-            for (size_t j = 0; j < model->param_elements[i]; j++) {
-                conversion_scratchpad[j] = (floatX)params_cpu_iterator[j];
-            }
-            cudaCheck(cudaMemcpy(params_gpu_iterator, conversion_scratchpad, model->param_elements[i] * sizeof(floatX), cudaMemcpyHostToDevice));
-            free(conversion_scratchpad);
-        }
-        params_cpu_iterator += model->param_elements[i];
-        params_gpu_iterator += model->param_elements[i] * model->param_sizeof[i];
-    }
+    float* params_memory_cpu = (float*)mallocCheck(model->num_parameters_bytes);
+    freadCheck(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
+    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     free(params_memory_cpu);
     fcloseCheck(model_file);
 
@@ -1925,11 +1909,9 @@ void gpt2_backward(GPT2 *model) {
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof, 1);
         printf0("allocated %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
         // we're going to be clever for the activations backward pass. we don't need to exactly
-        // mirror the forward pass acrtivations and we will save memory.
+        // mirror the forward pass activations and we will save memory.
         size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
-        GPT2Config cfg = model->config;
-        cfg.num_layers = 1; // copy the configuration but override number of layers to 1
-        fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, cfg);
+        fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, model->config);
         // count up and allocate the space
         model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
         model->num_grad_acts = 0;
@@ -2087,39 +2069,22 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
 
-    // Do adam per set of parameters
-    // We need to know the parameter types (float or floatX) to process consecutive chunks
-    // TODO - optimise this to require fewer kernel launches and/or independent via CUDA streams
-    char* params_mem = (char*)model->params_memory;
-    char* grads_mem = (char*)model->grads_memory;
-    size_t num_elements = model->param_elements[0];
-    size_t last_sizeof = model->param_sizeof[0];
-    size_t current_element = 0;
-
-    for (int i = 1; i <= NUM_PARAMETER_TENSORS; i++) {
-        if (i == NUM_PARAMETER_TENSORS || model->param_sizeof[i] != last_sizeof) {
-            unsigned int seed = random_u32(&model->rng_state); // seed for stochastic rounding
-            int num_blocks = CEIL_DIV(num_elements, block_size);
-            // atm some params are in low precision (floatX) and some are in high precision (float)
-            if (last_sizeof == sizeof(floatX)) {
-                adamw_kernel3<<<num_blocks, block_size>>>((floatX*)params_mem, (floatX*)grads_mem,
-                            &model->m_memory[current_element], &model->v_memory[current_element], num_elements,
-                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
-            } else {
-                adamw_kernel3<<<num_blocks, block_size>>>((float*)params_mem, (float*)grads_mem,
-                            &model->m_memory[current_element], &model->v_memory[current_element], num_elements,
-                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
-            }
-            params_mem += num_elements * last_sizeof;
-            grads_mem += num_elements * last_sizeof;
-            current_element += num_elements;
-            num_elements = 0;
-        }
-        if (i != NUM_PARAMETER_TENSORS) {
-            num_elements += model->param_elements[i];
-            last_sizeof = model->param_sizeof[i];
-        }
-    }
+    // Adam update for the floatX weights
+    unsigned int seed = random_u32(&model->rng_state); // seed for stochastic rounding
+    size_t n_floatx = (floatX*) model->params.ln1w - model->params.wte; // pointer arithmetic, makes layout assumptions
+    int num_blocks = CEIL_DIV(n_floatx, block_size);
+    adamw_kernel3<<<num_blocks, block_size>>>(model->params.wte, model->grads.wte,
+                                              model->m_memory, model->v_memory, n_floatx,
+                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps,
+                                              weight_decay, seed);
+    cudaCheck(cudaGetLastError());
+    // Adam update for the floatN weights
+    size_t n_floatn = model->num_parameters - n_floatx; // pointer arithmetic, makes layout assumptions
+    num_blocks = CEIL_DIV(n_floatn, block_size);
+    adamw_kernel3<<<num_blocks, block_size>>>(model->params.ln1w, model->grads.ln1w,
+                                              model->m_memory + n_floatx, model->v_memory + n_floatx, n_floatn,
+                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps,
+                                              weight_decay, seed);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2432,7 +2397,7 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
     printf0("| num_layers L          | %-50d |\n", model.config.num_layers);

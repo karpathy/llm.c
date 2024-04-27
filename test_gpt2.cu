@@ -5,9 +5,12 @@
 int check_tensor(float *a, float *b, int n, const char* label, float threshold=1e-0) {
     int print_upto = 5;
     int ok = 1;
+    float max_diff = 0.0f;
     printf("%s\n", label);
     for (int i = 0; i < n; i++) {
-        if (fabsf(a[i] - b[i]) <= threshold) {
+        float diff = fabsf(a[i] - b[i]);
+        max_diff = fmaxf(max_diff, diff);
+        if (diff <= threshold) {
             if (i < print_upto) { printf("OK "); }
         } else {
             if (i < print_upto) { printf("NOT OK "); }
@@ -17,9 +20,9 @@ int check_tensor(float *a, float *b, int n, const char* label, float threshold=1
     }
     // print the final result
     if (ok) {
-        printf("TENSOR OK\n");
+        printf("TENSOR OK, max diff: %e\n", max_diff);
     } else {
-        printf("TENSOR NOT OK\n");
+        printf("TENSOR NOT OK, max diff: %e\n", max_diff);
     }
     return ok;
 }
@@ -48,12 +51,12 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
-
-    // int C = model.config.channels;
-    int V = model.config.vocab_size;
-    int maxT = model.config.max_seq_len;
-    // int L = model.config.num_layers;
+    gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
+    size_t V = model.config.vocab_size;
+    size_t maxT = model.config.max_seq_len;
+    size_t L = model.config.num_layers;
+    size_t NH = model.config.num_heads;
+    size_t C = model.config.channels;
 
     // load additional information that we will use for debugging and error checking
     FILE *state_file = fopenCheck("gpt2_124M_debug_state.bin", "rb");
@@ -68,11 +71,11 @@ int main(int argc, char *argv[]) {
     printf("batch_size: %d\n", B);
     printf("seq_len: %d\n", T);
 
-    ParameterTensors expected_grads; // will be read from file (from PyTorch)
+    ParameterTensors expected_grads; // will be read from file. right now: all in fp32
     ParameterTensors calculated_grads; // will be calculated by us
-    float* expected_grads_memory = malloc_and_point_parameters(&expected_grads, model.param_elements, model.param_sizeof, 0);
-    float* calculated_grads_memory = malloc_and_point_parameters(&calculated_grads, model.param_elements, model.param_sizeof, 0);
-    float* converted_grads_memory = (float*)mallocCheck(model.num_parameters * sizeof(float));
+    float* expected_grads_memory = (float*)malloc_and_point_parameters(&expected_grads, model.param_elements, model.param_sizeof, 0);
+    void* calculated_grads_memory = malloc_and_point_parameters(&calculated_grads, model.param_elements, model.param_sizeof, 0);
+    float* converted_grads_memory = (float*)mallocCheck(model.num_parameters * sizeof(float)); // (to fp32)
 
     // inputs and expected outputs, only used for error checking
     int* x = (int*)mallocCheck(B * T * sizeof(int));
@@ -85,7 +88,7 @@ int main(int argc, char *argv[]) {
     freadCheck(y, sizeof(int), B*T, state_file);
     freadCheck(expected_logits, sizeof(float), B*T*V, state_file);
     freadCheck(expected_loss, sizeof(float), 1, state_file);
-    freadCheck(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
+    freadCheck(expected_grads_memory, 1, model.num_parameters_bytes, state_file);
     fcloseCheck(state_file);
 
     // overall OK signal for the test
@@ -103,14 +106,14 @@ int main(int argc, char *argv[]) {
     }
     int logits_ok = 1;
 
-    // FP16 and lower require very high tolerances unfortunately
+    // FP16 and lower require very high tolerances unfortunately. TODO look into more
     float accuracy_threshold = 1e-2;
     #if defined(ENABLE_BF16) || defined(ENABLE_F16)
     accuracy_threshold = 23;
     #endif
 
     for (int i=0; i<B*T*V; i++) {
-        if(i < 3) {
+        if(i < 10) {
             printf("%f %f\n", expected_logits[i], logits_cpu[i]);
         }
         if (fabsf(expected_logits[i] - logits_cpu[i]) >= accuracy_threshold) {
@@ -120,6 +123,7 @@ int main(int argc, char *argv[]) {
             break;
         }
     }
+    allok = allok && logits_ok;
     if(!logits_ok) { printf("NOT "); }
     printf("OK (LOGITS)\n");
 
@@ -136,11 +140,6 @@ int main(int argc, char *argv[]) {
 
         if (step == 0) {
             // error checking at step 0 for reference activations
-
-
-            allok = allok && logits_ok;
-            free(logits_cpu_raw);
-            free(logits_cpu);
 
             // compare the achieved loss
             if (fabsf(model.mean_loss - *expected_loss) >= accuracy_threshold) {
@@ -184,24 +183,51 @@ int main(int argc, char *argv[]) {
             // check_tensor(calculated_grads.wte, expected_grads.wte, V * C, "wte");
             // check_tensor(calculated_grads.wpe, expected_grads.wpe, maxT * C, "wpe");
 
-            // get gradients from GPU and convert all non-FP32 gradients back to FP32 for check_tensor
-            cudaMemcpy(calculated_grads_memory, model.grads_memory, model.num_parameters * sizeof(floatX), cudaMemcpyDeviceToHost);
-            char* src_iterator = (char*)calculated_grads_memory;
-            float* dst_iterator = (float*)converted_grads_memory;
-            for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            // get gradients from GPU
+            cudaMemcpy(calculated_grads_memory, model.grads_memory, model.num_parameters_bytes, cudaMemcpyDeviceToHost);
+            // "normalize" all the gradients to be in fp32, for simple comparison
+            char* src_iterator = (char*)calculated_grads_memory; // can be lower precision, so char*
+            float* dst_iterator = (float*)converted_grads_memory; // always sizeof(float) bytes
+            float* exp_iterator = expected_grads_memory; // expected gradients are already in fp32
+            float* tensors1[NUM_PARAMETER_TENSORS];
+            float* tensors2[NUM_PARAMETER_TENSORS];
+            for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
                 if (model.param_sizeof[i] == sizeof(float)) {
+                    // float tensor => copy over directly
                     memcpy(dst_iterator, src_iterator, model.param_elements[i] * sizeof(float));
                 } else {
+                    // low-precision tensor => convert to float
                     assert(model.param_sizeof[i] == sizeof(floatX));
                     for (size_t j = 0; j < model.param_elements[i]; j++) {
                         dst_iterator[j] = ((floatX*)src_iterator)[j];
                     }
                 }
+                // record the position
+                tensors1[i] = dst_iterator;
+                tensors2[i] = exp_iterator;
+                // advance
                 src_iterator += model.param_elements[i] * model.param_sizeof[i];
                 dst_iterator += model.param_elements[i];
+                exp_iterator += model.param_elements[i];
             }
-            // compare the gradients ona the parameters all at once
-            check_tensor(converted_grads_memory, expected_grads_memory, model.num_parameters, "grads");
+
+            // compare the gradients on the parameters all at once, in fp32
+            allok = allok & check_tensor(tensors1[0], tensors2[1], V * C, "wte", 1e-2f);
+            allok = allok & check_tensor(tensors1[1], tensors2[1], maxT * C, "wpe", 1e-2f);
+            allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", 1e-2f);
+            allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", 1e-2f);
+            allok = allok & check_tensor(tensors1[4], tensors2[4], L * C * C, "attprojw", 1e-2f);
+            allok = allok & check_tensor(tensors1[5], tensors2[5], L * C, "attprojb", 1e-2f);
+            allok = allok & check_tensor(tensors1[6], tensors2[6], L * 4*C * C, "fcw", 1e-2f);
+            allok = allok & check_tensor(tensors1[7], tensors2[7], L * 4*C, "fcb", 1e-2f);
+            allok = allok & check_tensor(tensors1[8], tensors2[8], L * C * 4*C, "fcprojw", 1e-2f);
+            allok = allok & check_tensor(tensors1[9], tensors2[9], L * C, "fcprojb", 1e-2f);
+            allok = allok & check_tensor(tensors1[10], tensors2[10], L * C, "ln1w", 1e-2f);
+            allok = allok & check_tensor(tensors1[11], tensors2[11], L * C, "ln1b", 1e-2f);
+            allok = allok & check_tensor(tensors1[12], tensors2[12], L * C, "ln2w", 1e-2f);
+            allok = allok & check_tensor(tensors1[13], tensors2[13], L * C, "ln2b", 1e-2f);
+            allok = allok & check_tensor(tensors1[14], tensors2[14], C, "lnfw", 1e-2f);
+            allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", 1e-2f);
         }
 
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1);
@@ -241,6 +267,8 @@ int main(int argc, char *argv[]) {
     // free everything
     free(x);
     free(y);
+    free(logits_cpu_raw);
+    free(logits_cpu);
     free(expected_logits);
     free(expected_loss);
     free(expected_grads_memory);
