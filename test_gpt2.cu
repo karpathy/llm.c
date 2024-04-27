@@ -225,7 +225,7 @@ int main(int argc, char *argv[]) {
             }
 
             // compare the gradients on the parameters all at once, in fp32
-            allok = allok & check_tensor(tensors1[0], tensors2[1], V * C, "wte", 1e-2f);
+            allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", 1e-2f);
             allok = allok & check_tensor(tensors1[1], tensors2[1], maxT * C, "wpe", 1e-2f);
             allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", 1e-2f);
             allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", 1e-2f);
