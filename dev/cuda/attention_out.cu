@@ -332,6 +332,63 @@ __device__ void att_out_vec(float* o, int os, const float* a, int as, const floa
     }
 }
 
+// shared memory
+__device__ void att_out_shared(float* o, int os, const float* a, int as, const float* v, int vs, int T) {
+    // get coordinates of our block
+    int i_base = 128 * blockIdx.y;
+    int j_base = 64 * blockIdx.x;
+    int i_max = i_base + 128;
+
+
+    __shared__ float4 v_buffer[16][16];
+    __shared__ float4 a_buffer[4][16][8];
+
+    // adjust pointers to current block
+    v += j_base;
+    a += i_base * as;
+    o += j_base + i_base * os;
+
+    // calculate 8x4 results in one thread, loading all the required inputs just once
+    float vals[8][4] = {};
+    for (int so = 0; so < i_max ; so += 16) {
+
+        // fill buffers
+        __syncthreads();
+        int si = threadIdx.y;
+        v_buffer[si][threadIdx.x] = ld_vec(v + vs * (so + si) + 4 * threadIdx.x);
+
+        for(int mo = 0; mo < 2; ++mo) {
+            int io = threadIdx.x % 8;
+            int sm = 2*mo + threadIdx.x / 8;
+            int i = 8 * threadIdx.y + io;
+            a_buffer[sm][threadIdx.y][io] = ld_vec(a + i * as + so + 4 * sm);
+        }
+        __syncthreads();
+        for(int sm = 0; sm < 4; ++sm) {
+            float4 ai[8];
+            for (int io = 0; io < 8; ++io) {
+                ai[io] = a_buffer[sm][threadIdx.y][io];
+            }
+            for (int si = 0; si < 4; ++si) {
+                float4 vj = v_buffer[4*sm + si][threadIdx.x];
+                for (int io = 0; io < 8; ++io) {
+                    vals[io][0] += vec_at(ai[io], si) * vj.x;
+                    vals[io][1] += vec_at(ai[io], si) * vj.y;
+                    vals[io][2] += vec_at(ai[io], si) * vj.z;
+                    vals[io][3] += vec_at(ai[io], si) * vj.w;
+                }
+            }
+        }
+    }
+
+    for (int io = 0; io < 8; ++io) {
+        int i = 8 * threadIdx.y + io;
+        float4 store = {vals[io][0], vals[io][1], vals[io][2], vals[io][3]};
+        int j = 4 * threadIdx.x;
+        st_vec(o + i * os + j, store);
+    }
+}
+
 // -------------------------------------------------------------------------------------------------------------
 //  dispatch
 
@@ -348,6 +405,9 @@ void att_out_gpu(int kernel_num, float* out, const float* att, const float* inp,
             break;
         case 3:
             att_out_launcher<att_out_vec>(out, att, inp, B, T, C, NH);
+            break;
+        case 4:
+            att_out_launcher<att_out_shared>(out, att, inp, B, T, C, NH);
             break;
         default:
             printf("Invalid kernel number\n");
