@@ -130,7 +130,7 @@ int main(int argc, char *argv[]) {
     // 3) results of backward pass (parameter gradients)
     FloatParameterTensors expected_grads; // will be read from file. right now: all in fp32
     float* expected_grads_memory = float_cpu_malloc_and_point_parameters(&expected_grads, model.param_elements);
-    freadCheck(expected_grads_memory, 1, model.num_parameters_bytes, state_file);
+    freadCheck(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
     fcloseCheck(state_file);
 
     // this memory will be used to do one single copy of all (mixed precision) GPU grads to CPU grads
