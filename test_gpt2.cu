@@ -52,6 +52,7 @@ int main(int argc, char *argv[]) {
 
     // int C = model.config.channels;
     int V = model.config.vocab_size;
+    int Vp = model.config.padded_vocab;
     int maxT = model.config.max_seq_len;
     // int L = model.config.num_layers;
 
@@ -95,10 +96,10 @@ int main(int argc, char *argv[]) {
     gpt2_forward(&model, x, NULL, B, T);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
-    floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * V * sizeof(floatX));
-    float* logits_cpu = (float*)mallocCheck(B * T * V * sizeof(float));
-    cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * V * sizeof(floatX), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < B * T * V; i++) {
+    floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
+    float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
+    cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < B * T * Vp; i++) {
         logits_cpu[i] = (float)logits_cpu_raw[i];
     }
     int logits_ok = 1;
@@ -109,15 +110,19 @@ int main(int argc, char *argv[]) {
     accuracy_threshold = 23;
     #endif
 
-    for (int i=0; i<B*T*V; i++) {
-        if(i < 3) {
-            printf("%f %f\n", expected_logits[i], logits_cpu[i]);
-        }
-        if (fabsf(expected_logits[i] - logits_cpu[i]) >= accuracy_threshold) {
-            printf("MISMATCH AT INDEX %d: ", i);
-            printf("%f %f\n", expected_logits[i],logits_cpu[i]);
-            logits_ok = 0;
-            break;
+    for (int bt=0; bt<B*T; bt++) {
+        for(int v = 0; v < V; ++v) {
+            int i = bt * Vp + v;
+            if (i < 3) {
+                printf("%f %f\n", expected_logits[i], logits_cpu[i]);
+            }
+            if (fabsf(expected_logits[bt*V + v] - logits_cpu[i]) >= accuracy_threshold) {
+                printf("MISMATCH AT INDEX %d,%d: ", bt, v);
+                printf("%f %f\n", expected_logits[bt*V + v], logits_cpu[i]);
+                logits_ok = 0;
+                bt = B * T;
+                break;
+            }
         }
     }
     if(!logits_ok) { printf("NOT "); }

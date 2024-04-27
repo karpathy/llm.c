@@ -27,11 +27,17 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
+constexpr const int MIN_SHAPE_FACTOR = 128;
+
 // ----------------------------------------------------------------------------
 // CUDA utils
 
 // convenience macro for calculating grid/block dimensions for kernels
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+
+size_t round_up(size_t value, size_t multiple) {
+    return CEIL_DIV(value, multiple) * multiple;
+}
 
 // CUDA error checking
 void cudaCheck(cudaError_t error, const char *file, int line) {
@@ -1085,6 +1091,7 @@ void fused_classifier3(float* logits, float* losses,
 typedef struct {
     int max_seq_len; // max sequence length, e.g. 1024
     int vocab_size; // vocab size, e.g. 50257
+    int padded_vocab; // vocab size padded to the next multiple of MIN_SHAPE_FACTOR
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
     int channels; // number of channels, e.g. 768
@@ -1112,11 +1119,12 @@ typedef struct {
 } ParameterTensors;
 
 void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
-    int V = config.vocab_size;
     int C = config.channels;
     int maxT = config.max_seq_len;
     int L = config.num_layers;
-    param_sizes[0] = V * C; // wte
+    int Vp = config.padded_vocab;
+
+    param_sizes[0] = Vp * C; // wte
     param_sizes[1] = maxT * C; // wpe
     param_sizes[2] = L * C; // ln1w
     param_sizes[3] = L * C; // ln1b
@@ -1196,7 +1204,7 @@ typedef struct {
 } ActivationTensors;
 
 void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
-    size_t V = config.vocab_size;
+    size_t Vp = config.padded_vocab;
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
     size_t C = config.channels;
@@ -1220,7 +1228,7 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[17] = B * T; // lnf_rstd
     act_sizes[18] = B * T; // losses
     act_sizes[19] = L * B * T * 3*C; // qkvr
-    act_sizes[20] = B * T * max(3*C, max(NH*T, V)); // output / scratch
+    act_sizes[20] = B * T * max(3*C, max(NH*T, Vp)); // output / scratch
 }
 
 // Backward pass is conceptually quite different from forward, because we can discard
@@ -1322,6 +1330,19 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->config.num_heads = model_header[5];
     model->config.channels = model_header[6];
 
+    model->config.padded_vocab = round_up(model->config.vocab_size, MIN_SHAPE_FACTOR);
+
+    // check that we have sensible sizes
+    if(model->config.channels % MIN_SHAPE_FACTOR != 0) {
+        printf("Number of channels must be a multiple of %d", MIN_SHAPE_FACTOR);
+        exit(EXIT_FAILURE);
+    }
+
+    if(model->config.max_seq_len % MIN_SHAPE_FACTOR != 0) {
+        printf("Maximum sequence length must be a multiple of %d", MIN_SHAPE_FACTOR);
+        exit(EXIT_FAILURE);
+    }
+
     // allocate space for all the parameters and read them in
     fill_in_parameter_sizes(model->param_sizes, model->config);
 
@@ -1370,6 +1391,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     int L = model->config.num_layers;
     int NH = model->config.num_heads;
     int C = model->config.channels;
+    int Vp = model->config.padded_vocab;
 
     // validate inputs, all indices must be in the range [0, V)
     for(int i = 0; i < B * T; i++) {
@@ -1471,13 +1493,13 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_cublas(acts.output, acts.lnf, params.wte, NULL, B, T, C, V);
+    matmul_forward_cublas(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         // fused classifier: does the forward pass and first part of the backward pass
         // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
-        fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, V);
+        fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, Vp);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         // move the (B,T) losses to CPU
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
@@ -1530,7 +1552,7 @@ void gpt2_backward(GPT2 *model) {
     // convenience shortcuts
     int B = model->batch_size;
     int T = model->seq_len;
-    int V = model->config.vocab_size;
+    int Vp = model->config.padded_vocab;
     int L = model->config.num_layers;
     int NH = model->config.num_heads;
     int C = model->config.channels;
@@ -1546,7 +1568,7 @@ void gpt2_backward(GPT2 *model) {
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, V);
+    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, Vp);
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass

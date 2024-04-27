@@ -221,6 +221,18 @@ class GPT(nn.Module):
 
         return idx
 
+
+def pad_tensor(tensor: torch.Tensor):
+    # ensure that every dimension of tensor is divisible by 128 by adding padding
+    multiple = 128
+    padding = []
+    # padding starts form the _last_ dimension, so we need to flip
+    for dim in reversed(tensor.shape):
+        pad = ((dim + multiple - 1) // multiple) * multiple - dim
+        padding += [0, pad]
+    return torch.nn.functional.pad(tensor, padding, value=0)
+
+
 # a few utilities for saving params/grads/activations to files for loading in C
 def write_fp32(tensor, file):
     t = tensor.detach().cpu().to(torch.float32)
@@ -235,7 +247,7 @@ def write_bf16(tensor, file):
     file.write(b)
 
 def write_tensors_fp32(model_tensors, L, file):
-    write_fp32(model_tensors["transformer.wte.weight"], file) # (V, C)
+    write_fp32(pad_tensor(model_tensors["transformer.wte.weight"]), file) # (V, C)
     write_fp32(model_tensors["transformer.wpe.weight"], file) # (T, C)
     for i in range(L): # (L, C)
         write_fp32(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
@@ -267,7 +279,7 @@ def write_tensors_fp32(model_tensors, L, file):
 def write_tensors_bf16(model_tensors, L, file):
     # same as fp32, but note we will re-order the tensors
     # because we keep the layernorm in fp32, we place them all at the end
-    write_bf16(model_tensors["transformer.wte.weight"], file) # (V, C)
+    write_bf16(pad_tensor(model_tensors["transformer.wte.weight"]), file) # (V, C)
     write_bf16(model_tensors["transformer.wpe.weight"], file) # (T, C)
     for i in range(L): # (L, 3C, C)
         write_bf16(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
