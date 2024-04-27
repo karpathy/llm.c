@@ -1123,6 +1123,7 @@ int main(int argc, char **argv) {
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
     cublasCreate(&cublas_handle);
+    cublasCheck(cublasSetMathMode(cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH));
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * C * sizeof(float));
@@ -1159,19 +1160,26 @@ int main(int argc, char **argv) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
         attention_forward(kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+
+        float prec = 1e-4;
+        // when we're using cuBLAS with tensor cores, we need to expect less precise results.
+        if(kernel_num == 3 || kernel_num == 4) {
+            prec = 5e-4;
+        }
+
         // all kernels should produce the correct output out
-        validate_result(d_out, out, "out", B * T * C, 1e-4f);
+        validate_result(d_out, out, "out", B * T * C, prec);
         // but as for preatt and att, things get a bit more complicated:
         if (kernel_num != 2) {
             // kernel 2 (knowingly) fails att/preatt because it uses a different algorithm
             // that estimates the softmax online and never materializes preatt/att
-            validate_result(d_att, att, "att", B * NH * T * T, 1e-4f);
+            validate_result(d_att, att, "att", B * NH * T * T, prec);
         }
         if (kernel_num != 2 && kernel_num != 4 && kernel_num != 5) {
             // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
             // into the softmax, so preatt is off by 1.0f / sqrt(HS)
             // but att and out (checked below) should match.
-            validate_result(d_preatt, preatt, "preatt", B * NH * T * T, 1e-4f);
+            validate_result(d_preatt, preatt, "preatt", B * NH * T * T, prec);
         }
     }
     printf("All results match. Starting benchmarks.\n\n");

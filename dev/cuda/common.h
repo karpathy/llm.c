@@ -26,7 +26,7 @@ void cuda_check(cudaError_t error, const char *file, int line) {
 void cublasCheck(cublasStatus_t status, const char *file, int line)
 {
     if (status != CUBLAS_STATUS_SUCCESS) {
-        printf("[cuBLAS ERROR]: %d %s %d\n", status, file, line);
+        printf("[cuBLAS ERROR]: %d %s %d %s\n", status, file, line, cublasGetStatusString(status));
         exit(EXIT_FAILURE);
     }
 }
