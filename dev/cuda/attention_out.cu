@@ -228,13 +228,17 @@ __device__ void att_out_naive(float* o, int os, const float* a, int as, const fl
     int i_base = 128 * blockIdx.y + 8 * threadIdx.y;
     int j_base = 64 * blockIdx.x + 4 * threadIdx.x;
 
-    // Simple nested loop that calculates 8x8 results in one thread.
-    for(int io = 0; io < 8; ++io) {
-        int i = i_base + io;
-        for(int jo = 0; jo < 4; ++jo) {
-            int j = j_base + jo;
+    // adjust pointers to current block
+    v += j_base;
+    a += i_base * as;
+    o += j_base + i_base * os;
+
+    // Simple nested loop that calculates 8x4 results in one thread.
+    for(int i = 0; i < 8; ++i) {
+        for(int j = 0; j < 4; ++j) {
             float val = 0;
-            for (int s = 0; s <= i; ++s) {
+            // don't loop to the end; a is a triangular matrix
+            for (int s = 0; s <= i_base + i; ++s) {
                 val += a[i * as + s] * v[j + vs * s];
             }
             o[i * os + j] = val;
@@ -247,30 +251,32 @@ __device__ void att_out_register(float* o, int os, const float* a, int as, const
     // get coordinates of our block
     int i_base = 128 * blockIdx.y + 8 * threadIdx.y;
     int j_base = 64 * blockIdx.x + 4 * threadIdx.x;
+    // don't load the zero part of the attention matrix
     int i_max = i_base + 8;
+
+    // adjust pointers to current block
+    v += j_base;
+    a += i_base * as;
+    o += j_base + i_base * os;
 
     // calculate 8x4 results in one thread, loading all the required inputs just once
     float vals[8][4] = {};
     for (int s = 0; s < i_max ; ++s) {
         float ai[8];
-        for (int io = 0; io < 8; ++io) {
-            int i = i_base + io;
-            ai[io] = a[i * as + s];
+        for (int i = 0; i < 8; ++i) {
+            ai[i] = a[i * as + s];
         }
-        for (int jo = 0; jo < 4; ++jo) {
-            int j = j_base + jo;
+        for (int j = 0; j < 4; ++j) {
             float vj = v[j + vs * s];
             for (int io = 0; io < 8; ++io) {
-                vals[io][jo] += ai[io] * vj;
+                vals[io][j] += ai[io] * vj;
             }
         }
     }
 
-    for (int io = 0; io < 8; ++io) {
-        int i = i_base + io;
-        for (int jo = 0; jo < 4; ++jo) {
-            int j = j_base + jo;
-            o[i * os + j] = vals[io][jo];
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            o[i * os + j] = vals[i][j];
         }
     }
 }
@@ -294,16 +300,21 @@ __device__ void att_out_vec(float* o, int os, const float* a, int as, const floa
     int j_base = 64 * blockIdx.x;
     int i_max = i_base + 128;
 
+    // adjust pointers to current block
+    v += j_base;
+    a += i_base * as;
+    o += j_base + i_base * os;
+
     // calculate 8x4 results in one thread, loading all the required inputs just once
     float vals[8][4] = {};
     for (int so = 0; so < i_max ; so += 4) {
         float4 ai[8];
         for (int io = 0; io < 8; ++io) {
-            int i = i_base + 8 * threadIdx.y + io;
+            int i = 8 * threadIdx.y + io;
             ai[io] = ld_vec(a + i * as + so);
         }
         for(int si = 0; si < 4; ++si) {
-            float4 vj = ld_vec(v + j_base + 4 * threadIdx.x + vs * (so + si));
+            float4 vj = ld_vec(v + 4 * threadIdx.x + vs * (so + si));
             for (int io = 0; io < 8; ++io) {
                 vals[io][0] += vec_at(ai[io], si) * vj.x;
                 vals[io][1] += vec_at(ai[io], si) * vj.y;
@@ -314,9 +325,9 @@ __device__ void att_out_vec(float* o, int os, const float* a, int as, const floa
     }
 
     for (int io = 0; io < 8; ++io) {
-        int i = i_base + 8 * threadIdx.y + io;
+        int i = 8 * threadIdx.y + io;
         float4 store = {vals[io][0], vals[io][1], vals[io][2], vals[io][3]};
-        int j = j_base + 4 * threadIdx.x;
+        int j = 4 * threadIdx.x;
         st_vec(o + i * os + j, store);
     }
 }
@@ -357,6 +368,7 @@ int main(int argc, char **argv) {
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
     cublasCreate(&cublas_handle);
+    cublasCheck(cublasSetMathMode(cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH));
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * C * sizeof(float));
