@@ -3,13 +3,23 @@
 
 // poor man's tensor checker
 int check_tensor(float *a, float *b, int n, const char* label, float threshold=1e-0) {
+    // a is the calculated tensor, b is the reference tensor
     int print_upto = 10;
     int ok = 1;
     float max_diff = 0.0f;
+    float max_rel_error = 0.0f;
+    float max_a = 0.0f;
+    float max_b = 0.0f;
     printf("%s\n", label);
     for (int i = 0; i < n; i++) {
         float diff = fabsf(a[i] - b[i]);
-        max_diff = fmaxf(max_diff, diff);
+        if (diff > max_diff) {
+            max_diff = diff;
+            float denom = fabsf(b[i]);
+            max_rel_error = (denom == 0.0f) ? 0.0f : diff / denom;
+            max_a = a[i];
+            max_b = b[i];
+        }
         if (diff <= threshold) {
             if (i < print_upto) { printf("OK "); }
         } else {
@@ -20,9 +30,11 @@ int check_tensor(float *a, float *b, int n, const char* label, float threshold=1
     }
     // print the final result
     if (ok) {
-        printf("TENSOR OK, max diff: %e\n", max_diff);
+        printf("TENSOR OK, max diff: %e, with rel error: %e (calculated=%f, ref=%f)\n",
+                max_diff, max_rel_error, max_a, max_b);
     } else {
-        printf("TENSOR NOT OK, max diff: %e\n", max_diff);
+        printf("TENSOR NOT OK, max diff: %e, with rel error: %e (calculated=%f, ref=%f)\n",
+                max_diff, max_rel_error, max_a, max_b);
     }
     return ok;
 }
