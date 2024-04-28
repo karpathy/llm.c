@@ -83,8 +83,6 @@ __global__ void encoder_forward_kernel2(float* out,
 }
 
 // use float4 for memory coalescing
-// optimized implementation: parallelize over all of B,T,C
-
 __device__ inline float4 operator+(const float4& a, const float4& b) {
     return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
 }
@@ -103,7 +101,7 @@ __global__ void encoder_forward_kernel3(float4* out,
         int c4 = idx % C4;
 
         int ix = inp[b * T + t];
-        
+
         out[b * T * C4 + t * C4 + c4] = wte[ix * C4 + c4] + wpe[t * C4 + c4];
     }
 }
