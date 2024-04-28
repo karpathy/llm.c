@@ -37,12 +37,13 @@ mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 #include <string.h>
 #include <unistd.h>
 #include <assert.h>
+// GPU / CUDA related
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-
+// Multi-GPU related
 #ifdef MULTI_GPU
 #include <mpi.h>
 #include <nccl.h>
@@ -51,9 +52,11 @@ mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 // ----------------------------------------------------------------------------
 // CUDA precision settings
 
-// turn on bf16 as default, done up here for now
-#define ENABLE_BF16
-// #define ENABLE_FP32
+enum PrecisionMode {
+    PRECISION_FP32,
+    PRECISION_FP16,
+    PRECISION_BF16
+};
 
 // use bf16 (bfloat 16)
 #if defined(ENABLE_BF16)
@@ -62,6 +65,8 @@ typedef float floatN;
 #define CUBLAS_LOWP CUDA_R_16BF
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
 const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights
+PrecisionMode PRECISION_MODE = PRECISION_BF16;
+const char* precision_mode_str = "bf16";
 
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclBfloat16;
@@ -75,6 +80,8 @@ typedef float floatN;
 #define CUBLAS_LOWP CUDA_R_16F
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
 const char* load_filename = "gpt2_124M.bin"; // fp32 weights
+PrecisionMode PRECISION_MODE = PRECISION_FP16;
+const char* precision_mode_str = "fp16";
 
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclHalf;
@@ -88,6 +95,8 @@ typedef float floatN;
 #define CUBLAS_LOWP CUDA_R_32F
 #define CUBLAS_LOWP_COMPUTE cublas_compute_type // auto-select FP32 vs TF32
 const char* load_filename = "gpt2_124M.bin"; // fp32 weights
+PrecisionMode PRECISION_MODE = PRECISION_FP32;
+const char* precision_mode_str = "fp32";
 
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclFloat;
@@ -271,6 +280,7 @@ FILE *fopen_check(const char *path, const char *mode, const char *file, int line
         fprintf(stderr, "  Line: %d\n", line);
         fprintf(stderr, "  Path: %s\n", path);
         fprintf(stderr, "  Mode: %s\n", mode);
+        fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
         exit(EXIT_FAILURE);
     }
     return fp;
@@ -1700,16 +1710,25 @@ typedef struct {
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
+    if (PRECISION_MODE == PRECISION_FP16) {
+        // TODO for later perhaps, would require us dynamically converting the
+        // model weights from fp32 to fp16 online, here in this function, or writing
+        // the fp16 weights directly from Python, which we only do for fp32/bf16 atm.
+        fprintf(stderr, "build_from_checkpoint() does not support fp16 right now.\n");
+        exit(EXIT_FAILURE);
+    }
+
     // read in model from a checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
     freadCheck(model_header, sizeof(int), 256, model_file);
-    if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(EXIT_FAILURE); }
+    if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(EXIT_FAILURE); }
     int version = model_header[1];
     if (!(version == 1 || version == 2)) {
         // 1 = fp32, ordered layernorm at the end
         // 2 = bf16, ordered layernorm at the end
-        printf("Bad version in model file");
+        fprintf(stderr, "Bad version in model file\n");
+        fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
         exit(EXIT_FAILURE);
     }
 
@@ -2410,6 +2429,7 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
     printf0("| device                | %-50s |\n", deviceProp.name);
     printf0("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
+    printf0("| precision             | %-50s |\n", precision_mode_str);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // build the GPT-2 model from a checkpoint
