@@ -49,8 +49,9 @@ mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 #include <mpi.h>
 #include <nccl.h>
 #endif
-
 // our own utilities
+// defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck
+// defines: mallocCheck
 #include "utils.h"
 
 // ----------------------------------------------------------------------------

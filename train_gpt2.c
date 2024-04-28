@@ -17,10 +17,14 @@ There will be other versions of this code that specialize it and make it fast.
 #include <time.h>
 #include <string.h>
 #include <unistd.h>
-#include "utils.h"
 #ifdef OMP
 #include <omp.h>
 #endif
+// our own utilities
+// defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck
+// defines: mallocCheck
+#include "utils.h"
+
 
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes

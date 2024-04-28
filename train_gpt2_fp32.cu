@@ -21,16 +21,16 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <string.h>
 #include <unistd.h>
 #include <assert.h>
-
-// our own utilities
-#include "utils.h"
-
 // GPU / CUDA related
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+// our own utilities
+// defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck
+// defines: mallocCheck
+#include "utils.h"
 
 // ----------------------------------------------------------------------------
 // CUDA utils
