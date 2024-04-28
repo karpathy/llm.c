@@ -137,22 +137,6 @@ void *malloc_check(size_t size, const char *file, int line) {
 // ----------------------------------------------------------------------------
 // all the kernels
 
-// warp-level reduction for finding the maximum value
-__device__ float warpReduceMax(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
-    }
-    return val;
-}
-
-// warp-level reduction for summing values
-__device__ float warpReduceSum(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-    }
-    return val;
-}
-
 __device__ inline float4 add_float4(const float4& a, const float4& b) {
     return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
 }
@@ -413,123 +397,6 @@ __global__ void gelu_backward_kernel(float* dinp, const float* inp, const float*
         float sech_out = 1.0f / (coshf_out * coshf_out);
         float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
         dinp[i] = local_grad * dout[i];
-    }
-}
-
-__global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int C) {
-    // out is (N, C) just like inp. Each row of inp will get softmaxed.
-    // same as kernel4, but optimised for very large Cs with advanced unrolling
-
-    // The trick is to read into a register array (all indices known at compile time)
-    // and always read UNROLL_FACTOR values to maximise memory level parallelism
-    // even if we would be out of bounds, we set the index to min(C-1, idx)
-    // so we just do some unnecessary reads (obviously bad for small C)
-    // the writes are in a separate loop with a conditional check for out of bounds
-    // making it separate is necessary to convince the compiler to do the right thing
-    const int UNROLL_FACTOR = 8;
-    const int warpsPerBlock = blockDim.x / 32;
-
-    extern __shared__ float shared[];
-    int idx = blockIdx.x;
-    int tid = threadIdx.x;
-    int warpId = threadIdx.x / 32; // warp index within a block
-    int laneId = threadIdx.x % 32; // thread index within a warp
-
-    // shared[] must be allocated to have 2 * warpsPerBlock elements
-    // first half for max values, the second half for sum values
-    float* maxvals = shared;
-    float* sumvals = &shared[warpsPerBlock];
-
-    if (tid >= C) {
-        maxvals[warpId] = -INFINITY;
-        sumvals[warpId] = 0.0f;
-        return;
-    }
-
-    const float* x = inp + idx * C; // input
-    float* y = out + idx * C; // output
-
-    // first, thread coarsening by directly accessing global memory in series
-    float maxval = -INFINITY;
-    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
-        #pragma unroll
-        for (int u = 0; u < UNROLL_FACTOR; u++) {
-            maxval = fmaxf(maxval, x[min(C - 1, i + u*blockDim.x)]);
-        }
-    }
-
-    // now within-warp reductions for maxval
-    maxval = warpReduceMax(maxval);
-    // the 0th thread of each warp writes the maxval of that warp to shared memory
-    if (laneId == 0) maxvals[warpId] = maxval;
-    __syncthreads();
-    // now the 0th thread reduces the maxvals in shared memory, i.e. across warps
-    if (tid == 0) {
-        float val = maxvals[tid];
-        #pragma unroll
-        for (int i = 1; i < warpsPerBlock; i++) {
-            val = fmaxf(val, maxvals[i]);
-        }
-        // store the final max in the first position
-        maxvals[0] = val;
-    }
-    __syncthreads();
-    // broadcast the max to all threads
-    float offset = maxvals[0];
-
-    // compute expf and write the result to global memory
-    // + thread coarsening for sum
-    float sumval = 0.0f;
-    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
-        float reg_array[UNROLL_FACTOR];
-        #pragma unroll
-        for (int u = 0; u < UNROLL_FACTOR; u++) {
-            reg_array[u] = __ldcs(&x[min(C - 1, i + u*blockDim.x)]);
-        }
-        #pragma unroll
-        for (int u = 0; u < UNROLL_FACTOR; u++) {
-            if (i + u*blockDim.x < C) {
-                float output = expf(reg_array[u] - offset);
-                y[min(C - 1, i + u*blockDim.x)] = output; // compiler likes redundant min()?!
-                sumval += output; // combined into the same loop unlike kernel3
-            }
-        }
-    }
-
-    // okay now we calculated exp(x - max(x))
-    // step 2: sum all the values and divide by the sum
-
-    // within-warp reduction for sumval
-    sumval = warpReduceSum(sumval);
-    // write sumval to shared memory
-    if (laneId == 0) sumvals[warpId] = sumval;
-    __syncthreads();
-    // inter-thread reduction of sum
-    if (tid == 0) {
-        float val = sumvals[tid];
-        #pragma unroll
-        for (int i = 1; i < warpsPerBlock; ++i) {
-            val += sumvals[i];
-        }
-        sumvals[0] = val;
-    }
-    __syncthreads();
-    // broadcast the sum to all threads
-    float sum = sumvals[0];
-
-    // divide the whole row by the sum
-    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
-        float reg_array[UNROLL_FACTOR];
-        #pragma unroll
-        for (int u = 0; u < UNROLL_FACTOR; u++) {
-            reg_array[u] = y[min(C - 1, i + u*blockDim.x)];
-        }
-        #pragma unroll
-        for (int u = 0; u < UNROLL_FACTOR; u++) {
-            if (i + u*blockDim.x < C) {
-                y[i + u*blockDim.x] = reg_array[u] / sum;
-            }
-        }
     }
 }
 
@@ -843,16 +710,6 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
-// uses cuBLAS
-void matmul_forward_cublas(float* out,
-                    float* inp, float* weight, float* bias,
-                    int B, int T, int C, int OC) {
-    assert(bias == NULL); // bias is not supported for this kernel
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC));
-}
-
 // uses cuBLASLt to fuse the bias and gelu. does not work with OC = 50257 (last layer)
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
 // https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtSgemm/sample_cublasLt_LtSgemm.cu
@@ -883,7 +740,10 @@ void matmul_forward_cublaslt(float* out,
     cublasCheck(cublasLtMatmulDescCreate(&operationDesc, cublas_compute_type, CUDA_R_32F));
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opNoTranspose, sizeof(opNoTranspose)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias, sizeof(epilogueBias)));
+    if(has_bias) {
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias,
+                                                   sizeof(epilogueBias)));
+    }
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
 
     // define matrix layouts
@@ -988,14 +848,6 @@ void gelu_backward(float* dinp, const float* inp, const float* dout, const int N
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N, block_size);
     gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout, N);
-    cudaCheck(cudaGetLastError());
-}
-
-void softmax_forward(float* out, float* inp, int N, int C) {
-    int grid_size = N;
-    const int block_size = 512;
-    size_t shared_mem_size = 2 * block_size / 32 * sizeof(float);
-    softmax_forward_kernel7<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1482,7 +1334,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_cublas(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
