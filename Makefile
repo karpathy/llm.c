@@ -85,6 +85,20 @@ else
   endif
 endif
 
+# Precision settings, default to bf16 but ability to override
+PRECISION ?= BF16
+VALID_PRECISIONS := FP32 FP16 BF16
+ifeq ($(filter $(PRECISION),$(VALID_PRECISIONS)),)
+  $(error Invalid precision $(PRECISION), valid precisions are $(VALID_PRECISIONS))
+endif
+ifeq ($(PRECISION), FP32)
+  PFLAGS = -DENABLE_FP32
+else ifeq ($(PRECISION), FP16)
+  PFLAGS = -DENABLE_FP16
+else
+  PFLAGS = -DENABLE_BF16
+endif
+
 # PHONY means these targets will always be executed
 .PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu
 
@@ -108,7 +122,7 @@ test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
 
 train_gpt2cu: train_gpt2.cu
-	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) -o $@
 
 train_gpt2fp32cu: train_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) -o $@

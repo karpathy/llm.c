@@ -37,12 +37,13 @@ mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 #include <string.h>
 #include <unistd.h>
 #include <assert.h>
+// GPU / CUDA related
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-
+// Multi-GPU related
 #ifdef MULTI_GPU
 #include <mpi.h>
 #include <nccl.h>
@@ -51,18 +52,24 @@ mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 // ----------------------------------------------------------------------------
 // CUDA precision settings
 
-// turn on bf16 as default, done up here for now
-#define ENABLE_BF16
+enum PrecisionMode {
+    PRECISION_FP32,
+    PRECISION_FP16,
+    PRECISION_BF16
+};
 
-// use bf16 (bfloat 16)
-#if defined(ENABLE_BF16)
-typedef __nv_bfloat16 floatX;
+// fp32
+#if defined(ENABLE_FP32)
+typedef float floatX;
 typedef float floatN;
-#define CUBLAS_LOWP CUDA_R_16BF
-#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+#define CUBLAS_LOWP CUDA_R_32F
+#define CUBLAS_LOWP_COMPUTE cublas_compute_type // auto-select FP32 vs TF32
+const char* load_filename = "gpt2_124M.bin"; // fp32 weights
+PrecisionMode PRECISION_MODE = PRECISION_FP32;
+const char* precision_mode_str = "fp32";
 
 #ifdef MULTI_GPU
-const ncclDataType_t ncclFloatX = ncclBfloat16;
+const ncclDataType_t ncclFloatX = ncclFloat;
 const ncclDataType_t ncclFloatN = ncclFloat;
 #endif
 
@@ -72,24 +79,29 @@ typedef half floatX;
 typedef float floatN;
 #define CUBLAS_LOWP CUDA_R_16F
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+const char* load_filename = "gpt2_124M.bin"; // fp32 weights
+PrecisionMode PRECISION_MODE = PRECISION_FP16;
+const char* precision_mode_str = "fp16";
 
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclHalf;
 const ncclDataType_t ncclFloatN = ncclFloat;
 #endif
 
-// fallback for fp32
+// bfloat16 (default!)
 #else
-typedef float floatX;
+typedef __nv_bfloat16 floatX;
 typedef float floatN;
-#define CUBLAS_LOWP CUDA_R_32F
-#define CUBLAS_LOWP_COMPUTE cublas_compute_type // auto-select FP32 vs TF32
+#define CUBLAS_LOWP CUDA_R_16BF
+#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights
+PrecisionMode PRECISION_MODE = PRECISION_BF16;
+const char* precision_mode_str = "bf16";
 
 #ifdef MULTI_GPU
-const ncclDataType_t ncclFloatX = ncclFloat;
+const ncclDataType_t ncclFloatX = ncclBfloat16;
 const ncclDataType_t ncclFloatN = ncclFloat;
 #endif
-
 #endif
 
 // ----------------------------------------------------------------------------
@@ -267,6 +279,7 @@ FILE *fopen_check(const char *path, const char *mode, const char *file, int line
         fprintf(stderr, "  Line: %d\n", line);
         fprintf(stderr, "  Path: %s\n", path);
         fprintf(stderr, "  Mode: %s\n", mode);
+        fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
         exit(EXIT_FAILURE);
     }
     return fp;
@@ -1468,25 +1481,27 @@ typedef struct {
 } GPT2Config;
 
 // the parameters of the model
-#define NUM_PARAMETER_TENSORS 16
+// note the layernorms are kept in higher precision (floatN)
+constexpr const int NUM_PARAMETER_TENSORS = 16;
 typedef struct {
-    floatX*   wte; // (V, C)
-    floatX*   wpe; // (maxT, C)
-    floatN*  ln1w; // (L, C)
-    floatN*  ln1b; // (L, C)
+    floatX* wte; // (V, C)
+    floatX* wpe; // (maxT, C)
+    floatN* ln1w; // (L, C)
+    floatN* ln1b; // (L, C)
     floatX* qkvw; // (L, 3*C, C)
     floatX* qkvb; // (L, 3*C)
     floatX* attprojw; // (L, C, C)
     floatX* attprojb; // (L, C)
-    floatN*  ln2w; // (L, C)
-    floatN*  ln2b; // (L, C)
+    floatN* ln2w; // (L, C)
+    floatN* ln2b; // (L, C)
     floatX* fcw; // (L, 4*C, C)
     floatX* fcb; // (L, 4*C)
     floatX* fcprojw; // (L, C, 4*C)
     floatX* fcprojb; // (L, C)
-    floatN*  lnfw; // (C)
-    floatN*  lnfb; // (C)
+    floatN* lnfw; // (C)
+    floatN* lnfb; // (C)
 } ParameterTensors;
+static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
 void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
     size_t V = config.vocab_size;
@@ -1510,11 +1525,10 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     param_sizes[14] = C; // lnfw
     param_sizes[15] = C; // lnfb
 
-    // Set parameter sizes
-    // floatN gives us an option to keep layernorm params in FP32 if we want to
+    // populate the parameter sizes in bytes
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         param_sizeof[i] = sizeof(floatX);
-    }
+    } // override layernorms here below
     param_sizeof[2] = sizeof(floatN); // ln1w
     param_sizeof[3] = sizeof(floatN); // ln1b
     param_sizeof[8] = sizeof(floatN); // ln2w
@@ -1524,8 +1538,8 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
-float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof, int on_device) {
-    // calculate the number of parameters
+void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof) {
+    // calculate the total number of parameters and bytes across all tensors
     size_t num_parameters = 0;
     size_t num_parameters_bytes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -1533,13 +1547,8 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_eleme
         num_parameters_bytes += param_elements[i] * param_sizeof[i];
     }
     // malloc all parameters all at once on the device
-    // on_device: 0 = CPU, 1 = GPU
-    float* params_memory;
-    if (on_device) {
-        cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
-    } else {
-        params_memory = (float*)mallocCheck(num_parameters * sizeof(float)); // keep FP32 here
-    }
+    void* params_memory;
+    cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
     // assign all the tensors their place in the array
     floatX** ptrs[] = {
         &params->wte, &params->wpe, (floatX**)&params->ln1w, (floatX**)&params->ln1b, &params->qkvw, &params->qkvb,
@@ -1700,12 +1709,27 @@ typedef struct {
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
+    if (PRECISION_MODE == PRECISION_FP16) {
+        // TODO for later perhaps, would require us dynamically converting the
+        // model weights from fp32 to fp16 online, here in this function, or writing
+        // the fp16 weights directly from Python, which we only do for fp32/bf16 atm.
+        fprintf(stderr, "build_from_checkpoint() does not support fp16 right now.\n");
+        exit(EXIT_FAILURE);
+    }
+
     // read in model from a checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
     freadCheck(model_header, sizeof(int), 256, model_file);
-    if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(EXIT_FAILURE); }
-    if (model_header[1] != 1) { printf("Bad version in model file"); exit(EXIT_FAILURE); }
+    if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(EXIT_FAILURE); }
+    int version = model_header[1];
+    if (!(version == 1 || version == 2)) {
+        // 1 = fp32, ordered layernorm at the end
+        // 2 = bf16, ordered layernorm at the end
+        fprintf(stderr, "Bad version in model file\n");
+        fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
+        exit(EXIT_FAILURE);
+    }
 
     // read in hyperparameters
     model->config.max_seq_len = model_header[2];
@@ -1723,34 +1747,14 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
         model->num_parameters += model->param_elements[i];
         model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
     }
-    size_t input_model_bytes = model->num_parameters * sizeof(float);
 
     // create memory for model parameters on the device
-    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof, 1);
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 
     // read in all the parameters from file and copy them to device
-    float* params_memory_cpu = (float*)mallocCheck(input_model_bytes);
-    freadCheck(params_memory_cpu, 1, input_model_bytes, model_file);
-
-    float* params_cpu_iterator = (float*)params_memory_cpu;
-    char* params_gpu_iterator = (char*)model->params_memory;
-
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        if (model->param_sizeof[i] == sizeof(float)) {
-            cudaCheck(cudaMemcpy(params_gpu_iterator, params_cpu_iterator, model->param_elements[i] * sizeof(float), cudaMemcpyHostToDevice));
-        } else {
-            // TODO: Currently only support float or floatX (cannot mix and match FP16/BF16 etc...)
-            assert(model->param_sizeof[i] == sizeof(floatX));
-            floatX* conversion_scratchpad = (floatX*)mallocCheck(model->param_elements[i] * sizeof(floatX));
-            for (size_t j = 0; j < model->param_elements[i]; j++) {
-                conversion_scratchpad[j] = (floatX)params_cpu_iterator[j];
-            }
-            cudaCheck(cudaMemcpy(params_gpu_iterator, conversion_scratchpad, model->param_elements[i] * sizeof(floatX), cudaMemcpyHostToDevice));
-            free(conversion_scratchpad);
-        }
-        params_cpu_iterator += model->param_elements[i];
-        params_gpu_iterator += model->param_elements[i] * model->param_sizeof[i];
-    }
+    float* params_memory_cpu = (float*)mallocCheck(model->num_parameters_bytes);
+    freadCheck(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
+    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     free(params_memory_cpu);
     fcloseCheck(model_file);
 
@@ -1922,14 +1926,12 @@ void gpt2_backward(GPT2 *model) {
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
         // allocate buffers for weight gradients
-        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof, 1);
+        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
         printf0("allocated %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
         // we're going to be clever for the activations backward pass. we don't need to exactly
-        // mirror the forward pass acrtivations and we will save memory.
+        // mirror the forward pass activations and we will save memory.
         size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
-        GPT2Config cfg = model->config;
-        cfg.num_layers = 1; // copy the configuration but override number of layers to 1
-        fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, cfg);
+        fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, model->config);
         // count up and allocate the space
         model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
         model->num_grad_acts = 0;
@@ -2087,15 +2089,13 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
 
-    // Do adam per set of parameters
+    // Adam upadte
     // We need to know the parameter types (float or floatX) to process consecutive chunks
-    // TODO - optimise this to require fewer kernel launches and/or independent via CUDA streams
     char* params_mem = (char*)model->params_memory;
     char* grads_mem = (char*)model->grads_memory;
     size_t num_elements = model->param_elements[0];
     size_t last_sizeof = model->param_sizeof[0];
     size_t current_element = 0;
-
     for (int i = 1; i <= NUM_PARAMETER_TENSORS; i++) {
         if (i == NUM_PARAMETER_TENSORS || model->param_sizeof[i] != last_sizeof) {
             unsigned int seed = random_u32(&model->rng_state); // seed for stochastic rounding
@@ -2428,11 +2428,13 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
     printf0("| device                | %-50s |\n", deviceProp.name);
     printf0("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
+    printf0("| precision             | %-50s |\n", precision_mode_str);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    gpt2_build_from_checkpoint(&model, load_filename);
+    printf0("| load_filename         | %-50s |\n", load_filename);
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
     printf0("| num_layers L          | %-50d |\n", model.config.num_layers);
