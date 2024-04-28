@@ -237,6 +237,10 @@ def write_bf16(tensor, file):
 def write_tensors_fp32(model_tensors, L, file):
     write_fp32(model_tensors["transformer.wte.weight"], file) # (V, C)
     write_fp32(model_tensors["transformer.wpe.weight"], file) # (T, C)
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
     for i in range(L): # (L, 3C, C)
         write_fp32(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
     for i in range(L): # (L, 3C)
@@ -245,6 +249,10 @@ def write_tensors_fp32(model_tensors, L, file):
         write_fp32(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
     for i in range(L): # (L, C)
         write_fp32(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
     for i in range(L): # (L, 4C, C)
         write_fp32(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
     for i in range(L): # (L, 4C)
@@ -253,23 +261,18 @@ def write_tensors_fp32(model_tensors, L, file):
         write_fp32(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
     for i in range(L): # (L, C)
         write_fp32(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
-    # LayerNorms are at the end
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
     write_fp32(model_tensors["transformer.ln_f.weight"], file) # (C, )
     write_fp32(model_tensors["transformer.ln_f.bias"], file) # (C, )
 
 def write_tensors_bf16(model_tensors, L, file):
-    # same as fp32, but note we will re-order the tensors
-    # because we keep the layernorm in fp32, we place them all at the end
+    # same but we keep the layernorm in fp32
+    # these two functions are so similar we can join them later most likely
     write_bf16(model_tensors["transformer.wte.weight"], file) # (V, C)
     write_bf16(model_tensors["transformer.wpe.weight"], file) # (T, C)
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
     for i in range(L): # (L, 3C, C)
         write_bf16(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
     for i in range(L): # (L, 3C)
@@ -278,6 +281,10 @@ def write_tensors_bf16(model_tensors, L, file):
         write_bf16(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
     for i in range(L): # (L, C)
         write_bf16(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+    for i in range(L): # (L, C)
+        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
     for i in range(L): # (L, 4C, C)
         write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
     for i in range(L): # (L, 4C)
@@ -286,15 +293,6 @@ def write_tensors_bf16(model_tensors, L, file):
         write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
     for i in range(L): # (L, C)
         write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
-    # LayerNorms are at the end and kept in fp32
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
     write_fp32(model_tensors["transformer.ln_f.weight"], file) # (C, )
     write_fp32(model_tensors["transformer.ln_f.bias"], file) # (C, )
 
@@ -303,8 +301,8 @@ def write_model(model, filename, dtype):
     # 1) header is: version int, GPTConfig ints, padding to 1024 bytes
     assert dtype in {"float32", "bfloat16"} # float16 todo maybe later
     version = {
-        "float32": 2,
-        "bfloat16": 3,
+        "float32": 1,
+        "bfloat16": 2,
     }[dtype]
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240326 # magic
@@ -330,7 +328,7 @@ def write_state(model, x, y, logits, loss, filename):
     # this can be used for checking the computation correctness in C
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240327 # magic
-    header[1] = 2 # run state version = 2
+    header[1] = 1 # run state version = 1
     header[2] = x.size(0) # batch size of the batch, B
     header[3] = x.size(1) # temporal extent of the batch, T
     grads = {name: param.grad.cpu() for name, param in model.named_parameters()}
