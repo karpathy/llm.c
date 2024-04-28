@@ -52,6 +52,7 @@ int main(int argc, char *argv[]) {
 
     // int C = model.config.channels;
     int V = model.config.vocab_size;
+    int Vp = model.config.padded_vocab_size;
     int maxT = model.config.max_seq_len;
     // int L = model.config.num_layers;
 
@@ -59,8 +60,12 @@ int main(int argc, char *argv[]) {
     FILE *state_file = fopenCheck("gpt2_124M_debug_state.bin", "rb");
     int state_header[256];
     freadCheck(state_header, sizeof(int), 256, state_file);
-    if (state_header[0] != 20240327) { printf("Bad magic state file"); exit(1); }
-    if (state_header[1] != 1) { printf("Bad version in state file"); exit(1); }
+    if (state_header[0] != 20240327) { printf("Bad magic state file\n"); exit(EXIT_FAILURE); }
+    if (state_header[1] != 2) {
+        fprintf(stderr, "Bad version in state file\n");
+        fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
+        exit(EXIT_FAILURE);
+    }
     int B = state_header[2]; // batch size, e.g. 4
     int T = state_header[3]; // time / sequence length (e.g. 64, up to maxT)
     assert(0 <= T && T <= maxT);
@@ -94,20 +99,31 @@ int main(int argc, char *argv[]) {
     gpt2_forward(&model, x, NULL, B, T);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
-    float* logits_cpu = (float*)mallocCheck(B * T * V * sizeof(float));
-    cudaMemcpy(logits_cpu, model.acts.output, B * T * V * sizeof(float), cudaMemcpyDeviceToHost);
+    float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
+    cudaMemcpy(logits_cpu, model.acts.output, B * T * Vp * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // compare the output logits from the forward pass
+    // also careful that we don't access and compare the padded columns of logits
     int logits_ok = 1;
-    for (int i=0; i<B*T*V; i++) {
-        if(i < 3) {
-            printf("%f %f\n", expected_logits[i], logits_cpu[i]);
-        }
-        if (fabsf(expected_logits[i] - logits_cpu[i]) >= 1e-2) {
-            printf("MISMATCH AT INDEX %d: ", i);
-            printf("%f %f\n", expected_logits[i],logits_cpu[i]);
-            logits_ok = 0;
-            break;
+    float max_diff = 0.0f;
+    for (int bt = 0; bt < B*T; bt++) {
+        for (int v = 0; v < V; v++) {
+            int i = bt * Vp + v; // linearized index
+            if (i < 10) {
+                printf("%f, %f\n", expected_logits[i], logits_cpu[i]);
+            }
+            float diff = fabsf(expected_logits[bt*V + v] - logits_cpu[i]);
+            max_diff = fmaxf(max_diff, diff);
+            if (diff >= 1e-2f) {
+                printf("MISMATCH AT INDEX %d,%d: ", bt, v);
+                printf("%f %f\n", expected_logits[bt*V + v], logits_cpu[i]);
+                logits_ok = 0;
+                bt = B*T; // to break out of both loops
+                break;
+            }
         }
     }
+    allok = allok && logits_ok;
     if(!logits_ok) { printf("NOT "); }
     printf("OK (LOGITS)\n");
 
@@ -124,9 +140,6 @@ int main(int argc, char *argv[]) {
 
         if (step == 0) {
             // error checking at step 0 for reference activations
-
-
-            allok = allok && logits_ok;
             free(logits_cpu);
 
             // compare the achieved loss

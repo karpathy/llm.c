@@ -1108,10 +1108,12 @@ __global__ void fused_classifier_kernel3(Type* logits, Type* losses, Type* probs
     }
 
     // very sensible default for dlosses is 1/(B*T), which is the uniform loss
-    float dloss = dlosses != NULL ? (float)dlosses[idx] : 1.0f / (B*T);
+    float dloss = (dlosses != NULL) ? (float)dlosses[idx] : 1.0f / (B*T);
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
     const Type* logits_vec = logits + idx * P;
+    // note that we use the padded dimension P to access data, but we only ever
+    // modify the elements up to V, ignoring the padded dimensions and leaving them at 0
     for (int i = threadIdx.x; i < V; i += blockDim.x) {
         // this is the 2nd read of logits after the one in prepare_softmax2
         // this data will never be needed again, so we reduce cache persistence
@@ -1475,6 +1477,7 @@ void fused_classifier3(Type* logits, Type* losses,
 typedef struct {
     int max_seq_len; // max sequence length, e.g. 1024
     int vocab_size; // vocab size, e.g. 50257
+    int padded_vocab_size; // padded to e.g. %128==0, 50304
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
     int channels; // number of channels, e.g. 768
@@ -1504,11 +1507,11 @@ typedef struct {
 static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
 void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
-    size_t V = config.vocab_size;
+    size_t Vp = config.padded_vocab_size;
     size_t C = config.channels;
     size_t maxT = config.max_seq_len;
     size_t L = config.num_layers;
-    param_sizes[0] = V * C; // wte
+    param_sizes[0] = Vp * C; // wte
     param_sizes[1] = maxT * C; // wpe
     param_sizes[2] = L * C; // ln1w
     param_sizes[3] = L * C; // ln1b
@@ -1595,7 +1598,7 @@ typedef struct {
 } ActivationTensors;
 
 void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config) {
-    size_t V = config.vocab_size;
+    size_t Vp = config.padded_vocab_size;
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
     size_t C = config.channels;
@@ -1619,7 +1622,7 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     act_sizes[17] = B * T; // lnf_rstd
     act_sizes[18] = B * T; // losses
     act_sizes[19] = L * B * T * 3*C; // qkvr
-    act_sizes[20] = B * T * max(3*C, max(NH*T, V)); // output / scratch
+    act_sizes[20] = B * T * max(3*C, max(NH*T, Vp)); // output / scratch
 }
 
 // Backward pass is conceptually quite different from forward, because we can discard
@@ -1723,9 +1726,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     freadCheck(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(EXIT_FAILURE); }
     int version = model_header[1];
-    if (!(version == 1 || version == 2)) {
-        // 1 = fp32, ordered layernorm at the end
-        // 2 = bf16, ordered layernorm at the end
+    if (!(version == 3 || version == 4)) {
+        // 3 = fp32, padded vocab
+        // 4 = bf16, padded vocab
         fprintf(stderr, "Bad version in model file\n");
         fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
         exit(EXIT_FAILURE);
@@ -1737,6 +1740,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->config.num_layers = model_header[4];
     model->config.num_heads = model_header[5];
     model->config.channels = model_header[6];
+    model->config.padded_vocab_size = model_header[7];
 
     // allocate space for all the parameters and read them in
     fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
@@ -1786,6 +1790,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 
     // convenience parameters
     size_t V = model->config.vocab_size;
+    size_t Vp = model->config.padded_vocab_size;
     size_t L = model->config.num_layers;
     size_t NH = model->config.num_heads;
     size_t C = model->config.channels;
@@ -1890,13 +1895,13 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_cublas(acts.output, acts.lnf, params.wte, NULL, B, T, C, V);
+    matmul_forward_cublas(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         // fused classifier: does the forward pass and first part of the backward pass
         // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
-        fused_classifier3(acts.output, acts.losses, (floatX*)NULL, model->targets, B, T, V, V);
+        fused_classifier3(acts.output, acts.losses, (floatX*)NULL, model->targets, B, T, V, Vp);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         // move the (B,T) losses to CPU
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost));
@@ -1946,7 +1951,7 @@ void gpt2_backward(GPT2 *model) {
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
     size_t B = model->batch_size;
     size_t T = model->seq_len;
-    size_t V = model->config.vocab_size;
+    size_t Vp = model->config.padded_vocab_size;
     size_t L = model->config.num_layers;
     size_t NH = model->config.num_heads;
     size_t C = model->config.channels;
@@ -1962,7 +1967,7 @@ void gpt2_backward(GPT2 *model) {
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, V);
+    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, Vp);
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     floatX* dresidual = (floatX*)grads_acts.residual3; // the main buffer holding the gradient in the backward pass
@@ -2437,6 +2442,7 @@ int main(int argc, char *argv[]) {
     printf0("| load_filename         | %-50s |\n", load_filename);
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
+    printf0("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
     printf0("| num_layers L          | %-50d |\n", model.config.num_layers);
     printf0("| num_heads NH          | %-50d |\n", model.config.num_heads);
     printf0("| channels C            | %-50d |\n", model.config.channels);
@@ -2520,8 +2526,8 @@ int main(int argc, char *argv[]) {
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
                 // get the V-dimensional vector probs[0, t-1, :]
-                floatX* logits = model.acts.output + (t - 1) * model.config.vocab_size;
-                // move probs back to CPU and sample
+                floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
+                // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
                 cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost));
                 // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
                 for (int i = 0; i < model.config.vocab_size; i++) {

@@ -1085,6 +1085,7 @@ void fused_classifier3(float* logits, float* losses,
 typedef struct {
     int max_seq_len; // max sequence length, e.g. 1024
     int vocab_size; // vocab size, e.g. 50257
+    int padded_vocab_size; // padded to e.g. %128==0, 50304
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
     int channels; // number of channels, e.g. 768
@@ -1112,11 +1113,12 @@ typedef struct {
 } ParameterTensors;
 
 void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
+    int Vp = config.padded_vocab_size;
     int V = config.vocab_size;
     int C = config.channels;
     int maxT = config.max_seq_len;
     int L = config.num_layers;
-    param_sizes[0] = V * C; // wte
+    param_sizes[0] = Vp * C; // wte
     param_sizes[1] = maxT * C; // wpe
     param_sizes[2] = L * C; // ln1w
     param_sizes[3] = L * C; // ln1b
@@ -1196,7 +1198,7 @@ typedef struct {
 } ActivationTensors;
 
 void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
-    size_t V = config.vocab_size;
+    size_t Vp = config.padded_vocab_size;
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
     size_t C = config.channels;
@@ -1220,7 +1222,7 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[17] = B * T; // lnf_rstd
     act_sizes[18] = B * T; // losses
     act_sizes[19] = L * B * T * 3*C; // qkvr
-    act_sizes[20] = B * T * max(3*C, max(NH*T, V)); // output / scratch
+    act_sizes[20] = B * T * max(3*C, max(NH*T, Vp)); // output / scratch
 }
 
 // Backward pass is conceptually quite different from forward, because we can discard
@@ -1312,8 +1314,13 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
     freadCheck(model_header, sizeof(int), 256, model_file);
-    if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(EXIT_FAILURE); }
-    if (model_header[1] != 1) { printf("Bad version in model file"); exit(EXIT_FAILURE); }
+    if (model_header[0] != 20240326) { fprintf(stderr, "Bad magic model file\n"); exit(EXIT_FAILURE); }
+    if (model_header[1] != 3) {
+        // was bumped from 1 -> 3 to incorporate the padded vocab size
+        fprintf(stderr, "Bad version in model file\n");
+        fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
+        exit(EXIT_FAILURE);
+    }
 
     // read in hyperparameters
     model->config.max_seq_len = model_header[2];
@@ -1321,6 +1328,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->config.num_layers = model_header[4];
     model->config.num_heads = model_header[5];
     model->config.channels = model_header[6];
+    model->config.padded_vocab_size = model_header[7];
 
     // allocate space for all the parameters and read them in
     fill_in_parameter_sizes(model->param_sizes, model->config);
@@ -1367,6 +1375,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     // convenience parameters
     int V = model->config.vocab_size;
+    int Vp = model->config.padded_vocab_size;
     int L = model->config.num_layers;
     int NH = model->config.num_heads;
     int C = model->config.channels;
@@ -1471,13 +1480,13 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_cublas(acts.output, acts.lnf, params.wte, NULL, B, T, C, V);
+    matmul_forward_cublas(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         // fused classifier: does the forward pass and first part of the backward pass
         // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
-        fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, V);
+        fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, Vp);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         // move the (B,T) losses to CPU
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
@@ -1530,7 +1539,7 @@ void gpt2_backward(GPT2 *model) {
     // convenience shortcuts
     int B = model->batch_size;
     int T = model->seq_len;
-    int V = model->config.vocab_size;
+    int Vp = model->config.padded_vocab_size;
     int L = model->config.num_layers;
     int NH = model->config.num_heads;
     int C = model->config.channels;
@@ -1546,7 +1555,7 @@ void gpt2_backward(GPT2 *model) {
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, V);
+    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, Vp);
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass
@@ -1961,6 +1970,7 @@ int main(int argc, char *argv[]) {
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
     printf("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf("| vocab_size V          | %-50d |\n", model.config.vocab_size);
+    printf("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
     printf("| num_layers L          | %-50d |\n", model.config.num_layers);
     printf("| num_heads NH          | %-50d |\n", model.config.num_heads);
     printf("| channels C            | %-50d |\n", model.config.channels);
@@ -2037,8 +2047,8 @@ int main(int argc, char *argv[]) {
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
                 // get the V-dimensional vector probs[0, t-1, :]
-                float* logits = model.acts.output + (t - 1) * model.config.vocab_size;
-                // move probs back to CPU and sample
+                float* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
+                // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
                 cudaCheck(cudaMemcpy(cpu_logits, logits, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
                 float coin = random_f32(&rng_state);
                 int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
