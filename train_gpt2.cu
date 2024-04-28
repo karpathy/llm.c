@@ -427,6 +427,76 @@ void printf0(const char *format, ...) {
 }
 
 // ----------------------------------------------------------------------------
+
+// Adam update is handled in two functions. The first is given a description of how the parameter/weight buffers
+// are partitioned into separate tensors, and which data types and training parameters we use for those. The parameter
+// info contains a prefix sum of parameter counts, so we can easily search that for a thread that is supposed to
+// work on parameter X, we are operating on tensor Y. To ensure that this does not incur too much overhead, the amount
+// of work performed within each thread gets increased. We assume that each tensor is a multiple of 128 elements.
+
+enum EDType {
+    FLOAT32,
+    FLOAT16,
+    BFLOAT16
+};
+
+// We need to have some info available programmatically that identifies key information regarding our tensors
+// in the huge weight buffer memory. If we want to have a single, fused call, we need the ability to quickly
+// identify which tensor a certain weight belongs to. Therefore, we add a pre-calculated prefix sum.
+struct ParameterInfo {
+    char** ptr;                 // pointers into the memory buffer
+    size_t* prefix_sum;         // how many weight _before_ this one
+    size_t* size;               // how many weights in this tensor
+    EDType* dtype;
+    float* learning_rate;
+    float* weight_decay;
+
+    int num_tensors;         // how many elements in each of the arrays above
+    size_t self_size;           // convenience value telling us the size (bytes) of the memory buffer belonging to this struct
+};
+
+size_t parameter_info_size(int num_tensors)  {
+    return (sizeof(char*) +         // ptr
+            2*sizeof(size_t) +      // prefix_sum, size
+            sizeof(EDType) +        // dtype
+            2 * sizeof(float)       //  lr, wd
+    ) * num_tensors;
+}
+
+// Set up pointers in ParameterInfo into the right places of memory
+void setup_parameter_info(ParameterInfo* target, char* memory, int num_tensors) {
+    char* begin = memory;
+    target->ptr = (char**)memory;
+    memory += num_tensors * sizeof(char*);
+    target->prefix_sum = (size_t*)memory;
+    memory += num_tensors * sizeof(size_t);
+    target->size = (size_t*)memory;
+    memory += num_tensors * sizeof(size_t);
+    target->dtype = (EDType*)memory;
+    memory += num_tensors * sizeof(EDType);
+    target->learning_rate = (float*)memory;
+    memory += num_tensors * sizeof(float);
+    target->weight_decay = (float*)memory;
+    memory += num_tensors * sizeof(float);
+
+    target->self_size = memory - begin;
+    target->num_tensors = num_tensors;
+}
+
+void free_parameter_info(ParameterInfo* target) {
+    free((void*)target->ptr);
+    target->ptr = nullptr;
+    target->prefix_sum = nullptr;
+    target->size = nullptr;
+    target->dtype = nullptr;
+    target->learning_rate = nullptr;
+    target->weight_decay = nullptr;
+    target->num_tensors = 0;
+    target->self_size = 0;
+}
+
+
+// ----------------------------------------------------------------------------
 // all the kernels
 
 // warp-level reduction for finding the maximum value
@@ -992,6 +1062,95 @@ __device__ inline float lerp(float start, float end, float weight) {
     return fma(weight, end, fma(-weight, start, start));
 }
 
+// This kernel template is responsible for performing the actual ADAM update.
+// TODO make this warp-level cooperative
+template<class T, class M>
+__device__ void adam_update(cg::thread_block_tile<32>& warp, T* params_memory, const T* grads_memory, size_t offset, size_t end,
+                            M* m_memory, M* v_memory,
+                            float beta1, float beta2,
+                            float inv_beta1_correction, float inv_beta2_correction, float epsilon,
+                            float learning_rate, float weight_decay, unsigned int seed)  {
+    for(size_t i = offset; i < end; ++i) {
+        float grad = (float) grads_memory[i];
+        float m = m_memory[i];
+        float v = v_memory[i];
+        // update the first moment (momentum)
+        m = lerp(grad, m, beta1);
+        m_memory[i] = m;
+        // update the second moment (RMSprop)
+        v = lerp(grad * grad, v, beta2);
+        v_memory[i] = v;
+        m *= inv_beta1_correction;  // m_hat
+        v *= inv_beta2_correction;  // v_hat
+        // update the parameters (weight/bias)
+        float param = (float) params_memory[i] -
+                      (learning_rate * (m / (sqrtf(v) + epsilon) + weight_decay * (float) params_memory[i]));
+        unsigned int random = Get2dNoiseUint(256 * threadIdx.x + i, blockIdx.x, seed);
+        // todo - explain stochastic rounding here
+        stochastic_rounding(param, &params_memory[i], random);
+    }
+}
+
+// Termplate type T instead of floatx
+__global__ void adamw_kernel3(ParameterInfo* p_info, char* grads, float* m_memory, float* v_memory,
+                              float beta1, float beta2, float inv_beta1_correction, float inv_beta2_correction, float eps,
+                              unsigned int seed) {
+    // who am I?
+    // give each thread multiple things to do so we can amortize the initial lookups
+    constexpr const int WORK_PER_THREAD = 128;
+
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    size_t b_idx = WORK_PER_THREAD * blockIdx.x * blockDim.x;
+    size_t t_idx = b_idx + threadIdx.x * WORK_PER_THREAD;
+
+    // which parameter am I responsible for?
+    // do a lower-bound computation. This is not based on binary search, but instead
+    // goes linearly through the small array. We can parallelize over the warp
+    // size, though, so really, this loop is quite short.
+    int lower_bound = 0;
+    for(int i = warp.thread_rank(); i < p_info->num_tensors; i += warp.size()) {
+        if(p_info->prefix_sum[i] <= b_idx) {
+            lower_bound = i;
+        } else {
+            break;
+        }
+    }
+
+    lower_bound = cg::reduce(warp, lower_bound, cg::greater<int>{});
+
+    // OK, we know at which tensor this block starts. Now each thread needs to search
+    for(int i = lower_bound; i < p_info->num_tensors; ++i) {
+        if(p_info->prefix_sum[i] <= t_idx) {
+            lower_bound = i;
+        } else {
+            break;
+        }
+    }
+
+    // get my info
+    EDType dtype = p_info->dtype[lower_bound];
+    char* ptr = p_info->ptr[lower_bound];
+    char* grd = grads + (ptr - p_info->ptr[0]);
+    size_t size = p_info->size[lower_bound];
+    float lr = p_info->learning_rate[lower_bound];
+    float wd = p_info->weight_decay[lower_bound];
+    size_t offset = t_idx - p_info->prefix_sum[lower_bound];
+    float* m = m_memory + p_info->prefix_sum[lower_bound];
+    float* v = v_memory + p_info->prefix_sum[lower_bound];
+    size_t end = min(offset + WORK_PER_THREAD, offset + size);
+
+    if(dtype == EDType::FLOAT32) {
+        adam_update(warp, (float*)ptr, (float*)grd, offset, end, m, v, beta1, beta2, inv_beta1_correction, inv_beta2_correction,
+                    eps, lr, wd, seed);
+    } else {
+        // TODO Fix up to actually use the correct datatype
+        adam_update(warp, (floatX*)ptr, (floatX*)grd, offset, end, m, v, beta1, beta2, inv_beta1_correction, inv_beta2_correction,
+                    eps, lr, wd, seed);
+    }
+}
+
 struct SoftmaxParams {
     float Scale;
     float Offset;
@@ -1463,115 +1622,6 @@ typedef struct {
     floatN*  lnfb; // (C)
 } ParameterTensors;
 
-enum EDType {
-    FLOAT32,
-    FLOAT16,
-    BFLOAT16
-};
-
-// Adam update is handled in two functions. The first is given a description of how the parameter/weight buffers
-// are partitioned into separate tensors, and which data types and training parameters we use for those. The parameter
-// info contains a prefix sum of parameter counts, so we can easily search that for a thread that is supposed to
-// work on parameter X, we are operating on tensor Y. To ensure that this does not incur too much overhead, the amount
-// of work performed within each thread gets increased. We assume that each tensor is a multiple of 128 elements.
-
-struct ParameterInfo {
-    char* ptr[NUM_PARAMETER_TENSORS];               // pointer into the memory buffer
-    size_t prefix_sum[NUM_PARAMETER_TENSORS];       // how many weight _before_ this one
-    size_t size[NUM_PARAMETER_TENSORS];             // how many weights in this one
-    EDType dtype[NUM_PARAMETER_TENSORS];
-    float learning_rate[NUM_PARAMETER_TENSORS];
-    float weight_decay[NUM_PARAMETER_TENSORS];
-};
-
-template<class T, class M>
-__device__ void adam_update(T* params_memory, const T* grads_memory, size_t offset, size_t end,
-                            M* m_memory, M* v_memory,
-                            float beta1, float beta2,
-                            float inv_beta1_correction, float inv_beta2_correction, float epsilon,
-                            float learning_rate, float weight_decay, unsigned int seed)  {
-    for(size_t i = offset; i < end; ++i) {
-        float grad = (float) grads_memory[i];
-        float m = m_memory[i];
-        float v = v_memory[i];
-        // update the first moment (momentum)
-        m = lerp(grad, m, beta1);
-        m_memory[i] = m;
-        // update the second moment (RMSprop)
-        v = lerp(grad * grad, v, beta2);
-        v_memory[i] = v;
-        m *= inv_beta1_correction;  // m_hat
-        v *= inv_beta2_correction;  // v_hat
-        // update the parameters (weight/bias)
-        float param = (float) params_memory[i] -
-                      (learning_rate * (m / (sqrtf(v) + epsilon) + weight_decay * (float) params_memory[i]));
-        unsigned int random = Get2dNoiseUint(256 * threadIdx.x + i, blockIdx.x, seed);
-        // todo - explain stochastic rounding here
-        stochastic_rounding(param, &params_memory[i], random);
-    }
-}
-
-
-// Termplate type T instead of floatx
-__global__ void adamw_kernel3(ParameterInfo* p_info, char* grads, float* m_memory, float* v_memory,
-                              float beta1, float beta2, float inv_beta1_correction, float inv_beta2_correction, float eps,
-                              unsigned int seed) {
-    // who am I?
-    // give each thread multiple things to do so we can amortize the initial lookups
-    constexpr const int WORK_PER_THREAD = 128;
-
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-
-    size_t b_idx = WORK_PER_THREAD * blockIdx.x * blockDim.x;
-    size_t t_idx = b_idx + threadIdx.x * WORK_PER_THREAD;
-
-    // which parameter am I responsible for?
-    // do a lower-bound computation. This is not based on binary search, but instead
-    // goes linearly through the small array. We can parallelize over the warp
-    // size, though, so really, this loop is quite short.
-    int lower_bound = 0;
-    for(int i = warp.thread_rank(); i < NUM_PARAMETER_TENSORS; i += warp.size()) {
-        if(p_info->prefix_sum[i] <= b_idx) {
-            lower_bound = i;
-        } else {
-            break;
-        }
-    }
-
-    lower_bound = cg::reduce(warp, lower_bound, cg::greater<int>{});
-
-    // OK, we know at which tensor this block starts. Now each thread needs to search
-    for(int i = lower_bound; i < NUM_PARAMETER_TENSORS; ++i) {
-        if(p_info->prefix_sum[i] <= t_idx) {
-            lower_bound = i;
-        } else {
-            break;
-        }
-    }
-
-    // get my info
-    EDType dtype = p_info->dtype[lower_bound];
-    char* ptr = p_info->ptr[lower_bound];
-    char* grd = grads + (ptr - p_info->ptr[0]);
-    size_t size = p_info->size[lower_bound];
-    float lr = p_info->learning_rate[lower_bound];
-    float wd = p_info->weight_decay[lower_bound];
-    size_t offset = t_idx - p_info->prefix_sum[lower_bound];
-    float* m = m_memory + p_info->prefix_sum[lower_bound];
-    float* v = v_memory + p_info->prefix_sum[lower_bound];
-    size_t end = min(offset + WORK_PER_THREAD, offset + size);
-
-    if(dtype == EDType::FLOAT32) {
-        adam_update((float*)ptr, (float*)grd, offset, end, m, v, beta1, beta2, inv_beta1_correction, inv_beta2_correction,
-                    eps, lr, wd, seed);
-    } else {
-        // TODO Fix up to actually use the correct datatype
-        adam_update((floatX*)ptr, (floatX*)grd, offset, end, m, v, beta1, beta2, inv_beta1_correction, inv_beta2_correction,
-                    eps, lr, wd, seed);
-    }
-}
-
 
 void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
     size_t V = config.vocab_size;
@@ -1816,6 +1866,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // prepare parameter info
     ParameterInfo param_info;
+    char* p_inf_buffer = (char*)mallocCheck(parameter_info_size(NUM_PARAMETER_TENSORS));
+    setup_parameter_info(&param_info, p_inf_buffer, NUM_PARAMETER_TENSORS);
 
     // read in all the parameters from file and copy them to device
     float* params_memory_cpu = (float*)mallocCheck(input_model_bytes);
@@ -1856,13 +1908,17 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     fcloseCheck(model_file);
 
     // move the metadata over to the gpu
-    ParameterInfo* d_pinfo;
-    cudaCheck(cudaMalloc(&d_pinfo, sizeof(ParameterInfo)));
-    cudaCheck(cudaMemcpy(d_pinfo, &param_info, sizeof(ParameterInfo), cudaMemcpyHostToDevice));
+    ParameterInfo d_pinfo;
+    char* d_pinfo_buffer;
+    cudaCheck(cudaMalloc(&d_pinfo_buffer, param_info.self_size + sizeof(ParameterInfo)));
+    setup_parameter_info(&d_pinfo, d_pinfo_buffer + sizeof(ParameterInfo), NUM_PARAMETER_TENSORS);
+    cudaCheck(cudaMemcpy(d_pinfo_buffer, &d_pinfo, sizeof(ParameterInfo), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(d_pinfo_buffer + sizeof(ParameterInfo), &param_info, param_info.self_size, cudaMemcpyHostToDevice));
+    free(p_inf_buffer);
 
     // other inits
     model->acts_memory = NULL;
-    model->d_param_info = d_pinfo;
+    model->d_param_info = (ParameterInfo*)d_pinfo_buffer;
     model->grads_memory = NULL;
     model->m_memory = NULL;
     model->v_memory = NULL;
