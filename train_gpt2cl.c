@@ -596,18 +596,18 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     if (model_header[1] != 1) { printf("Bad version in model file"); exit(1); }
 
     // read in hyperparameters
-    int maxT, V, L, NH, C;
+    size_t maxT, V, L, NH, C; // size_t to prevent int overflow
     model->config.max_seq_len = maxT = model_header[2];
     model->config.vocab_size = V = model_header[3];
     model->config.num_layers = L = model_header[4];
     model->config.num_heads = NH = model_header[5];
     model->config.channels = C = model_header[6];
     printf("[GPT-2]\n");
-    printf("max_seq_len: %d\n", maxT);
-    printf("vocab_size: %d\n", V);
-    printf("num_layers: %d\n", L);
-    printf("num_heads: %d\n", NH);
-    printf("channels: %d\n", C);
+    printf("max_seq_len: %zu\n", maxT);
+    printf("vocab_size: %zu\n", V);
+    printf("num_layers: %zu\n", L);
+    printf("num_heads: %zu\n", NH);
+    printf("channels: %zu\n", C);
 
     // allocate space for all the parameters and read them in
     model->param_sizes[0] = V * C; // wte
@@ -653,7 +653,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-void gpt2_forward(GPT2_CL *gcl, GPT2 *model, int* inputs, int* targets, int B, int T) {
+void gpt2_forward(GPT2_CL *gcl, GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     // targets are optional and could be NULL
 
     // ensure the model was initialized or error out
@@ -662,11 +662,11 @@ void gpt2_forward(GPT2_CL *gcl, GPT2 *model, int* inputs, int* targets, int B, i
         exit(1);
     }
 
-    // convenience parameters
-    int V = model->config.vocab_size;
-    int L = model->config.num_layers;
-    int NH = model->config.num_heads;
-    int C = model->config.channels;
+    // convenience parameters (size_t to help prevent int overflow)
+    size_t V = model->config.vocab_size;
+    size_t L = model->config.num_layers;
+    size_t NH = model->config.num_heads;
+    size_t C = model->config.channels;
 
     // validate inputs, all indices must be in the range [0, V)
     for(int i = 0; i < B * T; i++) {
@@ -719,7 +719,7 @@ void gpt2_forward(GPT2_CL *gcl, GPT2 *model, int* inputs, int* targets, int B, i
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
         if (B != model->batch_size || T != model->seq_len) {
-            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
+            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, (int)B, (int)T);
             exit(EXIT_FAILURE);
         }
     }
@@ -822,13 +822,13 @@ void gpt2_backward(GPT2 *model) {
         gpt2_zero_grad(model);
     }
 
-    // convenience shortcuts
-    int B = model->batch_size;
-    int T = model->seq_len;
-    int V = model->config.vocab_size;
-    int L = model->config.num_layers;
-    int NH = model->config.num_heads;
-    int C = model->config.channels;
+    // convenience shortcuts (and size_t to help prevent int overflow)
+    size_t B = model->batch_size;
+    size_t T = model->seq_len;
+    size_t V = model->config.vocab_size;
+    size_t L = model->config.num_layers;
+    size_t NH = model->config.num_heads;
+    size_t C = model->config.channels;
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
     ParameterTensors params = model->params; // for brevity
@@ -924,7 +924,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         model->v_memory = (float*)calloc(model->num_parameters, sizeof(float));
     }
 
-    for (int i = 0; i < model->num_parameters; i++) {
+    for (size_t i = 0; i < model->num_parameters; i++) {
         float param = model->params_memory[i];
         float grad = model->grads_memory[i];
 
@@ -1205,7 +1205,7 @@ int main() {
                 // we re-calculate the forward pass for all of (B,T) positions from scratch
                 // but the inference here is just for sanity checking anyway
                 // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&gcl, &model, gen_tokens, NULL, 1, t);
+                gpt2_forward(&gcl, &model, gen_tokens, NULL, B, T);
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // but only using position 0
