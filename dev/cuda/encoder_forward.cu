@@ -9,6 +9,9 @@ version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops ov
 
 version 2 is more optimized, parallelizes over all of B,T,C
 ./encoder_forward 2
+
+version 3 is like version 2 but uses float4 reads/writes
+./encoder_forward 3
 */
 
 #include <stdio.h>
@@ -82,27 +85,25 @@ __global__ void encoder_forward_kernel2(float* out,
     }
 }
 
-// use float4 for memory coalescing
-__device__ inline float4 operator+(const float4& a, const float4& b) {
+__device__ inline float4 add_float4(const float4& a, const float4& b) {
     return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
 }
 
+// use of float4 leads to using 128-bit LDG / STG instructions in SASS,
+// very helpful in memory-bound kernels like encoder_forward
 __global__ void encoder_forward_kernel3(float4* out,
                                const int* inp, const float4* wte, const float4* wpe,
                                int B, int T, int C) {
     int C4 = C / 4;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * T * C4;
-
     if (idx < N) {
         int bt = idx / C4;
         int b = bt / T;
         int t = bt % T;
         int c4 = idx % C4;
-
         int ix = inp[b * T + t];
-
-        out[b * T * C4 + t * C4 + c4] = wte[ix * C4 + c4] + wpe[t * C4 + c4];
+        out[b * T * C4 + t * C4 + c4] = add_float4(wte[ix * C4 + c4], wpe[t * C4 + c4]);
     }
 }
 
