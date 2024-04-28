@@ -487,6 +487,8 @@ template <typename Type, typename Tdout>
 __global__ void encoder_backward_kernel(Type* dwte, Type* dwpe,
                                         const Tdout* dout, const int* inp,
                                         int B, int T, int C) {
+    extern __shared__ Type shared_mem[];
+
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * T * C;
 
@@ -502,8 +504,21 @@ __global__ void encoder_backward_kernel(Type* dwte, Type* dwpe,
         Type* dwte_ix = dwte + ix * C + c;
         Type* dwpe_tc = dwpe + t * C + c;
 
-        atomicAddX(dwte_ix, (Type)*dout_btc);
-        atomicAddX(dwpe_tc, (Type)*dout_btc);
+        // Aggregating in shared memory
+        shared_mem[threadIdx.x] = (Type)*dout_btc;
+
+        __syncthreads(); // Wait for all threads to write to shared memory
+
+        // Perform reduction in shared memory
+        if (threadIdx.x == 0) {
+            Type sum = 0;
+            for (int i = 0; i < blockDim.x; i++) {
+                sum += shared_mem[i];
+            }
+            // Only one thread writes back to global memory
+            *dwte_ix += sum;
+            *dwpe_tc += sum;
+         }
     }
 }
 
@@ -691,11 +706,16 @@ __global__ void softmax_forward_kernel5(Type* out, float inv_temperature, const 
     }
 }
 
-template <typename TOut, typename T1, typename T2>
-__global__ void residual_forward_kernel(TOut* out, T1* inp1, T2* inp2, int N) {
+__global__ void residual_forward_kernel(Packed128<floatX>* out, Packed128<floatX>* inp1, Packed128<floatX>* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
-        out[idx] = (TOut)((float)__ldcs(&inp1[idx]) + (float)__ldcs(&inp2[idx]));
+        Packed128<floatX> inp1_packed = inp1[idx];
+        Packed128<floatX> inp2_packed = inp2[idx];
+        Packed128<floatX> out_packed;
+        for(int j = 0; j < Packed128<floatX>::size; j++){
+            out_packed[j] = (floatX)((float)inp1_packed[j] + (float)inp2_packed[j]);
+        }
+        out[idx] = out_packed;
     }
 }
 
@@ -1159,7 +1179,8 @@ void encoder_backward(Type* dwte, Type* dwpe,
     const int N = B * T * C;
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
-    encoder_backward_kernel<<<grid_size, block_size>>>(dwte, dwpe, dout, inp, B, T, C);
+    const size_t shared_mem_size = sizeof(Type) * block_size;
+    encoder_backward_kernel<<<grid_size, block_size, shared_mem_size>>>(dwte, dwpe, dout, inp, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1345,11 +1366,10 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     cudaCheck(cudaGetLastError());
 }
 
-template <typename TOut, typename T1, typename T2>
-void residual_forward(TOut* out, T1* inp1, T2* inp2, int N) {
+void residual_forward(floatX* out, floatX* inp1, floatX* inp2, int N) {
     const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
-    residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
+    const int grid_size = CEIL_DIV(N/Packed128<floatX>::size, block_size);
+    residual_forward_kernel<<<grid_size, block_size>>>((Packed128<floatX>*)out, (Packed128<floatX>*)inp1, (Packed128<floatX>*)inp2, N);
     cudaCheck(cudaGetLastError());
 }
 
