@@ -100,18 +100,17 @@ __global__ void adamw_kernel2(float* params_memory, const float* grads_memory, f
 
 
 // using float4 for memory coalescing based on kernel 2
-__device__ float& vec_at(float4& vec, int index) {
+__device__ inline float& vec_at(float4& vec, int index) {
     return reinterpret_cast<float*>(&vec)[index];
 }
 
-__device__ float vec_at(const float4& vec, int index) {
+__device__ inline float vec_at(const float4& vec, int index) {
     return reinterpret_cast<const float*>(&vec)[index];
 }
 
 __global__ void adamw_kernel3(float4* params_memory, const float4* grads_memory, float4* m_memory, float4* v_memory, long num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    assert(num_parameters % 4 == 0);
     if (i >= num_parameters / 4) return;  // guard
     float4 grad = grads_memory[i];
     float4 m = m_memory[i];
@@ -165,6 +164,7 @@ void adamw_dispatch2(float* params_memory, const float* grads_memory, float* m_m
 // version 3: using float4 for memory coalescing
 void adamw_dispatch3(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                      float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+    assert(num_parameters % 4 == 0);
     unsigned int block_size = 512;
     unsigned int num_blocks = ceil_div(num_parameters, (long) block_size);
     adamw_kernel3<<<num_blocks, block_size>>>((float4*) params_memory, (float4*) grads_memory, (float4*) m_memory, (float4*) v_memory, num_parameters,
