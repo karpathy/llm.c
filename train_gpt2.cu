@@ -1163,25 +1163,6 @@ void layernorm_forward(TOut* out, Type* mean, Type* rstd,
     cudaCheck(cudaGetLastError());
 }
 
-// uses cuBLAS
-void matmul_forward_cublas(floatX* out,
-                    floatX* inp, floatX* weight, floatX* bias,
-                    int B, int T, int C, int OC) {
-    assert(bias == NULL); // bias is not supported for this kernel
-
-    // FP16 alpha/beta need to be used if and only if CUBLAS_COMPUTE_16F
-    const float alpha = 1.0f, beta = 0.0f;
-    const half alpha_fp16 = (half)alpha, beta_fp16 = (half)beta;
-    const void* alpha_ptr = (CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F) ?
-                            (const void*)&alpha_fp16 : (const void*)&alpha;
-    const void* beta_ptr =  (CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F) ?
-                            (const void*)&beta_fp16 : (const void*)&beta;
-
-    cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C,
-                             alpha_ptr, weight, CUBLAS_LOWP, C, inp, CUBLAS_LOWP, C, beta_ptr,
-                             out, CUBLAS_LOWP, OC, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-}
-
 // uses cuBLASLt to fuse the bias and gelu. does not work with OC = 50257 (last layer)
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
 // https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtSgemm/sample_cublasLt_LtSgemm.cu
@@ -1222,7 +1203,10 @@ void matmul_forward_cublaslt(floatX* out,
     cublasCheck(cublasLtMatmulDescCreate(&operationDesc, CUBLAS_LOWP_COMPUTE, scale_type));
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opNoTranspose, sizeof(opNoTranspose)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias, sizeof(epilogueBias)));
+    if(has_bias) {
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias,
+                                                   sizeof(epilogueBias)));
+    }
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
 
     // define matrix layouts
@@ -1895,7 +1879,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_cublas(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
