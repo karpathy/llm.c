@@ -73,6 +73,7 @@ def tokenize():
     train_data_filename = os.path.join(DATA_CACHE_DIR, "wikitext-103/wikitext-103-raw/wiki.train.raw")
     train_text = open(train_data_filename, 'r').read()
 
+    print("Cleaning training data (this should take about 1 minute)...")
     # cleanup the training text
     train_text = train_text.strip() # remove leading and trailing whitespace
     train_text = train_text.replace(" \n \n ", '\n<|endoftext|>') # injecting special token in between sections
@@ -89,11 +90,13 @@ def tokenize():
     train_text = "<|endoftext|>".join(train_split[i] for i in range(len(train_split)))
     train_tokens = encode(train_text)
     train_tokens_np = np.array(train_tokens, dtype = np.int32)
+    print("Training data cleaned")
 
     # now repeat same cleanup process but for validation text
     val_data_filename = os.path.join(DATA_CACHE_DIR, "wikitext-103/wikitext-103-raw/wiki.valid.raw")
     val_text = open(val_data_filename, 'r').read()
 
+    print("Cleaning validation data...")
     val_text = val_text.strip() 
     val_text = val_text.replace(" \n \n ", '\n<|endoftext|>')
     val_text = "<|endoftext|>" + val_text
@@ -106,14 +109,18 @@ def tokenize():
     val_text = "<|endoftext|>".join(val_split[i] for i in range(len(val_split)))
     val_tokens = encode(val_text)
     val_tokens_np = np.array(val_tokens, dtype = np.int32)
+    print("Validation data cleaned")
 
     # now just dump the encoded tokens into binary files
     train_filename = os.path.join(DATA_CACHE_DIR, "wikitext-103_train.bin")
     val_filename = os.path.join(DATA_CACHE_DIR, "wikitext-103_val.bin")
     with open(train_filename, "wb") as f:
-       f.write(train_tokens_np.tobytes())
+        for chunk in tqdm([train_tokens_np[i : i + 1024] for i in range(0, len(train_tokens_np), 1024)], desc = "Writing train data to wikitext-103_train.bin", unit = "iB"):
+            f.write(chunk.tobytes())
+
     with open(val_filename, "wb") as f:
-        f.write(val_tokens_np.tobytes())
+        for chunk in tqdm([val_tokens_np[i : i + 1024] for i in range(0, len(val_tokens_np), 1024)], desc = "Writing validation data to wikitext-103_val.bin", unit = "iB"):
+            f.write(chunk.tobytes())
     
     print(f"Saved {len(val_tokens_np)} tokens to {val_filename}")
     print(f"Saved {len(train_tokens_np)} tokens to {train_filename}")
