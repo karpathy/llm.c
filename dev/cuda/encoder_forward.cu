@@ -15,6 +15,7 @@ version 2 is more optimized, parallelizes over all of B,T,C
 #include <stdlib.h>
 #include <cuda_runtime.h>
 #include "common.h"
+#include <cassert>
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -81,6 +82,49 @@ __global__ void encoder_forward_kernel2(float* out,
     }
 }
 
+// use float4 for memory coalescing
+// optimized implementation: parallelize over all of B,T,C
+
+__device__ inline float4 operator+(const float4& a, const float4& b) {
+    return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+}
+
+__device__ inline float& vec_at(float4& vec, int index) {
+    return reinterpret_cast<float*>(&vec)[index];
+}
+
+__device__ inline float vec_at(const float4& vec, int index) {
+    return reinterpret_cast<const float*>(&vec)[index];
+}
+
+__global__ void encoder_forward_kernel3(float4* out,
+                               const int* inp, const float4* wte, const float4* wpe,
+                               int B, int T, int C) {
+    int C4 = C / 4;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int N = B * T * C4;
+
+    if (idx < N) {
+        int bt = idx / C4;
+        int b = bt / T;
+        int t = bt % T;
+        int c4 = idx % C4;
+
+        int ix = inp[b * T + t];
+
+        // float4* out_btc4 = out + b * T * C4 + t * C4 + c4;
+        // const float4* wte_ix4 = wte + ix * C4 + c4;
+        // const float4* wpe_tc4 = wpe + t * C4 + c4;
+        // for (int i = 0; i < 4; i++) {
+        //     vec_at(*out_btc4, i) = vec_at(*wte_ix4, i) + vec_at(*wpe_tc4, i);
+        // }
+        //*out_btc4 = *wte_ix4 + *wpe_tc4;
+        out[b * T * C4 + t * C4 + c4] = wte[ix * C4 + c4] + wpe[t * C4 + c4];
+    }
+}
+
+
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -104,6 +148,17 @@ void encoder_forward2(float* out,
     cudaCheck(cudaGetLastError());
 }
 
+void encoder_forward3(float* out,
+                     const int* inp, const float* wte, const float* wpe,
+                     int B, int T, int C,
+                     const int block_size) {
+    assert(C % 4 == 0);
+    const int N = B * T * C;
+    const int grid_size = ceil_div(N, block_size);
+    encoder_forward_kernel3<<<grid_size, block_size>>>((float4*) out, inp, (float4*) wte, (float4*) wpe, B, T, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void encoder_forward(int kernel_num,
                      float* out,
@@ -116,6 +171,9 @@ void encoder_forward(int kernel_num,
             break;
         case 2:
             encoder_forward2(out, inp, wte, wpe, B, T, C, block_size);
+            break;
+        case 3:
+            encoder_forward3(out, inp, wte, wpe, B, T, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
