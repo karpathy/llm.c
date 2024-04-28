@@ -182,6 +182,7 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     err  = clSetKernelArg(gcl->matmul_forward, 0, sizeof(cl_mem), &gcl->matmul_out);
     err |= clSetKernelArg(gcl->matmul_forward, 1, sizeof(cl_mem), &gcl->matmul_inp);
     err |= clSetKernelArg(gcl->matmul_forward, 2, sizeof(cl_mem), &gcl->matmul_weight);
+    err |= clSetKernelArg(gcl->matmul_forward, 3, sizeof(cl_mem), &gcl->matmul_bias);
     if (err != CL_SUCCESS)
     {
         printf("error: Failed to set kernel arguments! %d\n", err);

@@ -773,19 +773,19 @@ void gpt2_forward(GPT2_CL *gcl, GPT2 *model, int* inputs, int* targets, size_t B
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        cl_matmul_forward_bias(gcl, l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        cl_matmul_forward(gcl, l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
-        cl_matmul_forward_bias(gcl, l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        cl_matmul_forward(gcl, l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        cl_matmul_forward_bias(gcl, l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+        cl_matmul_forward(gcl, l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        cl_matmul_forward_bias(gcl, l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        cl_matmul_forward(gcl, l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    cl_matmul_forward(gcl, acts.logits, acts.lnf, params.wte, B, T, C, V);
+    cl_matmul_forward(gcl, acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
     softmax_forward(acts.probs, acts.logits, B, T, V);
 
     // also forward the cross-entropy loss function if we have the targets

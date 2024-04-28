@@ -1,8 +1,9 @@
 MSTRINGIFY(
 
 
-__kernel void matmul_forward(__global float* out, __global float* inp, __global float* weight,
-                    int B, int T, int C, int OC)
+__kernel void matmul_forward(__global float* out, __global float* inp,
+                    __global float* weight, __global float* bias,
+                    int B, int T, int C, int OC, int use_bias)
 {
     // define local memory for input and weight tiles with padding
     __local float inp_tile[TILE_SIZE][TILE_SIZE + LOCAL_MEM_PADDING_SIZE];
@@ -18,7 +19,7 @@ __kernel void matmul_forward(__global float* out, __global float* inp, __global 
     int num_tiles = (C + TILE_SIZE - 1) / TILE_SIZE;
 
     // initialize output value
-    float val = 0.0f;
+    float val = use_bias? bias[global_id1] : 0.0f;
 
     // loop over tiles
     for (int t = 0; t < num_tiles; ++t) {
