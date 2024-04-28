@@ -4,7 +4,7 @@ LDFLAGS =
 LDLIBS = -lm
 INCLUDES =
 CFLAGS_COND = -march=native
-CLCFLAGS = -Idev/opencl
+CLCFLAGS =
 CLLDFLAGS =
 
 # Find nvcc
@@ -37,7 +37,8 @@ ifeq ($(NO_OMP), 1)
 else
   # Detect if running on macOS or Linux
   ifeq ($(shell uname), Darwin)
-    CLLDFLAGS = -framework OpenCL
+    CLLDFLAGS += -framework OpenCL
+
     # Check for Homebrew's libomp installation in different common directories
     ifeq ($(shell [ -d /opt/homebrew/opt/libomp/lib ] && echo "exists"), exists)
       # macOS with Homebrew on ARM (Apple Silicon)
@@ -57,7 +58,7 @@ else
       $(warning OpenMP not found, skipping OpenMP support)
     endif
   else
-    CLLDFLAGS = -lOpenCL
+    CLLDFLAGS += -lOpenCL
     # Check for OpenMP support in GCC or Clang on Linux
     ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
       CFLAGS += -fopenmp -DOMP

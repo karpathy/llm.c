@@ -7,7 +7,8 @@
 #include <CL/cl.h>
 #endif
 
-#define MATMUL_TILE_SIZE 8
+#include "tune.h"
+
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MSTRINGIFY(...) #__VA_ARGS__
 
@@ -118,7 +119,8 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     }
 
     // build program
-    sprintf(build_options_str, "%s -D TILE_SIZE=%d", build_options, MATMUL_TILE_SIZE);
+    sprintf(build_options_str, "%s -D TILE_SIZE=%d -D LOCAL_MEM_PADDING_SIZE=%d -D MATMUL_VLOAD_SIZE=%d",
+        build_options, MATMUL_TILE_SIZE, MATMUL_LOCAL_MEM_PADDING_SIZE, MATMUL_VLOAD_SIZE);
     err = clBuildProgram(gcl->program, 1, &gcl->device, build_options_str, NULL, NULL);
     if (err != CL_SUCCESS) {
         size_t buf_len = 0;
