@@ -166,7 +166,7 @@ void adamw_dispatch3(float* params_memory, const float* grads_memory, float* m_m
                      float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
     assert(num_parameters % 4 == 0);
     unsigned int block_size = 512;
-    unsigned int num_blocks = ceil_div(num_parameters, (long) block_size);
+    unsigned int num_blocks = ceil_div(num_parameters / 4, (long) block_size);
     adamw_kernel3<<<num_blocks, block_size>>>((float4*) params_memory, (float4*) grads_memory, (float4*) m_memory, (float4*) v_memory, num_parameters,
                                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
     cudaCheck(cudaGetLastError());
