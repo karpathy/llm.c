@@ -9,6 +9,7 @@ CFLAGS_COND = -march=native
 NVCC := $(shell which nvcc 2>/dev/null)
 
 # NVCC flags
+# -t=0 is short for --threads, 0 = number of CPUs on the machine
 NVCC_FLAGS = -O3 -t=0 --use_fast_math
 NVCC_LDFLAGS = -lcublas -lcublasLt
 NCLL_INCLUDES =
