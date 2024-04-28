@@ -241,8 +241,8 @@ int main(int argc, char *argv[]) {
 
             // compare the gradients on the parameters all at once, in fp32
             // I set the tolerances manually by inspecting the gradient differences for
-            // a few elements of each tensor. I think bf16 is very approximate here sadly.
-            // Maybe we have bugs, or maybe it is bf16. To be seen I think at this point.
+            // a few elements of each tensor. bf16 looks ok but not amazing here.
+            // It's possible we have bugs lurking, or maybe it is bf16. Not 100% sure.
             allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", 6e-1f);
             allok = allok & check_tensor(tensors1[1], tensors2[1], maxT * C, "wpe", 1e-2f);
             allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", 9e-2); // hmm a bit high
