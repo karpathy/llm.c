@@ -58,18 +58,18 @@ enum PrecisionMode {
     PRECISION_BF16
 };
 
-// use bf16 (bfloat 16)
-#if defined(ENABLE_BF16)
-typedef __nv_bfloat16 floatX;
+// fp32
+#if defined(ENABLE_FP32)
+typedef float floatX;
 typedef float floatN;
-#define CUBLAS_LOWP CUDA_R_16BF
-#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
-const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights
-PrecisionMode PRECISION_MODE = PRECISION_BF16;
-const char* precision_mode_str = "bf16";
+#define CUBLAS_LOWP CUDA_R_32F
+#define CUBLAS_LOWP_COMPUTE cublas_compute_type // auto-select FP32 vs TF32
+const char* load_filename = "gpt2_124M.bin"; // fp32 weights
+PrecisionMode PRECISION_MODE = PRECISION_FP32;
+const char* precision_mode_str = "fp32";
 
 #ifdef MULTI_GPU
-const ncclDataType_t ncclFloatX = ncclBfloat16;
+const ncclDataType_t ncclFloatX = ncclFloat;
 const ncclDataType_t ncclFloatN = ncclFloat;
 #endif
 
@@ -88,21 +88,20 @@ const ncclDataType_t ncclFloatX = ncclHalf;
 const ncclDataType_t ncclFloatN = ncclFloat;
 #endif
 
-// fallback for fp32
+// bfloat16 (default!)
 #else
-typedef float floatX;
+typedef __nv_bfloat16 floatX;
 typedef float floatN;
-#define CUBLAS_LOWP CUDA_R_32F
-#define CUBLAS_LOWP_COMPUTE cublas_compute_type // auto-select FP32 vs TF32
-const char* load_filename = "gpt2_124M.bin"; // fp32 weights
-PrecisionMode PRECISION_MODE = PRECISION_FP32;
-const char* precision_mode_str = "fp32";
+#define CUBLAS_LOWP CUDA_R_16BF
+#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights
+PrecisionMode PRECISION_MODE = PRECISION_BF16;
+const char* precision_mode_str = "bf16";
 
 #ifdef MULTI_GPU
-const ncclDataType_t ncclFloatX = ncclFloat;
+const ncclDataType_t ncclFloatX = ncclBfloat16;
 const ncclDataType_t ncclFloatN = ncclFloat;
 #endif
-
 #endif
 
 // ----------------------------------------------------------------------------
