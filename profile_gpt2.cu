@@ -24,7 +24,6 @@ For example, I have NVIDIA Nsight Compute installed on my Mac, and I rsync
 the profile.ncu-rep from a cloud box to local to pretty view.
 */
 
-#define ENABLE_BF16
 #define TESTING
 #include "train_gpt2.cu"
 

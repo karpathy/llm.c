@@ -41,6 +41,7 @@ mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cublasLt.h>
+#include <cuda_bf16.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 // Multi-GPU related

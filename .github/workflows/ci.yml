@@ -52,11 +52,38 @@ jobs:
   build-with-cuda-fp32:
     runs-on: ubuntu-latest  # Host OS, Docker will run on top of this
     container:
-      image: nvidia/cuda:11.2.2-devel-ubuntu20.04  # Example CUDA development image with nvcc
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Build FP32 checkpoint
+        run: make train_gpt2fp32cu test_gpt2fp32cu
+
+      - name: Build FP32 precision
+        run: PRECISION=FP32 make train_gpt2cu test_gpt2cu profile_gpt2cu
+
+  build-with-cuda-bf16:
+    runs-on: ubuntu-latest  # Host OS, Docker will run on top of this
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
       - name: Build project
-        run: make train_gpt2fp32cu test_gpt2fp32cu
+        run: PRECISION=BF16 make test_gpt2cu train_gpt2cu profile_gpt2cu
+
+  build-with-cuda-fp16:
+    runs-on: ubuntu-latest  # Host OS, Docker will run on top of this
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Build project
+        run: PRECISION=FP16 make test_gpt2cu train_gpt2cu profile_gpt2cu
