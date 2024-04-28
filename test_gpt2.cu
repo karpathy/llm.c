@@ -1,3 +1,4 @@
+#define ENABLE_BF16
 #define TESTING
 #include "train_gpt2.cu"
 

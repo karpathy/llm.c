@@ -24,6 +24,7 @@ For example, I have NVIDIA Nsight Compute installed on my Mac, and I rsync
 the profile.ncu-rep from a cloud box to local to pretty view.
 */
 
+#define ENABLE_BF16
 #define TESTING
 #include "train_gpt2.cu"
 
@@ -51,7 +52,7 @@ int main() {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
 
     int B = 4;
     int T = 1024;
