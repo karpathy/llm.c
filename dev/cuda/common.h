@@ -107,6 +107,12 @@ void validate_result(T* device_result, const T* cpu_reference, const char* name,
 
 template<class Kernel, class... KernelArgs>
 float benchmark_kernel(int repeats, Kernel kernel, KernelArgs&&... kernel_args) {
+    // Prevent division by zero error.
+    if (repeats <= 0) {
+        printf("benchamrk_kernel, repeats(%d) <= 0 \n", repeats);
+         exit(EXIT_FAILURE);
+    }
+
     cudaEvent_t start, stop;
     cudaCheck(cudaEventCreate(&start));
     cudaCheck(cudaEventCreate(&stop));
@@ -121,4 +127,22 @@ float benchmark_kernel(int repeats, Kernel kernel, KernelArgs&&... kernel_args) 
     cudaCheck(cudaEventElapsedTime(&elapsed_time, start, stop));
 
     return elapsed_time / repeats;
+}
+
+template<class Host, class... HostArgs>
+float benchmark_host(int repeats, Host host, HostArgs&&... host_args) {
+    // Prevent division by zero error.
+    if (repeats <= 0) {
+        printf("benchamrk_host, repeats(%d) <= 0 \n", repeats);
+         exit(EXIT_FAILURE);
+    }
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for(int i = 0; i < repeats; i++) {
+        host(std::forward<HostArgs>(host_args)...);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    float elapsed_time = (float)(((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9) * 1000);
+    return  elapsed_time / repeats;
 }
