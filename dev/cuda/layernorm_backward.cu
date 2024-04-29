@@ -736,9 +736,11 @@ void layernorm_backward(int kernel_num,
         case 3:
             layernorm_backward3(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
+#if defined(ENABLE_BF16)
         case 4:
             layernorm_backward4(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
+#endif
         case 5:
             layernorm_backward5(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
