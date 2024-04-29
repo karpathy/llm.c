@@ -18,11 +18,8 @@ version 1 is naive port from CPU code to kernel
 #include <cuda_runtime.h>
 #include "common.h"
 
-// Finally, we define a wrapper type that contains 128 bits of whatever underlying type we want
-// we store the actual data in an int4 vector, and reinterpret its bits, because int4 gets nvcc to
-// reliably produce 128-bit instructions
-// TODO do we really need this here, or can we get away with the int4 trick just inside the  load/store functions
-// we allow individual element access with [], and provide a convenience accessor to get the data converted to
+// We define a wrapper type that contains 128 bits of whatever underlying type we want
+// We allow individual element access with [], and provide a convenience accessor to get the data converted to
 // a regular float for mixed-precision operations.
 
 template<class ElementType>
@@ -56,23 +53,25 @@ struct alignas(16) Packed128 {
 };
 
 
-// use this function to load a Packet128 from an aligned memory address
+// load a Packet128 from an aligned memory address
 template<class ElementType>
 __device__ __forceinline__ Packed128<ElementType> load_aligned(const ElementType* address) {
     return Packed128<ElementType>{*reinterpret_cast<const int4*>(address)};
 }
 
+// load a Packet128 from an aligned memory address with streaming cache hint
 template<class ElementType>
 __device__ __forceinline__ Packed128<ElementType> load_aligned_cs(const ElementType* address) {
     return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
 }
 
-// use this function to store a Packet128 to an aligned memory address
+// store a Packet128 to an aligned memory address
 template<class ElementType>
 __device__ __forceinline__ void store_aligned(ElementType* target, Packed128<ElementType> value) {
     *reinterpret_cast<int4*>(target) = value.get_bits();
 }
 
+// store a Packet128 to an aligned memory address with streaming cache hint
 template<class ElementType>
 __device__ __forceinline__ void store_aligned_cs(ElementType* target, Packed128<ElementType> value) {
     __stcs(reinterpret_cast<int4*>(target), value.get_bits());
