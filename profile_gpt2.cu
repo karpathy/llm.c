@@ -51,7 +51,7 @@ int main() {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
 
     int B = 4;
     int T = 1024;
