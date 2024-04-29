@@ -2005,8 +2005,6 @@ void dataloader_free(DataLoader *loader) {
 // ----------------------------------------------------------------------------
 // sampler: takes probabilities and samples integers from them
 
-#define GPT2_EOT 50256
-
 int sample_softmax(const float* logits, int n, float coin) {
     // sample index from logits (converted to probabilities using softmax)
     // coin is a random number in [0, 1), usually from random_f32()
@@ -2222,9 +2220,10 @@ int main(int argc, char *argv[]) {
 
         // once in a while do model inference to print generated text
         if (multi_gpu_config.process_rank == 0 && (step > 0 && (step % sample_every) == 0 || last_step)) {
-            // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
+            // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
+            int eot_token = tokenizer.eot_token;
             for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = GPT2_EOT;
+                gen_tokens[i] = eot_token;
             }
             // now sample from the model autoregressively
             printf("generating:\n---\n");

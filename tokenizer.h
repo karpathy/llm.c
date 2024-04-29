@@ -19,6 +19,7 @@ typedef struct {
     uint32_t vocab_size;
     char **token_table;
     int init_ok;
+    int eot_token; // <|endoftext|> token id
 } Tokenizer;
 
 void safe_printf(const char *piece) {
@@ -53,8 +54,18 @@ void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
     uint32_t header[256];
     freadCheck(header, sizeof(uint32_t), 256, file);
     assert(header[0] == 20240328);
-    assert(header[1] == 1);
+    int version = header[1];
     tokenizer->vocab_size = header[2];
+    if (version == 1) {
+        // version 1 didn't include the EOT token id
+        // so we assume it is 50256, the EOT in GPT-2
+        tokenizer->eot_token = 50256;
+    } else if (version == 2) {
+        tokenizer->eot_token = header[3];
+    } else {
+        fprintf(stderr, "Tokenizer model file %s has bad version: %d\n", filename, version);
+        exit(EXIT_FAILURE);
+    }
     // read in all the tokens
     unsigned char length;
     tokenizer->token_table = (char **)mallocCheck(tokenizer->vocab_size * sizeof(char *));
