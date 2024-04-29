@@ -101,4 +101,4 @@ jobs:
         run: apt-get update && apt-get install -y libomp-dev libopenmpi-dev
 
       - name: Build project
-        run: make -C dev/cuda
+        run: make -j4 -C dev/cuda
