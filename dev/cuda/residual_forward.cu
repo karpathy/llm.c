@@ -26,10 +26,18 @@ void residual_forward_cpu(float* out, const float* inp1, const float* inp2, int 
 // GPU kernels
 
 // elementwise ops are nice and ez
-__global__ void residual_forward_kernel(float* out, const float* inp1, const float* inp2, int N) {
+__global__ void residual_forward_kernel1(float* out, const float* inp1, const float* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
         out[idx] = inp1[idx] + inp2[idx];
+    }
+}
+
+// loop unrolling
+__global__ void residual_forward_kernel2(float* out, const float* inp1, const float* inp2, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = idx; i < N; i += blockDim.x * gridDim.x) {
+        out[i] = inp1[i] + inp2[i];
     }
 }
 
@@ -38,7 +46,13 @@ __global__ void residual_forward_kernel(float* out, const float* inp1, const flo
 
 void residual_forward1(float* out, const float* inp1, const float* inp2, int N, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
-    residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
+    residual_forward_kernel1<<<grid_size, block_size>>>(out, inp1, inp2, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void residual_forward2(float* out, const float* inp1, const float* inp2, int N, const int block_size) {
+    const int grid_size = ceil_div(N / 2, block_size);
+    residual_forward_kernel2<<<grid_size, block_size>>>(out, inp1, inp2, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -52,6 +66,9 @@ void residual_forward(int kernel_num,
     switch (kernel_num) {
         case 1:
             residual_forward1(out, inp1, inp2, N, block_size);
+            break;
+        case 2:
+            residual_forward2(out, inp1, inp2, N, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
