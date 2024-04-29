@@ -157,7 +157,7 @@ void gelu_forward(int kernel_num,
 int main(int argc, char **argv) {
     srand(0);
 
-    int B = 80;
+    int B = 8;
     int T = 1024;
     int C = 768;
 
