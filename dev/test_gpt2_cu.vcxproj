@@ -60,6 +60,7 @@
     <CudaCompile>
       <TargetMachinePlatform>64</TargetMachinePlatform>
       <Include>.</Include>
+      <Defines>ENABLE_BF16</Defines>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -81,6 +82,7 @@
       <TargetMachinePlatform>64</TargetMachinePlatform>
       <Warning>Wall</Warning>
       <Include>.</Include>
+      <Defines>ENABLE_BF16</Defines>
     </CudaCompile>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
