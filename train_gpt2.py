@@ -11,6 +11,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 Example launches to only benchmark the speed of bfloat16 compiled GPU training:
 1 GPU:
 python train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
+you can also turn on flash-attention by appending --flash=1
 4 GPU:
 torchrun --standalone --nproc_per_node=4 train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
 """
@@ -33,6 +34,9 @@ class NewGELU(nn.Module):
     """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
     def forward(self, input):
         return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
+
+# using a global to toggle flash-attention
+FLASH = 0
 
 class CausalSelfAttention(nn.Module):
 
@@ -58,11 +62,16 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # manual implementation of attention
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        if FLASH:
+            # flashattention
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # manual implementation of attention
+            # this materializes the large (T,T) matrix for all the queries and keys
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -387,6 +396,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
     parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
+    parser.add_argument("--flash", type=int, default=0, help="use flash attention")
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
     parser.add_argument("--batch_size", type=int, default=4, help="batch size")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -441,6 +451,10 @@ if __name__ == "__main__":
     # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
     if args.tensorcores:
         torch.set_float32_matmul_precision('high')
+
+    # turn on/off flash attention
+    assert args.flash in {0, 1}
+    FLASH = args.flash
 
     # init (and write) the tokenizer
     enc = tiktoken.get_encoding("gpt2")
@@ -542,9 +556,10 @@ if __name__ == "__main__":
         # time and print
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
+        tokens_per_second = ddp_world_size * B * T / (t1-t0)
+        print0(f"iteration {i}, loss: {loss.item():.4f}, time: {(t1-t0)*1000:.3f}ms, tok/s: {tokens_per_second:.2f}")
         if i > 0 and i > args.num_iterations - 20:
             timings.append(t1-t0)
-            print0(f"iteration {i}, loss: {loss.item()}, time: {(t1-t0)*1000:.3f}ms")
 
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
