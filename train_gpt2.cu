@@ -66,6 +66,7 @@ enum PrecisionMode {
 // fp32
 #if defined(ENABLE_FP32)
 typedef float floatX;
+typedef float floatM;
 #define CUBLAS_LOWP CUDA_R_32F
 #define CUBLAS_LOWP_COMPUTE cublas_compute_type // auto-select FP32 vs TF32
 const char* load_filename = "gpt2_124M.bin"; // fp32 weights
@@ -79,6 +80,7 @@ const ncclDataType_t ncclFloatX = ncclFloat;
 // use fp16 (note: this may require gradient scaler, currently not implemented!)
 #elif defined(ENABLE_FP16)
 typedef half floatX;
+typedef half floatM;
 #define CUBLAS_LOWP CUDA_R_16F
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
 const char* load_filename = "gpt2_124M.bin"; // fp32 weights
@@ -92,6 +94,7 @@ const ncclDataType_t ncclFloatX = ncclHalf;
 // bfloat16 (default!)
 #else
 typedef __nv_bfloat16 floatX;
+typedef half floatM;
 #define CUBLAS_LOWP CUDA_R_16BF
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
 const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights
@@ -877,27 +880,56 @@ __device__ inline float lerp(float start, float end, float weight) {
 
 // Termplate type T instead of floatx
 template <typename Tp, typename Tg>
-__global__ void adamw_kernel3(Tp* params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+__global__ void adamw_kernel3(Tp* params_memory, Tg* grads_memory, floatM* m_memory, floatM* v_memory,
+                              float* m_scales, float* v_scales, size_t num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                               unsigned int seed) {
-   int i = blockIdx.x * blockDim.x + threadIdx.x;
-   if (i >= num_parameters) return;  // guard
-   float grad = (float)grads_memory[i];
-   float m = m_memory[i];
-   float v = v_memory[i];
-   // update the first moment (momentum)
-   m = lerp(grad, m, beta1);
-   m_memory[i] = m;
-   // update the second moment (RMSprop)
-   v = lerp(grad * grad, v, beta2);
-   v_memory[i] = v;
-   m /= beta1_correction;  // m_hat
-   v /= beta2_correction;  // v_hat
-   // update the parameters (weight/bias)
-   float param = (float)params_memory[i] - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * (float)params_memory[i]));
-   unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
-   // todo - explain stochastic rounding here
-   stochastic_rounding(param, &params_memory[i], random);
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_parameters) return;  // guard
+    float grad = (float)grads_memory[i];
+
+    // get the scaled momentum buffers
+    floatM m_scaled = m_memory[i];
+    floatM v_scaled = v_memory[i];
+    float m_scale = m_scales[i/32];
+    float v_scale = v_scales[i/32];
+
+    float m = (float)m_scaled * m_scale;
+    float v = (float)v_scaled * v_scale;
+
+    // update momenta (momentum and RMSprop)
+    m = lerp(grad, m, beta1);
+    v = lerp(grad * grad, v, beta2);
+
+    // get the largest (absolute value) in the current warp as the new scale
+    float largest_m = cg::reduce(warp, fabs(m), cg::greater<float>{});
+    float largest_v = cg::reduce(warp, fabs(v), cg::greater<float>{});
+
+    // we want: largest / scale_factor == HALF_MAX
+    // In references, I've seen m/MAX + 1e-8, but that
+    // changes the algorithm a bit, I believe, effectively
+    // adding a tiny decay.
+    m_scale = fmax(largest_m / 65504.f, 1e-8f);
+    v_scale = fmax(largest_v / 65504.f, 1e-8f);
+
+    m_memory[i] = m / m_scale;
+    v_memory[i] = v / v_scale;
+
+    if(warp.thread_rank() == 0) {
+        m_scales[i/32] = m_scale;
+        v_scales[i/32] = v_scale;
+    }
+
+    m /= beta1_correction;  // m_hat
+    v /= beta2_correction;  // v_hat
+    // update the parameters (weight/bias)
+    float param = (float)params_memory[i] - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * (float)params_memory[i]));
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+    // todo - explain stochastic rounding here
+    stochastic_rounding(param, &params_memory[i], random);
 }
 
 struct SoftmaxParams {
@@ -1520,8 +1552,10 @@ typedef struct {
     ParameterTensors grads;
     void* grads_memory;
     // buffers for the AdamW optimizer
-    float* m_memory;
-    float* v_memory;
+    floatM* m_memory;
+    floatM* v_memory;
+    float* m_scales;
+    float* v_scales;
     // the activations of the model, and their sizes
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
@@ -1908,12 +1942,20 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 
     // lazily allocate the memory for m_memory and v_memory
     if (model->m_memory == NULL) {
-        cudaCheck(cudaMalloc((void**)&model->m_memory, model->num_parameters * sizeof(float)));
-        cudaCheck(cudaMalloc((void**)&model->v_memory, model->num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->m_memory, 0, model->num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, model->num_parameters * sizeof(float)));
-        printf0("allocated %zu MiB for AdamW optimizer state m\n", (model->num_parameters * sizeof(float)) >> 20);
-        printf0("allocated %zu MiB for AdamW optimizer state v\n", (model->num_parameters * sizeof(float)) >> 20);
+        size_t num_scales = model->num_parameters / 32;
+        cudaCheck(cudaMalloc((void**)&model->m_memory, model->num_parameters * sizeof(floatM)));
+        cudaCheck(cudaMalloc((void**)&model->v_memory, model->num_parameters * sizeof(floatM)));
+        float* scales;
+        cudaCheck(cudaMalloc((void**)&scales, 2 * num_scales * sizeof(float)));
+        model->m_scales = scales;
+        model->v_scales = scales + num_scales;
+        cudaCheck(cudaMemset(model->m_memory, 0, model->num_parameters * sizeof(floatM)));
+        cudaCheck(cudaMemset(model->v_memory, 0, model->num_parameters * sizeof(floatM)));
+        cudaCheck(cudaMemset(model->m_scales, 0, num_scales * sizeof(float)));
+        cudaCheck(cudaMemset(model->v_scales, 0, num_scales * sizeof(float)));
+        size_t alloc = model->num_parameters * sizeof(floatM) + num_scales * sizeof(float);
+        printf0("allocated %zu MiB for AdamW optimizer state m\n", alloc >> 20u);
+        printf0("allocated %zu MiB for AdamW optimizer state v\n", alloc >> 20u);
     }
 
     int block_size = 512;
@@ -1922,7 +1964,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
     adamw_kernel3<<<num_blocks, block_size>>>((floatX*)model->params_memory, (floatX*)model->grads_memory, model->m_memory, model->v_memory,
-                                              model->num_parameters,
+                                              model->m_scales, model->v_scales, model->num_parameters,
                                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
     cudaCheck(cudaGetLastError());
 }
