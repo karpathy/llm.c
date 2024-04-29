@@ -59,6 +59,7 @@ void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
     if (version == 1) {
         // version 1 didn't include the EOT token id
         // so we assume it is 50256, the EOT in GPT-2
+        assert(tokenizer->vocab_size == 50257); // let's be defensive here
         tokenizer->eot_token = 50256;
     } else if (version == 2) {
         tokenizer->eot_token = header[3];
