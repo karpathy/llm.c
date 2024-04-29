@@ -900,7 +900,7 @@ __global__ void flashattention(float *out, float *K, float *Q, float* V, float s
     __shared__ float Q_i[B_r][BK]; // if you want to save SMEM loads and keep the full Q loaded then change this to [B_r][d]
     
     __shared__ float K_j[B_c][BK+1]; // reduce SMEM bank conflicts by adding 1 column as K will be loaded transposed!
-    __shared__ float V_j[B_c][d];
+    __shared__ float V_j[B_c][BK];
     
     // attention result
     __shared__ float S_i[B_r][B_c+1]; // reduce SMEM bank conflicts by adding 1 column (in the naive softmax part)
@@ -955,7 +955,6 @@ __global__ void flashattention(float *out, float *K, float *Q, float* V, float s
 
     for (int j = 0; j < T_c && j <= blockIdx.y ; j++) { // iterate of ver the chunks of K and V
         float threadResults[TM * TN] = {0.0}; // storing the intermediate outputs
-        S_i[tid_y][tid_x] = 0.f;
         
         for (int t=0; t<num_tiles; t++){
             // load K_j and V_j, thread idx, idy loads idy,idx
@@ -967,10 +966,10 @@ __global__ void flashattention(float *out, float *K, float *Q, float* V, float s
                 id = (innerRowK + j * B_c) * d + i * d + innerColK + t * B_c;
                 if (id < d*seq_len){
                     K_j[innerRowK+i][innerColK] = K[batch_offset + id];
-                    V_j[innerRowK+i][innerColK+t*B_c] = V[batch_offset + id];
+                    //V_j[innerRowK+i][innerColK+t*B_c] = V[batch_offset + id];
                 } else {
                     K_j[innerRowK+i][innerColK] = 0.0;
-                    V_j[innerRowK+i][innerColK+t*B_c] = 0.0;
+                    //V_j[innerRowK+i][innerColK+t*B_c] = 0.0;
                 }
         
             }
@@ -1036,26 +1035,37 @@ __global__ void flashattention(float *out, float *K, float *Q, float* V, float s
             l_i[i] *= exp(last_m[i] - m_i[i]);
         }
 
-        // 4) compute \exp(Q_iK^T_{j+1} - m^{j+1}) = \exp(S_i-m^{j+1}) // TODO: TO OPTIMIZE
-        for (int dd = 0; dd < B_c; dd++) {
-            for (int ii = 0; ii < TN; ii++){ 
-                // calculate new sum and load exp(Attention) weights
-                //check whether thus is in range or not (if not we set it to 0)
-                //if (idrow+ii < seq_len && idcol+dd < seq_len){
-                regM[ii] = exp(S_i[threadRow*TM+ii][dd] - m_i[ii]);
-                l_i[ii] += regM[ii];
+
+        for (int t = 0; t < num_tiles; t++){
+            // load V
+            __syncthreads();
+            for (int i=0; i<B_r; i+=strideK){
+                id = (innerRowK + j * B_c) * d + i * d + innerColK + t * B_c;
+                if (id < d*seq_len){
+                    V_j[innerRowK+i][innerColK] = V[batch_offset + id];
+                } else {
+                    V_j[innerRowK+i][innerColK] = 0.0;
+                }
             }
-            for (int t = 0; t < num_tiles; t++){
+            __syncthreads();
+
+            for (int dd = 0; dd < B_c; dd++) {
+                for (int ii = 0; ii < TN; ii++){
+                    regM[ii] = exp(S_i[threadRow*TM+ii][dd] - m_i[ii]);
+                    if (t==0){
+                        l_i[ii] += regM[ii];
+                    }
+                    regN[ii] = V_j[dd][threadCol * TN + ii];
+                }
                 for (int ii=0;ii<TN;ii++){
                     for (int jj=0;jj<TM;jj++){ // calculate output elements
-                        regN[jj] = V_j[dd][t * B_c + threadCol * TN + jj];
+                        regN[jj] = V_j[dd][threadCol * TN + jj];
                         O_i[t*TN*TM + ii*TM + jj] += regM[ii] * regN[jj];
                     }
                 }
             }
-        __syncthreads();
+            __syncthreads();
         }
-
     }
 
     // normalize by the output sum and write to out matrix
