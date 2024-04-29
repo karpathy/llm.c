@@ -2177,6 +2177,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { val_max_batches = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'c') { load_filename = argv[i + 1]; }
         else { error_usage(); }
     }
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -2191,6 +2192,7 @@ int main(int argc, char *argv[]) {
     printf0("| val_max_batches       | %-50d |\n", val_max_batches);
     printf0("| sample_every          | %-50d |\n", sample_every);
     printf0("| genT                  | %-50d |\n", genT);
+    printf0("| checkpoint file       | %-50s |\n", load_filename);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // set up the device

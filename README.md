@@ -131,6 +131,20 @@ Allay
 
 I like how Netflix comes up, it's clear that the shadow of the training past is still lurking in the model. I did not attempt to tune the finetuning hyperparameters so it's quite likely this can be improved quite a bit. I also noticed that slightly different platforms (e.g. MacOS / Linux) will (sadly) give very slightly different results, so perhaps don't expect to get the exact numbers or generation above. Also note that if you are seeing token ids instead of text in the generation, it might be because your code is out of date, as Tokenizer decoding was added April 14, 2024. `git pull` the updates, and then re-run `python train_gpt2.py`, which will now also save the tokenizer, which C can read and then use to print text instead of token ids.
 
+## training from scratch
+
+Training in the current "mainline", [train_gpt2.cu](train_gpt2.cu), requires a model weights checkpoint to be created by first running [train_gpt2.py](train_gpt2.py) which will run a training session on the base weights before writing to a checkpoint. If you want to train in the "mainline" with a model initialized from scratch then the provided [gen_base_weights_checkpoint.py](gen_base_weights_checkpoint.py) can generate the unmodified checkpoint. Compile and run with:
+
+```bash
+pip install -r requirements.txt
+python prepro_tinyshakespeare.py
+python gen_base_weights_checkpoint.py --model_type gpt2
+make train_gpt2cu
+./train_gpt2cu -base gpt2_124M_base_bf16.bin
+```
+
+At this time only 124M parameter model is supported although [gen_base_weights_checkpoint.py](gen_base_weights_checkpoint.py) is capable of generating all available sizes of model checkpoints.
+
 ## test
 
 I am also attaching a simple unit test for making sure our C code agrees with the PyTorch code. Compile and run with:
