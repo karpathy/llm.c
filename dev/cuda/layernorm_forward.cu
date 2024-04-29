@@ -477,7 +477,8 @@ int main(int argc, char **argv) {
     float* mean_gpu = (float*)malloc(B * T * sizeof(float));
     float* rstd_gpu = (float*)malloc(B * T * sizeof(float));
 
-    layernorm_forward_cpu(out, mean, rstd, inp, weight, bias, B, T, C);
+    float cpu_elapsed_time = benchmark_host(1, layernorm_forward_cpu, 
+                                            out, mean, rstd, inp, weight, bias, B, T, C);
 
     // check the correctness of the kernel at all block sizes
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
@@ -493,6 +494,10 @@ int main(int argc, char **argv) {
 
     printf("All results match. Starting benchmarks.\n\n");
 
+     long memory_ops = (2 * B * T * C) * 4; // *4 for float
+    float memory_bandwidth = memory_ops / cpu_elapsed_time / 1e6;
+    printf("CPU time %.4f ms | bandwidth %.2f GB/s\n", cpu_elapsed_time, memory_bandwidth);
+
     // time the kernel at different block sizes
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
@@ -504,10 +509,10 @@ int main(int argc, char **argv) {
 
         // napkin math: estimate the memory bandwidth achieved
         // e.g. A100 40GB PCIe is advertised at 1,555GB/s
-        long memory_ops = (2 * B * T * C) * 4; // *4 for float
-        float memory_bandwidth = memory_ops / elapsed_time / 1e6;
+        memory_ops = (2 * B * T * C) * 4; // *4 for float
+        memory_bandwidth = memory_ops / elapsed_time / 1e6;
 
-        printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
+        printf("GPU block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
     }
 
     // free memory

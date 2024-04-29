@@ -83,6 +83,12 @@ void crossentropy_softmax_backward_cpu(float* dlogits,
     }
 }
 
+void classifier_fused_cpu(float* probs, const float* logits, const int* targets, float* losses, float* dlogits, float* dlosses, int B, int T, int V) {
+    softmax_forward_cpu(probs, logits, B * T, V);
+    crossentropy_forward_cpu(losses, probs, targets, B, T, V);
+    crossentropy_softmax_backward_cpu(dlogits, dlosses, probs, targets, B, T, V);
+}
+
 // ----------------------------------------------------------------------------
 // GPU kernels
 
@@ -470,10 +476,8 @@ int main(int argc, char **argv) {
     // define block sizes we'll use in correctness and timing
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
 
-    // first check the correctness of the kernel
-    softmax_forward_cpu(probs, logits, B * T, V);
-    crossentropy_forward_cpu(losses, probs, targets, B, T, V);
-    crossentropy_softmax_backward_cpu(dlogits, dlosses, probs, targets, B, T, V);
+    float cpu_elapsed_time = benchmark_host(1, classifier_fused_cpu, 
+                                           probs, logits, targets, losses, dlogits, dlosses, B, T, V);
 
     // time the kernel at different block sizes
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
@@ -486,6 +490,7 @@ int main(int argc, char **argv) {
         validate_result(d_dlogits_no_pad, dlogits, "dlogits", B * T * V, 1e-4f);
     }
     printf("All results match. Starting benchmarks.\n\n");
+    printf("CPU time %f ms\n", cpu_elapsed_time);
 
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
@@ -493,7 +498,7 @@ int main(int argc, char **argv) {
         float elapsed_time = benchmark_kernel(repeat_times, fused_classifier,
                                               kernel_num, d_dlogits, d_losses, d_logits, d_dlosses, d_targets,
                                               B, T, V, P, block_size);
-        printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
+        printf("GPU block_size %4d | time %f ms\n", block_size, elapsed_time);
     }
 
     // free memory

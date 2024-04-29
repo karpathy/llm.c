@@ -192,12 +192,9 @@ int main(int argc, char **argv) {
     }
     printf("Using kernel %d\n", kernel_num);
 
-    // calculate the CPU reference (using default hyperparams)
-    clock_t start = clock();
-    adamw_cpu(params_memory, grads_memory, m_memory, v_memory, t, num_parameters);
-    clock_t end = clock();
-    // TODO: measure runtime with multiple runs
-    double elapsed_time_cpu = (double)(end - start) / CLOCKS_PER_SEC;
+    float elapsed_time_host = benchmark_host(1, adamw_cpu, 
+        params_memory, grads_memory, m_memory, v_memory, t, num_parameters, 
+        learning_rate, beta1, beta2, eps, weight_decay);
 
     // calculate the GPU version (using default hyperparams)
     adamw(kernel_num, d_params_memory, d_grads_memory, d_m_memory, d_v_memory, t, num_parameters);
@@ -212,13 +209,13 @@ int main(int argc, char **argv) {
     validate_result(d_v_memory, v_memory, "v_memory", num_parameters);
     printf("All results match.\n\n");
 
+    printf("time cpu %.4f ms\n", elapsed_time_host);
     // now benchmark the kernel
-    int repeat_times = 1000;
-    float elapsed_time = benchmark_kernel(repeat_times, adamw, kernel_num,
+    int kernel_repeat_times = 1000;
+    float elapsed_time_kernel = benchmark_kernel(kernel_repeat_times, adamw, kernel_num,
       d_params_memory, d_grads_memory, d_m_memory, d_v_memory, t, num_parameters,
       learning_rate, beta1, beta2, eps, weight_decay);
-    printf("time gpu %.4f ms\n", elapsed_time);
-    printf("time cpu %.4f ms\n", elapsed_time_cpu);
+    printf("time gpu %.4f ms\n", elapsed_time_kernel);
 
     // cleanup
     free(params_memory);

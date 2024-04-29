@@ -125,7 +125,8 @@ int main(int argc, char **argv) {
     printf("Using kernel %d\n", kernel_num);
 
     // first check the correctness of the kernel
-    crossentropy_softmax_backward_cpu(dlogits, dlosses, probs, targets, B, T, V);
+    float cpu_elapsed_time = benchmark_host(1, crossentropy_softmax_backward_cpu, 
+                                            dlogits, dlosses, probs, targets, B, T, V);
 
     // time the kernel at different block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
@@ -139,6 +140,7 @@ int main(int argc, char **argv) {
     }
 
     printf("All results match. Starting benchmarks.\n\n");
+    printf("CPU time %0.4f ms\n", cpu_elapsed_time);
 
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
@@ -148,7 +150,7 @@ int main(int argc, char **argv) {
                                               kernel_num, d_dlogits, d_dlosses, d_probs, d_targets,
                                               B, T, V, block_size);
 
-        printf("block_size %4d | time %.4f ms | per token %.2f µs\n", block_size, elapsed_time, elapsed_time * 1'000 / (B*T));
+        printf("GPU block_size %4d | time %.4f ms | per token %.2f µs\n", block_size, elapsed_time, elapsed_time * 1'000 / (B*T));
     }
 
     // free memory

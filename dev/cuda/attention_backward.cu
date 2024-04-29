@@ -1043,7 +1043,8 @@ int main(int argc, char **argv) {
     float* datt = make_zeros_float(B * NH * T * T);
 
     // call backward() on the CPU to get our reference gradients
-    attention_backward_cpu(dinp, dpreatt, datt, dout, inp, att, B, T, C, NH);
+    float cpu_elapsed_time = benchmark_host(1, attention_backward_cpu, 
+                                            dinp, dpreatt, datt, dout, inp, att, B, T, C, NH);
 
     // create device memory for the backward pass
     float *d_dinp, *d_dqkvr, *d_dpreatt, *d_datt, *d_dvaccum, *d_dout;
@@ -1123,6 +1124,8 @@ int main(int argc, char **argv) {
     // final verdict
     printf("All results match. Starting benchmarks.\n\n");
 
+    printf("CPU time %f ms\n", cpu_elapsed_time);
+
     // benchmark speed of the kernel
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
@@ -1133,7 +1136,7 @@ int main(int argc, char **argv) {
                                               d_dout, d_inp, d_qkvr, d_preatt, d_att, d_vaccum,
                                               B, T, C, NH, block_size);
 
-        printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
+        printf("GPU block_size %4d | time %f ms\n", block_size, elapsed_time);
     }
 
     // free memory

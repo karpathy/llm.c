@@ -273,29 +273,33 @@ int main(int argc, char **argv) {
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
 
     // calculate the CPU reference
-    matmul_backward_bias_cpu(NULL, NULL, dbias, dout, NULL, NULL, B, T, C, OC);
+    //matmul_backward_bias_cpu(NULL, NULL, dbias, dout, NULL, NULL, B, T, C, OC);
+    float *d_dinp, *d_dweight, *d_inp, *d_weight, *d_ones;
+    float cpu_elapsed_time = benchmark_host(1, matmul_backward_bias_cpu, 
+                                            d_dinp, d_dweight, dbias, dout, d_inp, d_weight, B, T, C, OC);
 
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         // memset the bias to zero
         cudaCheck(cudaMemset(d_dbias, 0, OC * sizeof(float)));
         // calculate the GPU version
-        matmul_backward_bias(kernel_num, NULL, NULL, d_dbias, d_dout, NULL, NULL, NULL, B, T, C, OC, 128);
+        matmul_backward_bias(kernel_num, d_dinp, d_dweight, d_dbias, d_dout, d_inp, d_weight, d_ones, B, T, C, OC, 128);
         // compare
         printf("Checking correctness...\n");
         validate_result(d_dbias, dbias, "dbias", OC, 5e-3f);
         printf("All results match for block_size=%d.\n\n", block_size);
     }
 
+    printf("CPU time %.4f ms\n", cpu_elapsed_time);
+
     // now benchmark the kernel
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
-        float *d_dinp, *d_dweight, *d_inp, *d_weight, *d_ones;
         int repeat_times = 2000;
         float elapsed_time = benchmark_kernel(repeat_times, matmul_backward_bias, kernel_num,
                                             d_dinp, d_dweight, d_dbias, d_dout, d_inp, d_weight, d_ones,
                                             B, T, C, OC, block_size);
-        printf("block_size %d time %.4f ms\n", block_size, elapsed_time);
+        printf("GPU block_size %d time %.4f ms\n", block_size, elapsed_time);
     }
 
     // cleanups

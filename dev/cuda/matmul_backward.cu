@@ -244,7 +244,8 @@ int main(int argc, char **argv) {
     printf("Using kernel %d\n", kernel_num);
 
     // calculate the CPU reference
-    matmul_backward_cpu(dinp, dweight, dbias, dout, inp, weight, B, T, C, OC);
+    float cpu_elapsed_time = benchmark_host(1, matmul_backward_cpu, 
+                                            dinp, dweight, dbias, dout, inp, weight, B, T, C, OC);
 
     // calculate the GPU version
     matmul_backward(kernel_num, d_dinp, d_dweight, d_dbias, d_dout, d_inp, d_weight, d_ones, B, T, C, OC);
@@ -259,12 +260,14 @@ int main(int argc, char **argv) {
     validate_result(d_dbias, dbias, "dbias", OC, 1e-3f);
     printf("All results match.\n\n");
 
+    printf("CPU time %.4f ms\n", cpu_elapsed_time);
+
     // now benchmark the kernel
     int repeat_times = 100;
     float elapsed_time = benchmark_kernel(repeat_times, matmul_backward, kernel_num,
                                           d_dinp, d_dweight, d_dbias, d_dout, d_inp, d_weight, d_ones,
                                           B, T, C, OC);
-    printf("time %.4f ms\n", elapsed_time);
+    printf("GPU time %.4f ms\n", elapsed_time);
 
     // cleanups
     free(dinp);

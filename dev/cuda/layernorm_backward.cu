@@ -293,7 +293,9 @@ int main(int argc, char **argv) {
     float *dinp = make_zeros_float(B * T * C);
     float *dweight = make_zeros_float(C);
     float *dbias = make_zeros_float(C);
-    layernorm_backward_cpu(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+    
+    float cpu_elapsed_time = benchmark_host(1, layernorm_backward_cpu, 
+                                            dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
 
     // the above calculations act as the reference
     // now let's do the same on the GPU
@@ -346,6 +348,8 @@ int main(int argc, char **argv) {
     printf("dbias:\n");
     validate_result(d_dbias, dbias, "dbias", C, 1e-3f);
 
+    printf("CPU time %.4f\n", cpu_elapsed_time);
+
     // now time the kernel
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
@@ -354,7 +358,7 @@ int main(int argc, char **argv) {
         float elapsed_time = benchmark_kernel(repeat_times, layernorm_backward, kernel_num,
                                               d_dinp, d_dweight, d_dbias, d_dout, d_inp, d_weight, d_mean, d_rstd,
                                               B, T, C, block_size);
-        printf("block_size %4d time %.4f ms\n", block_size, elapsed_time);
+        printf("GPU block_size %4d time %.4f ms\n", block_size, elapsed_time);
     }
 
     // cleanups

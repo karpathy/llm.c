@@ -306,7 +306,8 @@ int main(int argc, char **argv) {
     printf("Using kernel %d\n", kernel_num);
 
     // first check the correctness of the kernel
-    matmul_forward_cpu(out, inp, weight, bias, B, T, C, OC);
+    float cpu_elapsed_time = benchmark_host(1, matmul_forward_cpu, 
+                                            out, inp, weight, bias, B, T, C, OC);
 
     // time the kernel at different block sizes
     int sqrt_block_sizes[] = {4, 8, 16, 32};
@@ -320,6 +321,9 @@ int main(int argc, char **argv) {
 
     printf("All results match. Starting benchmarks.\n\n");
 
+    float tflops = (float)B * T * C * OC * 2 / cpu_elapsed_time * 1e3f / 1e12f;
+    printf("CPU time %.4f ms | tflops %.2f\n", cpu_elapsed_time, tflops);
+
     for (int j = 0; j < sizeof(sqrt_block_sizes) / sizeof(int); j++) {
         int sqrt_block_size = sqrt_block_sizes[j];
 
@@ -330,8 +334,8 @@ int main(int argc, char **argv) {
 
         // napkin math: estimate the flops achieved
         // e.g. A100 40GB PCIe is advertised at 19.5 TFLOPS fp32
-        float tflops = (float)B * T * C * OC * 2 / elapsed_time * 1e3f / 1e12f;
-        printf("sqrt_block_size %4d | time %.4f ms | tflops %.2f\n", sqrt_block_size, elapsed_time, tflops);
+        tflops = (float)B * T * C * OC * 2 / elapsed_time * 1e3f / 1e12f;
+        printf("GPU sqrt_block_size %4d | time %.4f ms | tflops %.2f\n", sqrt_block_size, elapsed_time, tflops);
     }
 
     // free memory

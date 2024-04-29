@@ -942,7 +942,9 @@ int main(int argc, char **argv) {
     int block_sizes[] = {32, 64, 128, 256, 512};
 
     // first check the correctness of the kernel
-    attention_forward_cpu(out, preatt, att, inp, B, T, C, NH);
+    float cpu_elapsed_time = benchmark_host(1, attention_forward_cpu, 
+                                            out, preatt, att, inp, B, T, C, NH);
+
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
@@ -963,6 +965,7 @@ int main(int argc, char **argv) {
         }
     }
     printf("All results match. Starting benchmarks.\n\n");
+    printf("CPU time %f ms\n", cpu_elapsed_time);
 
     // benchmark speed of the kernel
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
@@ -973,7 +976,7 @@ int main(int argc, char **argv) {
                                               kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp,
                                               B, T, C, NH, block_size);
 
-        printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
+        printf("GPU block_size %4d | time %f ms\n", block_size, elapsed_time);
     }
 
     // free memory

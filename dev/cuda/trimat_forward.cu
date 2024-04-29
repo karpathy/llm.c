@@ -565,11 +565,14 @@ int main(int argc, char **argv) {
     printf("Using kernel %d\n", kernel_num);
 
     // first check the correctness of the kernel
-    trimul_cpu(out, inp, B, T, C, NH);
+    float cpu_elapsed_time = benchmark_host(1, trimul_cpu, 
+                                            out, inp, B, T, C, NH);
     trimul_gpu(kernel_num, d_out, d_inp, B, T, C, NH);
     validate_result(d_out, out, "out", B * NH * T * T, 1e-4f);
 
     printf("All results match. Starting benchmarks.\n\n");
+
+    printf("CPU time %.2f ms\n", cpu_elapsed_time);
 
     // benchmark speed of the kernel
     int repeat_times = 100;
@@ -583,7 +586,7 @@ int main(int argc, char **argv) {
                                          0, d_out, d_inp,
                                          B, T, C, NH);
 
-    printf("time %.2f ms vs %.2f ms for CuBLAS\n", elapsed_time, cublas_time);
+    printf("GPU time %.2f ms vs %.2f ms for CuBLAS\n", elapsed_time, cublas_time);
 
     // free memory
     free(out);

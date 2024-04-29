@@ -166,23 +166,27 @@ int main(int argc, char **argv) {
     // set up block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
 
+    float cpu_elapsed_time;
     // first check the correctness of the kernel
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
-        encoder_backward_cpu(dwte, dwpe, dout, inp, B, T, C);
+        cpu_elapsed_time += benchmark_host(1, encoder_backward_cpu, 
+                                            dwte, dwpe, dout, inp, B, T, C);
         encoder_backward(kernel_num, d_dwte, d_dwpe, d_dout, d_inp, B, T, C, block_size);
         validate_result(d_dwte, dwte, "dwte", V * C, 1e-5f);
         validate_result(d_dwpe, dwpe, "dwpe", T * C, 1e-5f);
     }
+
     printf("All results match. Starting benchmarks.\n\n");
+    printf("CPU time %.4f ms\n", cpu_elapsed_time / (sizeof(block_sizes) / sizeof(int)));
 
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         int repeat_times = 1000;
         float elapsed_time = benchmark_kernel(repeat_times, encoder_backward,
                                               kernel_num, d_dwte, d_dwpe, d_dout, d_inp, B, T, C, block_size);
-        printf("block_size %4d | time %.4f ms\n", block_size, elapsed_time);
+        printf("GPU block_size %4d | time %.4f ms\n", block_size, elapsed_time);
     }
 
     // free memory

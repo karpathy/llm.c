@@ -100,7 +100,8 @@ int main(int argc, char **argv) {
     printf("Using kernel %d\n", kernel_num);
 
     // first check the correctness of the kernel
-    gelu_forward_cpu(out, inp, B * T * C);
+    float cpu_elapsed_time = benchmark_host(1, gelu_forward_cpu, 
+                                            out, inp, B * T * C);
 
 
     // time the kernel at different block sizes
@@ -114,6 +115,10 @@ int main(int argc, char **argv) {
 
     printf("All results match. Starting benchmarks.\n\n");
 
+    long memory_ops = B * T * C * 4 * 4;
+    float memory_bandwidth = memory_ops / cpu_elapsed_time / 1e6;
+    printf("CPU time %.4f ms | bandwidth %.2f GB/s\n", cpu_elapsed_time, memory_bandwidth);
+
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
 
@@ -126,10 +131,10 @@ int main(int argc, char **argv) {
         // napkin math: estimate the memory bandwidth achieved
         // for each (B,T,C) output element, we do 1 read and 1 write, 4 bytes each
         // and e.g. A100 40GB PCIe is advertised at 1,555GB/s
-        long memory_ops = B * T * C * 2 * 4;
-        float memory_bandwidth = memory_ops / elapsed_time / 1e6;
+        memory_ops = B * T * C * 2 * 4;
+        memory_bandwidth = memory_ops / elapsed_time / 1e6;
 
-        printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
+        printf("GPU block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
     }
 
     // free memory
