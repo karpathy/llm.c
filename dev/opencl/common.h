@@ -25,10 +25,10 @@ typedef struct {
     cl_command_queue queue;
     cl_program program;
     cl_kernel matmul_forward;
-    cl_mem matmul_inp;
-    cl_mem matmul_out;
-    cl_mem matmul_weight;
+    cl_mem matmul_A;
+    cl_mem matmul_B;
     cl_mem matmul_bias;
+    cl_mem matmul_out;
     size_t max_wg_size;
 } GPT2_CL;
 
@@ -152,27 +152,32 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
         exit(1);
     }
 
-    gcl->matmul_inp = clCreateBuffer(gcl->context,  CL_MEM_READ_ONLY,  sizeof(float) * B * T * 4 * C, NULL, &err);
-    if (err != CL_SUCCESS) {
-        printf("error creating opencl buffer: %d\n", err);
-        exit(1);
-    }
-
     size = MAX(B * T * 4 * C, B * T * V);
-    gcl->matmul_out = clCreateBuffer(gcl->context, CL_MEM_WRITE_ONLY, sizeof(float) * size, NULL, &err);
+    gcl->matmul_A = clCreateBuffer(gcl->context,  CL_MEM_READ_ONLY,  sizeof(float) * size, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl buffer: %d\n", err);
         exit(1);
     }
 
     size = MAX(4 * C * C, V * C);
-    gcl->matmul_weight = clCreateBuffer(gcl->context, CL_MEM_READ_ONLY, sizeof(float) * size, NULL, &err);
+    size = MAX(size, B * T * 4 * C);
+    gcl->matmul_B = clCreateBuffer(gcl->context, CL_MEM_READ_ONLY, sizeof(float) * size, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl buffer: %d\n", err);
         exit(1);
     }
 
-    gcl->matmul_bias = clCreateBuffer(gcl->context, CL_MEM_READ_ONLY, sizeof(float) * 4 * C, NULL, &err);
+    size = MAX(4 * C, V);
+    gcl->matmul_bias = clCreateBuffer(gcl->context, CL_MEM_READ_ONLY, sizeof(float) * size, NULL, &err);
+    if (err != CL_SUCCESS) {
+        printf("error creating opencl buffer: %d\n", err);
+        exit(1);
+    }
+
+    size = MAX(B * T * 4 * C, B * T * V);
+    size = MAX(size, 4 * C * C);
+    size = MAX(size, V * C);
+    gcl->matmul_out = clCreateBuffer(gcl->context, CL_MEM_WRITE_ONLY, sizeof(float) * size, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl buffer: %d\n", err);
         exit(1);
@@ -180,8 +185,8 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
 
     err = 0;
     err  = clSetKernelArg(gcl->matmul_forward, 0, sizeof(cl_mem), &gcl->matmul_out);
-    err |= clSetKernelArg(gcl->matmul_forward, 1, sizeof(cl_mem), &gcl->matmul_inp);
-    err |= clSetKernelArg(gcl->matmul_forward, 2, sizeof(cl_mem), &gcl->matmul_weight);
+    err |= clSetKernelArg(gcl->matmul_forward, 1, sizeof(cl_mem), &gcl->matmul_A);
+    err |= clSetKernelArg(gcl->matmul_forward, 2, sizeof(cl_mem), &gcl->matmul_B);
     err |= clSetKernelArg(gcl->matmul_forward, 3, sizeof(cl_mem), &gcl->matmul_bias);
     if (err != CL_SUCCESS)
     {
@@ -191,10 +196,10 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
 }
 
 void cl_deinit(GPT2_CL *gcl) {
-    clReleaseMemObject(gcl->matmul_inp);
-    clReleaseMemObject(gcl->matmul_out);
-    clReleaseMemObject(gcl->matmul_weight);
+    clReleaseMemObject(gcl->matmul_A);
+    clReleaseMemObject(gcl->matmul_B);
     clReleaseMemObject(gcl->matmul_bias);
+    clReleaseMemObject(gcl->matmul_out);
     clReleaseKernel(gcl->matmul_forward);
     clReleaseProgram(gcl->program);
     clReleaseCommandQueue(gcl->queue);

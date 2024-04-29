@@ -1,11 +1,11 @@
 MSTRINGIFY(
 
 
-__kernel void matmul_forward(__global float* out, __global float* inp,
-                    __global float* weight, __global float* bias,
+__kernel void matmul_forward(__global float* out, __global float* AMat,
+                    __global float* BMat, __global float* bias,
                     int B, int T, int C, int OC, int use_bias)
 {
-    // define local memory for input and weight tiles with padding
+    // define local memory for AMat and BMat tiles with padding
     __local float inp_tile[TILE_SIZE][TILE_SIZE + LOCAL_MEM_PADDING_SIZE];
     __local float weight_tile[TILE_SIZE][TILE_SIZE + LOCAL_MEM_PADDING_SIZE];
 
@@ -28,10 +28,10 @@ __kernel void matmul_forward(__global float* out, __global float* inp,
         int col = t * TILE_SIZE + local_id1;
 
         // load input tile
-        inp_tile[local_id0][local_id1] = (row < C && global_id0 < B * C) ? inp[global_id0 * C + col] : 0.0f;
+        inp_tile[local_id0][local_id1] = (row < C && global_id0 < B * C) ? AMat[global_id0 * C + col] : 0.0f;
 
-        // transpose weight tile
-        weight_tile[local_id1][local_id0] = (col < C && global_id1 < OC) ? weight[global_id1 * C + row] : 0.0f;
+        // transpose BMat tile
+        weight_tile[local_id1][local_id0] = (col < C && global_id1 < OC) ? BMat[global_id1 * C + row] : 0.0f;
 
         // synchronize to make sure all data is loaded into local memory
         barrier(CLK_LOCAL_MEM_FENCE);
