@@ -634,7 +634,7 @@ __global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floa
 // the idea is to employ one block to reduce along several columns,
 // where each block has a width of 32 columns to ensure coalesced access.
 // at the end we accumulate the reductions performed by the warps in each block via shared memory
-__global__ void matmul_backward_bias_kernel4(floatX* dbias, const floatX* dout, int B, int T, int OC) {
+__global__ void matmul_backward_bias_kernel2(floatX* dbias, const floatX* dout, int B, int T, int OC) {
     // this kernel is launched with 1D grid_dim of OC/32
     // for example let's say block_size is 128
     extern __shared__ float smem[]; // of size block_size (128)
@@ -1160,7 +1160,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
     if (dbias != NULL) {
         const int block_size = 1024;
         const int grid_size = OC / 32; // for now, OC must be divisible by 32 for this kernel to work
-        matmul_backward_bias_kernel4<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
+        matmul_backward_bias_kernel2<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
         cudaCheck(cudaGetLastError());
     }
 }

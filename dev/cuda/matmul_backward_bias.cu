@@ -6,8 +6,6 @@ nvcc -O3 matmul_backward_bias.cu -lineinfo -o matmul_backward_bias
 
 ./matmul_backward_bias 1
 ./matmul_backward_bias 2
-./matmul_backward_bias 3
-./matmul_backward_bias 4
 
 ncu:
 sudo ncu --set full --import-source yes -o bias -f ./matmul_backward_bias 1
@@ -19,8 +17,6 @@ sudo ncu --set full --import-source yes -o bias -f ./matmul_backward_bias 1
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <omp.h>
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
 #include "common.h"
 
 // ----------------------------------------------------------------------------
@@ -70,68 +66,12 @@ __global__ void matmul_backward_bias_kernel1(float* dbias, const float* dout, in
     }
 }
 
-// cooperative groups solution, one warp per output channel
-__global__ void matmul_backward_bias_kernel2(float* dbias, const float* dout, int B, int T, int OC) {
-    // dout is (B, T, OC), dbias is (OC)
-    // e.g. if block_size = 128, then we have 4 warps per block, each in charge of one output channel
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    // meta_group_size is the number of warps in a block (e.g. 4), meta_group_rank is the warp index (0,1,2,3)
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    if(idx >= OC) { return; }
-    int BT = B * T; // number of elements to reduce in total, per channel
-    // first, thread coarsening to sum reduce the problem size from B*T to 32
-    float sum = 0.0f;
-    for(int i = warp.thread_rank(); i < BT; i += warp.size()) {
-        sum += dout[i * OC + idx];
-    }
-    // now do a warp-level reduce to get the sum across the 32 threads in this warp
-    sum = cg::reduce(warp, sum, cg::plus<float>{});
-    // write the result to output (global memory)
-    if(warp.thread_rank() == 0) {
-        dbias[idx] += sum;
-    }
-}
-
-__global__ void matmul_backward_bias_kernel3(float* dbias, const float* dout, int B, int T, int OC) {
-    // dout is (B, T, OC), dbias is (OC)
-    // in this version of the kernel the entire block of block_size is dedicated to one output channel
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    __shared__ float shared_sum[32]; // block_size max is 1024 = 32 * 32 warps
-    int BT = B * T; // number of elements to reduce in total, per channel
-    int num_warps = blockDim.x / 32;
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-    int idx = blockIdx.x; // simply one block per row
-    // round 1: thread coarsening to reduce the problem size from B*T to 32
-    float thread_sum = 0.0f;
-    for(int i = threadIdx.x; i < BT; i += blockDim.x) {
-        thread_sum += dout[i * OC + idx];
-    }
-    // now do a warp-level reduce to get the sum across the 32 threads in each warp
-    float warp_sum = cg::reduce(warp, thread_sum, cg::plus<float>{});
-    // store the warp sum in shared memory (we could have lane_id == 0 guard but not needed)
-    shared_sum[warp_id] = warp_sum;
-    __syncthreads();
-    // load results from shared memory to threads, pad with zeros for threads that are out of bounds
-    warp_sum = (lane_id < num_warps) ? shared_sum[lane_id] : 0.0f;
-    // now reduce the warp-level reductions
-    float block_sum = cg::reduce(warp, warp_sum, cg::plus<float>{}); // sum(x)
-    // write the result to output (global memory)
-    if(threadIdx.x == 0) {
-        dbias[idx] += block_sum;
-    }
-}
-
 // this kernel performs a column-wise reduction over dout, in PyTorch equivalent to:
 // dbias = dout.sum((0,1))
 // the idea is to employ one block to reduce along several columns,
 // where each block has a width of 32 columns to ensure coalesced access.
 // at the end we accumulate the reductions performed by the warps in each block via shared memory
-__global__ void matmul_backward_bias_kernel4(float* dbias, const float* dout, int B, int T, int OC) {
+__global__ void matmul_backward_bias_kernel2(float* dbias, const float* dout, int B, int T, int OC) {
     // this kernel is launched with 1D grid_dim of OC/32
     // for example let's say block_size is 128
     extern __shared__ float smem[]; // of size block_size (128)
@@ -182,24 +122,9 @@ void matmul_backward_bias1(float* dinp, float* dweight, float* dbias,
 void matmul_backward_bias2(float* dinp, float* dweight, float* dbias,
                       float* dout, float* inp, float* weight, float* ones,
                       int B, int T, int C, int OC, int block_size) {
-    // block_size 512 seems best
-    const int grid_size = ceil_div(OC * 32, block_size);
-    matmul_backward_bias_kernel2<<<grid_size, block_size>>>(dbias, dout, B, T, OC);
-}
-
-void matmul_backward_bias3(float* dinp, float* dweight, float* dbias,
-                      float* dout, float* inp, float* weight, float* ones,
-                      int B, int T, int C, int OC, int block_size) {
-    // block_size 256 seems best
-    matmul_backward_bias_kernel3<<<OC, block_size>>>(dbias, dout, B, T, OC);
-}
-
-void matmul_backward_bias4(float* dinp, float* dweight, float* dbias,
-                      float* dout, float* inp, float* weight, float* ones,
-                      int B, int T, int C, int OC, int block_size) {
     assert(OC % 32 == 0); // OC must be divisible by 32 for this kernel
     const int grid_size = OC / 32;
-    matmul_backward_bias_kernel4<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
+    matmul_backward_bias_kernel2<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
 }
 
 void matmul_backward_bias(int kernel_num,
@@ -212,12 +137,6 @@ void matmul_backward_bias(int kernel_num,
             break;
         case 2:
             matmul_backward_bias2(dinp, dweight, dbias, dout, inp, weight, ones, B, T, C, OC, block_size);
-            break;
-        case 3:
-            matmul_backward_bias3(dinp, dweight, dbias, dout, inp, weight, ones, B, T, C, OC, block_size);
-            break;
-        case 4:
-            matmul_backward_bias4(dinp, dweight, dbias, dout, inp, weight, ones, B, T, C, OC, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
