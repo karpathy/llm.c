@@ -18,6 +18,65 @@ version 1 is naive port from CPU code to kernel
 #include <cuda_runtime.h>
 #include "common.h"
 
+// We define a wrapper type that contains 128 bits of whatever underlying type we want
+// We allow individual element access with [], and provide a convenience accessor to get the data converted to
+// a regular float for mixed-precision operations.
+
+template<class ElementType>
+struct alignas(16) Packed128 {
+    __device__ __forceinline__ Packed128() = default;
+    __device__ __forceinline__ explicit Packed128(int4 bits) {
+        static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
+        memcpy(&payload, &bits, sizeof(bits));
+    }
+
+    __device__ __forceinline__ ElementType& operator[](int index) {
+        return payload[index];
+    }
+    __device__ __forceinline__ const ElementType& operator[](int index) const {
+        return payload[index];
+    }
+    __device__ __forceinline__ float fp32(int index) {
+        return static_cast<float>(payload[index]);
+    }
+
+    __device__ __forceinline__ int4 get_bits() const {
+        int4 bits;
+        static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
+        memcpy(&bits, &payload, sizeof(bits));
+        return bits;
+    }
+
+    static constexpr const size_t size = sizeof(int4) / sizeof(ElementType);
+
+    ElementType payload[size];
+};
+
+
+// load a Packet128 from an aligned memory address
+template<class ElementType>
+__device__ __forceinline__ Packed128<ElementType> load_aligned(const ElementType* address) {
+    return Packed128<ElementType>{*reinterpret_cast<const int4*>(address)};
+}
+
+// load a Packet128 from an aligned memory address with streaming cache hint
+template<class ElementType>
+__device__ __forceinline__ Packed128<ElementType> load_aligned_cs(const ElementType* address) {
+    return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
+}
+
+// store a Packet128 to an aligned memory address
+template<class ElementType>
+__device__ __forceinline__ void store_aligned(ElementType* target, Packed128<ElementType> value) {
+    *reinterpret_cast<int4*>(target) = value.get_bits();
+}
+
+// store a Packet128 to an aligned memory address with streaming cache hint
+template<class ElementType>
+__device__ __forceinline__ void store_aligned_cs(ElementType* target, Packed128<ElementType> value) {
+    __stcs(reinterpret_cast<int4*>(target), value.get_bits());
+}
+
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -44,12 +103,34 @@ __global__ void gelu_kernel(float* out, const float* inp, int N) {
     }
 }
 
+// elementwise ops are nice and ez
+__global__ void gelu_kernel2(float* out, const float* inp, int N) {
+    using packet_t = Packed128<float>;
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * packet_t::size;
+    if (i < N) {
+        packet_t packet_out;
+        packet_t packet_in = load_aligned_cs(inp + i);
+        for(int k = 0; k < packet_in.size; ++k) {
+            float xi = packet_in[k];
+            float cube = 0.044715f * xi * xi * xi;
+            packet_out[k] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
+        }
+        store_aligned(out + i, packet_out);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
 void gelu_forward1(float* out, const float* inp, int N, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
     gelu_kernel<<<grid_size, block_size>>>(out, inp, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void gelu_forward2(float* out, const float* inp, int N, const int block_size) {
+    const int grid_size = ceil_div(N, 4 * block_size);
+    gelu_kernel2<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -62,6 +143,9 @@ void gelu_forward(int kernel_num,
     switch (kernel_num) {
         case 1:
             gelu_forward1(out, inp, B * T * C, block_size);
+            break;
+        case 2:
+            gelu_forward2(out, inp, B * T * C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
