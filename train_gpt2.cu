@@ -342,7 +342,7 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
     ncclCheck(ncclCommInitRank(&result.nccl_comm, result.num_processes, nccl_id, result.process_rank));
     return result;
 #else
-    printf("Multi-GPU support is disabled. Using a single GPU.");
+    printf("Multi-GPU support is disabled. Using a single GPU.\n");
     return MultiGpuConfig{
         .process_rank = 0,
         .num_processes = 1,
