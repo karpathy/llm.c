@@ -76,19 +76,19 @@ float* make_ones_float(size_t N) {
 // ----------------------------------------------------------------------------
 // testing and benchmarking utils
 
-template<class T>
-void validate_result(T* device_result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance=1e-4) {
-    T* out_gpu = (T*)malloc(num_elements * sizeof(T));
-    cudaCheck(cudaMemcpy(out_gpu, device_result, num_elements * sizeof(T), cudaMemcpyDeviceToHost));
+template<class D, class T>
+void validate_result(D* device_result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance=1e-4) {
+    D* out_gpu = (D*)malloc(num_elements * sizeof(T));
+    cudaCheck(cudaMemcpy(out_gpu, device_result, num_elements * sizeof(D), cudaMemcpyDeviceToHost));
     int nfaults = 0;
     for (int i = 0; i < num_elements; i++) {
         // print the first few comparisons
         if (i < 5) {
-            printf("%f %f\n", cpu_reference[i], out_gpu[i]);
+            printf("%f %f\n", cpu_reference[i], (T)out_gpu[i]);
         }
         // ensure correctness for all elements. We can set an "ignore" mask by writing NaN
-        if (fabs(cpu_reference[i] - out_gpu[i]) > tolerance && !isnan(cpu_reference[i])) {
-            printf("Mismatch of %s at %d: CPU_ref: %f vs GPU: %f\n", name, i, cpu_reference[i], out_gpu[i]);
+        if (fabs(cpu_reference[i] - (T)out_gpu[i]) > tolerance && !isnan(cpu_reference[i])) {
+            printf("Mismatch of %s at %d: CPU_ref: %f vs GPU: %f\n", name, i, cpu_reference[i], (T)out_gpu[i]);
             nfaults ++;
             if (nfaults >= 10) {
                 free(out_gpu);

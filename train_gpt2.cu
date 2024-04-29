@@ -69,13 +69,13 @@ const ncclDataType_t ncclFloatN = ncclBfloat16;
 // use fp16 (note: this may require gradient scaler, currently not implemented!)
 #elif defined(ENABLE_FP16)
 typedef half floatX;
-typedef float floatN;
+typedef half floatN;
 #define CUBLAS_LOWP CUDA_R_16F
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
 
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclHalf;
-const ncclDataType_t ncclFloatN = ncclFloat;
+const ncclDataType_t ncclFloatN = ncclHalf;
 #endif
 
 // fallback for fp32
@@ -870,386 +870,12 @@ __global__ void matmul_backward_bias_kernel4(Td* dbias, const Td* dout, int B, i
     }
 }
 
-// uses shared memory instead for the reduces
-template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-__global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
-                        const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
-                        int B, int T, int C) {
-    extern __shared__ float shared[]; // size = 2 * C
-
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    int N = B * T;
-    if(idx >= N) { return; } // thread guards
-
-    int b = idx / T;
-    int t = idx % T;
-
-    const Tdout* dout_bt = dout + b * T * C + t * C;
-    const Trest* inp_bt = inp + b * T * C + t * C;
-    Tdinp* dinp_bt = dinp + b * T * C + t * C;
-    const float mean_bt = (float)mean[b * T + t];
-    const float rstd_bt = (float)rstd[b * T + t];
-
-    // the first half of shared memory is bias, second is weight
-    float* dbias_shared = shared;
-    float* dweight_shared = shared + C;
-
-    // init shared memory to zero
-    #pragma unroll
-    for(int i = threadIdx.x; i < C; i+= blockDim.x){
-       dbias_shared[i] = 0.0f;
-       dweight_shared[i] = 0.0f;
-    }
-    __syncthreads();
-
-    // first: two reduce operations
-    float dnorm_mean = 0.0f;
-    float dnorm_norm_mean = 0.0f;
-    for (int i = warp.thread_rank(); i < C; i  += warp.size()) {
-        float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
-        float dnorm_i = (float)weight[i] * (float)dout_bt[i];
-        dnorm_mean += dnorm_i;
-        dnorm_norm_mean += dnorm_i * norm_bti;
-    }
-    dnorm_mean = cg::reduce(warp, dnorm_mean, cg::plus<float>{});
-    dnorm_norm_mean = cg::reduce(warp, dnorm_norm_mean, cg::plus<float>{});
-    dnorm_mean = dnorm_mean / C;
-    dnorm_norm_mean = dnorm_norm_mean / C;
-
-    // now iterate again and accumulate all the gradients
-    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
-        float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
-        float dnorm_i = (float)weight[i] * (float)dout_bt[i];
-        // gradient contribution to bias
-        atomicAdd(&dbias_shared[i], (float)dout_bt[i]);
-        // gradient contribution to weight
-        atomicAdd(&dweight_shared[i], norm_bti * (float)dout_bt[i]);
-        // gradient contribution to input
-        float dval = 0.0f;
-        dval += dnorm_i; // term 1
-        dval -= dnorm_mean; // term 2
-        dval -= norm_bti * dnorm_norm_mean; // term 3
-        dval *= rstd_bt; // final scale
-        dinp_bt[i] = (Tdinp)((float)dinp_bt[i] + dval);
-    }
-    __syncthreads();
-
-    // write to global memory
-    for(int i = threadIdx.x; i < C; i+= blockDim.x) {
-        atomicAddX(&dbias[i], (Tparams)dbias_shared[i]);
-        atomicAddX(&dweight[i], (Tparams)dweight_shared[i]);
-    }
-}
-
-// kernel2 is 1 threadblock for all Cs on 32 BTs (assuming threadblock size of 1024 threads = 32 warps)
-// To minimise the amount of atomicAdds, we will aim for 1 threadblock per SM, processing (total BTs / threadblocks) BTs
-template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-__global__ void layernorm_backward_kernel3(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
-                        const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
-                        int B, int T, int C) {
-    extern __shared__ float shared[]; // size = 2 * C
-
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int base_idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-
-
-    // the first half of shared memory is bias, second is weight
-    float* dbias_shared = shared;
-    float* dweight_shared = shared + C;
-
-    // init shared memory to zero
-    #pragma unroll
-    for(int i = threadIdx.x; i < C; i+= blockDim.x){
-       dbias_shared[i] = 0.0f;
-       dweight_shared[i] = 0.0f;
-    }
-    uint *tmp_flag = (uint*)(shared + C*2);
-    __syncthreads();
-
-    int warps_in_grid = gridDim.x * warp.meta_group_size();
-    for (int idx = base_idx; idx < B * T; idx += warps_in_grid) {
-        int b = idx / T;
-        int t = idx % T;
-
-        const Tdout* dout_bt = dout + b * T * C + t * C;
-        const Trest* inp_bt = inp + b * T * C + t * C;
-        Tdinp* dinp_bt = dinp + b * T * C + t * C;
-        const float mean_bt = (float)mean[b * T + t];
-        const float rstd_bt = (float)rstd[b * T + t];
-
-        // first: two reduce operations
-        float dnorm_mean = 0.0f;
-        float dnorm_norm_mean = 0.0f;
-        for (int i = warp.thread_rank(); i < C; i  += warp.size()) {
-            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
-            float dnorm_i = (float)weight[i] * (float)dout_bt[i];
-            dnorm_mean += dnorm_i;
-            dnorm_norm_mean += dnorm_i * norm_bti;
-        }
-        dnorm_mean = cg::reduce(warp, dnorm_mean, cg::plus<float>{});
-        dnorm_norm_mean = cg::reduce(warp, dnorm_norm_mean, cg::plus<float>{});
-        dnorm_mean = dnorm_mean / C;
-        dnorm_norm_mean = dnorm_norm_mean / C;
-
-        // now iterate again and accumulate all the gradients
-        for (int i = warp.thread_rank(); i < C; i += warp.size()) {
-            float dout_i = (float)__ldcs(&dout_bt[i]);
-            float norm_bti = ((float)__ldcs(&inp_bt[i]) - mean_bt) * rstd_bt;
-            float dnorm_i = (float)weight[i] * dout_i;
-            // gradient contribution to bias
-            atomicAdd(&dbias_shared[i], dout_i);
-            // gradient contribution to weight
-            atomicAdd(&dweight_shared[i], norm_bti * dout_i);
-            // gradient contribution to input
-            float dval = 0.0f;
-            dval += dnorm_i; // term 1
-            dval -= dnorm_mean; // term 2
-            dval -= norm_bti * dnorm_norm_mean; // term 3
-            dval *= rstd_bt; // final scale
-            dinp_bt[i] = (Tdinp)((float)dinp_bt[i] + dval);
-        }
-    }
-    __syncthreads();
-
-    for(int i = threadIdx.x; i < C; i+= blockDim.x) {
-        atomicAddX(&dbias[i], (Tparams)dbias_shared[i]);
-        atomicAddX(&dweight[i], (Tparams)dweight_shared[i]);
-    }
-}
-
-// atomicCAS version of kernel3
-template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-__global__ void layernorm_backward_kernel4(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
-                        const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
-                        int B, int T, int C) {
-    extern __shared__ float shared[]; // size = 2 * C
-
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int base_idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-
-
-    // the first half of shared memory is bias, second is weight
-    float* dbias_shared = shared;
-    float* dweight_shared = shared + C;
-
-    // init shared memory to zero
-    #pragma unroll
-    for(int i = threadIdx.x; i < C; i+= blockDim.x){
-       dbias_shared[i] = 0.0f;
-       dweight_shared[i] = 0.0f;
-    }
-    uint *tmp_flag = (uint*)(shared + C*2);
-    __syncthreads();
-
-    int warps_in_grid = gridDim.x * warp.meta_group_size();
-    for (int idx = base_idx; idx < B * T; idx += warps_in_grid) {
-        int b = idx / T;
-        int t = idx % T;
-
-        const Tdout* dout_bt = dout + b * T * C + t * C;
-        const Trest* inp_bt = inp + b * T * C + t * C;
-        Tdinp* dinp_bt = dinp + b * T * C + t * C;
-        const float mean_bt = (float)mean[b * T + t];
-        const float rstd_bt = (float)rstd[b * T + t];
-
-        // first: two reduce operations
-        float dnorm_mean = 0.0f;
-        float dnorm_norm_mean = 0.0f;
-        for (int i = warp.thread_rank(); i < C; i  += warp.size()) {
-            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
-            float dnorm_i = (float)weight[i] * (float)dout_bt[i];
-            dnorm_mean += dnorm_i;
-            dnorm_norm_mean += dnorm_i * norm_bti;
-        }
-        dnorm_mean = cg::reduce(warp, dnorm_mean, cg::plus<float>{});
-        dnorm_norm_mean = cg::reduce(warp, dnorm_norm_mean, cg::plus<float>{});
-        dnorm_mean = dnorm_mean / C;
-        dnorm_norm_mean = dnorm_norm_mean / C;
-
-        // now iterate again and accumulate all the gradients
-        for (int i = warp.thread_rank(); i < C; i += warp.size()) {
-            float dout_i = (float)__ldcs(&dout_bt[i]);
-            float norm_bti = ((float)__ldcs(&inp_bt[i]) - mean_bt) * rstd_bt;
-            float dnorm_i = (float)weight[i] * dout_i;
-            // gradient contribution to bias
-            atomicAdd(&dbias_shared[i], dout_i);
-            // gradient contribution to weight
-            atomicAdd(&dweight_shared[i], norm_bti * dout_i);
-            // gradient contribution to input
-            float dval = 0.0f;
-            dval += dnorm_i; // term 1
-            dval -= dnorm_mean; // term 2
-            dval -= norm_bti * dnorm_norm_mean; // term 3
-            dval *= rstd_bt; // final scale
-            dinp_bt[i] = (Tdinp)((float)dinp_bt[i] + dval);
-        }
-    }
-    __syncthreads();
-
-    __nv_bfloat162* dbiasVec2 = reinterpret_cast<__nv_bfloat162*>(dbias);
-    __nv_bfloat162* dweightVec2 = reinterpret_cast<__nv_bfloat162*>(dweight);
-
-    // write to global memory
-    for(int i = threadIdx.x; i < C/2; i+= blockDim.x) {
-        __nv_bfloat162 add_dbias = __halves2bfloat162((__nv_bfloat16)dbias_shared[i*2], (__nv_bfloat16)dbias_shared[i*2+1]);
-        __nv_bfloat162 add_dweight = __halves2bfloat162((__nv_bfloat16)dweight_shared[i*2], (__nv_bfloat16)dweight_shared[i*2+1]);
-
-        // Get the current value from L2 cache
-        __nv_bfloat162 current_dbias = __ldcg(&dbiasVec2[i]);
-        __nv_bfloat162 current_dweight = __ldcg(&dbiasVec2[i]);
-
-        // Add the two values
-        add_dbias = __hadd2(add_dbias, current_dbias);
-        add_dweight = __hadd2(add_dweight, current_dweight);
-
-        // Write the result back to L2 cache using atomic compare and exchange
-        uint current_dbias32b = *reinterpret_cast<uint*>(&current_dbias);
-        uint current_dweight32b = *reinterpret_cast<uint*>(&current_dweight);
-
-        uint add_dbias32b = *reinterpret_cast<uint*>(&current_dbias);
-        uint add_dweight32b = *reinterpret_cast<uint*>(&current_dweight);
-
-        uint old_dbias32b = atomicCAS((uint*)&dbiasVec2[i], current_dbias32b, add_dbias32b);
-        uint old_dweight32b = atomicCAS((uint*)&dweightVec2[i], current_dweight32b, add_dweight32b);
-
-        while (old_dbias32b != current_dbias32b) {
-            current_dbias32b = old_dbias32b;
-
-            // If the value has changed, we need to re-add the values
-            add_dbias = __hadd2(*reinterpret_cast<__nv_bfloat162*>(&old_dbias32b), add_dbias);
-            uint add_dbias32b = *reinterpret_cast<uint*>(&current_dbias);
-
-            // Write the result back to L2 cache using atomic compare and exchange
-            old_dbias32b = atomicCAS((uint*)&dbiasVec2[i], old_dbias32b, add_dbias32b);
-        }
-
-        while (old_dweight32b != current_dweight32b) {
-            current_dweight32b = old_dweight32b;
-
-            // If the value has changed, we need to re-add the values
-            add_dweight = __hadd2(*reinterpret_cast<__nv_bfloat162*>(&old_dweight32b), add_dweight);
-            uint add_dweight32b = *reinterpret_cast<uint*>(&current_dweight);
-
-            // Write the result back to L2 cache using atomic compare and exchange
-            old_dweight32b = atomicCAS((uint*)&dweightVec2[i], old_dweight32b, add_dweight32b);
-        }
-    }
-}
-
-// FP32 scratchpad per threadgroup, zero atomics except atomicAdd on uint for the flag (based on kernel3)
-template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-__global__ void layernorm_backward_kernel5(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
-                        const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
-                        int B, int T, int C) {
-    extern __shared__ float shared[]; // size = 2 * C
-
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int base_idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-
-
-    // the first half of shared memory is bias, second is weight
-    float* dbias_shared = shared;
-    float* dweight_shared = shared + C;
-
-    // init shared memory to zero
-    #pragma unroll
-    for(int i = threadIdx.x; i < C; i+= blockDim.x){
-       dbias_shared[i] = 0.0f;
-       dweight_shared[i] = 0.0f;
-    }
-    uint *tmp_flag = (uint*)(shared + C*2);
-    __syncthreads();
-
-    int warps_in_grid = gridDim.x * warp.meta_group_size();
-    for (int idx = base_idx; idx < B * T; idx += warps_in_grid) {
-        int b = idx / T;
-        int t = idx % T;
-
-        const Tdout* dout_bt = dout + b * T * C + t * C;
-        const Trest* inp_bt = inp + b * T * C + t * C;
-        Tdinp* dinp_bt = dinp + b * T * C + t * C;
-        const float mean_bt = (float)mean[b * T + t];
-        const float rstd_bt = (float)rstd[b * T + t];
-
-        // first: two reduce operations
-        float dnorm_mean = 0.0f;
-        float dnorm_norm_mean = 0.0f;
-        for (int i = warp.thread_rank(); i < C; i  += warp.size()) {
-            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
-            float dnorm_i = (float)weight[i] * (float)dout_bt[i];
-            dnorm_mean += dnorm_i;
-            dnorm_norm_mean += dnorm_i * norm_bti;
-        }
-        dnorm_mean = cg::reduce(warp, dnorm_mean, cg::plus<float>{});
-        dnorm_norm_mean = cg::reduce(warp, dnorm_norm_mean, cg::plus<float>{});
-        dnorm_mean = dnorm_mean / C;
-        dnorm_norm_mean = dnorm_norm_mean / C;
-
-        // now iterate again and accumulate all the gradients
-        for (int i = warp.thread_rank(); i < C; i += warp.size()) {
-            float dout_i = (float)__ldcs(&dout_bt[i]);
-            float norm_bti = ((float)__ldcs(&inp_bt[i]) - mean_bt) * rstd_bt;
-            float dnorm_i = (float)weight[i] * dout_i;
-            // gradient contribution to bias
-            atomicAdd(&dbias_shared[i], dout_i);
-            // gradient contribution to weight
-            atomicAdd(&dweight_shared[i], norm_bti * dout_i);
-            // gradient contribution to input
-            float dval = 0.0f;
-            dval += dnorm_i; // term 1
-            dval -= dnorm_mean; // term 2
-            dval -= norm_bti * dnorm_norm_mean; // term 3
-            dval *= rstd_bt; // final scale
-            dinp_bt[i] = (Tdinp)((float)dinp_bt[i] + dval);
-        }
-    }
-    __syncthreads();
-
-    float* scratch_dbias = scratch;
-    float* scratch_dweight = scratch + C * gridDim.x;
-    uint* scratchFlag = (uint*)(scratch + (2 * C * gridDim.x));
-
-    for(int i = threadIdx.x; i < C; i+= blockDim.x) {
-        scratch_dbias[i + C*blockIdx.x] = dbias_shared[i];
-        scratch_dweight[i + C*blockIdx.x] = dweight_shared[i];
-    }
-    __threadfence();
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        *tmp_flag = atomicAdd(scratchFlag, 1);
-    }
-    __syncthreads();
-    if (*tmp_flag == gridDim.x-1) {
-        // last block to finish, accumulate the scratchpad
-        for (int i = threadIdx.x; i < C; i += blockDim.x) {
-            float dbias_sum = 0.0f;
-            float dweight_sum = 0.0f;
-            #pragma unroll 8
-            for (int j = 0; j < gridDim.x; j++) {
-                dbias_sum += scratch_dbias[i + j*C];
-                dweight_sum += scratch_dweight[i + j*C];
-            }
-            dbias[i] = (Tparams)((float)dbias[i] + dbias_sum);
-            dweight[i] = (Tparams)((float)dweight[i] + dweight_sum);
-        }
-    }
-}
-
 // single FP32 scratchpad shared by all the threadblocks (based on kernels 3 & 5)
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 __global__ void layernorm_backward_kernel6(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C) {
-    extern __shared__ float shared[]; // size = 2 * C
+    extern __shared__ float shared[]; // size = 2 * C + 1
 
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
@@ -1262,7 +888,7 @@ __global__ void layernorm_backward_kernel6(Tdinp* dinp, Tparams* dweight, Tparam
     float* dweight_shared = shared + C;
 
     // init shared memory to zero
-    #pragma unroll
+    #pragma unroll 4
     for(int i = threadIdx.x; i < C; i+= blockDim.x){
        dbias_shared[i] = 0.0f;
        dweight_shared[i] = 0.0f;
@@ -1316,6 +942,7 @@ __global__ void layernorm_backward_kernel6(Tdinp* dinp, Tparams* dweight, Tparam
 
     // Accumulate into a FP32 scratchpad
     // BF16 atomics are potentially much slower... and this is more precise!
+    // todo - could potentially avoid the extra copy if floatX is FP32, fairly negligible though
     __syncthreads();
     float* scratch_dbias = scratch;
     float* scratch_dweight = scratch + C;
@@ -1772,54 +1399,12 @@ template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 void layernorm_backward(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C) {
-    const int version = 6;
-
-    if(version == 2) {
-        const int block_size = 512;
-        const int N = B * T;
-        const int grid_size = CEIL_DIV(32*N, block_size);
-        size_t shared_mem_size = 2 * C * sizeof(float);
-        layernorm_backward_kernel2<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
-        cudaCheck(cudaGetLastError());
-    } else if(version == 3) {
-        const int block_size = 1024;
-        const int grid_size = 1 * cuda_num_SMs;
-        size_t shared_mem_size = 2 * C * sizeof(float);
-
-        layernorm_backward_kernel3<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
-        cudaCheck(cudaGetLastError());
-    } else if(version == 4) {
-        const int block_size = 1024;
-        const int grid_size = 1 * cuda_num_SMs;
-        size_t shared_mem_size = 2 * C * sizeof(float);
-
-        layernorm_backward_kernel4<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
-        cudaCheck(cudaGetLastError());
-    } else if(version == 5) {
-        const int block_size = 1024;
-        const int grid_size = 1 * cuda_num_SMs;
-        size_t shared_mem_size = 2 * C * sizeof(float);
-
-        // todo - memset in parallel with previous kernels using streams
-        cudaMemset(scratch, 0, (1 + grid_size * 2 * C) * sizeof(float));
-
-        layernorm_backward_kernel5<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
-        cudaCheck(cudaGetLastError());
-    } else if(version == 6) {
-        const int block_size = 1024;
-        const int grid_size = 1 * cuda_num_SMs;
-        size_t shared_mem_size = 2 * C * sizeof(float);
-        cudaCheck(cudaGetLastError());
-
-        // todo - memset in parallel with previous kernels using streams
-        cudaMemset(scratch, 0, (1 + 2 * C) * sizeof(float));
-        cudaCheck(cudaGetLastError());
-
-        layernorm_backward_kernel6<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
-        cudaCheck(cudaGetLastError());
-    }
-
-
+    const int block_size = 1024;
+    const int grid_size = 1 * cuda_num_SMs;
+    size_t shared_mem_size = (2 * C + 1) * sizeof(float);
+    cudaMemset(scratch, 0, (2 * C + 1) * sizeof(float)); // todo - memset in parallel with previous kernels using streams
+    layernorm_backward_kernel6<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+    cudaCheck(cudaGetLastError());
 }
 
 // the sequence of transformations in this compound op is:
