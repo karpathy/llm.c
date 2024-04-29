@@ -882,8 +882,8 @@ __device__ inline float lerp(float start, float end, float weight) {
 template <typename Tp, typename Tg>
 __global__ void adamw_kernel3(Tp* params_memory, Tg* grads_memory, floatM* m_memory, floatM* v_memory,
                               float* m_scales, float* v_scales, size_t num_parameters,
-                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
-                              unsigned int seed) {
+                              float learning_rate, float beta1, float beta2, float inv_beta1_correction, float inv_beta2_correction,
+                              float eps, float weight_decay, unsigned int seed) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
 
@@ -923,8 +923,8 @@ __global__ void adamw_kernel3(Tp* params_memory, Tg* grads_memory, floatM* m_mem
         v_scales[i/32] = v_scale;
     }
 
-    m /= beta1_correction;  // m_hat
-    v /= beta2_correction;  // v_hat
+    m *= inv_beta1_correction;  // m_hat
+    v *= inv_beta2_correction;  // v_hat
     // update the parameters (weight/bias)
     float param = (float)params_memory[i] - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * (float)params_memory[i]));
     unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
@@ -1965,7 +1965,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     unsigned int seed = random_u32(&model->rng_state);
     adamw_kernel3<<<num_blocks, block_size>>>((floatX*)model->params_memory, (floatX*)model->grads_memory, model->m_memory, model->v_memory,
                                               model->m_scales, model->v_scales, model->num_parameters,
-                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
+                                              learning_rate, beta1, beta2, 1.f/beta1_correction, 1.f/beta2_correction, eps, weight_decay, seed);
     cudaCheck(cudaGetLastError());
 }
 
