@@ -51,29 +51,29 @@ struct alignas(16) Packed128 {
 
     ElementType payload[size];
 };
+typedef Packed128<float> f128;
 
-
-// load a Packet128 from an aligned memory address
+// load a Packed128 from an aligned memory address
 template<class ElementType>
-__device__ __forceinline__ Packed128<ElementType> load_aligned(const ElementType* address) {
+__device__ __forceinline__ Packed128<ElementType> load(const ElementType* address) {
     return Packed128<ElementType>{*reinterpret_cast<const int4*>(address)};
 }
 
-// load a Packet128 from an aligned memory address with streaming cache hint
+// load a Packed128 from an aligned memory address with streaming cache hint
 template<class ElementType>
-__device__ __forceinline__ Packed128<ElementType> load_aligned_cs(const ElementType* address) {
+__device__ __forceinline__ Packed128<ElementType> loadcs(const ElementType* address) {
     return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
 }
 
-// store a Packet128 to an aligned memory address
+// store a Packed128 to an aligned memory address
 template<class ElementType>
-__device__ __forceinline__ void store_aligned(ElementType* target, Packed128<ElementType> value) {
+__device__ __forceinline__ void store(ElementType* target, Packed128<ElementType> value) {
     *reinterpret_cast<int4*>(target) = value.get_bits();
 }
 
-// store a Packet128 to an aligned memory address with streaming cache hint
+// store a Packed128 to an aligned memory address with streaming cache hint
 template<class ElementType>
-__device__ __forceinline__ void store_aligned_cs(ElementType* target, Packed128<ElementType> value) {
+__device__ __forceinline__ void storecs(ElementType* target, Packed128<ElementType> value) {
     __stcs(reinterpret_cast<int4*>(target), value.get_bits());
 }
 
@@ -105,17 +105,16 @@ __global__ void gelu_kernel(float* out, const float* inp, int N) {
 
 // elementwise ops are nice and ez
 __global__ void gelu_kernel2(float* out, const float* inp, int N) {
-    using packet_t = Packed128<float>;
-    int i = (blockIdx.x * blockDim.x + threadIdx.x) * packet_t::size;
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * f128::size;
     if (i < N) {
-        packet_t packet_out;
-        packet_t packet_in = load_aligned_cs(inp + i);
+        f128 packet_out;
+        f128 packet_in = loadcs(inp + i);
         for(int k = 0; k < packet_in.size; ++k) {
             float xi = packet_in[k];
             float cube = 0.044715f * xi * xi * xi;
             packet_out[k] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
         }
-        store_aligned(out + i, packet_out);
+        store(out + i, packet_out);
     }
 }
 
@@ -158,7 +157,7 @@ void gelu_forward(int kernel_num,
 int main(int argc, char **argv) {
     srand(0);
 
-    int B = 8;
+    int B = 80;
     int T = 1024;
     int C = 768;
 
