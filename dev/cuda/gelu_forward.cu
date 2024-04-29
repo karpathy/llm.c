@@ -18,108 +18,64 @@ version 1 is naive port from CPU code to kernel
 #include <cuda_runtime.h>
 #include "common.h"
 
-// OK, so this part requires a bit of explanation. Our end goal here is that we get a convenient interface that
-// allows us to interact with vectorized loads that read 128 bits of aligned memory in a uniform way, independent
-// of the underlying datatype, and the whims of the nvcc compiler.
-
-// as a first step, we define some constants that indicate which type of memory operation we intend to do.
-// these correspond to https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#cache-operators
-enum class ELoadMode {
-    CA, CG, CS, LU, CV
-};
-
-enum class EStoreMode {
-    WB, CG, CS, WT
-};
-
-
-// in order to enable dispatch _at compile time_, we need to encode the load/store mode into types (unless we want
-// to have ugly template syntax at the call sites, like load<ELoadMode::CG>(address).
-// Therefore, we wrap all these into compile-time integers, and provide global objects that can be passed to
-// select the correct function overload.
-template<ELoadMode V>
-using load_mode_t = std::integral_constant<ELoadMode, V>;
-
-template<EStoreMode V>
-using store_mode_t = std::integral_constant<EStoreMode, V>;
-
-constexpr load_mode_t<ELoadMode::CA> LdCA;
-constexpr load_mode_t<ELoadMode::CG> LdCG;
-constexpr load_mode_t<ELoadMode::CS> LdCS;
-constexpr load_mode_t<ELoadMode::LU> LdLU;
-constexpr load_mode_t<ELoadMode::CV> LdCV;
-
-constexpr store_mode_t<EStoreMode::WB> StWB;
-constexpr store_mode_t<EStoreMode::CG> StCG;
-constexpr store_mode_t<EStoreMode::CS> StCS;
-constexpr store_mode_t<EStoreMode::WT> StWT;
-
-// Finally, we define the dispatch mechanism itself. Really just a long if-else chain, except
-// that all of this needs to be decided at compile time (hence constexpr if)
-template<ELoadMode Mode, class T>
-__device__ T generic_load(const T* address, load_mode_t<Mode>) {
-    if constexpr (Mode == ELoadMode::CA) {
-        return __ldca(address);
-    } else if constexpr (Mode == ELoadMode::CG) {
-        return __ldcg(address);
-    } else if constexpr (Mode == ELoadMode::CS) {
-        return __ldcs(address);
-    } else if constexpr (Mode == ELoadMode::LU) {
-        return __ldlu(address);
-    } else if constexpr (Mode == ELoadMode::CV) {
-        return __ldcv(address);
-    } else {
-        __builtin_unreachable();
-    }
-}
-
-template<EStoreMode Mode, class T>
-__device__ void generic_store(T* address, const T& value, store_mode_t<Mode>) {
-    if constexpr (Mode == EStoreMode::WB) {
-        return __stwb(address, value);
-    } else if constexpr (Mode == EStoreMode::CG) {
-        return __stcg(address, value);
-    } else if constexpr (Mode == EStoreMode::CS) {
-        return __stcs(address, value);
-    } else if constexpr (Mode == EStoreMode::WT) {
-        return __stwt(address, value);
-    }  else {
-        __builtin_unreachable();
-    }
-}
-
 // Finally, we define a wrapper type that contains 128 bits of whatever underlying type we want
 // we store the actual data in an int4 vector, and reinterpret its bits, because int4 gets nvcc to
 // reliably produce 128-bit instructions
 // TODO do we really need this here, or can we get away with the int4 trick just inside the  load/store functions
 // we allow individual element access with [], and provide a convenience accessor to get the data converted to
 // a regular float for mixed-precision operations.
+
 template<class ElementType>
 struct alignas(16) Packed128 {
-    __device__ ElementType& operator[](int index) {
-        return reinterpret_cast<ElementType*>(&payload)[index];
+    __device__ __forceinline__ Packed128() = default;
+    __device__ __forceinline__ explicit Packed128(int4 bits) {
+        static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
+        memcpy(&payload, &bits, sizeof(bits));
     }
-    __device__ const ElementType& operator[](int index) const {
-        return reinterpret_cast<const ElementType*>(&payload)[index];
+
+    __device__ __forceinline__ ElementType& operator[](int index) {
+        return payload[index];
     }
-    __device__ float fp32(int index) {
-        return static_cast<float>(reinterpret_cast<ElementType*>(&payload)[index]);
+    __device__ __forceinline__ const ElementType& operator[](int index) const {
+        return payload[index];
     }
+    __device__ __forceinline__ float fp32(int index) {
+        return static_cast<float>(payload[index]);
+    }
+
+    __device__ __forceinline__ int4 get_bits() const {
+        int4 bits;
+        static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
+        memcpy(&bits, &payload, sizeof(bits));
+        return bits;
+    }
+
     static constexpr const size_t size = sizeof(int4) / sizeof(ElementType);
 
-    int4 payload;
+    ElementType payload[size];
 };
 
+
 // use this function to load a Packet128 from an aligned memory address
-template<class ElementType, ELoadMode Mode=ELoadMode::CA>
-__device__ Packed128<ElementType> load_aligned(const ElementType* address, load_mode_t<Mode> mode = {}) {
-    return {generic_load(reinterpret_cast<const int4*>(address), mode)};
+template<class ElementType>
+__device__ __forceinline__ Packed128<ElementType> load_aligned(const ElementType* address) {
+    return Packed128<ElementType>{*reinterpret_cast<const int4*>(address)};
+}
+
+template<class ElementType>
+__device__ __forceinline__ Packed128<ElementType> load_aligned_cs(const ElementType* address) {
+    return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
 }
 
 // use this function to store a Packet128 to an aligned memory address
-template<class ElementType, EStoreMode Mode=EStoreMode::WB>
-__device__ void store_aligned(ElementType* target, Packed128<ElementType> value, store_mode_t<Mode> mode = {}) {
-    generic_store(reinterpret_cast<int4*>(target), value.payload, mode);
+template<class ElementType>
+__device__ __forceinline__ void store_aligned(ElementType* target, Packed128<ElementType> value) {
+    *reinterpret_cast<int4*>(target) = value.get_bits();
+}
+
+template<class ElementType>
+__device__ __forceinline__ void store_aligned_cs(ElementType* target, Packed128<ElementType> value) {
+    __stcs(reinterpret_cast<int4*>(target), value.get_bits());
 }
 
 // ----------------------------------------------------------------------------
@@ -154,7 +110,7 @@ __global__ void gelu_kernel2(float* out, const float* inp, int N) {
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * packet_t::size;
     if (i < N) {
         packet_t packet_out;
-        packet_t packet_in = load_aligned(inp + i, LdCS);
+        packet_t packet_in = load_aligned_cs(inp + i);
         for(int k = 0; k < packet_in.size; ++k) {
             float xi = packet_in[k];
             float cube = 0.044715f * xi * xi * xi;
