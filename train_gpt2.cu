@@ -66,7 +66,6 @@ enum PrecisionMode {
 // fp32
 #if defined(ENABLE_FP32)
 typedef float floatX;
-typedef float floatN;
 #define CUBLAS_LOWP CUDA_R_32F
 #define CUBLAS_LOWP_COMPUTE cublas_compute_type // auto-select FP32 vs TF32
 const char* load_filename = "gpt2_124M.bin"; // fp32 weights
@@ -75,13 +74,11 @@ const char* precision_mode_str = "fp32";
 
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclFloat;
-const ncclDataType_t ncclFloatN = ncclFloat;
 #endif
 
 // use fp16 (note: this may require gradient scaler, currently not implemented!)
 #elif defined(ENABLE_FP16)
 typedef half floatX;
-typedef half floatN;
 #define CUBLAS_LOWP CUDA_R_16F
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
 const char* load_filename = "gpt2_124M.bin"; // fp32 weights
@@ -90,13 +87,11 @@ const char* precision_mode_str = "fp16";
 
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclHalf;
-const ncclDataType_t ncclFloatN = ncclHalf;
 #endif
 
 // bfloat16 (default!)
 #else
 typedef __nv_bfloat16 floatX;
-typedef __nv_bfloat16 floatN;
 #define CUBLAS_LOWP CUDA_R_16BF
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
 const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights
@@ -105,7 +100,6 @@ const char* precision_mode_str = "bf16";
 
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclBfloat16;
-const ncclDataType_t ncclFloatN = ncclBfloat16;
 #endif
 #endif
 
@@ -283,7 +277,7 @@ typedef struct {
     int num_processes;     // Total number of processes. 1 if no multi-GPU.
     int local_device_idx;  // This process GPU index on current machine. 0 if no multi-GPU.
 #ifdef MULTI_GPU
-    ncclComm_t nccl_comm;  // NCCL communication primitive, used for collective mutli-GPU work.
+    ncclComm_t nccl_comm;  // NCCL communication primitive, used for collective multi-GPU work.
 #endif
 } MultiGpuConfig;
 
@@ -424,8 +418,8 @@ __global__ void encoder_backward_kernel(floatX* dwte, floatX* dwpe,
 
 // currently reads FP32, outputs floatX(FP16/BF16/FP8)
 __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __restrict__ mean, floatX* __restrict__ rstd,
-                                    const floatX*  __restrict__ inp, const floatN*  __restrict__ weight,
-                                    const floatN* __restrict__ bias, int N, int C) {
+                                    const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
+                                    const floatX* __restrict__ bias, int N, int C) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
@@ -964,7 +958,7 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
 }
 
 void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
-                       floatX* inp, floatN* weight, floatN* bias,
+                       floatX* inp, floatX* weight, floatX* bias,
                        int B, int T, int C) {
     const int block_size = 512;
     const int N = B * T;
@@ -1172,7 +1166,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
 }
 
 void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
-                        const floatX* dout, const floatX* inp, const floatN* weight, const floatX* mean, const floatX* rstd,
+                        const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
                         int B, int T, int C) {
     const int block_size = 1024;
     const int grid_size = 1 * cuda_num_SMs;
@@ -1268,25 +1262,24 @@ typedef struct {
 } GPT2Config;
 
 // the parameters of the model
-// note the layernorms are kept in higher precision (floatN)
 constexpr const int NUM_PARAMETER_TENSORS = 16;
 typedef struct {
     floatX* wte; // (V, C)
     floatX* wpe; // (maxT, C)
-    floatN* ln1w; // (L, C)
-    floatN* ln1b; // (L, C)
+    floatX* ln1w; // (L, C)
+    floatX* ln1b; // (L, C)
     floatX* qkvw; // (L, 3*C, C)
     floatX* qkvb; // (L, 3*C)
     floatX* attprojw; // (L, C, C)
     floatX* attprojb; // (L, C)
-    floatN* ln2w; // (L, C)
-    floatN* ln2b; // (L, C)
+    floatX* ln2w; // (L, C)
+    floatX* ln2b; // (L, C)
     floatX* fcw; // (L, 4*C, C)
     floatX* fcb; // (L, 4*C)
     floatX* fcprojw; // (L, C, 4*C)
     floatX* fcprojb; // (L, C)
-    floatN* lnfw; // (C)
-    floatN* lnfb; // (C)
+    floatX* lnfw; // (C)
+    floatX* lnfb; // (C)
 } ParameterTensors;
 static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
@@ -1312,16 +1305,10 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     param_sizes[14] = C; // lnfw
     param_sizes[15] = C; // lnfb
 
-    // populate the parameter sizes in bytes
+    // populate the parameter sizes in bytes (all the same for now, keeping for future use)
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         param_sizeof[i] = sizeof(floatX);
-    } // override layernorms here below
-    param_sizeof[2] = sizeof(floatN); // ln1w
-    param_sizeof[3] = sizeof(floatN); // ln1b
-    param_sizeof[8] = sizeof(floatN); // ln2w
-    param_sizeof[9] = sizeof(floatN); // ln2b
-    param_sizeof[14] = sizeof(floatN); // lnfw
-    param_sizeof[15] = sizeof(floatN); // lnfb
+    }
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
@@ -1631,14 +1618,14 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
-        floatN* l_ln1w = params.ln1w + l * C;
-        floatN* l_ln1b = params.ln1b + l * C;
+        floatX* l_ln1w = params.ln1w + l * C;
+        floatX* l_ln1b = params.ln1b + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
         floatX* l_qkvb = params.qkvb + l * 3*C;
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_attprojb = params.attprojb + l * C;
-        floatN* l_ln2w = params.ln2w + l * C;
-        floatN* l_ln2b = params.ln2b + l * C;
+        floatX* l_ln2w = params.ln2w + l * C;
+        floatX* l_ln2b = params.ln2b + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcb = params.fcb + l * 4*C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
@@ -1766,21 +1753,21 @@ void gpt2_backward(GPT2 *model) {
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
-        floatN* l_ln1w = params.ln1w + l * C;
+        floatX* l_ln1w = params.ln1w + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
         floatX* l_attprojw = params.attprojw + l * C * C;
-        floatN* l_ln2w = params.ln2w + l * C;
+        floatX* l_ln2w = params.ln2w + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
-        floatN* dl_ln1w = grads.ln1w + l * C;
-        floatN* dl_ln1b = grads.ln1b + l * C;
+        floatX* dl_ln1w = grads.ln1w + l * C;
+        floatX* dl_ln1b = grads.ln1b + l * C;
         floatX* dl_qkvw = grads.qkvw + l * 3*C * C;
         floatX* dl_qkvb = grads.qkvb + l * 3*C;
         floatX* dl_attprojw = grads.attprojw + l * C * C;
         floatX* dl_attprojb = grads.attprojb + l * C;
-        floatN* dl_ln2w = grads.ln2w + l * C;
-        floatN* dl_ln2b = grads.ln2b + l * C;
+        floatX* dl_ln2w = grads.ln2w + l * C;
+        floatX* dl_ln2b = grads.ln2b + l * C;
         floatX* dl_fcw = grads.fcw + l * 4*C * C;
         floatX* dl_fcb = grads.fcb + l * 4*C;
         floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
@@ -1840,25 +1827,18 @@ float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_conf
 }
 
 // Averages out the loss and gradients across all GPUs. No-op when multi-GPU is disabled.
-void gpt2_mutli_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
+// todo - this version only works if all the parameters are the same size (floatX)
+void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
     // Average all losses.
     model->accumulated_mean_loss = multi_gpu_cpu_float_mean(model->mean_loss, multi_gpu_config);
 #ifdef MULTI_GPU
     // Average all gradients.
-    char* grads_memory_iterator = (char*)model->grads_memory;
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
-        int current_param_sizeof = model->param_sizeof[i];
-        int current_param_elements = model->param_elements[i];
-        ncclDataType_t data_type = current_param_sizeof == sizeof(floatX) ? ncclFloatX : ncclFloatN;
-        ncclCheck(ncclAllReduce(grads_memory_iterator, grads_memory_iterator,
-            current_param_elements,
-            data_type, ncclAvg,
-            multi_gpu_config->nccl_comm,
-            // use 0 for default stream (all other computations use this stream)
-            /*stream=*/0));
-        grads_memory_iterator += current_param_elements * current_param_sizeof;
-    }
-    assert(grads_memory_iterator == (char*)model->grads_memory + model->num_parameters_bytes);
+    ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
+        model->num_parameters,
+        ncclFloatX, ncclAvg,
+        multi_gpu_config->nccl_comm,
+        // use 0 for default stream (all other computations use this stream)
+        /*stream=*/0));
 #endif
 }
 
@@ -1871,45 +1851,18 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         cudaCheck(cudaMalloc((void**)&model->v_memory, model->num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->m_memory, 0, model->num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->v_memory, 0, model->num_parameters * sizeof(float)));
-        printf0("allocated %d MiB for AdamW optimizer state m\n", (int)round(model->num_parameters * sizeof(float) / (1024 * 1024)));
-        printf0("allocated %d MiB for AdamW optimizer state v\n", (int)round(model->num_parameters * sizeof(float) / (1024 * 1024)));
+        printf0("allocated %zu MiB for AdamW optimizer state m\n", (model->num_parameters * sizeof(float)) >> 20);
+        printf0("allocated %zu MiB for AdamW optimizer state v\n", (model->num_parameters * sizeof(float)) >> 20);
     }
 
     int block_size = 512;
+    int num_blocks = CEIL_DIV(model->num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
-
-    // Adam upadte
-    // We need to know the parameter types (float or floatX) to process consecutive chunks
-    char* params_mem = (char*)model->params_memory;
-    char* grads_mem = (char*)model->grads_memory;
-    size_t num_elements = model->param_elements[0];
-    size_t last_sizeof = model->param_sizeof[0];
-    size_t current_element = 0;
-    for (int i = 1; i <= NUM_PARAMETER_TENSORS; i++) {
-        if (i == NUM_PARAMETER_TENSORS || model->param_sizeof[i] != last_sizeof) {
-            unsigned int seed = random_u32(&model->rng_state); // seed for stochastic rounding
-            int num_blocks = CEIL_DIV(num_elements, block_size);
-            // atm some params are in low precision (floatX) and some are in high precision (float)
-            if (last_sizeof == sizeof(floatX)) {
-                adamw_kernel3<<<num_blocks, block_size>>>((floatX*)params_mem, (floatX*)grads_mem,
-                            &model->m_memory[current_element], &model->v_memory[current_element], num_elements,
-                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
-            } else {
-                adamw_kernel3<<<num_blocks, block_size>>>((float*)params_mem, (float*)grads_mem,
-                            &model->m_memory[current_element], &model->v_memory[current_element], num_elements,
-                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
-            }
-            params_mem += num_elements * last_sizeof;
-            grads_mem += num_elements * last_sizeof;
-            current_element += num_elements;
-            num_elements = 0;
-        }
-        if (i != NUM_PARAMETER_TENSORS) {
-            num_elements += model->param_elements[i];
-            last_sizeof = model->param_sizeof[i];
-        }
-    }
+    unsigned int seed = random_u32(&model->rng_state);
+    adamw_kernel3<<<num_blocks, block_size>>>((floatX*)model->params_memory, (floatX*)model->grads_memory, model->m_memory, model->v_memory,
+                                              model->num_parameters,
+                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2139,7 +2092,7 @@ int main(int argc, char *argv[]) {
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
-    (void)cublas_compute_type; // unused in BF16 mode, avoid warning
+    if(cublas_compute_type); // unused in BF16 mode, avoid warning
 
     printf0("| device                | %-50s |\n", deviceProp.name);
     printf0("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
@@ -2214,7 +2167,7 @@ int main(int argc, char *argv[]) {
             }
             val_loss /= val_num_batches;
             val_loss = multi_gpu_cpu_float_mean(val_loss, &multi_gpu_config);
-            printf("val loss %f\n", val_loss);
+            printf0("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
         }
 
@@ -2273,14 +2226,17 @@ int main(int argc, char *argv[]) {
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
-        gpt2_mutli_gpu_accumulate(&model, &multi_gpu_config);
+        if (multi_gpu_config.num_processes > 1) {
+            gpt2_multi_gpu_accumulate(&model, &multi_gpu_config);
+        }
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
         total_sum_iteration_time_s += time_elapsed_s;
         int tokens_per_second = multi_gpu_config.num_processes * (B * T) / time_elapsed_s;
-        printf0("step %4d/%d: train loss %f (acc %f) (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, model.accumulated_mean_loss, time_elapsed_s * 1000, tokens_per_second);
+        float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
+        printf0("step %4d/%d: train loss %f (acc %f) (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, accumulated_loss, time_elapsed_s * 1000, tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
     }
     // add a total average, for optimizations that are only mild improvements
