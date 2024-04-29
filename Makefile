@@ -38,7 +38,7 @@ else
   ifneq ($(shell where nvcc 2> nul),"")
     NVCC := nvcc
   else
-    NVCC := 
+    NVCC :=
   endif
   CC := cl
   CFLAGS = /Idev /Zi /nologo /Wall /WX- /diagnostics:column /sdl /O2 /Oi /Ot /GL /D _DEBUG /D _CONSOLE /D _UNICODE /D UNICODE /Gm- /EHsc /MD /GS /Gy /fp:fast /Zc:wchar_t /Zc:forScope /Zc:inline /permissive- \
@@ -119,7 +119,7 @@ else
       $(warning OpenMPI is not found, disabling multi-GPU support)
       $(warning On Linux you can try install OpenMPI with `sudo apt install openmpi-bin openmpi-doc libopenmpi-dev`)
     endif
-  endif  
+  endif
 endif
 
 # Precision settings, default to bf16 but ability to override

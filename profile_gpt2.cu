@@ -2,7 +2,7 @@
 This code is a convenience tool for profiling the CUDA kernels in the training
 loop of train_gpt2.cu. Compile:
 
-make profile_gpt2.cu
+make profile_gpt2cu NO_MULTI_GPU=1
 
 And then e.g. use ncu from NVIDIA. The CLI docs for example:
 https://docs.nvidia.com/nsight-compute/NsightComputeCli/
@@ -34,6 +34,7 @@ int main() {
     cudaCheck(cudaSetDevice(deviceIdx));
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
+    cuda_num_SMs = deviceProp.multiProcessorCount;
     printf("[System]\n");
     printf("Device %d: %s\n", deviceIdx, deviceProp.name);
 
