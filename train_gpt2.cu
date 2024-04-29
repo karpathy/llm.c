@@ -1851,8 +1851,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         cudaCheck(cudaMalloc((void**)&model->v_memory, model->num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->m_memory, 0, model->num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->v_memory, 0, model->num_parameters * sizeof(float)));
-        printf("allocated %zu MiB for AdamW optimizer state m\n", (model->num_parameters * sizeof(float)) >> 20);
-        printf("allocated %zu MiB for AdamW optimizer state v\n", (model->num_parameters * sizeof(float)) >> 20);
+        printf0("allocated %zu MiB for AdamW optimizer state m\n", (model->num_parameters * sizeof(float)) >> 20);
+        printf0("allocated %zu MiB for AdamW optimizer state v\n", (model->num_parameters * sizeof(float)) >> 20);
     }
 
     int block_size = 512;
@@ -2249,7 +2249,7 @@ int main(int argc, char *argv[]) {
             }
             val_loss /= val_num_batches;
             val_loss = multi_gpu_cpu_float_mean(val_loss, &multi_gpu_config);
-            printf("val loss %f\n", val_loss);
+            printf0("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
         }
 
