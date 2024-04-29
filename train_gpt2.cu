@@ -374,9 +374,8 @@ void printf0(const char *format, ...) {
 // ----------------------------------------------------------------------------
 // all the kernels
 
-template <typename TOut, typename Tw>
-__global__ void encoder_forward_kernel2(TOut* out,
-                               int* inp, Tw* wte, Tw* wpe,
+__global__ void encoder_forward_kernel2(floatX* out,
+                               int* inp, floatX* wte, floatX* wpe,
                                int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * T * C;
@@ -389,17 +388,16 @@ __global__ void encoder_forward_kernel2(TOut* out,
 
         int ix = inp[b * T + t];
 
-        TOut* out_btc = out + b * T * C + t * C + c;
-        Tw* wte_ix = wte + ix * C + c;
-        Tw* wpe_tc = wpe + t * C + c;
-        *out_btc = (TOut)((float)*wte_ix + (float)*wpe_tc);
+        floatX* out_btc = out + b * T * C + t * C + c;
+        floatX* wte_ix = wte + ix * C + c;
+        floatX* wpe_tc = wpe + t * C + c;
+        *out_btc = (floatX)((float)*wte_ix + (float)*wpe_tc);
     }
 }
 
 // really bad naive kernel with atomicAdd
-template <typename Type, typename Tdout>
-__global__ void encoder_backward_kernel(Type* dwte, Type* dwpe,
-                                        const Tdout* dout, const int* inp,
+__global__ void encoder_backward_kernel(floatX* dwte, floatX* dwpe,
+                                        const floatX* dout, const int* inp,
                                         int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * T * C;
@@ -412,27 +410,26 @@ __global__ void encoder_backward_kernel(Type* dwte, Type* dwpe,
 
         int ix = inp[b * T + t];
 
-        const Tdout* dout_btc = dout + b * T * C + t * C + c;
-        Type* dwte_ix = dwte + ix * C + c;
-        Type* dwpe_tc = dwpe + t * C + c;
+        const floatX* dout_btc = dout + b * T * C + t * C + c;
+        floatX* dwte_ix = dwte + ix * C + c;
+        floatX* dwpe_tc = dwpe + t * C + c;
 
-        atomicAddX(dwte_ix, (Type)*dout_btc);
-        atomicAddX(dwpe_tc, (Type)*dout_btc);
+        atomicAddX(dwte_ix, (floatX)*dout_btc);
+        atomicAddX(dwpe_tc, (floatX)*dout_btc);
     }
 }
 
 // currently reads FP32, outputs floatX(FP16/BF16/FP8)
-template <typename Type, typename TOut, typename TParam>
-__global__ void layernorm_forward_kernel3(TOut* __restrict__ out, Type* __restrict__ mean, Type* __restrict__ rstd,
-                                    const Type*  __restrict__ inp, const TParam*  __restrict__ weight,
-                                    const TParam* __restrict__ bias, int N, int C) {
+__global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __restrict__ mean, floatX* __restrict__ rstd,
+                                    const floatX*  __restrict__ inp, const floatN*  __restrict__ weight,
+                                    const floatN* __restrict__ bias, int N, int C) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
     if(idx >= N) { return; } // guard
 
     // the row of input that this group of threads is responsible for
-    const Type* x = inp + idx * C;
+    const floatX* x = inp + idx * C;
 
     // mean
     float sum = 0.0f;
@@ -442,7 +439,7 @@ __global__ void layernorm_forward_kernel3(TOut* __restrict__ out, Type* __restri
     sum = cg::reduce(warp, sum, cg::plus<float>{});
     float m = sum / C;
     if(warp.thread_rank() == 0 && mean != nullptr) {
-        __stcs(mean + idx, (Type)m);
+        __stcs(mean + idx, (floatX)m);
     }
 
     // rstd
@@ -454,17 +451,17 @@ __global__ void layernorm_forward_kernel3(TOut* __restrict__ out, Type* __restri
     sum = cg::reduce(warp, sum, cg::plus<float>{});
     float s = rsqrtf(sum / C + 1e-5f);
     if(warp.thread_rank() == 0 && rstd != nullptr) {
-        __stcs(rstd + idx, (Type)s);
+        __stcs(rstd + idx, (floatX)s);
     }
 
     // final normalization and scaling by weight/bias
-    TOut* o = out + idx * C;
+    floatX* o = out + idx * C;
     for (int c = warp.thread_rank(); c < C; c += warp.size()) {
         // load and store using the .cs "streaming" hint to the compiler,
         // indicating that this data will not be reused soon, and can be streamed through the caches
         // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
         float n = s * ((float)__ldcs(x+c) - m);
-        __stcs(o+c, (TOut)(n * (float)weight[c] + (float)bias[c]));
+        __stcs(o+c, (floatX)(n * (float)weight[c] + (float)bias[c]));
     }
 }
 
@@ -539,8 +536,7 @@ __global__ void unpermute_kernel_backward(floatX* dinp, const floatX *dout, int 
     }
 }
 
-template <typename Type>
-__global__ void softmax_forward_kernel5(Type* out, float inv_temperature, const Type* inp, int N, int T) {
+__global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, const floatX* inp, int N, int T) {
     // inp, out shape: (N, T, T), where N = B * NH
     // fuses the multiplication by scale inside attention
     // directly autoregressive, so we only compute the lower triangular part
@@ -561,13 +557,13 @@ __global__ void softmax_forward_kernel5(Type* out, float inv_temperature, const 
     int pos_by_4 = own_pos / 4;
 
     // one row of inp, i.e. inp[idx, :] of shape (T,)
-    const Type* x = inp + idx * T;
+    const floatX* x = inp + idx * T;
 
     // not INF, so we don't get NaNs accidentally when subtracting two values.
     float maxval = -FLT_MAX;
     float sumval = 0.0f;
 
-    const Type* x_aligned = reinterpret_cast<const Type*>(__builtin_assume_aligned(x, 16));
+    const floatX* x_aligned = reinterpret_cast<const floatX*>(__builtin_assume_aligned(x, 16));
     for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
         float regarray[4];
         #pragma unroll
@@ -601,15 +597,14 @@ __global__ void softmax_forward_kernel5(Type* out, float inv_temperature, const 
     for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
         // recalculation is faster than doing the round-trip through memory.
         float ev = expf(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
-        __stcs(out + idx * T + i, (Type)(ev * norm));
+        __stcs(out + idx * T + i, (floatX)(ev * norm));
     }
 }
 
-template <typename TOut, typename T1, typename T2>
-__global__ void residual_forward_kernel(TOut* out, T1* inp1, T2* inp2, int N) {
+__global__ void residual_forward_kernel(floatX* out, floatX* inp1, floatX* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
-        out[idx] = (TOut)((float)__ldcs(&inp1[idx]) + (float)__ldcs(&inp2[idx]));
+        out[idx] = (floatX)((float)__ldcs(&inp1[idx]) + (float)__ldcs(&inp2[idx]));
     }
 }
 
@@ -642,8 +637,7 @@ __global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floa
 // the idea is to employ one block to reduce along several columns,
 // where each block has a width of 32 columns to ensure coalesced access.
 // at the end we accumulate the reductions performed by the warps in each block via shared memory
-template <typename Td>
-__global__ void matmul_backward_bias_kernel4(Td* dbias, const Td* dout, int B, int T, int OC) {
+__global__ void matmul_backward_bias_kernel4(floatX* dbias, const floatX* dout, int B, int T, int OC) {
     // this kernel is launched with 1D grid_dim of OC/32
     // for example let's say block_size is 128
     extern __shared__ float smem[]; // of size block_size (128)
@@ -654,7 +648,7 @@ __global__ void matmul_backward_bias_kernel4(Td* dbias, const Td* dout, int B, i
 
     // pointer to the start of the column for one lane of threads
     // so e.g. 4 threads (of the same lane_id) will reduce this one column
-    const Td* dout_col = dout + tl + lane_id;
+    const floatX* dout_col = dout + tl + lane_id;
 
     // column reductions by looping through the rows
     // each of the 4 threads offsets by its warp_id and then skips by vstep
@@ -674,14 +668,12 @@ __global__ void matmul_backward_bias_kernel4(Td* dbias, const Td* dout, int B, i
         for (int j = 0; j < vstep; j++) {
             dout_sum += smem[lane_id + j * warpSize];
         }
-        dbias[tl + lane_id] = (Td)dout_sum;
+        dbias[tl + lane_id] = (floatX)dout_sum;
     }
 }
 
-// uses shared memory instead for the reduces
-template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-__global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
-                        const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+__global__ void layernorm_backward_kernel2(floatX* dinp, floatN* dweight, floatN* dbias,
+                        const floatX* dout, const floatX* inp, const floatN* weight, const floatX* mean, const floatX* rstd,
                         int B, int T, int C) {
     extern __shared__ float shared[]; // size = 2 * C
 
@@ -695,9 +687,9 @@ __global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparam
     int b = idx / T;
     int t = idx % T;
 
-    const Tdout* dout_bt = dout + b * T * C + t * C;
-    const Trest* inp_bt = inp + b * T * C + t * C;
-    Tdinp* dinp_bt = dinp + b * T * C + t * C;
+    const floatX* dout_bt = dout + b * T * C + t * C;
+    const floatX* inp_bt = inp + b * T * C + t * C;
+    floatX* dinp_bt = dinp + b * T * C + t * C;
     const float mean_bt = (float)mean[b * T + t];
     const float rstd_bt = (float)rstd[b * T + t];
 
@@ -741,14 +733,14 @@ __global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparam
         dval -= dnorm_mean; // term 2
         dval -= norm_bti * dnorm_norm_mean; // term 3
         dval *= rstd_bt; // final scale
-        dinp_bt[i] = (Tdinp)((float)dinp_bt[i] + dval);
+        dinp_bt[i] = (floatX)((float)dinp_bt[i] + dval);
     }
     __syncthreads();
 
     // write to global memory
     for(int i = threadIdx.x; i < C; i+= blockDim.x) {
-        atomicAddX(&dbias[i], (Tparams)dbias_shared[i]);
-        atomicAddX(&dweight[i], (Tparams)dweight_shared[i]);
+        atomicAddX(&dbias[i], (floatN)dbias_shared[i]);
+        atomicAddX(&dweight[i], (floatN)dweight_shared[i]);
     }
 }
 
@@ -834,13 +826,12 @@ struct SoftmaxParams {
     float Offset;
 };
 
-template <typename Type>
 __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_tile<32>& warp,
-                                                   int idx, const Type* inp, int V, int P) {
+                                                   int idx, const floatX* inp, int V, int P) {
     // same but not float4
     // one row of inp, i.e. inp[idx, :] of shape (V,)
 
-    const Type* x = inp + idx * P;
+    const floatX* x = inp + idx * P;
     float thread_maxval = -INFINITY;
     float thread_sumval = 0.0f;
     // do the loop in reverse to maximise probability of L2 cache hits
@@ -887,9 +878,8 @@ __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_til
 
 // same as 2 but not using float4 (see dev/cuda/classifier_fused.cu)
 // will _update_ logits to logit gradients
-template <typename Type>
-__global__ void fused_classifier_kernel3(Type* logits, Type* losses, Type* probs,
-                                         const Type* dlosses, const int* targets,
+__global__ void fused_classifier_kernel3(floatX* logits, floatX* losses, floatX* probs,
+                                         const floatX* dlosses, const int* targets,
                                          int B, int T, int V, int P) {
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
@@ -903,14 +893,14 @@ __global__ void fused_classifier_kernel3(Type* logits, Type* losses, Type* probs
     // calculate the probability needed for the loss and update (single-threaded)
     if(threadIdx.x == 0) {
         float prob = expf((float)logits[idx * P + ix] - sp.Offset) * sp.Scale;
-        losses[idx] = (Type)(-logf(prob));
+        losses[idx] = (floatX)(-logf(prob));
     }
 
     // very sensible default for dlosses is 1/(B*T), which is the uniform loss
     float dloss = (dlosses != NULL) ? (float)dlosses[idx] : 1.0f / (B*T);
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
-    const Type* logits_vec = logits + idx * P;
+    const floatX* logits_vec = logits + idx * P;
     // note that we use the padded dimension P to access data, but we only ever
     // modify the elements up to V, ignoring the padded dimensions and leaving them at 0
     for (int i = threadIdx.x; i < V; i += blockDim.x) {
@@ -919,19 +909,18 @@ __global__ void fused_classifier_kernel3(Type* logits, Type* losses, Type* probs
         float v = (float)__ldcs(&logits_vec[i]);
         float prob = expf(v - sp.Offset) * sp.Scale;
         if (probs != NULL) {
-            probs[idx * P + i] = (Type)prob;
+            probs[idx * P + i] = (floatX)prob;
         }
         float indicator = (i == ix) ? 1.0f : 0.0f;
-        logits[idx * P + i] = (Type)((prob - indicator) * dloss);
+        logits[idx * P + i] = (floatX)((prob - indicator) * dloss);
     }
 }
 
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-template <typename TOut, typename Tw>
-void encoder_forward(TOut* out,
-                     int* inp, Tw* wte, Tw* wpe,
+void encoder_forward(floatX* out,
+                     int* inp, floatX* wte, floatX* wpe,
                      int B, int T, int C) {
     const int N = B * T * C;
     const int block_size = 256;
@@ -940,9 +929,8 @@ void encoder_forward(TOut* out,
     cudaCheck(cudaGetLastError());
 }
 
-template <typename Type, typename Tdout>
-void encoder_backward(Type* dwte, Type* dwpe,
-                    const Tdout* dout, const int* inp,
+void encoder_backward(floatX* dwte, floatX* dwpe,
+                    const floatX* dout, const int* inp,
                     int B, int T, int C) {
     const int N = B * T * C;
     const int block_size = 256;
@@ -951,9 +939,8 @@ void encoder_backward(Type* dwte, Type* dwpe,
     cudaCheck(cudaGetLastError());
 }
 
-template <typename TOut, typename Type, typename Tparam>
-void layernorm_forward(TOut* out, Type* mean, Type* rstd,
-                       Type* inp, Tparam* weight, Tparam* bias,
+void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
+                       floatX* inp, floatN* weight, floatN* bias,
                        int B, int T, int C) {
     const int block_size = 512;
     const int N = B * T;
@@ -1117,8 +1104,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     cudaCheck(cudaGetLastError());
 }
 
-template <typename TOut, typename T1, typename T2>
-void residual_forward(TOut* out, T1* inp1, T2* inp2, int N) {
+void residual_forward(floatX* out, floatX* inp1, floatX* inp2, int N) {
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
     residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
@@ -1161,9 +1147,8 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
     }
 }
 
-template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
-void layernorm_backward(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
-                        const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+void layernorm_backward(floatX* dinp, floatN* dweight, floatN* dbias,
+                        const floatX* dout, const floatX* inp, const floatN* weight, const floatX* mean, const floatX* rstd,
                         int B, int T, int C) {
     const int block_size = 512;
     const int N = B * T;
