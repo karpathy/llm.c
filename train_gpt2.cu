@@ -2138,7 +2138,7 @@ int main(int argc, char *argv[]) {
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
-    (void)cublas_compute_type; // unused in BF16 mode, avoid warning 
+    if(cublas_compute_type); // unused in BF16 mode, avoid warning 
 
     printf0("| device                | %-50s |\n", deviceProp.name);
     printf0("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
