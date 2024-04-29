@@ -1510,9 +1510,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     freadCheck(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(EXIT_FAILURE); }
     int version = model_header[1];
-    if (!(version == 3 || version == 4)) {
+    if (!(version == 3 || version == 5)) {
         // 3 = fp32, padded vocab
-        // 4 = bf16, padded vocab
+        // 5 = bf16, padded vocab, layernorms also in bf16
         fprintf(stderr, "Bad version in model file\n");
         fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
         exit(EXIT_FAILURE);
