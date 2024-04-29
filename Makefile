@@ -68,28 +68,28 @@ endif
 ifeq ($(NO_OMP), 1)
   $(info OpenMP is manually disabled)
 else
+  ifneq ($(OS), Windows_NT)
   # Detect if running on macOS or Linux
-  ifeq ($(SHELL_UNAME), Darwin)
-    # Check for Homebrew's libomp installation in different common directories
-    ifeq ($(shell [ -d /opt/homebrew/opt/libomp/lib ] && echo "exists"), exists)
-      # macOS with Homebrew on ARM (Apple Silicon)
-      CFLAGS += -Xclang -fopenmp -DOMP
-      LDFLAGS += -L/opt/homebrew/opt/libomp/lib
-      LDLIBS += -lomp
-      INCLUDES += -I/opt/homebrew/opt/libomp/include
-      $(info OpenMP found, compiling with OpenMP support)
-    else ifeq ($(shell [ -d /usr/local/opt/libomp/lib ] && echo "exists"), exists)
-      # macOS with Homebrew on Intel
-      CFLAGS += -Xclang -fopenmp -DOMP
-      LDFLAGS += -L/usr/local/opt/libomp/lib
-      LDLIBS += -lomp
-      INCLUDES += -I/usr/local/opt/libomp/include
-      $(info OpenMP found, compiling with OpenMP support)
+    ifeq ($(SHELL_UNAME), Darwin)
+      # Check for Homebrew's libomp installation in different common directories
+      ifeq ($(shell [ -d /opt/homebrew/opt/libomp/lib ] && echo "exists"), exists)
+        # macOS with Homebrew on ARM (Apple Silicon)
+        CFLAGS += -Xclang -fopenmp -DOMP
+        LDFLAGS += -L/opt/homebrew/opt/libomp/lib
+        LDLIBS += -lomp
+        INCLUDES += -I/opt/homebrew/opt/libomp/include
+        $(info OpenMP found, compiling with OpenMP support)
+      else ifeq ($(shell [ -d /usr/local/opt/libomp/lib ] && echo "exists"), exists)
+        # macOS with Homebrew on Intel
+        CFLAGS += -Xclang -fopenmp -DOMP
+        LDFLAGS += -L/usr/local/opt/libomp/lib
+        LDLIBS += -lomp
+        INCLUDES += -I/usr/local/opt/libomp/include
+        $(info OpenMP found, compiling with OpenMP support)
+      else
+        $(warning OpenMP not found, skipping OpenMP support)
+      endif
     else
-      $(warning OpenMP not found, skipping OpenMP support)
-    endif
-  else
-    ifneq ($(OS), Windows_NT)
       # Check for OpenMP support in GCC or Clang on Linux
       ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
         CFLAGS += -fopenmp -DOMP
