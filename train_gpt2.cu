@@ -59,6 +59,7 @@ mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 
 enum PrecisionMode {
     PRECISION_FP32,
+    PRECISION_FP16,
     PRECISION_BF16
 };
 
@@ -73,6 +74,19 @@ const char* precision_mode_str = "fp32";
 
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclFloat;
+#endif
+
+// use fp16 (note: this may require gradient scaler, currently not implemented!)
+#elif defined(ENABLE_FP16)
+typedef half floatX;
+#define CUBLAS_LOWP CUDA_R_16F
+#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+const char* load_filename = "gpt2_124M.bin"; // fp32 weights
+PrecisionMode PRECISION_MODE = PRECISION_FP16;
+const char* precision_mode_str = "fp16";
+
+#ifdef MULTI_GPU
+const ncclDataType_t ncclFloatX = ncclHalf;
 #endif
 
 // bfloat16 (default!)
@@ -160,6 +174,19 @@ __device__ void atomicAddX(__nv_bfloat16* addr, __nv_bfloat16 val) {
     atomicAdd(ptr_bf16, add_val);
 }
 #endif
+
+#ifdef ENABLE_FP16
+__device__ void atomicAddX(half* addr, half val) {
+    uintptr_t ptr_val = reinterpret_cast<uintptr_t>(addr);
+    half2* ptr_fp16 = reinterpret_cast<half2*>(ptr_val & ~uintptr_t(0x3));
+
+    // Prepare the value to add, setting the other half to zero
+    half2 add_val = (ptr_val & 0x3) ? __halves2half2(__ushort_as_half(0), val)
+                                    : __halves2half2(val, __ushort_as_half(0));
+    atomicAdd(ptr_fp16, add_val);
+}
+#endif
+
 __device__ void atomicAddX(float* addr, float val) {
     atomicAdd(addr, val);
 }
@@ -250,7 +277,7 @@ typedef struct {
     int num_processes;     // Total number of processes. 1 if no multi-GPU.
     int local_device_idx;  // This process GPU index on current machine. 0 if no multi-GPU.
 #ifdef MULTI_GPU
-    ncclComm_t nccl_comm;  // NCCL communication primitive, used for collective mutli-GPU work.
+    ncclComm_t nccl_comm;  // NCCL communication primitive, used for collective multi-GPU work.
 #endif
 } MultiGpuConfig;
 
@@ -1455,6 +1482,15 @@ typedef struct {
 } GPT2;
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
+
+    if (PRECISION_MODE == PRECISION_FP16) {
+        // TODO for later perhaps, would require us dynamically converting the
+        // model weights from fp32 to fp16 online, here in this function, or writing
+        // the fp16 weights directly from Python, which we only do for fp32/bf16 atm.
+        fprintf(stderr, "build_from_checkpoint() does not support fp16 right now.\n");
+        exit(EXIT_FAILURE);
+    }
+
     // read in model from a checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
@@ -1792,7 +1828,7 @@ float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_conf
 
 // Averages out the loss and gradients across all GPUs. No-op when multi-GPU is disabled.
 // todo - this version only works if all the parameters are the same size (floatX)
-void gpt2_mutli_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
+void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
     // Average all losses.
     model->accumulated_mean_loss = multi_gpu_cpu_float_mean(model->mean_loss, multi_gpu_config);
 #ifdef MULTI_GPU
@@ -2271,7 +2307,9 @@ int main(int argc, char *argv[]) {
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
-        gpt2_mutli_gpu_accumulate(&model, &multi_gpu_config);
+        if (multi_gpu_config.num_processes > 1) {
+            gpt2_multi_gpu_accumulate(&model, &multi_gpu_config);
+        }
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
