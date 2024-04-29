@@ -112,7 +112,7 @@ struct alignas(16) Packed128 {
 
 // use this function to load a Packet128 from an aligned memory address
 template<class ElementType, ELoadMode Mode=ELoadMode::CA>
-__device__ Packed128<std::remove_const_t<ElementType>> load_aligned(ElementType* address, load_mode_t<Mode> mode = {}) {
+__device__ Packed128<ElementType> load_aligned(const ElementType* address, load_mode_t<Mode> mode = {}) {
     return {generic_load(reinterpret_cast<const int4*>(address), mode)};
 }
 
