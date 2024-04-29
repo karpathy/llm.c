@@ -33,7 +33,7 @@ __global__ void residual_forward_kernel1(float* out, const float* inp1, const fl
     }
 }
 
-// loop unrolling
+// grid-stride loop
 __global__ void residual_forward_kernel2(float* out, const float* inp1, const float* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     for (int i = idx; i < N; i += blockDim.x * gridDim.x) {
