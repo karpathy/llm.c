@@ -365,7 +365,7 @@ __device__ void st_vec(float* address, float4 val) {
 }
 
 // vector instructions for coalesced memory access: 1.7 ms
-__device__ void matmul_tri3(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
+__device__ void matmul_tri_vectorized(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
     int i_base = 128 * blockIdx.x + 8 * threadIdx.x;
     int j_base = 128 * blockIdx.y + 8 * threadIdx.y;
 
@@ -425,7 +425,7 @@ __device__ void matmul_tri3(float* p, int ps, const float* k, int ks, const floa
  *  details.]
  *
  */
-__device__ void matmul_tri4(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
+__device__ void matmul_tri_shared(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
     int i_base = 128 * blockIdx.x + 8 * threadIdx.x;
     int j_base = 128 * blockIdx.y + 8 * threadIdx.y;
 
@@ -439,6 +439,11 @@ __device__ void matmul_tri4(float* p, int ps, const float* k, int ks, const floa
 
     __shared__ float lhs_s[128][32];
     __shared__ float rhs_s[128][32];
+
+    // The different threads will go through the inner loop not in sync, but with a specific
+    // offset so that shared memory will be accessed conflict-free. Calculating the loop
+    // counter once results in noticeably fewer instructions generated.
+    int si_start = 16 * threadIdx.y + threadIdx.x;
 
     float vals[8][8] = {};
     for (int so = 0; so < hs; so += 32) {
@@ -457,14 +462,18 @@ __device__ void matmul_tri4(float* p, int ps, const float* k, int ks, const floa
         }
         __syncthreads();
 
-        for (int si = 0; si < 32; ++si) {
+        // Note: This loop-counter deliberately overflows the maximum value of 32.
+        // By doing % 32 inside, we ensure that we warp-around.
+        for (int s = si_start; s < si_start + 32; ++s) {
+            // shuffle the order in which different threads go through this sum to ensure
+            // coalesced access.
             float rhs[8];
             for (int u = 0; u < 8; ++u) {
-                rhs[u] = rhs_s[u + 8 * threadIdx.y][(si + threadIdx.x) % 32];
+                rhs[u] = rhs_s[u + 8 * threadIdx.y][s%32];
             }
 
             for (int ii = 0; ii < 8; ++ii) {
-                float lhs = lhs_s[ii + 8 * threadIdx.x][(si + threadIdx.x) % 32];
+                float lhs = lhs_s[ii + 8 * threadIdx.x][s%32];
                 for (int ji = 0; ji < 8; ++ji) {
                     vals[ii][ji] += lhs * rhs[ji];
                 }
@@ -489,6 +498,76 @@ __device__ void matmul_tri4(float* p, int ps, const float* k, int ks, const floa
         }
     }
 }
+
+
+// This version reorganizes the subblock that is calculated by each thread. Instead of continuous 8x8 blocks, each thread
+// calculates distributed results, so that results can be written in a coalesced way. This also requires transposing
+// the threads within each block compared to the earlier versions.
+__device__ void matmul_tri5(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
+    // we need all threads for loading data, so none of them can chicken out early, even
+    // if they are not responsible for any useful result.
+    if (blockIdx.y > blockIdx.x)
+        return;
+
+    k += 128 * blockIdx.x * ks;
+    q += 128 * blockIdx.y * qs;
+    p += 128 * blockIdx.x * ps + 128 * blockIdx.y;
+
+    __shared__ float lhs_s[128][32];
+    __shared__ float rhs_s[128][32];
+
+    // The different threads will go through the inner loop not in sync, but with a specific
+    // offset so that shared memory will be accessed conflict-free. Calculating the loop
+    // counter once results in noticeably fewer instructions generated.
+    int si_start = 16 * threadIdx.y + threadIdx.x;
+
+    float vals[8][8] = {};
+    for (int so = 0; so < hs; so += 32) {
+        // Read a large slice of the input, worked on together by all threads.
+        // They are organized differently for this part. We want to ensure
+        // fully coalesced loads, so we let a single warp handle consecutive
+        // addresses, which means we need to combine two threadIdx.y values
+        // in one read operation.
+        // note: threads may read data here that they don't need themselves.
+        //       this really is a block-level operation.
+        __syncthreads();
+        // vectoriezd loading of inputs.
+        int ty = threadIdx.x / 8;
+        for(int y = ty + 2 * threadIdx.y; y < 128; y += 32) {
+            int tx = threadIdx.x % 8;
+            st_vec(lhs_s[y] + 4*tx, ld_vec(k + y * ks + so + 4 * tx));
+            st_vec(rhs_s[y] + 4*tx, ld_vec(q + y * ks + so + 4 * tx));
+        }
+        __syncthreads();
+
+        // Note: This loop-counter deliberately overflows the maximum value of 32.
+        // By doing % 32 inside, we ensure that we warp-around.
+        for (int s = si_start; s < si_start + 32; ++s) {
+            // shuffle the order in which different threads go through this sum to ensure
+            // coalesced access.
+            float rhs[8];
+            for (int u = 0; u < 8; ++u) {
+                rhs[u] = rhs_s[u*16 + threadIdx.x][s%32];
+            }
+
+            for (int ii = 0; ii < 8; ++ii) {
+                float lhs = lhs_s[ii + 8 * threadIdx.y][s%32];
+                for (int ji = 0; ji < 8; ++ji) {
+                    vals[ii][ji] += lhs * rhs[ji];
+                }
+            }
+        }
+    }
+
+    for (int ii = 0; ii < 8; ++ii) {
+        for (int ji = 0; ji < 8; ++ji) {
+            int i = 8 * threadIdx.y + ii;
+            int j = threadIdx.x + 16*ji;
+            p[i * ps + j] = vals[ii][ji] * alpha;
+        }
+    }
+}
+
 
 /*                     ** Chapter VI - Competition Day **
  *
@@ -518,10 +597,13 @@ void trimul_gpu(int kernel_num,
             trimul_launcher<matmul_tri_registers>(out, inp, B, T, C, NH);
             break;
         case 3:
-            trimul_launcher<matmul_tri3>(out, inp, B, T, C, NH);
+            trimul_launcher<matmul_tri_vectorized>(out, inp, B, T, C, NH);
             break;
         case 4:
-            trimul_launcher<matmul_tri4>(out, inp, B, T, C, NH);
+            trimul_launcher<matmul_tri_shared>(out, inp, B, T, C, NH);
+            break;
+        case 5:
+            trimul_launcher<matmul_tri5>(out, inp, B, T, C, NH);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -542,6 +624,7 @@ int main(int argc, char **argv) {
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
     cublasCreate(&cublas_handle);
+    cublasCheck(cublasSetMathMode(cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH));
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * NH * T * T * sizeof(float));

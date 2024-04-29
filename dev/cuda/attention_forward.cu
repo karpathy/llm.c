@@ -649,6 +649,180 @@ __global__ void attention_forward_fused1(float* out, float* preatt, float* att,
     }
 }
 
+__device__ float4 ld_vec(const float* address) {
+    return *reinterpret_cast<const float4*>(address);
+}
+
+__device__ void st_vec(float* address, float4 val) {
+    *reinterpret_cast<float4*>(address) = val;
+}
+
+__device__ void matmul_tri(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
+    // we need all threads for loading data, so none of them can chicken out early, even
+    // if they are not responsible for any useful result.
+    if (blockIdx.y > blockIdx.x)
+        return;
+
+    k += 128 * blockIdx.x * ks;
+    q += 128 * blockIdx.y * qs;
+    p += 128 * blockIdx.x * ps + 128 * blockIdx.y;
+
+    __shared__ float lhs_s[128][32];
+    __shared__ float rhs_s[128][32];
+
+    // The different threads will go through the inner loop not in sync, but with a specific
+    // offset so that shared memory will be accessed conflict-free. Calculating the loop
+    // counter once results in noticeably fewer instructions generated.
+    int si_start = 16 * threadIdx.y + threadIdx.x;
+
+    float vals[8][8] = {};
+    for (int so = 0; so < hs; so += 32) {
+        // Read a large slice of the input, worked on together by all threads.
+        // They are organized differently for this part. We want to ensure
+        // fully coalesced loads, so we let a single warp handle consecutive
+        // addresses, which means we need to combine two threadIdx.y values
+        // in one read operation.
+        // note: threads may read data here that they don't need themselves.
+        //       this really is a block-level operation.
+        __syncthreads();
+        // vectoriezd loading of inputs.
+        int ty = threadIdx.x / 8;
+        for(int y = ty + 2 * threadIdx.y; y < 128; y += 32) {
+            int tx = threadIdx.x % 8;
+            st_vec(lhs_s[y] + 4*tx, ld_vec(k + y * ks + so + 4 * tx));
+            st_vec(rhs_s[y] + 4*tx, ld_vec(q + y * ks + so + 4 * tx));
+        }
+        __syncthreads();
+
+        // Note: This loop-counter deliberately overflows the maximum value of 32.
+        // By doing % 32 inside, we ensure that we warp-around.
+        for (int s = si_start; s < si_start + 32; ++s) {
+            // shuffle the order in which different threads go through this sum to ensure
+            // coalesced access.
+            float rhs[8];
+            for (int u = 0; u < 8; ++u) {
+                rhs[u] = rhs_s[u*16 + threadIdx.x][s%32];
+            }
+
+            for (int ii = 0; ii < 8; ++ii) {
+                float lhs = lhs_s[ii + 8 * threadIdx.y][s%32];
+                for (int ji = 0; ji < 8; ++ji) {
+                    vals[ii][ji] += lhs * rhs[ji];
+                }
+            }
+        }
+    }
+
+    for (int ii = 0; ii < 8; ++ii) {
+        for (int ji = 0; ji < 8; ++ji) {
+            int i = 8 * threadIdx.y + ii;
+            int j = threadIdx.x + 16*ji;
+            p[i * ps + j] = vals[ii][ji] * alpha;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256, 2) trimul_global(float* out, const float* inp, int T, int C, int NH) {
+    // skip above the diagonal
+    if(blockIdx.y > blockIdx.x)
+        return;
+
+    // set up indices
+    int C3 = C*3;
+    int hs = C / NH; // head size
+    float scale = 1.0 / sqrtf(hs);
+
+    // we put the "batch x head" dimension into the z block index.
+    int h = blockIdx.z % NH;
+    int b = blockIdx.z / NH;
+
+    // Get the base address for the current batch and head
+    const float* q = inp + b * T * C3 + h * hs;
+    const float* k = inp + b * T * C3 + h * hs + C;
+    float* r = out + (b*NH + h)*T*T;
+
+    // start the multiplication
+    matmul_tri(r, T, q, C3, k, C3, T, hs, scale);
+}
+
+__device__ void att_out_shared(float* o, int os, const float* a, int as, const float* v, int vs, int T) {
+    // get coordinates of our block
+    int i_base = 128 * blockIdx.y;
+    int j_base = 64 * blockIdx.x;
+    int i_max = i_base + 128;
+
+
+    __shared__ float4 v_buffer[16][16];
+    __shared__ float4 a_buffer[4][16][8];
+
+    // adjust pointers to current block
+    v += j_base;
+    a += i_base * as;
+    o += j_base + i_base * os;
+
+    // calculate 8x4 results in one thread, loading all the required inputs just once
+    float vals[8][4] = {};
+    for (int so = 0; so < i_max ; so += 16) {
+
+        // fill buffers
+        __syncthreads();
+        int si = threadIdx.y;
+        v_buffer[si][threadIdx.x] = ld_vec(v + vs * (so + si) + 4 * threadIdx.x);
+
+        for(int mo = 0; mo < 2; ++mo) {
+            int io = threadIdx.x % 8;
+            int sm = 2*mo + threadIdx.x / 8;
+            int i = 8 * threadIdx.y + io;
+            a_buffer[sm][threadIdx.y][io] = ld_vec(a + i * as + so + 4 * sm);
+        }
+        __syncthreads();
+        for(int sm = 0; sm < 4; ++sm) {
+            float4 ai[8];
+            for (int io = 0; io < 8; ++io) {
+                ai[io] = a_buffer[sm][threadIdx.y][io];
+            }
+            for (int si = 0; si < 4; ++si) {
+                float4 vj = v_buffer[4*sm + si][threadIdx.x];
+                for (int io = 0; io < 8; ++io) {
+                    vals[io][0] += vec_at(ai[io], si) * vj.x;
+                    vals[io][1] += vec_at(ai[io], si) * vj.y;
+                    vals[io][2] += vec_at(ai[io], si) * vj.z;
+                    vals[io][3] += vec_at(ai[io], si) * vj.w;
+                }
+            }
+        }
+    }
+
+    for (int io = 0; io < 8; ++io) {
+        int i = 8 * threadIdx.y + io;
+        float4 store = {vals[io][0], vals[io][1], vals[io][2], vals[io][3]};
+        int j = 4 * threadIdx.x;
+        st_vec(o + i * os + j, store);
+    }
+}
+
+
+__global__ void __launch_bounds__(256, 2) att_out_global(float* out, const float* att, const float* inp, int T, int C, int NH) {
+    // att: (B, NH, T, T), inp: (B, T, 3C), out: (B, T, C)
+    // set up indices
+    int C3 = C*3;
+    int hs = C / NH; // head size
+
+    // we put the "batch x head" dimension into the z block index.
+    int h = blockIdx.z % NH;
+    int b = blockIdx.z / NH;
+
+    // Get the base address for the current batch and head
+    // (B, nh, T, hs)
+    const float* a = att + b * NH * T * T + h * T * T;
+    const float* v = inp + b * T * C3 + h * hs + 2*C;
+    float* r = out + b*T*C + h * hs;
+    //float* rend = out + B;
+
+    // start the multiplication
+    att_out_shared(r, C, a, T, v, C3, T);
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -763,6 +937,7 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     int total_threads = B * NH * T * HS;
     int num_blocks = ceil_div(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+    cudaCheck(cudaGetLastError());
 
     // batched matrix multiply with cuBLAS
     const float alpha = 1.0f;
@@ -788,6 +963,7 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     int grid_size = B * NH * T;
     size_t shared_mem_size = 2 * softmax_block_size / 32 * sizeof(float);
     softmax_forward_kernel4<<<grid_size, softmax_block_size, shared_mem_size>>>(att, preatt, B * NH * T, T);
+    cudaCheck(cudaGetLastError());
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
@@ -805,6 +981,7 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = ceil_div(B * T * C, block_size);
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+    cudaCheck(cudaGetLastError());
 }
 
 void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
@@ -824,6 +1001,7 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     int total_threads = B * NH * T * HS;
     int num_blocks = ceil_div(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+    cudaCheck(cudaGetLastError());
 
     // batched matrix multiply with cuBLAS
     const float alpha = 1.0f;
@@ -843,6 +1021,7 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     int softmax_block_size = 256;
     int grid_size = ceil_div(B * NH * T * 32, softmax_block_size);
     softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
+    cudaCheck(cudaGetLastError());
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
@@ -860,6 +1039,7 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = ceil_div(B * T * C, block_size);
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+    cudaCheck(cudaGetLastError());
 }
 
 void attention_forward5(float* out, float* preatt, float* att,
@@ -869,6 +1049,35 @@ void attention_forward5(float* out, float* preatt, float* att,
     // attention calculation
     int x_blocks = ceil_div(T, block_size / 32);
     attention_forward_fused1<<<dim3(x_blocks, NH, B), block_size>>>(out, preatt, att, inp, B, T, C, NH);
+    cudaCheck(cudaGetLastError());
+}
+
+void attention_forward6(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
+                        const float* inp,
+                        int B, int T, int C, int NH,
+                        const int block_size) {
+    // inp is (B, T, 3C) QKV
+    // preatt, att are (B, NH, T, T)
+    // output is (B, T, C)
+    assert(T % 128 == 0);
+    assert(C % 32 == 0);
+    trimul_global<<<dim3(T / 128, T / 128, NH * B), dim3(16, 16)>>>(preatt, inp, T, C, NH);
+    cudaCheck(cudaGetLastError());
+
+    // TODO get rid of scale, not needed here.
+    float scale = 1.0;
+    int grid_size = ceil_div(B * NH * T * 32, block_size);
+    softmax_forward_kernel5<<<grid_size, block_size>>>(att, scale, preatt, B * NH, T);
+    cudaCheck(cudaGetLastError());
+
+    // we assume nice shapes here. Let's not make the code a mess by supporting weird shapes that you
+    // wouldn't want to use anyway.
+    assert(T % 128 == 0);
+    assert(C % 128 == 0);
+    assert((C / NH) % 64 == 0);
+    // No need to ceil_div, if it's not a multiple of 128, we would get wrong results anyway.
+    att_out_global<<<dim3(C / NH / 64, T / 128, NH * B), dim3(16, 16)>>>(out, att, inp, T, C, NH);
+    cudaCheck(cudaGetLastError());
 }
 
 // kernel version dispatch
@@ -893,6 +1102,9 @@ void attention_forward(int kernel_num,
         case 5:
             attention_forward5(out, preatt, att, inp, B, T, C, NH, block_size);
             break;
+        case 6:
+            attention_forward6(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+            break;
         default:
             printf("Invalid kernel number\n");
             exit(1);
@@ -911,6 +1123,7 @@ int main(int argc, char **argv) {
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
     cublasCreate(&cublas_handle);
+    cublasCheck(cublasSetMathMode(cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH));
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * C * sizeof(float));
@@ -947,19 +1160,26 @@ int main(int argc, char **argv) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
         attention_forward(kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+
+        float prec = 1e-4;
+        // when we're using cuBLAS with tensor cores, we need to expect less precise results.
+        if(kernel_num == 3 || kernel_num == 4) {
+            prec = 5e-4;
+        }
+
         // all kernels should produce the correct output out
-        validate_result(d_out, out, "out", B * T * C, 1e-4f);
+        validate_result(d_out, out, "out", B * T * C, prec);
         // but as for preatt and att, things get a bit more complicated:
         if (kernel_num != 2) {
             // kernel 2 (knowingly) fails att/preatt because it uses a different algorithm
             // that estimates the softmax online and never materializes preatt/att
-            validate_result(d_att, att, "att", B * NH * T * T, 1e-4f);
+            validate_result(d_att, att, "att", B * NH * T * T, prec);
         }
         if (kernel_num != 2 && kernel_num != 4 && kernel_num != 5) {
             // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
             // into the softmax, so preatt is off by 1.0f / sqrt(HS)
             // but att and out (checked below) should match.
-            validate_result(d_preatt, preatt, "preatt", B * NH * T * T, 1e-4f);
+            validate_result(d_preatt, preatt, "preatt", B * NH * T * T, prec);
         }
     }
     printf("All results match. Starting benchmarks.\n\n");
