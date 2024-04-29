@@ -11,71 +11,15 @@ If encountering "error: identifier "M_PI" is undefined", add the following lines
 
 version 1 is naive port from CPU code to kernel
 ./gelu_forward 1
+
+version 2 uses the Packed128 data structure
+./gelu_forward 2
 */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
 #include "common.h"
-
-// We define a wrapper type that contains 128 bits of whatever underlying type we want
-// We allow individual element access with [], and provide a convenience accessor to get the data converted to
-// a regular float for mixed-precision operations.
-
-template<class ElementType>
-struct alignas(16) Packed128 {
-    __device__ __forceinline__ Packed128() = default;
-    __device__ __forceinline__ explicit Packed128(int4 bits) {
-        static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
-        memcpy(&payload, &bits, sizeof(bits));
-    }
-
-    __device__ __forceinline__ ElementType& operator[](int index) {
-        return payload[index];
-    }
-    __device__ __forceinline__ const ElementType& operator[](int index) const {
-        return payload[index];
-    }
-    __device__ __forceinline__ float fp32(int index) {
-        return static_cast<float>(payload[index]);
-    }
-
-    __device__ __forceinline__ int4 get_bits() const {
-        int4 bits;
-        static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
-        memcpy(&bits, &payload, sizeof(bits));
-        return bits;
-    }
-
-    static constexpr const size_t size = sizeof(int4) / sizeof(ElementType);
-
-    ElementType payload[size];
-};
-typedef Packed128<float> f128;
-
-// load a Packed128 from an aligned memory address
-template<class ElementType>
-__device__ __forceinline__ Packed128<ElementType> load128(const ElementType* address) {
-    return Packed128<ElementType>{*reinterpret_cast<const int4*>(address)};
-}
-
-// load a Packed128 from an aligned memory address with streaming cache hint
-template<class ElementType>
-__device__ __forceinline__ Packed128<ElementType> load128cs(const ElementType* address) {
-    return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
-}
-
-// store a Packed128 to an aligned memory address
-template<class ElementType>
-__device__ __forceinline__ void store128(ElementType* target, Packed128<ElementType> value) {
-    *reinterpret_cast<int4*>(target) = value.get_bits();
-}
-
-// store a Packed128 to an aligned memory address with streaming cache hint
-template<class ElementType>
-__device__ __forceinline__ void store128cs(ElementType* target, Packed128<ElementType> value) {
-    __stcs(reinterpret_cast<int4*>(target), value.get_bits());
-}
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -108,12 +52,14 @@ __global__ void gelu_kernel2(float* out, const float* inp, int N) {
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * f128::size;
     if (i < N) {
         f128 packet_out;
-        f128 packet_in = load128cs(inp + i);
+        f128 packet_in = load128cs(inp + i); // load and do not keep in cache
         for(int k = 0; k < packet_in.size; ++k) {
             float xi = packet_in[k];
             float cube = 0.044715f * xi * xi * xi;
             packet_out[k] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
         }
+        // store instead of storecs (without cache streaming) in case it is useful for the
+        // data to be in the cache for the next operation after this GeLU
         store128(out + i, packet_out);
     }
 }
