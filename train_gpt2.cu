@@ -675,7 +675,6 @@ __global__ void matmul_backward_bias_kernel4(floatX* dbias, const floatX* dout, 
     }
 }
 
-__global__ void layernorm_backward_kernel2(floatX* dinp, floatN* dweight, floatN* dbias, float* scratch,
 // single FP32 scratchpad shared by all the threadblocks (based on kernels 3 & 5)
 __global__ void layernorm_backward_kernel6(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                         const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
@@ -706,9 +705,9 @@ __global__ void layernorm_backward_kernel6(floatX* dinp, floatX* dweight, floatX
         int b = idx / T;
         int t = idx % T;
 
-        const Tdout* dout_bt = dout + b * T * C + t * C;
-        const Trest* inp_bt = inp + b * T * C + t * C;
-        Tdinp* dinp_bt = dinp + b * T * C + t * C;
+        const floatX* dout_bt = dout + b * T * C + t * C;
+        const floatX* inp_bt = inp + b * T * C + t * C;
+        floatX* dinp_bt = dinp + b * T * C + t * C;
         const float mean_bt = (float)mean[b * T + t];
         const float rstd_bt = (float)rstd[b * T + t];
 
@@ -741,7 +740,7 @@ __global__ void layernorm_backward_kernel6(floatX* dinp, floatX* dweight, floatX
             dval -= dnorm_mean; // term 2
             dval -= norm_bti * dnorm_norm_mean; // term 3
             dval *= rstd_bt; // final scale
-            dinp_bt[i] = (Tdinp)((float)dinp_bt[i] + dval);
+            dinp_bt[i] = (floatX)((float)dinp_bt[i] + dval);
         }
     }
 
@@ -764,8 +763,8 @@ __global__ void layernorm_backward_kernel6(floatX* dinp, floatX* dweight, floatX
     if (*tmp_flag == gridDim.x-1) {
         for(int i = threadIdx.x; i < C; i+= blockDim.x) {
             // todo - potentially do stochastic rounding here as well
-            dbias[i] = (Tparams)scratch_dbias[i];
-            dweight[i] = (Tparams)scratch_dweight[i];
+            dbias[i] = (floatX)scratch_dbias[i];
+            dweight[i] = (floatX)scratch_dweight[i];
         }
     }
 }

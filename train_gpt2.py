@@ -270,9 +270,9 @@ def write_tensors_bf16(model_tensors, L, file):
     write_bf16(model_tensors["transformer.wte.weight"], file) # (V, C)
     write_bf16(model_tensors["transformer.wpe.weight"], file) # (T, C)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+        write_bf16(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
+        write_bf16(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
     for i in range(L): # (L, 3C, C)
         write_bf16(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
     for i in range(L): # (L, 3C)
@@ -282,9 +282,9 @@ def write_tensors_bf16(model_tensors, L, file):
     for i in range(L): # (L, C)
         write_bf16(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+        write_bf16(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
+        write_bf16(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
     for i in range(L): # (L, 4C, C)
         write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
     for i in range(L): # (L, 4C)
@@ -293,8 +293,8 @@ def write_tensors_bf16(model_tensors, L, file):
         write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
     for i in range(L): # (L, C)
         write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
-    write_fp32(model_tensors["transformer.ln_f.weight"], file) # (C, )
-    write_fp32(model_tensors["transformer.ln_f.bias"], file) # (C, )
+    write_bf16(model_tensors["transformer.ln_f.weight"], file) # (C, )
+    write_bf16(model_tensors["transformer.ln_f.bias"], file) # (C, )
 
 @torch.no_grad()
 def pad_vocab(tensor, multiple=128, value=0):
@@ -323,7 +323,7 @@ def write_model(model, filename, dtype):
     assert dtype in {"float32", "bfloat16"} # float16 todo maybe later
     version = {
         "float32": 3,
-        "bfloat16": 4,
+        "bfloat16": 5,
     }[dtype]
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240326 # magic
