@@ -78,7 +78,7 @@ float* make_ones_float(size_t N) {
 
 template<class D, class T>
 void validate_result(D* device_result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance=1e-4) {
-    D* out_gpu = (D*)malloc(num_elements * sizeof(T));
+    D* out_gpu = (D*)malloc(num_elements * sizeof(D));
     cudaCheck(cudaMemcpy(out_gpu, device_result, num_elements * sizeof(D), cudaMemcpyDeviceToHost));
     int nfaults = 0;
     for (int i = 0; i < num_elements; i++) {
