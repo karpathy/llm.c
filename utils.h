@@ -4,6 +4,8 @@
  C standard library function and check its return code. If an error was reported,
  the program prints some debug information and exits.
 */
+#ifndef UTILS_H
+#define UTILS_H
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,3 +97,5 @@ void *malloc_check(size_t size, const char *file, int line) {
 }
 
 #define mallocCheck(size) malloc_check(size, __FILE__, __LINE__)
+
+#endif

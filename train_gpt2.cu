@@ -29,7 +29,6 @@ mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
-#include <ctype.h>
 #include <math.h>
 #include <time.h>
 #include <assert.h>
@@ -50,9 +49,10 @@ mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 #include <nccl.h>
 #endif
 // our own utilities
-// defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck
-// defines: mallocCheck
+// defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 #include "utils.h"
+// defines: tokenizer_init, tokenizer_decode, tokenizer_free
+#include "tokenizer.h"
 
 // ----------------------------------------------------------------------------
 // CUDA precision settings
@@ -1958,8 +1958,6 @@ void dataloader_free(DataLoader *loader) {
 // ----------------------------------------------------------------------------
 // sampler: takes probabilities and samples integers from them
 
-#define GPT2_EOT 50256
-
 int sample_softmax(const float* logits, int n, float coin) {
     // sample index from logits (converted to probabilities using softmax)
     // coin is a random number in [0, 1), usually from random_f32()
@@ -1977,86 +1975,6 @@ int sample_softmax(const float* logits, int n, float coin) {
         }
     }
     return n - 1; // in case of rounding errors
-}
-
-// ----------------------------------------------------------------------------
-// Tokenizer (only supports decoding: tokens (integers) -> strings)
-
-typedef struct {
-    uint32_t vocab_size;
-    char **token_table;
-    int init_ok;
-} Tokenizer;
-
-void safe_printf(const char *piece) {
-    // the tokens are raw bytes, and we we only want to print the printable ones
-    // many bytes can be various control codes, backspace, etc.
-    if (piece == NULL) { return; }
-    if (piece[0] == '\0') { return; }
-    // handle individual byte tokens
-    // every token is asserted to be at least one byte so doing piece[1] is ok
-    if (piece[1] == '\0') {
-        unsigned char byte_val = piece[0];
-        if (!(isprint(byte_val) || isspace(byte_val))) {
-            return; // weird byte, don't print it
-        }
-    }
-    printf("%s", piece);
-}
-
-void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
-    FILE *file = fopen(filename, "rb");
-    if (file == NULL) {
-        // try to be more helpful as we just added this feature, erase later
-        printf("---\n");
-        printf("WARNING: Failed to open the tokenizer file %s\n", filename);
-        printf("The Tokenizer is a new feature added April 14 2024.\n");
-        printf("Re-run `python train_gpt2.py` to write it\n");
-        printf("---\n");
-        tokenizer->init_ok = 0;
-        return;
-    }
-    // read in the header
-    uint32_t header[256];
-    freadCheck(header, sizeof(uint32_t), 256, file);
-    assert(header[0] == 20240328);
-    assert(header[1] == 1);
-    tokenizer->vocab_size = header[2];
-    // read in all the tokens
-    unsigned char length;
-    tokenizer->token_table = (char **)mallocCheck(tokenizer->vocab_size * sizeof(char *));
-    for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
-        freadCheck(&length, sizeof(unsigned char), 1, file);
-        assert(length > 0); // every token should be at least one character
-        char *token_bytes = (char *)mallocCheck(length + 1);
-        freadCheck(token_bytes, sizeof(char), length, file);
-        token_bytes[length] = '\0';  // Add null terminator for printing
-        tokenizer->token_table[i] = token_bytes;
-    }
-    // cleanups
-    fcloseCheck(file);
-    tokenizer->init_ok = 1;
-}
-
-const char *tokenizer_decode(Tokenizer *tokenizer, uint32_t token_id) {
-    if (tokenizer->init_ok == 0) {
-        return NULL;
-    }
-    if (token_id < tokenizer->vocab_size) {
-        return tokenizer->token_table[token_id];
-    } else {
-        printf("invalid token id %d!\n", token_id);
-        return NULL;
-    }
-}
-
-void tokenizer_free(Tokenizer *tokenizer) {
-    if (tokenizer->init_ok) {
-        for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
-            free(tokenizer->token_table[i]);
-        }
-        free(tokenizer->token_table);
-    }
 }
 
 // ----------------------------------------------------------------------------
@@ -2255,9 +2173,10 @@ int main(int argc, char *argv[]) {
 
         // once in a while do model inference to print generated text
         if (multi_gpu_config.process_rank == 0 && (step > 0 && (step % sample_every) == 0 || last_step)) {
-            // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
+            // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
+            int eot_token = tokenizer.eot_token;
             for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = GPT2_EOT;
+                gen_tokens[i] = eot_token;
             }
             // now sample from the model autoregressively
             printf("generating:\n---\n");

@@ -351,8 +351,9 @@ def write_tokenizer(enc, filename):
     n = enc.max_token_value + 1
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240328 # magic
-    header[1] = 1 # tokenizer version = 1
+    header[1] = 2 # tokenizer version = 2 (1 -> 2: includes EOT token)
     header[2] = n # number of tokens
+    header[3] = enc.eot_token # EOT token
     with open(filename, "wb") as file:
         file.write(header.numpy().tobytes())
         for i in range(n):
