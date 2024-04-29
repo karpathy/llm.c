@@ -44,6 +44,7 @@ int main(int argc, char *argv[]) {
 
     int C = model.config.channels;
     int V = model.config.vocab_size;
+    int Vp = model.config.padded_vocab_size;
     int maxT = model.config.max_seq_len;
     int L = model.config.num_layers;
 
@@ -52,8 +53,12 @@ int main(int argc, char *argv[]) {
     if (state_file == NULL) { printf("Error opening state file\n"); return 1; }
     int state_header[256];
     fread(state_header, sizeof(int), 256, state_file);
-    if (state_header[0] != 20240327) { printf("Bad magic state file"); return 1; }
-    if (state_header[1] != 1) { printf("Bad version in state file"); return 1; }
+    if (state_header[0] != 20240327) { printf("Bad magic state file\n"); return 1; }
+    if (state_header[1] != 2) {
+        printf("Bad version in state file\n");
+        printf("---> HINT: try to re-run `python train_gpt2.py`\n");
+        return 1;
+    }
     int B = state_header[2]; // batch size, e.g. 4
     int T = state_header[3]; // time / sequence length (e.g. 64, up to maxT)
     printf("[State]\n");
@@ -107,22 +112,29 @@ int main(int argc, char *argv[]) {
 
         if (step == 0) {
             // error checking at step 0 for reference activations/gradients
-
             // at this point, target should be equal to expected_logits, let's compare
             int logits_ok = 1;
-            for (int i=0; i<B*T*V; i++) {
-                if(i < 3) {
-                    printf("%f %f\n", expected_logits[i], model.acts.logits[i]);
-                }
-                if (fabsf(expected_logits[i] - model.acts.logits[i]) >= 1e-2) {
-                    printf("MISMATCH AT INDEX %d: ", i);
-                    printf("%f %f\n", expected_logits[i],model.acts.logits[i]);
-                    logits_ok = 0;
-                    break;
+            float* calculated_logits = model.acts.logits;
+            float max_diff = 0.0f;
+            for (int bt = 0; bt < B*T; bt++) {
+                for (int v = 0; v < V; v++) { // note we only loop to V (ignoring padding)
+                    int i = bt * Vp + v; // linearized index, using Vp
+                    if (i < 10) {
+                        printf("%f, %f\n", expected_logits[i], calculated_logits[i]);
+                    }
+                    float diff = fabsf(expected_logits[bt*V + v] - calculated_logits[i]);
+                    max_diff = fmaxf(max_diff, diff);
+                    if (diff >= 1e-2f) {
+                        printf("MISMATCH AT INDEX %d,%d: ", bt, v);
+                        printf("%f %f\n", expected_logits[bt*V + v], calculated_logits[i]);
+                        logits_ok = 0;
+                        bt = B*T; // to break out of both loops
+                        break;
+                    }
                 }
             }
             if(!logits_ok) { printf("NOT "); }
-            printf("OK (LOGITS)\n");
+            printf("OK (LOGITS), max_diff = %e\n", max_diff);
             allok = allok && logits_ok;
 
             // compare the achieved loss

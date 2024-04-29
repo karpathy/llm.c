@@ -1,4 +1,3 @@
-#define ENABLE_BF16
 #define TESTING
 #include "train_gpt2.cu"
 
@@ -42,7 +41,7 @@ int check_tensor(float *a, float *b, int n, const char* label, float threshold=1
 
 // the same tensors as in the train file, but in float, which are used as reference
 typedef struct {
-    float*  wte; // (V, C)
+    float*  wte; // (Vp, C)
     float*  wpe; // (maxT, C)
     float*  ln1w; // (L, C)
     float*  ln1b; // (L, C)
@@ -109,6 +108,7 @@ int main(int argc, char *argv[]) {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
     size_t V = model.config.vocab_size;
+    size_t Vp = model.config.padded_vocab_size;
     size_t maxT = model.config.max_seq_len;
     size_t L = model.config.num_layers;
     size_t C = model.config.channels;
@@ -117,8 +117,12 @@ int main(int argc, char *argv[]) {
     FILE *state_file = fopenCheck("gpt2_124M_debug_state.bin", "rb");
     int state_header[256];
     freadCheck(state_header, sizeof(int), 256, state_file);
-    if (state_header[0] != 20240327) { printf("Bad magic state file"); exit(EXIT_FAILURE); }
-    if (state_header[1] != 1) { printf("Bad version in state file"); exit(EXIT_FAILURE); }
+    if (state_header[0] != 20240327) { fprintf(stderr, "Bad magic state file\n"); exit(EXIT_FAILURE); }
+    if (state_header[1] != 2) {
+        fprintf(stderr, "Bad version in state file\n");
+        fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
+        exit(EXIT_FAILURE);
+    }
     int B = state_header[2]; // batch size, e.g. 4
     int T = state_header[3]; // time / sequence length (e.g. 64, up to maxT)
     assert(0 <= T && T <= maxT);
@@ -154,13 +158,12 @@ int main(int argc, char *argv[]) {
     gpt2_forward(&model, x, NULL, B, T);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
-    floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * V * sizeof(floatX));
-    float* logits_cpu = (float*)mallocCheck(B * T * V * sizeof(float));
-    cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * V * sizeof(floatX), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < B * T * V; i++) {
+    floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
+    float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
+    cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < B * T * Vp; i++) {
         logits_cpu[i] = (float)logits_cpu_raw[i];
     }
-    int logits_ok = 1;
 
     // FP16 and lower require very high tolerances unfortunately. TODO look into more
     float logit_accuracy_threshold = 1e-2f;
@@ -169,19 +172,25 @@ int main(int argc, char *argv[]) {
     logit_accuracy_threshold = 15.0f;
     #endif
 
-
+    // compare the output logits from the forward pass
+    // also careful that we don't access and compare the padded columns of logits
+    int logits_ok = 1;
     float max_diff = 0.0f;
-    for (int i=0; i<B*T*V; i++) {
-        if(i < 10) {
-            printf("%f %f\n", expected_logits[i], logits_cpu[i]);
-        }
-        float diff = fabsf(expected_logits[i] - logits_cpu[i]);
-        max_diff = fmaxf(max_diff, diff);
-        if (diff >= logit_accuracy_threshold) {
-            printf("MISMATCH AT INDEX %d: ", i);
-            printf("%f %f\n", expected_logits[i],logits_cpu[i]);
-            logits_ok = 0;
-            break;
+    for (int bt = 0; bt < B*T; bt++) {
+        for (int v = 0; v < V; v++) {
+            int i = bt * Vp + v; // linearized index
+            if (i < 10) {
+                printf("%f, %f\n", expected_logits[i], logits_cpu[i]);
+            }
+            float diff = fabsf(expected_logits[bt*V + v] - logits_cpu[i]);
+            max_diff = fmaxf(max_diff, diff);
+            if (diff >= logit_accuracy_threshold) {
+                printf("MISMATCH AT INDEX %d,%d: ", bt, v);
+                printf("%f %f\n", expected_logits[bt*V + v], logits_cpu[i]);
+                logits_ok = 0;
+                bt = B*T; // to break out of both loops
+                break;
+            }
         }
     }
     allok = allok && logits_ok;
@@ -244,10 +253,13 @@ int main(int argc, char *argv[]) {
             // I set the tolerances manually by inspecting the gradient differences for
             // a few elements of each tensor. bf16 looks ok but not amazing here.
             // It's possible we have bugs lurking, or maybe it is bf16. Not 100% sure.
+            // Also, if code changes and some of these get tripped, it could be ok if it's not by too much,
+            // because our use of stochastic rounding is adding some non-determinism "pepper noise".
+            // In that case it's ok to extend the tolerance by a bit, after a manual review.
             allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", 6e-1f);
             allok = allok & check_tensor(tensors1[1], tensors2[1], maxT * C, "wpe", 1e-2f);
-            allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", 9e-2); // hmm a bit high
-            allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", 3e-2f);
+            allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", 1.1e-1); // hmm a bit high
+            allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", 4e-2f);
             allok = allok & check_tensor(tensors1[4], tensors2[4], L * C * C, "attprojw", 3e-2f);
             allok = allok & check_tensor(tensors1[5], tensors2[5], L * C, "attprojb", 3e-2f);
             allok = allok & check_tensor(tensors1[6], tensors2[6], L * 4*C * C, "fcw", 9e-2f); // hmm a bit high

@@ -20,6 +20,11 @@ There will be other versions of this code that specialize it and make it fast.
 #ifdef OMP
 #include <omp.h>
 #endif
+// our own utilities
+// defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck
+// defines: mallocCheck
+#include "utils.h"
+
 
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
@@ -395,15 +400,17 @@ void residual_backward(float* dinp1, float* dinp2, float* dout, int N) {
     }
 }
 
-void softmax_forward(float* probs, float* logits, int B, int T, int V) {
-    // output: probs are (B,T,V) of the probabilities (sums to 1.0 in each b,t position)
-    // input: logits is (B,T,V) of the unnormalized log probabilities
+void softmax_forward(float* probs, float* logits, int B, int T, int V, int Vp) {
+    // output: probs are (B,T,Vp) of the probabilities (sums to 1.0 in each b,t position)
+    // input: logits is (B,T,Vp) of the unnormalized log probabilities
+    // Vp is the padded vocab size (for efficiency), V is the "real" vocab size
+    // example: Vp is 50304 and V is 50257
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // probs <- softmax(logits)
-            float* logits_bt = logits + b * T * V + t * V;
-            float* probs_bt = probs + b * T * V + t * V;
+            float* logits_bt = logits + b * T * Vp + t * Vp;
+            float* probs_bt = probs + b * T * Vp + t * Vp;
 
             // maxval is only calculated and subtracted for numerical stability
             float maxval = -10000.0f; // TODO something better
@@ -417,8 +424,14 @@ void softmax_forward(float* probs, float* logits, int B, int T, int V) {
                 probs_bt[i] = expf(logits_bt[i] - maxval);
                 sum += probs_bt[i];
             }
+            // note we only loop to V, leaving the padded dimensions
             for (int i = 0; i < V; i++) {
                 probs_bt[i] /= sum;
+            }
+            // for extra super safety we may wish to include this too,
+            // forcing the probabilities here to be zero, but it shouldn't matter
+            for (int i = V; i < Vp; i++) {
+                probs_bt[i] = 0.0f;
             }
         }
     }
@@ -426,14 +439,14 @@ void softmax_forward(float* probs, float* logits, int B, int T, int V) {
 
 void crossentropy_forward(float* losses,
                           float* probs, int* targets,
-                          int B, int T, int V) {
+                          int B, int T, int Vp) {
     // output: losses is (B,T) of the individual losses at each position
-    // input: probs are (B,T,V) of the probabilities
+    // input: probs are (B,T,Vp) of the probabilities
     // input: targets is (B,T) of integers giving the correct index in logits
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // loss = -log(probs[target])
-            float* probs_bt = probs + b * T * V + t * V;
+            float* probs_bt = probs + b * T * Vp + t * Vp;
             int ix = targets[b * T + t];
             losses[b * T + t] = -logf(probs_bt[ix]);
         }
@@ -442,14 +455,16 @@ void crossentropy_forward(float* losses,
 
 void crossentropy_softmax_backward(float* dlogits,
                            float* dlosses, float* probs, int* targets,
-                           int B, int T, int V) {
+                           int B, int T, int V, int Vp) {
     // backwards through both softmax and crossentropy
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            float* dlogits_bt = dlogits + b * T * V + t * V;
-            float* probs_bt = probs + b * T * V + t * V;
+            float* dlogits_bt = dlogits + b * T * Vp + t * Vp;
+            float* probs_bt = probs + b * T * Vp + t * Vp;
             float dloss = dlosses[b * T + t];
             int ix = targets[b * T + t];
+            // note we only loop to V, leaving the padded dimensions
+            // of dlogits untouched, so gradient there stays at zero
             for (int i = 0; i < V; i++) {
                 float p = probs_bt[i];
                 float indicator = i == ix ? 1.0f : 0.0f;
@@ -490,7 +505,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
         num_parameters += param_sizes[i];
     }
     // malloc all parameters all at once
-    float* params_memory = (float*)malloc(num_parameters * sizeof(float));
+    float* params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
     // assign all the tensors
     float** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
@@ -537,7 +552,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         num_activations += act_sizes[i];
     }
-    float* acts_memory = (float*)malloc(num_activations * sizeof(float));
+    float* acts_memory = (float*)mallocCheck(num_activations * sizeof(float));
     float** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
         &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
@@ -555,6 +570,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
 typedef struct {
     int max_seq_len; // max sequence length, e.g. 1024
     int vocab_size; // vocab size, e.g. 50257
+    int padded_vocab_size; // padded to e.g. %128==0, 50304
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
     int channels; // number of channels, e.g. 768
@@ -592,29 +608,35 @@ typedef struct {
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in model from a checkpoint file
-    FILE *model_file = fopen(checkpoint_path, "rb");
+    FILE *model_file = fopenCheck(checkpoint_path, "rb");
     if (model_file == NULL) { printf("Error opening model file\n"); exit(1); }
     int model_header[256];
-    fread(model_header, sizeof(int), 256, model_file);
-    if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(1); }
-    if (model_header[1] != 1) { printf("Bad version in model file"); exit(1); }
+    freadCheck(model_header, sizeof(int), 256, model_file);
+    if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(1); }
+    if (model_header[1] != 3) {
+        printf("Bad version in model file\n");
+        printf("---> HINT: try to re-run `python train_gpt2.py`\n");
+        exit(1);
+    }
 
     // read in hyperparameters
-    size_t maxT, V, L, NH, C; // size_t to prevent int overflow
+    size_t maxT, V, Vp, L, NH, C; // size_t to prevent int overflow
     model->config.max_seq_len = maxT = model_header[2];
     model->config.vocab_size = V = model_header[3];
     model->config.num_layers = L = model_header[4];
     model->config.num_heads = NH = model_header[5];
     model->config.channels = C = model_header[6];
+    model->config.padded_vocab_size = Vp = model_header[7];
     printf("[GPT-2]\n");
     printf("max_seq_len: %zu\n", maxT);
     printf("vocab_size: %zu\n", V);
+    printf("padded_vocab_size: %zu\n", Vp);
     printf("num_layers: %zu\n", L);
     printf("num_heads: %zu\n", NH);
     printf("channels: %zu\n", C);
 
     // allocate space for all the parameters and read them in
-    model->param_sizes[0] = V * C; // wte
+    model->param_sizes[0] = Vp * C; // wte
     model->param_sizes[1] = maxT * C; // wpe
     model->param_sizes[2] = L * C; // ln1w
     model->param_sizes[3] = L * C; // ln1b
@@ -641,8 +663,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in all the parameters from file
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
-    fread(model->params_memory, sizeof(float), num_parameters, model_file);
-    fclose(model_file);
+    freadCheck(model->params_memory, sizeof(float), num_parameters, model_file);
+    fcloseCheck(model_file);
 
     // other inits
     model->acts_memory = NULL;
@@ -668,6 +690,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 
     // convenience parameters (size_t to help prevent int overflow)
     size_t V = model->config.vocab_size;
+    size_t Vp = model->config.padded_vocab_size;
     size_t L = model->config.num_layers;
     size_t NH = model->config.num_heads;
     size_t C = model->config.channels;
@@ -706,8 +729,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         model->act_sizes[17] = B * T * C; // lnf
         model->act_sizes[18] = B * T; // lnf_mean
         model->act_sizes[19] = B * T; // lnf_rstd
-        model->act_sizes[20] = B * T * V; // logits
-        model->act_sizes[21] = B * T * V; // probs
+        model->act_sizes[20] = B * T * Vp; // logits
+        model->act_sizes[21] = B * T * Vp; // probs
         model->act_sizes[22] = B * T; // losses
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
@@ -717,8 +740,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
         // also create memory for caching inputs and targets
-        model->inputs = (int*)malloc(B * T * sizeof(int));
-        model->targets = (int*)malloc(B * T * sizeof(int)); // might be unused if we never have targets but it's small
+        model->inputs = (int*)mallocCheck(B * T * sizeof(int));
+        model->targets = (int*)mallocCheck(B * T * sizeof(int)); // might be unused if we never have targets but it's small
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -789,12 +812,12 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     }
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
-    softmax_forward(acts.probs, acts.logits, B, T, V);
+    matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    softmax_forward(acts.probs, acts.logits, B, T, V, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
-        crossentropy_forward(model->acts.losses, model->acts.probs, targets, B, T, V);
+        crossentropy_forward(model->acts.losses, model->acts.probs, targets, B, T, Vp);
         // for convenience also evaluate the mean loss
         float mean_loss = 0.0f;
         for (int i=0; i<B*T; i++) { mean_loss += model->acts.losses[i]; }
@@ -830,6 +853,7 @@ void gpt2_backward(GPT2 *model) {
     size_t B = model->batch_size;
     size_t T = model->seq_len;
     size_t V = model->config.vocab_size;
+    size_t Vp = model->config.padded_vocab_size;
     size_t L = model->config.num_layers;
     size_t NH = model->config.num_heads;
     size_t C = model->config.channels;
@@ -846,8 +870,8 @@ void gpt2_backward(GPT2 *model) {
     float dloss_mean = 1.0f / (B*T);
     for (int i = 0; i < B*T; i++) { grads_acts.losses[i] = dloss_mean; }
 
-    crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V);
-    matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, V);
+    crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V, Vp);
+    matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, Vp);
     float* residual = acts.residual3 + (L-1) * B * T * C; // last layer's residual
     float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // write to last layer's residual
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
@@ -993,9 +1017,9 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     }
 
     // determine the file size
-    fseek(loader->tokens_file, 0, SEEK_END);
+    fseekCheck(loader->tokens_file, 0, SEEK_END);
     loader->file_size = ftell(loader->tokens_file);
-    fseek(loader->tokens_file, 0, SEEK_SET);
+    fseekCheck(loader->tokens_file, 0, SEEK_SET);
     if (loader->file_size < (B * T + 1) * sizeof(int)) {
         printf("Error: file size is too small for the batch size and sequence length\n");
         exit(1);
@@ -1003,7 +1027,7 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     loader->current_position = 0; // start at the beginning
 
     // allocate space for B*T + 1 integers to store the inputs and targets
-    loader->batch = (int*) malloc((B * T + 1) * sizeof(int));
+    loader->batch = (int*) mallocCheck((B * T + 1) * sizeof(int));
     loader->inputs = loader->batch;
     loader->targets = loader->batch + 1; // targets are shifted by one
     loader->num_batches = loader->file_size / (B * T * sizeof(int));
@@ -1021,14 +1045,14 @@ void dataloader_next_batch(DataLoader *loader) {
         loader->current_position = 0;
     }
     // read the B*T+1 integers from the file into batch
-    fseek(loader->tokens_file, loader->current_position, SEEK_SET);
-    fread(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
+    fseekCheck(loader->tokens_file, loader->current_position, SEEK_SET);
+    freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
     // advance the current position by B*T integers
     loader->current_position += B*T * sizeof(int);
 }
 
 void dataloader_free(DataLoader *loader) {
-    fclose(loader->tokens_file);
+    fcloseCheck(loader->tokens_file);
     free(loader->batch);
 }
 
@@ -1101,23 +1125,23 @@ void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
     }
     // read in the header
     uint32_t header[256];
-    fread(header, sizeof(uint32_t), 256, file);
+    freadCheck(header, sizeof(uint32_t), 256, file);
     assert(header[0] == 20240328);
     assert(header[1] == 1);
     tokenizer->vocab_size = header[2];
     // read in all the tokens
     unsigned char length;
-    tokenizer->token_table = (char **)malloc(tokenizer->vocab_size * sizeof(char *));
+    tokenizer->token_table = (char **)mallocCheck(tokenizer->vocab_size * sizeof(char *));
     for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
-        fread(&length, sizeof(unsigned char), 1, file);
+        freadCheck(&length, sizeof(unsigned char), 1, file);
         assert(length > 0); // every token should be at least one character
-        char *token_bytes = (char *)malloc(length + 1);
-        fread(token_bytes, sizeof(char), length, file);
+        char *token_bytes = (char *)mallocCheck(length + 1);
+        freadCheck(token_bytes, sizeof(char), length, file);
         token_bytes[length] = '\0';  // Add null terminator for printing
         tokenizer->token_table[i] = token_bytes;
     }
     // cleanups
-    fclose(file);
+    fcloseCheck(file);
     tokenizer->init_ok = 1;
 }
 
@@ -1173,7 +1197,7 @@ int main() {
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    int* gen_tokens = (int*)malloc(B * T * sizeof(int));
+    int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     const int genT = 64; // number of steps of inference we will do
 
     // train
@@ -1210,9 +1234,11 @@ int main() {
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // but only using position 0
-                // get the V-dimensional vector probs[0, t-1, :]
-                float* probs = model.acts.probs + (t-1) * model.config.vocab_size;
+                // get the Vp-dimensional vector probs[0, t-1, :]
+                float* probs = model.acts.probs + (t-1) * model.config.padded_vocab_size;
                 float coin = random_f32(&rng_state);
+                // note we're only sampling from the first V elements, ignoring padding
+                // (the probabilities in the padded region should be zero anyway)
                 int next_token = sample_mult(probs, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
                 // print the generated token, either using the Tokenizer or a fallback
