@@ -856,8 +856,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_til
     // two reductions of up to 1024 threads:
     // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
     // this results in much cleaner assembly than a multi-warp cg::reduce
-    __shared__ float shared_maxval[32];
-    __shared__ float shared_sumval[32];
+    __shared__ float shared_maxval_sumval[32];
     int num_warps = blockDim.x / 32;
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
@@ -865,21 +864,21 @@ __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_til
     // reduce maxval within each warp
     float warp_maxval = cg::reduce(warp, thread_maxval, cg::greater<float>{});
     // thread 0 in each warp writes to shared memory
-    if (lane_id == 0) { shared_maxval[warp_id] = warp_maxval; }
+    if (lane_id == 0) { shared_maxval_sumval[warp_id] = warp_maxval; }
     __syncthreads();
     // each thread now loads the maxval across previous warps
     // if the thread is "out of range" of data, use -FLT_MAX as the maxval
-    warp_maxval = (lane_id < num_warps) ? shared_maxval[lane_id] : -FLT_MAX;
+    warp_maxval = (lane_id < num_warps) ? shared_maxval_sumval[lane_id] : -FLT_MAX;
     // now reduce the maxval among the warp threads
     float block_maxval = cg::reduce(warp, warp_maxval, cg::greater<float>{});
     // each thread uses maxval to scale sumval to avoid numerical instability / overflow
     thread_sumval *= expf(thread_maxval - block_maxval);
     // (warp-level) reduce sumval, thread 0 in each warp saves result in shared memory
     float warp_sumval = cg::reduce(warp, thread_sumval, cg::plus<float>{});
-    if (lane_id == 0) { shared_sumval[warp_id] = warp_sumval; }
+    if (lane_id == 0) { shared_maxval_sumval[warp_id] = warp_sumval; }
     __syncthreads();
     // same strategy, now reduce sumval across warps
-    warp_sumval = (lane_id < num_warps) ? shared_sumval[lane_id] : 0.0f;
+    warp_sumval = (lane_id < num_warps) ? shared_maxval_sumval[lane_id] : 0.0f;
     float block_sumval = cg::reduce(warp, warp_sumval, cg::plus<float>{});
     // return the softmax parameters
     return SoftmaxParams{1.f / block_sumval, block_maxval};
