@@ -16,6 +16,7 @@ const char *build_options = "-cl-fast-relaxed-math -cl-mad-enable";
 
 const char *KernelSource =
 #include "matmul_forward.cl"
+#include "matmul_backward.cl"
 ;
 
 // structure to house opencl variables
@@ -25,6 +26,9 @@ typedef struct {
     cl_command_queue queue;
     cl_program program;
     cl_kernel matmul_forward;
+    cl_kernel matmul_backward1;
+    cl_kernel matmul_backward2;
+    cl_kernel matmul_backward3;
     cl_mem matmul_A;
     cl_mem matmul_B;
     cl_mem matmul_bias;
@@ -145,6 +149,24 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
         exit(1);
     }
 
+    gcl->matmul_backward1 = clCreateKernel(gcl->program, "matmul_backward1", &err);
+    if (err != CL_SUCCESS) {
+        printf("error creating opencl kernel: %d\n", err);
+        exit(1);
+    }
+
+    gcl->matmul_backward2 = clCreateKernel(gcl->program, "matmul_backward2", &err);
+    if (err != CL_SUCCESS) {
+        printf("error creating opencl kernel: %d\n", err);
+        exit(1);
+    }
+
+    gcl->matmul_backward3 = clCreateKernel(gcl->program, "matmul_backward3", &err);
+    if (err != CL_SUCCESS) {
+        printf("error creating opencl kernel: %d\n", err);
+        exit(1);
+    }
+
     err = clGetKernelWorkGroupInfo(gcl->matmul_forward, gcl->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(gcl->max_wg_size), &gcl->max_wg_size, NULL);
     if (err != CL_SUCCESS)
     {
@@ -188,6 +210,14 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     err |= clSetKernelArg(gcl->matmul_forward, 1, sizeof(cl_mem), &gcl->matmul_A);
     err |= clSetKernelArg(gcl->matmul_forward, 2, sizeof(cl_mem), &gcl->matmul_B);
     err |= clSetKernelArg(gcl->matmul_forward, 3, sizeof(cl_mem), &gcl->matmul_bias);
+    err |= clSetKernelArg(gcl->matmul_backward1, 0, sizeof(cl_mem), &gcl->matmul_out);
+    err |= clSetKernelArg(gcl->matmul_backward1, 1, sizeof(cl_mem), &gcl->matmul_A);
+    err |= clSetKernelArg(gcl->matmul_backward1, 2, sizeof(cl_mem), &gcl->matmul_B);
+    err |= clSetKernelArg(gcl->matmul_backward2, 0, sizeof(cl_mem), &gcl->matmul_out);
+    err |= clSetKernelArg(gcl->matmul_backward2, 1, sizeof(cl_mem), &gcl->matmul_A);
+    err |= clSetKernelArg(gcl->matmul_backward2, 2, sizeof(cl_mem), &gcl->matmul_B);
+    err |= clSetKernelArg(gcl->matmul_backward3, 0, sizeof(cl_mem), &gcl->matmul_A);
+    err |= clSetKernelArg(gcl->matmul_backward3, 1, sizeof(cl_mem), &gcl->matmul_bias);
     if (err != CL_SUCCESS)
     {
         printf("error: Failed to set kernel arguments! %d\n", err);
@@ -201,6 +231,9 @@ void cl_deinit(GPT2_CL *gcl) {
     clReleaseMemObject(gcl->matmul_bias);
     clReleaseMemObject(gcl->matmul_out);
     clReleaseKernel(gcl->matmul_forward);
+    clReleaseKernel(gcl->matmul_backward1);
+    clReleaseKernel(gcl->matmul_backward2);
+    clReleaseKernel(gcl->matmul_backward3);
     clReleaseProgram(gcl->program);
     clReleaseCommandQueue(gcl->queue);
     clReleaseContext(gcl->context);
