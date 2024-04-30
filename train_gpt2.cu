@@ -2346,7 +2346,7 @@ int main(int argc, char *argv[]) {
         if (multi_gpu_config.num_processes > 1) {
             gpt2_multi_gpu_accumulate(&model, &multi_gpu_config);
         }
-        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
+        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1, &multi_gpu_config);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
