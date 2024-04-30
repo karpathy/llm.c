@@ -33,6 +33,23 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
 
 // ----------------------------------------------------------------------------
+// converting size_t typed but small values to integer.
+
+int int_check(size_t small_but_size_t, const char *file, int line) {
+    if(small_but_size_t > INT32_MAX) {
+        fprintf(stderr, "Error: Integer conversion failed at %s:%d\n", file, line);
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        fprintf(stderr, "  Value: %zu\n", small_but_size_t);
+        exit(EXIT_FAILURE);
+    }
+    return (int)small_but_size_t;
+}
+
+#define toIntCheck(value) int_check(value, __FILE__, __LINE__)
+
+// ----------------------------------------------------------------------------
 // Packed128 data structure, which forces the compiler to use 128-bit loads/stores
 // in GPUs that support (the LDG.128 and STS.128 instructions)
 // This is a bit similar to the use of float4 in the case of 32-bit floats, but
