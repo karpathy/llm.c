@@ -25,6 +25,7 @@ Also we're using TinyStories here for example as it is a bigger dataset
 Example launch using bfloat16 on 4 GPUs, same as above:
 mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 */
+#define ENABLE_CUDNN // can be enabled via nvcc "-DENABLE_CUDNN"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,6 +103,23 @@ const char* precision_mode_str = "bf16";
 const ncclDataType_t ncclFloatX = ncclBfloat16;
 #endif
 #endif
+
+#ifdef ENABLE_CUDNN
+#include <cudnn_frontend.h>
+namespace fe = cudnn_frontend;
+#if CUBLAS_LOWP == CUDA_R_16BF
+#define CUDNN_16BIT fe::DataType_t::BFLOAT16
+#else
+#define CUDNN_16BIT fe::DataType_t::HALF
+#endif
+
+static cudnnHandle_t cudnn_handle;
+static size_t cudnn_workspace_size = 32 * 1024 * 1024; // TODO is this only for backward?
+static void* cudnn_workspace = NULL;
+
+#define checkCudaErr(err) assert((int)err == 0);
+#define checkCudnnErr(err) assert((int)err == 0);
+#endif // ENABLE_CUDNN
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -428,6 +446,171 @@ void printf0(const char *format, ...) {
         va_end(args);
     }
 }
+
+// ----------------------------------------------------------------------------
+// cuDNN path
+
+#ifdef ENABLE_CUDNN
+using graph_and_tensors = std::tuple<std::shared_ptr<fe::graph::Graph>,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Q,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // K,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // V,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Attn_scale,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // O
+                                     std::shared_ptr<fe::graph::Tensor_attributes>>; // Stats
+
+// Need a cache because graph->build_operation_graph() is slow but everything else seems fast
+using cache_type = std::unordered_map<std::size_t, graph_and_tensors>;
+
+// Loosely based on cuDNN frontend samples functions and massively simplified
+template <typename... Args>
+auto lookup_cache_or_build_graph(Args... args) {
+    static cache_type user_maintained_cache;
+    auto [b, h, s_qkv, d, is_inference] = std::make_tuple(args...);
+
+    auto graph = std::make_shared<fe::graph::Graph>();
+    graph->set_io_data_type(CUDNN_16BIT)
+          .set_intermediate_data_type(fe::DataType_t::FLOAT)
+          .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    // QKV is (B, N, 3, NH, d) which cuDNN can handle directly without an external permute
+    auto Q = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("Q")
+                               .set_dim({b, h, s_qkv, d})
+                               .set_stride({3 * h * d * s_qkv,  d, 3 * h * d, 1}));
+    auto K = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("K")
+                               .set_dim({b, h, s_qkv, d})
+                               .set_stride({3 * h * d * s_qkv, d, 3 * h * d, 1}));
+    auto V = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("V")
+                               .set_dim({b, h, s_qkv, d})
+                               .set_stride({3 * h * d * s_qkv, d, 3 * h * d, 1}));
+    auto attn_scale = graph->tensor(fe::graph::Tensor_attributes()
+                                .set_name("attn_scale")
+                                .set_dim({1, 1, 1, 1})
+                                .set_stride({1, 1, 1, 1})
+                                .set_is_pass_by_value(true)
+                                .set_data_type(fe::DataType_t::FLOAT));
+
+    auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention");
+    sdpa_options.set_is_inference(is_inference);
+    sdpa_options.set_attn_scale(attn_scale);
+    sdpa_options.set_causal_mask(true);
+
+    auto [O, stats] = graph->sdpa(Q, K, V, sdpa_options);
+
+    // Output is (B, N, NH, d) BF16/FP16 and stats for backward pass is (B, NH, N) FP32
+    O->set_output(true).set_dim({b, h, s_qkv, d}).set_stride({h * d * s_qkv, d, h * d, 1});
+    assert(stats == nullptr || is_inference == false);
+    if (is_inference == false) {
+        stats->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+    }
+
+    assert(graph->validate().is_good());
+    auto key = graph->key();
+    auto it = user_maintained_cache.find(key);
+    if (it != user_maintained_cache.end()) {
+        return it->second;
+    }
+
+    assert(graph->build_operation_graph(cudnn_handle).is_good());
+    auto plans = graph->create_execution_plans({fe::HeurMode_t::A});
+    assert(graph->check_support(cudnn_handle).is_good());
+    assert(graph->build_plans(cudnn_handle).is_good());
+
+    auto tuple = std::make_tuple(graph, Q, K, V, attn_scale, O, stats);
+    user_maintained_cache.insert({key, tuple});
+    return tuple;
+}
+
+__global__ void fp32_to_lowp_kernel(floatX* out, const float* inp) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    out[idx] = (floatX)inp[idx];
+}
+
+__global__ void lowp_to_fp32_kernel(const floatX* inp, float *out) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    out[idx] = (float)inp[idx];
+}
+
+void attention_forward_cudnn(floatX* out, // output: (B, T, NH, HS)
+                             floatX* inp, // input: (B, T, 3, NH, HS) QKV
+                             float* stats, // for use in backward pass: (B, NH, T)
+                             int B, int T, int C, int NH) {
+    int64_t HS = C / NH; // number of features per head
+    bool is_inference = (stats == NULL);
+    float attn_scale_cpu = 1.0 / sqrtf(HS);
+
+    auto [graph, Q, K, V, attn_scale, O, softmax_stats] =
+        lookup_cache_or_build_graph(B, NH, T, HS, is_inference);
+
+    //// Build variant pack
+    void* devPtrQ = inp;
+    void* devPtrK = (inp + C);
+    void* devPtrV = (inp + 2 * C);
+    void* devPtrO = (void*)out;
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
+        {Q, devPtrQ}, {K, devPtrK}, {V, devPtrV}, {attn_scale, &attn_scale_cpu}, {O, devPtrO}};
+    if (is_inference == false) {
+        variant_pack[softmax_stats] = (void*)stats;
+    }
+
+    cudaCheck(cudaGetLastError());
+
+    // Execute graph
+    assert(graph->get_workspace_size() <= cudnn_workspace_size); // TODO - not needed for forward?
+    assert(graph->execute(cudnn_handle, variant_pack, cudnn_workspace).is_good());
+
+    cudaCheck(cudaGetLastError());
+}
+
+void attention_forward10(float* out, // output: (B, T, NH, HS)
+                         float* stats, // for use in backward pass: (B, NH, T)
+                         floatX* vaccum, floatX* qkvr,
+                         const float* inp, // input: (B, T, 3, NH, HS) QKV
+                         int B, int T, int C, int NH,
+                         bool skip_conversion=false) {
+    int64_t HS = C / NH; // number of features per head
+    bool is_inference = stats != NULL;
+    float attn_scale_cpu = 1.0 / sqrtf(HS);
+
+    // Optionally convert from FP32 to FP16/BF16 (always on 1st run to get correct results)
+    const int block_size = 64; // smallest full occupancy block size on modern GPUs
+    int total_threads = B * T * C * 3;
+    assert(total_threads % block_size == 0);
+    int num_blocks = total_threads / block_size;
+    if (!skip_conversion/* || first_run_validation*/) {
+        fp32_to_lowp_kernel<<<num_blocks, block_size>>>(qkvr, inp);
+    }
+
+    auto [graph, Q, K, V, attn_scale, O, softmax_stats] =
+        lookup_cache_or_build_graph(B, NH, T, HS, is_inference);
+
+    //// Build variant pack
+    void* devPtrQ = qkvr;
+    void* devPtrK = (qkvr + NH * HS);
+    void* devPtrV = (qkvr + 2 * NH * HS);
+    void* devPtrO = (void*)vaccum;
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
+        {Q, devPtrQ}, {K, devPtrK}, {V, devPtrV}, {attn_scale, &attn_scale_cpu}, {O, devPtrO}};
+    if (is_inference == false) {
+        variant_pack[softmax_stats] = (void*)stats;
+    }
+
+    // Execute graph
+    assert(graph->get_workspace_size() <= cudnn_workspace_size); // TODO - not needed for forward?
+    assert(graph->execute(cudnn_handle, variant_pack, cudnn_workspace).is_good());
+
+    // Optionally convert back from FP16/BF16 to FP32
+    total_threads = B * T * C;
+    assert(total_threads % block_size == 0);
+    num_blocks = total_threads / block_size;
+    if (!skip_conversion/* || first_run_validation*/) {
+        lowp_to_fp32_kernel<<<num_blocks, block_size>>>(vaccum, out);
+    }
+}
+#endif // ENABLE_CUDNN
 
 // ----------------------------------------------------------------------------
 // all the kernels
@@ -1113,6 +1296,13 @@ void matmul_forward_cublaslt(floatX* out,
 void attention_forward(floatX* out, floatX* qkvr, floatX* att,
                        floatX* inp,
                        int B, int T, int C, int NH) {
+
+#ifdef ENABLE_CUDNN
+    // weeeee
+    attention_forward_cudnn(out, inp, NULL, B, T, C, NH);
+    return;
+#endif
+
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
     // Its contents will be overwritten by this function.
     const int block_size = 256;
@@ -2154,6 +2344,12 @@ int main(int argc, char *argv[]) {
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
     if(cublas_compute_type); // unused in BF16 mode, avoid warning
+
+    #ifdef ENABLE_CUDNN
+    checkCudnnErr(cudnnCreate(&cudnn_handle));
+    cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
+    printf("INIT CUDNN %d\n", cudnn_workspace_size);
+    #endif
 
     printf0("| device                | %-50s |\n", deviceProp.name);
     printf0("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
