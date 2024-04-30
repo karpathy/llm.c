@@ -439,6 +439,36 @@ void printf0(const char *format, ...) {
     }
 }
 
+void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t total_parameters) {
+
+    multi_gpu_config->zero_stage = 0;
+    multi_gpu_config->zero_active = false;
+    multi_gpu_config->shard_num_parameters = total_parameters;
+    multi_gpu_config->shard_offset = 0;
+
+#ifdef MULTI_GPU
+        // Check the Zero Stage and define sharding parameters
+        if (zero_stage == 0) {
+            printf0("| Zero Optimization is disabled                                              |\n");
+        }
+        else if (zero_stage == 1) {
+            if (total_parameters % multi_gpu_config->num_processes != 0) {
+                printf0("| Zero Optimization is disabled, Can't equally partition parameters          |\n");
+            }
+            else {
+                printf0("| Zero Stage1 is enabled                                                     |\n");
+                multi_gpu_config->zero_stage = 1;
+                multi_gpu_config->zero_active = true;
+                multi_gpu_config->shard_num_parameters = total_parameters / multi_gpu_config->num_processes;
+                multi_gpu_config->shard_offset = multi_gpu_config->process_rank * (total_parameters / multi_gpu_config->num_processes);
+            }
+        }
+        else{
+            printf0("| Disabling Zero Optimization, Zero Stage2 and Stage3 are not yet supported  |\n");
+        }
+#endif
+}
+
 // ----------------------------------------------------------------------------
 // all the kernels
 
