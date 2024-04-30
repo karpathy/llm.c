@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#define CL_TARGET_OPENCL_VERSION 120
 #if defined(__APPLE__) || defined(__MACOSX)
 #include <OpenCL/cl.h>
 #else
@@ -43,7 +44,7 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     char platform_name[1024];
     cl_uint num_platforms;
     int selected_platform = 0;
-    cl_device_id devices[5];
+    cl_device_id devices[10];
     char device_name[1024];
     cl_uint num_devices;
     int selected_device = 0;
@@ -76,8 +77,8 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     }
     printf("using opencl platform: %s\n", platform_name);
 
-    err = clGetDeviceIDs(platforms[selected_platform], CL_DEVICE_TYPE_GPU, 0, NULL, &num_devices);
-    err |= clGetDeviceIDs(platforms[selected_platform], CL_DEVICE_TYPE_GPU, num_devices, devices, NULL);
+    err = clGetDeviceIDs(platforms[selected_platform], CL_DEVICE_TYPE_ALL, 0, NULL, &num_devices);
+    err |= clGetDeviceIDs(platforms[selected_platform], CL_DEVICE_TYPE_ALL, num_devices, devices, NULL);
     if (err != CL_SUCCESS) {
         printf("error getting opencl device: %d\n", err);
         exit(1);
