@@ -40,7 +40,7 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 
 template<class ElementType>
 struct alignas(16) Packed128 {
-    __device__ Packed128() = default;
+    Packed128() = default;
     __device__ explicit Packed128(int4 bits) {
         static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
         memcpy(&payload, &bits, sizeof(bits));
