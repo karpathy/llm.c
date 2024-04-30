@@ -2137,7 +2137,7 @@ int main(int argc, char *argv[]) {
     printf0("| output log file       | %-50s |\n", output_log_file == NULL ? "NULL" : output_log_file);
     printf0("| batch size B          | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
-    printf0("| learning rate         | %-50f |\n", learning_rate);
+    printf0("| learning rate         | %-50e |\n", learning_rate);
     printf0("| max_steps             | %-50d |\n", max_steps);
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
     printf0("| val_max_batches       | %-50d |\n", val_max_batches);
@@ -2189,7 +2189,10 @@ int main(int argc, char *argv[]) {
     char train_tokens_filename[128];
     char val_tokens_filename[128];
     assert(strlen(input_dataset_prefix) < 100); // being bit lazy here, make sure we don't overflow
-    sprintf(train_tokens_filename, "%s_train.bin", input_dataset_prefix);
+    // if we're only overfitting a single batch for debugging, let's overfit the first batch
+    // from val instead of train split, because val is smaller and a bit faster
+    const char* train_split = (overfit_single_batch == 1) ? "val" : "train";
+    sprintf(train_tokens_filename, "%s_%s.bin", input_dataset_prefix, train_split);
     sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
     DataLoader train_loader;
     dataloader_init(&train_loader, &multi_gpu_config, train_tokens_filename, B, T);
@@ -2296,6 +2299,7 @@ int main(int argc, char *argv[]) {
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
         if (overfit_single_batch == 0 || (step == 0 && overfit_single_batch == 1)) {
+            // if we're overfitting a single batch, we'll only call this at step = 0
             dataloader_next_batch(&train_loader);
         }
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
