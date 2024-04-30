@@ -574,7 +574,7 @@ __global__ void permute_kernel_backward(floatX* dinp,
 
 __global__ void unpermute_kernel(floatX* inp, floatX *out, int B, int N, int NH, int d) {
    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
-    
+
     int idx = (blockIdx.x * blockDim.x + threadIdx.x);
     // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
     if (idx < B * NH * N * d) {

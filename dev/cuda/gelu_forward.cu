@@ -9,10 +9,10 @@ If encountering "error: identifier "M_PI" is undefined", add the following lines
 #define _USE_MATH_DEFINES
 #include <math.h>  OR  #include <cmath>
 
-version 1 is naive port from CPU code to kernel
+version 1 is naive CPU port, for use in float
 ./gelu_forward 1
 
-version 2 uses the Packed128 data structure
+version 2 is bfloat16 with the Packed128 data structure
 ./gelu_forward 2
 */
 
@@ -22,7 +22,7 @@ version 2 uses the Packed128 data structure
 #include "common.h"
 
 // turn on bf16 as default, done up here for now
-//#define ENABLE_BF16
+#define ENABLE_BF16
 
 #if defined(ENABLE_BF16)
 typedef __nv_bfloat16 floatX;
@@ -54,7 +54,7 @@ void gelu_forward_cpu(float* out, const float* inp, int N) {
 // GPU kernels
 
 // elementwise ops are nice and ez
-__global__ void gelu_kernel(float* out, const float* inp, int N) {
+__global__ void gelu_forward_kernel1(float* out, const float* inp, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) {
         float xi = inp[i];
@@ -64,7 +64,7 @@ __global__ void gelu_kernel(float* out, const float* inp, int N) {
 }
 
 // elementwise ops are nice and ez
-__global__ void gelu_kernel2(floatX* out, const floatX* inp, int N) {
+__global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     if (i < N) {
         x128 packed_out;
@@ -72,7 +72,7 @@ __global__ void gelu_kernel2(floatX* out, const floatX* inp, int N) {
         for(int k = 0; k < packed_inp.size; ++k) {
             float xi = (float)packed_inp[k];
             float cube = 0.044715f * xi * xi * xi;
-            packed_out[k] = (float)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
+            packed_out[k] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
         }
         // store instead of storecs (without cache streaming) in case it is useful for the
         // data to be in the cache for the next operation after this GeLU
@@ -85,13 +85,13 @@ __global__ void gelu_kernel2(floatX* out, const floatX* inp, int N) {
 
 void gelu_forward1(float* out, const float* inp, int N, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
-    gelu_kernel<<<grid_size, block_size>>>(out, inp, N);
+    gelu_forward_kernel1<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
 
 void gelu_forward2(floatX* out, const floatX* inp, int N, const int block_size) {
     const int grid_size = ceil_div(N, block_size)/x128::size;
-    gelu_kernel2<<<grid_size, block_size>>>(out, inp, N);
+    gelu_forward_kernel2<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
 
