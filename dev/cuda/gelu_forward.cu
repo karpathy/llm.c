@@ -2,7 +2,10 @@
 Kernels for gelu forward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math gelu_forward.cu -o gelu_forward
+nvcc -O3 --use_fast_math gelu_forward.cu -o gelu_forward 
+
+If encountering "warning #20012-D: __device__ annotation is ignored on a function("Packed128") that is explicitly defaulted on its first declaration":
+nvcc -O3 --use_fast_math gelu_forward.cu -o gelu_forward  -Xcudafe --diag_suppress=esa_on_defaulted_function_ignored
 
 If encountering "error: identifier "M_PI" is undefined", add the following lines to the top of the file:
 
