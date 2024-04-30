@@ -25,6 +25,22 @@ thread coarsening/ILP
 #include <cuda_runtime.h>
 #include "common.h"
 
+// turn on bf16 as default, done up here for now
+//#define ENABLE_BF16
+
+#if defined(ENABLE_BF16)
+typedef __nv_bfloat16 floatX;
+typedef __nv_bfloat16 floatN;
+#elif defined(ENABLE_FP16)
+typedef half floatX;
+typedef half floatN;
+#else
+typedef float floatX;
+typedef float floatN;
+#endif
+
+typedef Packed128<float> x128;
+
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -55,6 +71,83 @@ void adamw_cpu(float* params_memory, const float* grads_memory, float* m_memory,
 // GPU kernels
 
 // utility functions
+
+// ----------------------------------------------------------------------------
+// Random Number Generatiom
+
+// Simple xorshift RNG
+__device__ __host__ unsigned int random_u32(unsigned long long *state) {
+    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
+}
+__device__ __host__ float random_f32(unsigned long long *state) { // random float32 in [0,1)
+    return (random_u32(state) >> 8) / 16777216.0f;
+}
+
+// SquirrelNoise5 - Squirrel's Raw Noise utilities (version 5)
+// This gives us a random number from threadIdx/blockIdx + a single seed for the entire GPU
+// todo - possibly overkill and we don't need such high quality random numbers? (tbd)
+// http://eiserloh.net/noise/SquirrelNoise5.hpp
+__device__ __host__ constexpr unsigned int SquirrelNoise5(int positionX, unsigned int seed)
+{
+	constexpr unsigned int SQ5_BIT_NOISE1 = 0xd2a80a3f;	// 11010010101010000000101000111111
+	constexpr unsigned int SQ5_BIT_NOISE2 = 0xa884f197;	// 10101000100001001111000110010111
+	constexpr unsigned int SQ5_BIT_NOISE3 = 0x6C736F4B; // 01101100011100110110111101001011
+	constexpr unsigned int SQ5_BIT_NOISE4 = 0xB79F3ABB;	// 10110111100111110011101010111011
+	constexpr unsigned int SQ5_BIT_NOISE5 = 0x1b56c4f5;	// 00011011010101101100010011110101
+	unsigned int mangledBits = (unsigned int) positionX;
+	mangledBits *= SQ5_BIT_NOISE1;
+	mangledBits += seed;
+	mangledBits ^= (mangledBits >> 9);
+	mangledBits += SQ5_BIT_NOISE2;
+	mangledBits ^= (mangledBits >> 11);
+	mangledBits *= SQ5_BIT_NOISE3;
+	mangledBits ^= (mangledBits >> 13);
+	mangledBits += SQ5_BIT_NOISE4;
+	mangledBits ^= (mangledBits >> 15);
+	mangledBits *= SQ5_BIT_NOISE5;
+	mangledBits ^= (mangledBits >> 17);
+	return mangledBits;
+}
+__device__ __host__ constexpr unsigned int Get1dNoiseUint(int positionX, unsigned int seed)
+{
+	return SquirrelNoise5(positionX, seed);
+}
+__device__ __host__ constexpr unsigned int Get2dNoiseUint(int indexX, int indexY, unsigned int seed)
+{
+	constexpr int PRIME_NUMBER = 198491317; // Large prime number with non-boring bits
+	return SquirrelNoise5(indexX + (PRIME_NUMBER * indexY), seed);
+}
+__device__ __host__ constexpr float Get1dNoiseZeroToOne(int index, unsigned int seed)
+{
+	constexpr double ONE_OVER_MAX_UINT = (1.0 / (double) 0xFFFFFFFF);
+	return (float)(ONE_OVER_MAX_UINT * (double) SquirrelNoise5(index, seed));
+}
+__device__ __host__ constexpr float Get2dNoiseZeroToOne(int indexX, int indexY, unsigned int seed)
+{
+	constexpr double ONE_OVER_MAX_UINT = (1.0 / (double) 0xFFFFFFFF);
+	return (float)(ONE_OVER_MAX_UINT * (double) Get2dNoiseUint(indexX, indexY, seed));
+}
+
+// stochastic rounding built on top of Squirel Noise above (with seed updated per step via xorshift)
+__device__ __forceinline__ void stochastic_rounding(float in, __nv_bfloat16 *out, unsigned int seed) {
+    // todo - is this stochastic rounding *too good*? can we cut any corners?
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+    unsigned int threshold = random & 0xFFFF;
+    unsigned int float_bits = __float_as_uint(in);
+    unsigned int rounded_bits = float_bits & 0x0000FFFF;
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
+    *out = __float2bfloat16_rn(__uint_as_float(float_bits));
+}
+__device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigned int random) {
+    *out = (float)in; // todo - implement this...
+}
+__device__ __forceinline__ void stochastic_rounding(float in, float *out, unsigned int random) {
+    *out = in; // dummy function for when floatX is float (FP32 mode)
+}
 
 // Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
 // Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
@@ -98,6 +191,40 @@ __global__ void adamw_kernel2(float* params_memory, const float* grads_memory, f
 }
 
 
+template <typename Tp, typename Tg>
+__global__ void adamw_kernel3(Tp* params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
+                              unsigned int seed) {
+   int i = (blockIdx.x * blockDim.x + threadIdx.x);
+   x128 packed_grads_memory = load128(grads_memory+(i*x128::size));
+   x128 packed_params_memory = load128(params_memory+(i*x128::size));
+   f128 packed_m_memory = load128(m_memory+(i*f128::size));
+   f128 packed_v_memory = load128(v_memory+(i*f128::size));
+   for(int k = 0; k < packed_v_memory.size; ++k){
+    if (i*4 + k >= num_parameters) return;  // guard
+    float grad = (float)packed_grads_memory[k];
+    float m = packed_m_memory[k];
+    float v = packed_v_memory[k];
+    // update the first moment (momentum)
+    m = lerp(grad, m, beta1);
+    packed_m_memory[k] = m;
+    // update the second moment (RMSprop)
+    v = lerp(grad * grad, v, beta2);
+    packed_v_memory[k] = v;
+    m /= beta1_correction;  // m_hat
+    v /= beta2_correction;  // v_hat
+    // update the parameters (weight/bias)
+    float param = (float)packed_params_memory[k] - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * (float)packed_params_memory[k]));
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+    // todo - explain stochastic rounding here
+    stochastic_rounding(param, &packed_params_memory[k], random);
+   }
+   store128(m_memory+(i*f128::size), packed_m_memory);
+   store128(v_memory+(i*f128::size), packed_v_memory);
+   store128(params_memory+(i*x128::size), packed_params_memory);
+}
+
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -121,6 +248,17 @@ void adamw_dispatch2(float* params_memory, const float* grads_memory, float* m_m
     cudaCheck(cudaGetLastError());
 }
 
+// version 2: naive dispatch to slightly optimized kernel
+void adamw_dispatch3(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+                     float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+    unsigned int block_size = 512;
+    unsigned int num_blocks = ceil_div(num_parameters, (long) block_size)/f128::size;
+    adamw_kernel3<<<num_blocks, block_size>>>(params_memory, grads_memory, m_memory, v_memory, num_parameters,
+                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, 1337);
+    cudaCheck(cudaGetLastError());
+}
+
+
 void adamw(int kernel_num,
            float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, int t, long num_parameters,
            float learning_rate=1e-3, float beta1=0.9, float beta2=0.999, float eps=1e-8, float weight_decay=0.0) {
@@ -134,6 +272,10 @@ void adamw(int kernel_num,
             break;
         case 2:
             adamw_dispatch2(params_memory, grads_memory, m_memory, v_memory, num_parameters,
+                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+            break;
+        case 3:
+            adamw_dispatch3(params_memory, grads_memory, m_memory, v_memory, num_parameters,
                             learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
             break;
         default:
