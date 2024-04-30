@@ -115,6 +115,7 @@ cublasLtHandle_t cublaslt_handle;
 int cuda_arch_major = 0;
 int cuda_arch_minor = 0;
 int cuda_num_SMs = 0; // for persistent threads where we want 1 threadblock per SM
+unsigned long long gpu_rng_state = 1337; // randomised on every kernel launch with RNG
 
 namespace cg = cooperative_groups;
 
@@ -313,21 +314,40 @@ __device__ __host__ constexpr float Get2dNoiseZeroToOne(int indexX, int indexY, 
 }
 
 // stochastic rounding built on top of Squirel Noise above (with seed updated per step via xorshift)
-__device__ __forceinline__ void stochastic_rounding(float in, __nv_bfloat16 *out, unsigned int seed) {
-    // todo - is this stochastic rounding *too good*? can we cut any corners?
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+__device__ __forceinline__ void stochastic_rounding_raw(__nv_bfloat16 *out, float in, uint random) {
     unsigned int threshold = random & 0xFFFF;
     unsigned int float_bits = __float_as_uint(in);
     unsigned int rounded_bits = float_bits & 0x0000FFFF;
     float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
     *out = __float2bfloat16_rn(__uint_as_float(float_bits));
 }
-__device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigned int random) {
+__device__ __forceinline__ void stochastic_rounding_raw(half *out, float in, uint random) {
     *out = (float)in; // todo - implement this...
 }
-__device__ __forceinline__ void stochastic_rounding(float in, float *out, unsigned int random) {
+__device__ __forceinline__ void stochastic_rounding_raw(float *out, float in, uint random) {
     *out = in; // dummy function for when floatX is float (FP32 mode)
 }
+template <typename T>
+__device__ __forceinline__ void stochastic_rounding_step(T *out, float in, uint &seed, uint &random, uint step=0) {
+    //*out = (T)in; return;
+
+    if ((step % 4) == 0) {
+        random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+        seed ^= random;
+    } else {
+        random = __funnelshift_r(random, random, 8); // rotate 8 bits to the right
+    }
+    stochastic_rounding_raw(out, in, random);
+    step++;
+}
+template <typename T>
+__device__ __forceinline__ void stochastic_rounding(T *out, float in, uint seed) {
+    //*out = (T)in; return;
+
+    uint random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+    stochastic_rounding_raw(out, in, random);
+}
+
 
 // ----------------------------------------------------------------------------
 // MPI / multi-processing setup
@@ -456,7 +476,7 @@ __global__ void encoder_forward_kernel2(floatX* out,
 // really bad naive kernel with atomicAdd
 __global__ void encoder_backward_kernel(floatX* dwte, floatX* dwpe,
                                         const floatX* dout, const int* inp,
-                                        int B, int T, int C) {
+                                        int B, int T, int C, uint seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * T * C;
 
@@ -676,7 +696,7 @@ __global__ void gelu_forward_kernel(floatX* out, const floatX* inp, int N) {
     }
 }
 
-__global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
+__global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floatX* dout, const int N, uint seed) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) {
         float x = (float)inp[i];
@@ -686,7 +706,9 @@ __global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floa
         float coshf_out = coshf(tanh_arg);
         float sech_out = 1.0f / (coshf_out * coshf_out);
         float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
-        dinp[i] = (floatX)(local_grad * (float)dout[i]);
+
+        //dinp[i] = (floatX)(local_grad * (float)dout[i]);
+        stochastic_rounding(dinp + i, local_grad * (float)dout[i], seed);
     }
 }
 
@@ -695,7 +717,7 @@ __global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floa
 // the idea is to employ one block to reduce along several columns,
 // where each block has a width of 32 columns to ensure coalesced access.
 // at the end we accumulate the reductions performed by the warps in each block via shared memory
-__global__ void matmul_backward_bias_kernel4(floatX* dbias, const floatX* dout, int B, int T, int OC) {
+__global__ void matmul_backward_bias_kernel4(floatX* dbias, const floatX* dout, int B, int T, int OC, uint seed) {
     // this kernel is launched with 1D grid_dim of OC/32
     // for example let's say block_size is 128
     extern __shared__ float smem[]; // of size block_size (128)
@@ -726,6 +748,7 @@ __global__ void matmul_backward_bias_kernel4(floatX* dbias, const floatX* dout, 
         for (int j = 0; j < vstep; j++) {
             dout_sum += smem[lane_id + j * warpSize];
         }
+        // todo - stochastic rounding here?
         dbias[tl + lane_id] = (floatX)dout_sum;
     }
 }
@@ -733,7 +756,7 @@ __global__ void matmul_backward_bias_kernel4(floatX* dbias, const floatX* dout, 
 // single FP32 scratchpad shared by all the threadblocks (based on kernels 3 & 5)
 __global__ void layernorm_backward_kernel6(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                         const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
-                        int B, int T, int C) {
+                        int B, int T, int C, uint seed) {
     extern __shared__ float shared[]; // size = 2 * C + 1
 
     namespace cg = cooperative_groups;
@@ -780,7 +803,12 @@ __global__ void layernorm_backward_kernel6(floatX* dinp, floatX* dweight, floatX
         dnorm_mean = dnorm_mean / C;
         dnorm_norm_mean = dnorm_norm_mean / C;
 
+        // RNG state for stochastic rounding
+        uint random = 0, step = 0;
+
         // now iterate again and accumulate all the gradients
+        // todo - use f128
+        #pragma unroll 4
         for (int i = warp.thread_rank(); i < C; i += warp.size()) {
             float dout_i = (float)__ldcs(&dout_bt[i]);
             float norm_bti = ((float)__ldcs(&inp_bt[i]) - mean_bt) * rstd_bt;
@@ -795,7 +823,8 @@ __global__ void layernorm_backward_kernel6(floatX* dinp, floatX* dweight, floatX
             dval -= dnorm_mean; // term 2
             dval -= norm_bti * dnorm_norm_mean; // term 3
             dval *= rstd_bt; // final scale
-            dinp_bt[i] = (floatX)((float)dinp_bt[i] + dval);
+            //dinp_bt[i] = (floatX)((float)dinp_bt[i] + dval);
+            stochastic_rounding_step(&dinp_bt[i], (float)dinp_bt[i] + dval, seed, random, step++);
         }
     }
 
@@ -825,7 +854,7 @@ __global__ void layernorm_backward_kernel6(floatX* dinp, floatX* dweight, floatX
 }
 
 __global__ void softmax_autoregressive_backward_kernel(floatX* dpreatt, const floatX* datt, const floatX* att,
-                                                       int B, int T, int C, float scale) {
+                                                       int B, int T, int C, float scale, uint seed) {
     constexpr const int BlockSize = 256;
     constexpr int T_per_block = 4;
     cg::thread_block block = cg::this_thread_block();
@@ -860,11 +889,19 @@ __global__ void softmax_autoregressive_backward_kernel(floatX* dpreatt, const fl
         block.sync();
         local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
 
+        // RNG state for stochastic rounding
+        uint random = 0, step = 0;
+
+        #pragma unroll 4
         for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
             // don't touch the cache. Some parts will still be here from the previous loop, and
             // we want to exploit those.
             float acc = (float)__ldcs(att_bth + t3) * ((float)__ldcs(datt_bth + t3) - local_sum);
-            __stcs(dpreatt_bth + t3, (floatX)(scale * acc));
+
+            //__stcs(dpreatt_bth + t3, (floatX)(scale * acc));
+            floatX rounded;
+            stochastic_rounding_step(&rounded, scale * acc, seed, random, step++);
+            __stcs(dpreatt_bth + t3, rounded);
         }
     }
 }
@@ -879,7 +916,7 @@ __device__ inline float lerp(float start, float end, float weight) {
 template <typename Tp, typename Tg>
 __global__ void adamw_kernel3(Tp* params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
-                              unsigned int seed) {
+                              uint seed) {
    int i = blockIdx.x * blockDim.x + threadIdx.x;
    if (i >= num_parameters) return;  // guard
    float grad = (float)grads_memory[i];
@@ -895,9 +932,8 @@ __global__ void adamw_kernel3(Tp* params_memory, Tg* grads_memory, float* m_memo
    v /= beta2_correction;  // v_hat
    // update the parameters (weight/bias)
    float param = (float)params_memory[i] - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * (float)params_memory[i]));
-   unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
    // todo - explain stochastic rounding here
-   stochastic_rounding(param, &params_memory[i], random);
+   stochastic_rounding(&params_memory[i], param, seed);
 }
 
 struct SoftmaxParams {
@@ -959,7 +995,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_til
 // will _update_ logits to logit gradients
 __global__ void fused_classifier_kernel3(floatX* logits, floatX* losses, floatX* probs,
                                          const floatX* dlosses, const int* targets,
-                                         int B, int T, int V, int P) {
+                                         int B, int T, int V, int P, uint seed) {
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
@@ -975,6 +1011,8 @@ __global__ void fused_classifier_kernel3(floatX* logits, floatX* losses, floatX*
         losses[idx] = (floatX)(-logf(prob));
     }
 
+    // RNG state for stochastic rounding
+    uint random = 0, step = 0;
     // very sensible default for dlosses is 1/(B*T), which is the uniform loss
     float dloss = (dlosses != NULL) ? (float)dlosses[idx] : 1.0f / (B*T);
     // calculate the gradients directly, saves bandwidth from probs during training
@@ -982,6 +1020,7 @@ __global__ void fused_classifier_kernel3(floatX* logits, floatX* losses, floatX*
     const floatX* logits_vec = logits + idx * P;
     // note that we use the padded dimension P to access data, but we only ever
     // modify the elements up to V, ignoring the padded dimensions and leaving them at 0
+    #pragma unroll 4
     for (int i = threadIdx.x; i < V; i += blockDim.x) {
         // this is the 2nd read of logits after the one in prepare_softmax2
         // this data will never be needed again, so we reduce cache persistence
@@ -991,7 +1030,9 @@ __global__ void fused_classifier_kernel3(floatX* logits, floatX* losses, floatX*
             probs[idx * P + i] = (floatX)prob;
         }
         float indicator = (i == ix) ? 1.0f : 0.0f;
-        logits[idx * P + i] = (floatX)((prob - indicator) * dloss);
+        float dlogit = (prob - indicator) * dloss;
+        stochastic_rounding_step(&logits[idx * P + i], dlogit, seed, random, step++);
+        //logits[idx * P + i] = (floatX)(dlogit);
     }
 }
 
@@ -1014,7 +1055,7 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
     const int N = B * T * C;
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
-    encoder_backward_kernel<<<grid_size, block_size>>>(dwte, dwpe, dout, inp, B, T, C);
+    encoder_backward_kernel<<<grid_size, block_size>>>(dwte, dwpe, dout, inp, B, T, C, random_u32(&gpu_rng_state));
     cudaCheck(cudaGetLastError());
 }
 
@@ -1200,7 +1241,7 @@ void gelu_forward(floatX* out, const floatX* inp, int N) {
 void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N, block_size);
-    gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout, N);
+    gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout, N, random_u32(&gpu_rng_state));
     cudaCheck(cudaGetLastError());
 }
 
@@ -1221,7 +1262,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
     if (dbias != NULL) {
         const int block_size = 1024;
         const int grid_size = OC / 32; // for now, OC must be divisible by 32 for this kernel to work
-        matmul_backward_bias_kernel4<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
+        matmul_backward_bias_kernel4<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC, random_u32(&gpu_rng_state));
         cudaCheck(cudaGetLastError());
     }
 }
@@ -1233,7 +1274,7 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     const int grid_size = 1 * cuda_num_SMs;
     size_t shared_mem_size = (2 * C + 1) * sizeof(float);
     cudaMemset(scratch, 0, (2 * C + 1) * sizeof(float)); // todo - memset in parallel with previous kernels using streams
-    layernorm_backward_kernel6<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+    layernorm_backward_kernel6<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, random_u32(&gpu_rng_state));
     cudaCheck(cudaGetLastError());
 }
 
@@ -1282,7 +1323,7 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* da
     // backward into preatt
     int hs = C / NH; // head size
     float scale = 1.0f / sqrtf(hs);
-    softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, C, scale);
+    softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, C, scale, random_u32(&gpu_rng_state));
     cudaCheck(cudaGetLastError());
     // backward into q
     cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, alpha_ptr,
@@ -1306,7 +1347,7 @@ void fused_classifier3(Type* logits, Type* losses,
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = N;
-    fused_classifier_kernel3<<<grid_size, block_size>>>(logits, losses, (Type*)NULL, dlosses, targets, B, T, V, P);
+    fused_classifier_kernel3<<<grid_size, block_size>>>(logits, losses, (Type*)NULL, dlosses, targets, B, T, V, P, random_u32(&gpu_rng_state));
     cudaCheck(cudaGetLastError());
 }
 
@@ -1606,7 +1647,6 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
-    model->rng_state = 13371337;
 }
 
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
@@ -1920,10 +1960,10 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     int num_blocks = CEIL_DIV(model->num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
-    unsigned int seed = random_u32(&model->rng_state);
     adamw_kernel3<<<num_blocks, block_size>>>((floatX*)model->params_memory, (floatX*)model->grads_memory, model->m_memory, model->v_memory,
                                               model->num_parameters,
-                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
+                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
+                                              random_u32(&gpu_rng_state));
     cudaCheck(cudaGetLastError());
 }
 
