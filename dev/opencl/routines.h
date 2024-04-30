@@ -161,10 +161,11 @@ void cl_matmul_backward(GPT2_CL *gcl, float* dinp, float* dweight, float* dbias,
             exit(1);
         }
 
-        size_t oc_round = ((OC + tile_size - 1) / tile_size) * tile_size;
-        size_t size_global3[2] = {oc_round, 1};
-        size_t size_local3[2] = {tile_size, 1};
-        err = clEnqueueNDRangeKernel(gcl->queue, gcl->matmul_backward3, 2, NULL, size_global3, size_local3, 0, NULL, NULL);
+        size_t wg_size = gcl->max_wg_size;
+        size_t oc_round = ((OC + wg_size - 1) / wg_size) * wg_size;
+        size_t size_global3 = oc_round;
+        size_t size_local3 = wg_size;
+        err = clEnqueueNDRangeKernel(gcl->queue, gcl->matmul_backward3, 1, NULL, &size_global3, &size_local3, 0, NULL, NULL);
         if (err != CL_SUCCESS)
         {
             printf("error: failed to execute kernel! %d\n", err);
