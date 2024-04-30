@@ -14,6 +14,8 @@ __kernel void matmul_forward(__global float* out, __global float* AMat,
     size_t global_id1 = get_global_id(1);
     size_t local_id0 = get_local_id(0);
     size_t local_id1 = get_local_id(1);
+    bool is_valid_g0 = global_id0 < B * T;
+    bool is_valid_g1 = global_id1 < OC;
 
     // calculate number of tiles
     int num_tiles = (C + TILE_SIZE - 1) / TILE_SIZE;
@@ -27,10 +29,10 @@ __kernel void matmul_forward(__global float* out, __global float* AMat,
         int col = t * TILE_SIZE + local_id1;
 
         // load AMat tile
-        A_tile[local_id0][local_id1] = (row < C && global_id0 < B * C) ? AMat[global_id0 * C + col] : 0.0f;
+        A_tile[local_id0][local_id1] = (col < C && is_valid_g0) ? AMat[global_id0 * C + col] : 0.0f;
 
         // transpose BMat tile
-        B_tile[local_id1][local_id0] = (col < C && global_id1 < OC) ? BMat[global_id1 * C + row] : 0.0f;
+        B_tile[local_id1][local_id0] = (row < C && is_valid_g1) ? BMat[global_id1 * C + row] : 0.0f;
 
         // synchronize to make sure all data is loaded into local memory
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -69,7 +71,7 @@ __kernel void matmul_forward(__global float* out, __global float* AMat,
     }
 
     // write result to global memory
-    if (global_id0 < B * T && global_id1 < OC) {
+    if (is_valid_g0 && is_valid_g1) {
         out[global_id0 * OC + global_id1] = val;
     }
 }
