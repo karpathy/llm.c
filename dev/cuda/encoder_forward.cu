@@ -85,25 +85,32 @@ __global__ void encoder_forward_kernel2(float* out,
     }
 }
 
-__device__ inline float4 add_float4(const float4& a, const float4& b) {
-    return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
-}
-
 // use of float4 leads to using 128-bit LDG / STG instructions in SASS,
 // very helpful in memory-bound kernels like encoder_forward
-__global__ void encoder_forward_kernel3(float4* out,
-                               const int* inp, const float4* wte, const float4* wpe,
+__global__ void encoder_forward_kernel3(float* out,
+                               const int* inp, const float* wte, const float* wpe,
                                int B, int T, int C) {
-    int C4 = C / 4;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int N = B * T * C4;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * f128::size;
+    int N = B * T * C;
     if (idx < N) {
-        int bt = idx / C4;
+        int bt = idx / C;
         int b = bt / T;
         int t = bt % T;
-        int c4 = idx % C4;
+        int c = idx % C;
+
         int ix = inp[b * T + t];
-        out[b * T * C4 + t * C4 + c4] = add_float4(wte[ix * C4 + c4], wpe[t * C4 + c4]);
+
+        float* out_btc = out + b * T * C + t * C + c;
+        const float* wte_ix = wte + ix * C + c;
+        const float* wpe_tc = wpe + t * C + c;
+
+        f128 wte = load128cs(wte_ix);
+        f128 wpe = load128cs(wpe_tc);
+        f128 packet_out;
+        for(int k = 0; k < wte.size; ++k) {
+            packet_out[k] = wte[k] + wpe[k];
+        }
+        store128(out_btc,  packet_out);
     }
 }
 
@@ -137,7 +144,7 @@ void encoder_forward3(float* out,
     assert(C % 4 == 0);
     const int N = B * T * C;
     const int grid_size = ceil_div(N / 4, block_size);
-    encoder_forward_kernel3<<<grid_size, block_size>>>((float4*) out, inp, (float4*) wte, (float4*) wpe, B, T, C);
+    encoder_forward_kernel3<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
