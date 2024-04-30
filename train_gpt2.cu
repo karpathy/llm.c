@@ -1943,28 +1943,39 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 #endif
 }
 
-void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
+void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t, MultiGpuConfig* multi_gpu_config) {
     // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
-    
+    size_t num_parameters = multi_gpu_config->shard_num_parameters;
+    size_t offset = multi_gpu_config->shard_offset;
+    floatX* params_memory = (floatX*)model->params_memory + offset;
+    floatX* grads_memory = (floatX*)model->grads_memory + offset;
+
     // lazily allocate the memory for m_memory and v_memory
     if (model->m_memory == NULL) {
-        cudaCheck(cudaMalloc((void**)&model->m_memory, model->num_parameters * sizeof(float)));
-        cudaCheck(cudaMalloc((void**)&model->v_memory, model->num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->m_memory, 0, model->num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, model->num_parameters * sizeof(float)));
-        printf0("allocated %zu MiB for AdamW optimizer state m\n", (model->num_parameters * sizeof(float)) >> 20);
-        printf0("allocated %zu MiB for AdamW optimizer state v\n", (model->num_parameters * sizeof(float)) >> 20);
+        cudaCheck(cudaMalloc((void**)&model->m_memory, num_parameters * sizeof(float)));
+        cudaCheck(cudaMalloc((void**)&model->v_memory, num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->m_memory, 0, num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->v_memory, 0, num_parameters * sizeof(float)));
+        printf0("allocated %zu MiB for AdamW optimizer state m\n", (num_parameters * sizeof(float)) >> 20);
+        printf0("allocated %zu MiB for AdamW optimizer state v\n", (num_parameters * sizeof(float)) >> 20);
     }
 
     int block_size = 512;
-    int num_blocks = CEIL_DIV(model->num_parameters, block_size);
+    int num_blocks = CEIL_DIV(num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
-    adamw_kernel3<<<num_blocks, block_size>>>((floatX*)model->params_memory, (floatX*)model->grads_memory, model->m_memory, model->v_memory,
-                                              model->num_parameters,
+    adamw_kernel3<<<num_blocks, block_size>>>(params_memory, grads_memory, model->m_memory, model->v_memory,
+                                              num_parameters,
                                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
     cudaCheck(cudaGetLastError());
+
+    if (multi_gpu_config->zero_active) {
+        // gather all parameter updates from each process
+        ncclCheck(ncclAllGather(params_memory, (floatX*)model->params_memory,
+                                num_parameters, ncclFloatX, 
+                                multi_gpu_config->nccl_comm, 0)); // using default stream
+    }
 }
 
 void gpt2_free(GPT2 *model) {
