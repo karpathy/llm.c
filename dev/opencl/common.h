@@ -123,6 +123,10 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     }
 
     // build program
+    if(MATMUL_VLOAD_SIZE && (MATMUL_TILE_SIZE % MATMUL_VLOAD_SIZE) != 0) {
+        printf("error: MATMUL_TILE_SIZE must be multiple of MATMUL_VLOAD_SIZE\n");
+        exit(1);
+    }
     sprintf(build_options_str, "%s -D TILE_SIZE=%d -D LOCAL_MEM_PADDING_SIZE=%d -D MATMUL_VLOAD_SIZE=%d",
         build_options, MATMUL_TILE_SIZE, MATMUL_LOCAL_MEM_PADDING_SIZE, MATMUL_VLOAD_SIZE);
     err = clBuildProgram(gcl->program, 1, &gcl->device, build_options_str, NULL, NULL);
