@@ -227,6 +227,7 @@ struct alignas(16) Packed128 {
 
 // short-form typedef
 typedef Packed128<float> f128;
+typedef Packed128<floatX> x128;
 
 // load a Packed128 from an aligned memory address
 template<class ElementType>
@@ -566,7 +567,8 @@ __global__ void permute_kernel_backward(floatX* dinp,
 
 __global__ void unpermute_kernel(floatX* inp, floatX *out, int B, int N, int NH, int d) {
    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x);
     // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
     if (idx < B * NH * N * d) {
         int b = idx / (NH * N * d);
@@ -668,11 +670,18 @@ __global__ void residual_forward_kernel(floatX* out, floatX* inp1, floatX* inp2,
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 __global__ void gelu_forward_kernel(floatX* out, const floatX* inp, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     if (i < N) {
-        float xi = (float)inp[i];
-        float cube = 0.044715f * xi * xi * xi;
-        out[i] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
+        x128 packed_out;
+        x128 packed_inp = load128cs(inp + i); // load and do not keep in cache
+        for(int k = 0; k < packed_inp.size; ++k) {
+            float xi =(float)packed_inp[k];
+            float cube = 0.044715f * xi * xi * xi;
+            packed_out[k] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
+        }
+        // store instead of storecs (without cache streaming) in case it is useful for the
+        // data to be in the cache for the next operation after this GeLU
+        store128(out + i, packed_out);
     }
 }
 
@@ -1192,7 +1201,7 @@ void residual_forward(floatX* out, floatX* inp1, floatX* inp2, int N) {
 
 void gelu_forward(floatX* out, const floatX* inp, int N) {
     const int block_size = 128;
-    const int grid_size = CEIL_DIV(N, block_size);
+    const int grid_size = CEIL_DIV(N/x128::size, block_size);
     gelu_forward_kernel<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
