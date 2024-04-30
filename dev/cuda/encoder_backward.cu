@@ -84,6 +84,69 @@ __global__ void encoder_backward_kernel2(float* dwte, float* dwpe,
     }
 }
 
+// naive implementation with atomics
+__global__ void encoder_backward_kernel3(__nv_bfloat16* dwte, __nv_bfloat16* dwpe,
+                                        const __nv_bfloat16* dout, const int* inp,
+                                        int B, int T, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int N = B * T * C;
+
+    if (idx < N) {
+        int bt = idx / C;
+        int b = bt / T;
+        int t = bt % T;
+        int c = idx % C;
+
+        int ix = inp[b * T + t];
+
+        const __nv_bfloat16* dout_btc = dout + b * T * C + t * C + c;
+        __nv_bfloat16* dwte_ix = dwte + ix * C + c;
+        __nv_bfloat16* dwpe_tc = dwpe + t * C + c;
+
+        atomicAdd(dwte_ix, *dout_btc);
+        atomicAdd(dwpe_tc, *dout_btc);
+    }
+}
+
+__device__ void atomicStochasticAdd(__nv_bfloat16* address, float val0, float val1) {
+    float2 val = make_float2(val0, val1);
+    uint* address_as_uint = (uint*)address;
+    uint old = *address_as_uint, assumed;
+    do {
+        assumed = old;
+        float2 old_fp32 = __bfloat1622float2(*(__nv_bfloat162*)&old);
+        float2 new_fp32 = make_float2(old_fp32.x + val.x, old_fp32.y + val.y);
+        __nv_bfloat162 new_bf16 = __float22bfloat162_rn(new_fp32); // TODO: stochastic rounding
+        old = atomicCAS(address_as_uint, assumed, *(uint*)&new_bf16);
+    } while (assumed != old);
+}
+
+typedef __nv_bfloat16 floatX;
+__global__ void encoder_backward_kernel4(__nv_bfloat16* dwte, __nv_bfloat16* dwpe,
+                                        const __nv_bfloat16* dout, const int* inp,
+                                        int B, int T, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int N = B * T * C;
+    idx *= 2; // 2 elements per thread
+
+    if (idx < N) {
+        int bt = idx / C;
+        int b = bt / T;
+        int t = bt % T;
+        int c = idx % C;
+
+        int ix = inp[b * T + t];
+
+        const __nv_bfloat16* dout_btc = dout + b * T * C + t * C + c;
+        __nv_bfloat16* dwte_ix = dwte + ix * C + c;
+        __nv_bfloat16* dwpe_tc = dwpe + t * C + c;
+
+        float2 dout_data = make_float2(dout_btc[0], dout_btc[1]);
+        atomicStochasticAdd(dwte_ix, dout_data.x, dout_data.y);
+        atomicStochasticAdd(dwpe_tc, dout_data.x, dout_data.y);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -106,6 +169,27 @@ void encoder_backward2(float* dwte, float* dwpe,
     cudaCheck(cudaGetLastError());
 }
 
+void encoder_backward3(float* dwte, float* dwpe,
+                    const float* dout, const int* inp,
+                    int B, int T, int C,
+                    const int block_size) {
+    const int N = B * T * C;
+    const int grid_size = ceil_div(N, block_size);
+    encoder_backward_kernel3<<<grid_size, block_size>>>((__nv_bfloat16*)dwte, (__nv_bfloat16*)dwpe, (__nv_bfloat16*)dout, inp, B, T, C);
+    cudaCheck(cudaGetLastError());
+}
+
+void encoder_backward4(float* dwte, float* dwpe,
+                    const float* dout, const int* inp,
+                    int B, int T, int C,
+                    const int block_size) {
+    const int N = B * T * C;
+    const int grid_size = ceil_div(N, block_size);
+    encoder_backward_kernel4<<<grid_size, block_size>>>((__nv_bfloat16*)dwte, (__nv_bfloat16*)dwpe, (__nv_bfloat16*)dout, inp, B, T, C);
+    cudaCheck(cudaGetLastError());
+}
+
+
 // kernel version dispatch
 void encoder_backward(int kernel_num,
                      float* dwte, float* dwpe,
@@ -118,6 +202,12 @@ void encoder_backward(int kernel_num,
             break;
         case 2:
             encoder_backward2(dwte, dwpe, dout, inp, B, T, C, block_size);
+            break;
+        case 3:
+            encoder_backward3(dwte, dwpe, dout, inp, B, T, C, block_size);
+            break;
+        case 4:
+            encoder_backward4(dwte, dwpe, dout, inp, B, T, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -166,18 +256,20 @@ int main(int argc, char **argv) {
     // set up block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
 
-    // first check the correctness of the kernel
-    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
-        int block_size = block_sizes[j];
-        printf("Checking block size %d.\n", block_size);
-        encoder_backward_cpu(dwte, dwpe, dout, inp, B, T, C);
-        encoder_backward(kernel_num, d_dwte, d_dwpe, d_dout, d_inp, B, T, C, block_size);
-        validate_result(d_dwte, dwte, "dwte", V * C, 1e-5f);
-        validate_result(d_dwpe, dwpe, "dwpe", T * C, 1e-5f);
+    if (kernel_num < 3) {
+        // first check the correctness of the kernel
+        for (size_t j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+            int block_size = block_sizes[j];
+            printf("Checking block size %d.\n", block_size);
+            encoder_backward_cpu(dwte, dwpe, dout, inp, B, T, C);
+            encoder_backward(kernel_num, d_dwte, d_dwpe, d_dout, d_inp, B, T, C, block_size);
+            validate_result(d_dwte, dwte, "dwte", V * C, 1e-5f);
+            validate_result(d_dwpe, dwpe, "dwpe", T * C, 1e-5f);
+        }
+        printf("All results match. Starting benchmarks.\n\n");
     }
-    printf("All results match. Starting benchmarks.\n\n");
 
-    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+    for (size_t j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         int repeat_times = 1000;
         float elapsed_time = benchmark_kernel(repeat_times, encoder_backward,

@@ -473,27 +473,48 @@ __global__ void encoder_forward_kernel2(floatX* out,
     }
 }
 
-// really bad naive kernel with atomicAdd
+__device__ void atomicStochasticAdd(__nv_bfloat16* address, float val0, float val1, uint seed) {
+    float2 val = make_float2(val0, val1);
+    uint* address_as_uint = (uint*)address;
+    uint old = *address_as_uint, assumed;
+    uint random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+    do {
+        assumed = old;
+        float2 old_fp32 = __bfloat1622float2(*(__nv_bfloat162*)&old);
+        float2 new_fp32 = make_float2(old_fp32.x + val.x, old_fp32.y + val.y);
+        __nv_bfloat162 new_bf16;
+        stochastic_rounding_raw(&new_bf16.x, new_fp32.x, random);
+        stochastic_rounding_raw(&new_bf16.y, new_fp32.y, random >> 16);
+        old = atomicCAS(address_as_uint, assumed, *(uint*)&new_bf16);
+    } while (assumed != old);
+}
+
+__device__ void atomicStochasticAdd(float* address, float val0, float val1, uint seed, uint random) {
+    atomicAdd(address, val0);
+    atomicAdd(address + 1, val1);
+}
+
 __global__ void encoder_backward_kernel(floatX* dwte, floatX* dwpe,
                                         const floatX* dout, const int* inp,
                                         int B, int T, int C, uint seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * T * C;
+    idx *= 2; // 2 elements per thread
 
     if (idx < N) {
         int bt = idx / C;
         int b = bt / T;
         int t = bt % T;
         int c = idx % C;
-
         int ix = inp[b * T + t];
 
         const floatX* dout_btc = dout + b * T * C + t * C + c;
         floatX* dwte_ix = dwte + ix * C + c;
         floatX* dwpe_tc = dwpe + t * C + c;
 
-        atomicAddX(dwte_ix, (floatX)*dout_btc);
-        atomicAddX(dwpe_tc, (floatX)*dout_btc);
+        float2 dout_data = make_float2(dout_btc[0], dout_btc[1]);
+        atomicStochasticAdd(dwte_ix, dout_data.x, dout_data.y, seed);
+        atomicStochasticAdd(dwpe_tc, dout_data.x, dout_data.y, seed ^ 0xFFFFFFFF);
     }
 }
 
@@ -1054,7 +1075,7 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
                     int B, int T, int C) {
     const int N = B * T * C;
     const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
+    const int grid_size = CEIL_DIV(N, block_size * 2); // each thread handles 2 elements
     encoder_backward_kernel<<<grid_size, block_size>>>(dwte, dwpe, dout, inp, B, T, C, random_u32(&gpu_rng_state));
     cudaCheck(cudaGetLastError());
 }
