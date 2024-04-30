@@ -21,11 +21,17 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <string.h>
 #include <unistd.h>
 #include <assert.h>
+// GPU / CUDA related
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+// our own utilities
+// defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
+#include "utils.h"
+// defines: tokenizer_init, tokenizer_decode, tokenizer_free
+#include "tokenizer.h"
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -63,114 +69,27 @@ cublasLtHandle_t cublaslt_handle;
 namespace cg = cooperative_groups;
 
 // ----------------------------------------------------------------------------
-// fread convenience utils, with nice handling of error checking using macros
-// simple replace fopen, fread, fclose with fopenCheck, freadCheck, fcloseCheck
-
-FILE *fopen_check(const char *path, const char *mode, const char *file, int line) {
-    FILE *fp = fopen(path, mode);
-    if (fp == NULL) {
-        fprintf(stderr, "Error: Failed to open file '%s' at %s:%d\n", path, file, line);
-        fprintf(stderr, "Error details:\n");
-        fprintf(stderr, "  File: %s\n", file);
-        fprintf(stderr, "  Line: %d\n", line);
-        fprintf(stderr, "  Path: %s\n", path);
-        fprintf(stderr, "  Mode: %s\n", mode);
-        exit(EXIT_FAILURE);
-    }
-    return fp;
-}
-
-#define fopenCheck(path, mode) fopen_check(path, mode, __FILE__, __LINE__)
-
-void fread_check(void *ptr, size_t size, size_t nmemb, FILE *stream, const char *file, int line) {
-    size_t result = fread(ptr, size, nmemb, stream);
-    if (result != nmemb) {
-        if (feof(stream)) {
-            fprintf(stderr, "Error: Unexpected end of file at %s:%d\n", file, line);
-        } else if (ferror(stream)) {
-            fprintf(stderr, "Error: File read error at %s:%d\n", file, line);
-        } else {
-            fprintf(stderr, "Error: Partial read at %s:%d. Expected %zu elements, read %zu\n",
-                    file, line, nmemb, result);
-        }
-        fprintf(stderr, "Error details:\n");
-        fprintf(stderr, "  File: %s\n", file);
-        fprintf(stderr, "  Line: %d\n", line);
-        fprintf(stderr, "  Expected elements: %zu\n", nmemb);
-        fprintf(stderr, "  Read elements: %zu\n", result);
-        exit(EXIT_FAILURE);
-    }
-}
-
-#define freadCheck(ptr, size, nmemb, stream) fread_check(ptr, size, nmemb, stream, __FILE__, __LINE__)
-
-void fclose_check(FILE *fp, const char *file, int line) {
-    if (fclose(fp) != 0) {
-        fprintf(stderr, "Error: Failed to close file at %s:%d\n", file, line);
-        fprintf(stderr, "Error details:\n");
-        fprintf(stderr, "  File: %s\n", file);
-        fprintf(stderr, "  Line: %d\n", line);
-        exit(EXIT_FAILURE);
-    }
-}
-
-#define fcloseCheck(fp) fclose_check(fp, __FILE__, __LINE__)
-
-// ----------------------------------------------------------------------------
-// malloc error-handling wrapper util
-
-void *malloc_check(size_t size, const char *file, int line) {
-    void *ptr = malloc(size);
-    if (ptr == NULL) {
-        fprintf(stderr, "Error: Memory allocation failed at %s:%d\n", file, line);
-        fprintf(stderr, "Error details:\n");
-        fprintf(stderr, "  File: %s\n", file);
-        fprintf(stderr, "  Line: %d\n", line);
-        fprintf(stderr, "  Size: %zu bytes\n", size);
-        exit(EXIT_FAILURE);
-    }
-    return ptr;
-}
-
-#define mallocCheck(size) malloc_check(size, __FILE__, __LINE__)
-
-// ----------------------------------------------------------------------------
 // all the kernels
 
-// warp-level reduction for finding the maximum value
-__device__ float warpReduceMax(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
-    }
-    return val;
+__device__ inline float4 add_float4(const float4& a, const float4& b) {
+    return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
 }
 
-// warp-level reduction for summing values
-__device__ float warpReduceSum(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-    }
-    return val;
-}
-
-__global__ void encoder_forward_kernel2(float* out,
-                               int* inp, float* wte, float* wpe,
+// use of float4 leads to using 128-bit LDG / STG instructions in SASS,
+// very helpful in memory-bound kernels like encoder_forward
+__global__ void encoder_forward_kernel3(float4* out,
+                               const int* inp, const float4* wte, const float4* wpe,
                                int B, int T, int C) {
+    int C4 = C / 4;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int N = B * T * C;
-
+    int N = B * T * C4;
     if (idx < N) {
-        int bt = idx / C;
+        int bt = idx / C4;
         int b = bt / T;
         int t = bt % T;
-        int c = idx % C;
-
+        int c4 = idx % C4;
         int ix = inp[b * T + t];
-
-        float* out_btc = out + b * T * C + t * C + c;
-        float* wte_ix = wte + ix * C + c;
-        float* wpe_tc = wpe + t * C + c;
-        *out_btc = *wte_ix + *wpe_tc;
+        out[b * T * C4 + t * C4 + c4] = add_float4(wte[ix * C4 + c4], wpe[t * C4 + c4]);
     }
 }
 
@@ -412,123 +331,6 @@ __global__ void gelu_backward_kernel(float* dinp, const float* inp, const float*
         float sech_out = 1.0f / (coshf_out * coshf_out);
         float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
         dinp[i] = local_grad * dout[i];
-    }
-}
-
-__global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int C) {
-    // out is (N, C) just like inp. Each row of inp will get softmaxed.
-    // same as kernel4, but optimised for very large Cs with advanced unrolling
-
-    // The trick is to read into a register array (all indices known at compile time)
-    // and always read UNROLL_FACTOR values to maximise memory level parallelism
-    // even if we would be out of bounds, we set the index to min(C-1, idx)
-    // so we just do some unnecessary reads (obviously bad for small C)
-    // the writes are in a separate loop with a conditional check for out of bounds
-    // making it separate is necessary to convince the compiler to do the right thing
-    const int UNROLL_FACTOR = 8;
-    const int warpsPerBlock = blockDim.x / 32;
-
-    extern __shared__ float shared[];
-    int idx = blockIdx.x;
-    int tid = threadIdx.x;
-    int warpId = threadIdx.x / 32; // warp index within a block
-    int laneId = threadIdx.x % 32; // thread index within a warp
-
-    // shared[] must be allocated to have 2 * warpsPerBlock elements
-    // first half for max values, the second half for sum values
-    float* maxvals = shared;
-    float* sumvals = &shared[warpsPerBlock];
-
-    if (tid >= C) {
-        maxvals[warpId] = -INFINITY;
-        sumvals[warpId] = 0.0f;
-        return;
-    }
-
-    const float* x = inp + idx * C; // input
-    float* y = out + idx * C; // output
-
-    // first, thread coarsening by directly accessing global memory in series
-    float maxval = -INFINITY;
-    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
-        #pragma unroll
-        for (int u = 0; u < UNROLL_FACTOR; u++) {
-            maxval = fmaxf(maxval, x[min(C - 1, i + u*blockDim.x)]);
-        }
-    }
-
-    // now within-warp reductions for maxval
-    maxval = warpReduceMax(maxval);
-    // the 0th thread of each warp writes the maxval of that warp to shared memory
-    if (laneId == 0) maxvals[warpId] = maxval;
-    __syncthreads();
-    // now the 0th thread reduces the maxvals in shared memory, i.e. across warps
-    if (tid == 0) {
-        float val = maxvals[tid];
-        #pragma unroll
-        for (int i = 1; i < warpsPerBlock; i++) {
-            val = fmaxf(val, maxvals[i]);
-        }
-        // store the final max in the first position
-        maxvals[0] = val;
-    }
-    __syncthreads();
-    // broadcast the max to all threads
-    float offset = maxvals[0];
-
-    // compute expf and write the result to global memory
-    // + thread coarsening for sum
-    float sumval = 0.0f;
-    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
-        float reg_array[UNROLL_FACTOR];
-        #pragma unroll
-        for (int u = 0; u < UNROLL_FACTOR; u++) {
-            reg_array[u] = __ldcs(&x[min(C - 1, i + u*blockDim.x)]);
-        }
-        #pragma unroll
-        for (int u = 0; u < UNROLL_FACTOR; u++) {
-            if (i + u*blockDim.x < C) {
-                float output = expf(reg_array[u] - offset);
-                y[min(C - 1, i + u*blockDim.x)] = output; // compiler likes redundant min()?!
-                sumval += output; // combined into the same loop unlike kernel3
-            }
-        }
-    }
-
-    // okay now we calculated exp(x - max(x))
-    // step 2: sum all the values and divide by the sum
-
-    // within-warp reduction for sumval
-    sumval = warpReduceSum(sumval);
-    // write sumval to shared memory
-    if (laneId == 0) sumvals[warpId] = sumval;
-    __syncthreads();
-    // inter-thread reduction of sum
-    if (tid == 0) {
-        float val = sumvals[tid];
-        #pragma unroll
-        for (int i = 1; i < warpsPerBlock; ++i) {
-            val += sumvals[i];
-        }
-        sumvals[0] = val;
-    }
-    __syncthreads();
-    // broadcast the sum to all threads
-    float sum = sumvals[0];
-
-    // divide the whole row by the sum
-    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
-        float reg_array[UNROLL_FACTOR];
-        #pragma unroll
-        for (int u = 0; u < UNROLL_FACTOR; u++) {
-            reg_array[u] = y[min(C - 1, i + u*blockDim.x)];
-        }
-        #pragma unroll
-        for (int u = 0; u < UNROLL_FACTOR; u++) {
-            if (i + u*blockDim.x < C) {
-                y[i + u*blockDim.x] = reg_array[u] / sum;
-            }
-        }
     }
 }
 
@@ -812,12 +614,13 @@ __global__ void fused_classifier_kernel3(float* logits, float* losses, float* pr
 // kernel launchers
 
 void encoder_forward(float* out,
-                     int* inp, float* wte, float* wpe,
+                     const int* inp, const float* wte, const float* wpe,
                      int B, int T, int C) {
+    assert(C % 4 == 0);
+    const int block_size = 512;
     const int N = B * T * C;
-    const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
-    encoder_forward_kernel2<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
+    const int grid_size = CEIL_DIV(N / 4, block_size);
+    encoder_forward_kernel3<<<grid_size, block_size>>>((float4*) out, inp, (float4*) wte, (float4*) wpe, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -839,16 +642,6 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     const int grid_size = CEIL_DIV(N * 32, block_size);
     layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
-}
-
-// uses cuBLAS
-void matmul_forward_cublas(float* out,
-                    float* inp, float* weight, float* bias,
-                    int B, int T, int C, int OC) {
-    assert(bias == NULL); // bias is not supported for this kernel
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC));
 }
 
 // uses cuBLASLt to fuse the bias and gelu. does not work with OC = 50257 (last layer)
@@ -881,7 +674,10 @@ void matmul_forward_cublaslt(float* out,
     cublasCheck(cublasLtMatmulDescCreate(&operationDesc, cublas_compute_type, CUDA_R_32F));
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opNoTranspose, sizeof(opNoTranspose)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias, sizeof(epilogueBias)));
+    if(has_bias) {
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias,
+                                                   sizeof(epilogueBias)));
+    }
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
 
     // define matrix layouts
@@ -989,14 +785,6 @@ void gelu_backward(float* dinp, const float* inp, const float* dout, const int N
     cudaCheck(cudaGetLastError());
 }
 
-void softmax_forward(float* out, float* inp, int N, int C) {
-    int grid_size = N;
-    const int block_size = 512;
-    size_t shared_mem_size = 2 * block_size / 32 * sizeof(float);
-    softmax_forward_kernel7<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
-    cudaCheck(cudaGetLastError());
-}
-
 void matmul_backward(float* dinp, float* dweight, float* dbias,
                      float* dout, float* inp, float* weight,
                      int B, int T, int C, int OC) {
@@ -1085,6 +873,7 @@ void fused_classifier3(float* logits, float* losses,
 typedef struct {
     int max_seq_len; // max sequence length, e.g. 1024
     int vocab_size; // vocab size, e.g. 50257
+    int padded_vocab_size; // padded to e.g. %128==0, 50304
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
     int channels; // number of channels, e.g. 768
@@ -1112,11 +901,11 @@ typedef struct {
 } ParameterTensors;
 
 void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
-    int V = config.vocab_size;
+    int Vp = config.padded_vocab_size;
     int C = config.channels;
     int maxT = config.max_seq_len;
     int L = config.num_layers;
-    param_sizes[0] = V * C; // wte
+    param_sizes[0] = Vp * C; // wte
     param_sizes[1] = maxT * C; // wpe
     param_sizes[2] = L * C; // ln1w
     param_sizes[3] = L * C; // ln1b
@@ -1196,7 +985,7 @@ typedef struct {
 } ActivationTensors;
 
 void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config) {
-    size_t V = config.vocab_size;
+    size_t Vp = config.padded_vocab_size;
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
     size_t C = config.channels;
@@ -1220,7 +1009,7 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[17] = B * T; // lnf_rstd
     act_sizes[18] = B * T; // losses
     act_sizes[19] = L * B * T * 3*C; // qkvr
-    act_sizes[20] = B * T * max(3*C, max(NH*T, V)); // output / scratch
+    act_sizes[20] = B * T * max(3*C, max(NH*T, Vp)); // output / scratch
 }
 
 // Backward pass is conceptually quite different from forward, because we can discard
@@ -1312,8 +1101,13 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
     freadCheck(model_header, sizeof(int), 256, model_file);
-    if (model_header[0] != 20240326) { printf("Bad magic model file"); exit(EXIT_FAILURE); }
-    if (model_header[1] != 1) { printf("Bad version in model file"); exit(EXIT_FAILURE); }
+    if (model_header[0] != 20240326) { fprintf(stderr, "Bad magic model file\n"); exit(EXIT_FAILURE); }
+    if (model_header[1] != 3) {
+        // was bumped from 1 -> 3 to incorporate the padded vocab size
+        fprintf(stderr, "Bad version in model file\n");
+        fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
+        exit(EXIT_FAILURE);
+    }
 
     // read in hyperparameters
     model->config.max_seq_len = model_header[2];
@@ -1321,6 +1115,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->config.num_layers = model_header[4];
     model->config.num_heads = model_header[5];
     model->config.channels = model_header[6];
+    model->config.padded_vocab_size = model_header[7];
 
     // allocate space for all the parameters and read them in
     fill_in_parameter_sizes(model->param_sizes, model->config);
@@ -1367,6 +1162,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     // convenience parameters
     int V = model->config.vocab_size;
+    int Vp = model->config.padded_vocab_size;
     int L = model->config.num_layers;
     int NH = model->config.num_heads;
     int C = model->config.channels;
@@ -1471,13 +1267,13 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_cublas(acts.output, acts.lnf, params.wte, NULL, B, T, C, V);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         // fused classifier: does the forward pass and first part of the backward pass
         // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
-        fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, V);
+        fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, Vp);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         // move the (B,T) losses to CPU
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
@@ -1530,7 +1326,7 @@ void gpt2_backward(GPT2 *model) {
     // convenience shortcuts
     int B = model->batch_size;
     int T = model->seq_len;
-    int V = model->config.vocab_size;
+    int Vp = model->config.padded_vocab_size;
     int L = model->config.num_layers;
     int NH = model->config.num_heads;
     int C = model->config.channels;
@@ -1546,7 +1342,7 @@ void gpt2_backward(GPT2 *model) {
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, V);
+    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, Vp);
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass
@@ -1686,9 +1482,9 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     loader->tokens_file = fopenCheck(filename, "rb");
 
     // determine the file size
-    fseek(loader->tokens_file, 0, SEEK_END);
+    fseekCheck(loader->tokens_file, 0, SEEK_END);
     loader->file_size = ftell(loader->tokens_file);
-    fseek(loader->tokens_file, 0, SEEK_SET);
+    fseekCheck(loader->tokens_file, 0, SEEK_SET);
     if (loader->file_size < (B * T + 1) * sizeof(int)) {
         printf("Error: file size is too small for the batch size and sequence length\n");
         exit(EXIT_FAILURE);
@@ -1716,7 +1512,7 @@ void dataloader_next_batch(DataLoader *loader) {
         loader->current_position = 0;
     }
     // read the B*T+1 integers from the file into batch
-    fseek(loader->tokens_file, loader->current_position, SEEK_SET);
+    fseekCheck(loader->tokens_file, loader->current_position, SEEK_SET);
     freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
     // advance the current position by B*T integers
     loader->current_position += B*T * sizeof(int);
@@ -1763,86 +1559,6 @@ int sample_softmax(const float* logits, int n, float coin) {
 }
 
 // ----------------------------------------------------------------------------
-// Tokenizer (only supports decoding: tokens (integers) -> strings)
-
-typedef struct {
-    uint32_t vocab_size;
-    char **token_table;
-    int init_ok;
-} Tokenizer;
-
-void safe_printf(const char *piece) {
-    // the tokens are raw bytes, and we we only want to print the printable ones
-    // many bytes can be various control codes, backspace, etc.
-    if (piece == NULL) { return; }
-    if (piece[0] == '\0') { return; }
-    // handle individual byte tokens
-    // every token is asserted to be at least one byte so doing piece[1] is ok
-    if (piece[1] == '\0') {
-        unsigned char byte_val = piece[0];
-        if (!(isprint(byte_val) || isspace(byte_val))) {
-            return; // weird byte, don't print it
-        }
-    }
-    printf("%s", piece);
-}
-
-void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
-    FILE *file = fopen(filename, "rb");
-    if (file == NULL) {
-        // try to be more helpful as we just added this feature, erase later
-        printf("---\n");
-        printf("WARNING: Failed to open the tokenizer file %s\n", filename);
-        printf("The Tokenizer is a new feature added April 14 2024.\n");
-        printf("Re-run `python train_gpt2.py` to write it\n");
-        printf("---\n");
-        tokenizer->init_ok = 0;
-        return;
-    }
-    // read in the header
-    uint32_t header[256];
-    freadCheck(header, sizeof(uint32_t), 256, file);
-    assert(header[0] == 20240328);
-    assert(header[1] == 1);
-    tokenizer->vocab_size = header[2];
-    // read in all the tokens
-    unsigned char length;
-    tokenizer->token_table = (char **)mallocCheck(tokenizer->vocab_size * sizeof(char *));
-    for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
-        freadCheck(&length, sizeof(unsigned char), 1, file);
-        assert(length > 0); // every token should be at least one character
-        char *token_bytes = (char *)mallocCheck(length + 1);
-        freadCheck(token_bytes, sizeof(char), length, file);
-        token_bytes[length] = '\0';  // Add null terminator for printing
-        tokenizer->token_table[i] = token_bytes;
-    }
-    // cleanups
-    fcloseCheck(file);
-    tokenizer->init_ok = 1;
-}
-
-const char *tokenizer_decode(Tokenizer *tokenizer, uint32_t token_id) {
-    if (tokenizer->init_ok == 0) {
-        return NULL;
-    }
-    if (token_id < tokenizer->vocab_size) {
-        return tokenizer->token_table[token_id];
-    } else {
-        printf("invalid token id %d!\n", token_id);
-        return NULL;
-    }
-}
-
-void tokenizer_free(Tokenizer *tokenizer) {
-    if (tokenizer->init_ok) {
-        for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
-            free(tokenizer->token_table[i]);
-        }
-        free(tokenizer->token_table);
-    }
-}
-
-// ----------------------------------------------------------------------------
 // Logger lite, will probably grow/change some over time
 
 typedef struct {
@@ -1879,8 +1595,8 @@ void logger_free(Logger *logger) {
 void error_usage() {
     // default run = debugging run with TinyShakespeare
     // bigger run = train on TinyStories! e.g. val/sample less often, but sample more tokens, write to logfile
-    fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
-    fprintf(stderr, "Example: ./train_gpt2cu -i data/TinyStories -v 100 -s 100 -g 144 -o stories.log\n");
+    fprintf(stderr, "Usage:   ./train_gpt2fp32cu [options]\n");
+    fprintf(stderr, "Example: ./train_gpt2fp32cu -i data/TinyStories -v 100 -s 100 -g 144 -o stories.log\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -i <string> input dataset prefix (default = data/tiny_shakespeare)\n");
     fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
@@ -1961,6 +1677,7 @@ int main(int argc, char *argv[]) {
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
     printf("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf("| vocab_size V          | %-50d |\n", model.config.vocab_size);
+    printf("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
     printf("| num_layers L          | %-50d |\n", model.config.num_layers);
     printf("| num_heads NH          | %-50d |\n", model.config.num_heads);
     printf("| channels C            | %-50d |\n", model.config.channels);
@@ -2037,8 +1754,8 @@ int main(int argc, char *argv[]) {
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
                 // get the V-dimensional vector probs[0, t-1, :]
-                float* logits = model.acts.output + (t - 1) * model.config.vocab_size;
-                // move probs back to CPU and sample
+                float* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
+                // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
                 cudaCheck(cudaMemcpy(cpu_logits, logits, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
                 float coin = random_f32(&rng_state);
                 int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);

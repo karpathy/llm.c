@@ -49,14 +49,56 @@ jobs:
       - name: Execute testing program (No OpenMP)
         run: ./test_gpt2
 
-  build-with-cuda-fp32:
-    runs-on: ubuntu-latest  # Host OS, Docker will run on top of this
+  build-cuda-fp32:
+    runs-on: ubuntu-latest
     container:
-      image: nvidia/cuda:11.2.2-devel-ubuntu20.04  # Example CUDA development image with nvcc
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Build FP32 checkpoint
+        run: make train_gpt2fp32cu test_gpt2fp32cu
+
+      - name: Build FP32 precision
+        run: PRECISION=FP32 make train_gpt2cu test_gpt2cu profile_gpt2cu
+
+  build-cuda-bf16:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
       - name: Build project
-        run: make train_gpt2fp32cu test_gpt2fp32cu
+        run: PRECISION=BF16 make test_gpt2cu train_gpt2cu profile_gpt2cu
+
+  build-cuda-fp16:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Build project
+        run: PRECISION=FP16 make test_gpt2cu train_gpt2cu profile_gpt2cu
+
+  build-cuda-kernels:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install OpenMP and OpenMPI
+        run: apt-get update && apt-get install -y libomp-dev libopenmpi-dev
+
+      - name: Build project
+        run: make -j4 -C dev/cuda

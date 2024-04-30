@@ -11,6 +11,9 @@ If encountering "error: identifier "M_PI" is undefined", add the following lines
 
 version 1 is naive port from CPU code to kernel
 ./gelu_forward 1
+
+version 2 uses the Packed128 data structure
+./gelu_forward 2
 */
 
 #include <stdio.h>
@@ -44,12 +47,35 @@ __global__ void gelu_kernel(float* out, const float* inp, int N) {
     }
 }
 
+// elementwise ops are nice and ez
+__global__ void gelu_kernel2(float* out, const float* inp, int N) {
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * f128::size;
+    if (i < N) {
+        f128 packet_out;
+        f128 packet_in = load128cs(inp + i); // load and do not keep in cache
+        for(int k = 0; k < packet_in.size; ++k) {
+            float xi = packet_in[k];
+            float cube = 0.044715f * xi * xi * xi;
+            packet_out[k] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
+        }
+        // store instead of storecs (without cache streaming) in case it is useful for the
+        // data to be in the cache for the next operation after this GeLU
+        store128(out + i, packet_out);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
 void gelu_forward1(float* out, const float* inp, int N, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
     gelu_kernel<<<grid_size, block_size>>>(out, inp, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void gelu_forward2(float* out, const float* inp, int N, const int block_size) {
+    const int grid_size = ceil_div(N, block_size) / 4;
+    gelu_kernel2<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -62,6 +88,9 @@ void gelu_forward(int kernel_num,
     switch (kernel_num) {
         case 1:
             gelu_forward1(out, inp, B * T * C, block_size);
+            break;
+        case 2:
+            gelu_forward2(out, inp, B * T * C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");

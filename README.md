@@ -303,7 +303,7 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
   - [llm.metal](https://github.com/regrettable-username/llm.metal) by @[regrettable-username](https://github.com/regrettable-username): LLM training in simple, raw C/Metal Shading Language
 
 - Zig
-  - [llm.zig]() by @[saimirbaci](https://github.com/Saimirbaci/llm.zig/): a Zig port of this project
+  - [llm.zig](https://github.com/Saimirbaci/llm.zig) by @[saimirbaci](https://github.com/Saimirbaci): a Zig port of this project
 
 - Go
   - [llm.go](https://github.com/joshcarp/llm.go) by @[joshcarp](https://github.com/joshcarp): a Go port of this project

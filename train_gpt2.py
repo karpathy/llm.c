@@ -11,6 +11,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 Example launches to only benchmark the speed of bfloat16 compiled GPU training:
 1 GPU:
 python train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
+you can also turn on flash-attention by appending --flash=1
 4 GPU:
 torchrun --standalone --nproc_per_node=4 train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
 """
@@ -33,6 +34,9 @@ class NewGELU(nn.Module):
     """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
     def forward(self, input):
         return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
+
+# using a global to toggle flash-attention
+FLASH = 0
 
 class CausalSelfAttention(nn.Module):
 
@@ -58,11 +62,16 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # manual implementation of attention
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        if FLASH:
+            # flashattention
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # manual implementation of attention
+            # this materializes the large (T,T) matrix for all the queries and keys
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -234,76 +243,66 @@ def write_bf16(tensor, file):
     b = t.numpy().tobytes()
     file.write(b)
 
-def write_tensors_fp32(model_tensors, L, file):
-    write_fp32(model_tensors["transformer.wte.weight"], file) # (V, C)
-    write_fp32(model_tensors["transformer.wpe.weight"], file) # (T, C)
+def write_tensors(model_tensors, L, file, dtype):
+    assert dtype in {"float32", "bfloat16"}
+    write_fun = write_fp32 if dtype == "float32" else write_bf16
+    write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
+    write_fun(model_tensors["transformer.wpe.weight"], file) # (T, C)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
     for i in range(L): # (L, 3C, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
     for i in range(L): # (L, 3C)
-        write_fp32(model_tensors[f"transformer.h.{i}.attn.c_attn.bias"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.bias"], file)
     for i in range(L): # (L, C, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
     for i in range(L): # (L, 4C, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
     for i in range(L): # (L, 4C)
-        write_fp32(model_tensors[f"transformer.h.{i}.mlp.c_fc.bias"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.bias"], file)
     for i in range(L): # (L, C, 4C)
-        write_fp32(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
-    write_fp32(model_tensors["transformer.ln_f.weight"], file) # (C, )
-    write_fp32(model_tensors["transformer.ln_f.bias"], file) # (C, )
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
+    write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
+    write_fun(model_tensors["transformer.ln_f.bias"], file) # (C, )
 
-def write_tensors_bf16(model_tensors, L, file):
-    # same as fp32, but note we will re-order the tensors
-    # because we keep the layernorm in fp32, we place them all at the end
-    write_bf16(model_tensors["transformer.wte.weight"], file) # (V, C)
-    write_bf16(model_tensors["transformer.wpe.weight"], file) # (T, C)
-    for i in range(L): # (L, 3C, C)
-        write_bf16(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
-    for i in range(L): # (L, 3C)
-        write_bf16(model_tensors[f"transformer.h.{i}.attn.c_attn.bias"], file)
-    for i in range(L): # (L, C, C)
-        write_bf16(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
-    for i in range(L): # (L, C)
-        write_bf16(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
-    for i in range(L): # (L, 4C, C)
-        write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
-    for i in range(L): # (L, 4C)
-        write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_fc.bias"], file)
-    for i in range(L): # (L, C, 4C)
-        write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
-    for i in range(L): # (L, C)
-        write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
-    # LayerNorms are at the end and kept in fp32
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
-    write_fp32(model_tensors["transformer.ln_f.weight"], file) # (C, )
-    write_fp32(model_tensors["transformer.ln_f.bias"], file) # (C, )
+@torch.no_grad()
+def pad_vocab(tensor, multiple=128, value=0):
+    """
+    The dimension of the vocab size in GPT-2 is 50,257
+    which is unfortunately a very unfriendly number for a lot of
+    matrix operations on the GPU. So we pad it to the nearest
+    friendlier multiple, e.g. 50,304 if multiple=128 when we
+    export the weights into C land. This is a NOOP algorithmically
+    and is only done to make the tensor operations more efficient.
+    """
+    assert tensor.ndim == 2
+    V, C = tensor.shape
+    assert V == 50257, "just being defensive here"
+    # calculate padded vocab size by rounding up to nearest multiple
+    Vp = ((V + multiple - 1) // multiple) * multiple
+    # pad the tensor
+    pad_rows = Vp - V
+    padded = tensor if pad_rows == 0 else F.pad(tensor, (0, 0, 0, pad_rows), value=value)
+    assert padded.shape == (Vp, C)
+    return padded
 
 def write_model(model, filename, dtype):
     # everything we need to instantiate the model
     # 1) header is: version int, GPTConfig ints, padding to 1024 bytes
     assert dtype in {"float32", "bfloat16"} # float16 todo maybe later
     version = {
-        "float32": 1,
-        "bfloat16": 2,
+        "float32": 3, # 3: all tensors are fp32, padded vocab
+        "bfloat16": 5, # 5: all tensors are bf16, padded vocab
     }[dtype]
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240326 # magic
@@ -315,14 +314,16 @@ def write_model(model, filename, dtype):
     header[6] = model.config.n_embd
     # 2) the parameters follow the header
     params = {name: param.cpu() for name, param in model.named_parameters()}
+    # pad the vocab to a multiple of 128 here at export, for efficiency in C
+    wte = params["transformer.wte.weight"] # (V, C)
+    wte_padded = pad_vocab(wte) # (Vp, C)
+    params["transformer.wte.weight"] = wte_padded # (Vp, C)
+    print(f"padded vocab size from {wte.size(0)} to {wte_padded.size(0)}")
+    header[7] = wte_padded.size(0) # padded vocab size store in header
+    # now write to file
     with open(filename, "wb") as file:
-        # write header
-        file.write(header.numpy().tobytes())
-        # write params
-        if dtype == "float32":
-            write_tensors_fp32(params, model.config.n_layer, file)
-        elif dtype == "bfloat16":
-            write_tensors_bf16(params, model.config.n_layer, file)
+        file.write(header.numpy().tobytes()) # header
+        write_tensors(params, model.config.n_layer, file, dtype) # params
     print(f"wrote {filename}")
 
 def write_state(model, x, y, logits, loss, filename):
@@ -331,10 +332,15 @@ def write_state(model, x, y, logits, loss, filename):
     # this can be used for checking the computation correctness in C
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240327 # magic
-    header[1] = 1 # run state version = 1
+    header[1] = 2 # run state version = 2 (1 -> 2 for padded vocab changes)
     header[2] = x.size(0) # batch size of the batch, B
     header[3] = x.size(1) # temporal extent of the batch, T
     grads = {name: param.grad.cpu() for name, param in model.named_parameters()}
+    # pad the vocab grads here as well, to mirror write_model
+    wte_grad = grads["transformer.wte.weight"] # (V, C)
+    wte_grad_padded = pad_vocab(wte_grad, value=0) # (Vp, C) # TODO later maybe pad with nan?
+    grads["transformer.wte.weight"] = wte_grad_padded # (Vp, C)
+    print(f"padded vocab size in reference grads from {wte_grad.size(0)} to {wte_grad_padded.size(0)}")
     with open(filename, "wb") as file:
         # header
         file.write(header.numpy().tobytes())
@@ -347,15 +353,16 @@ def write_state(model, x, y, logits, loss, filename):
         # loss (single float, result of the cross entropy loss)
         write_fp32(loss.cpu(), file)
         # gradients
-        write_tensors_fp32(grads, model.config.n_layer, file)
+        write_tensors(grads, model.config.n_layer, file, "float32")
     print(f"wrote {filename}")
 
 def write_tokenizer(enc, filename):
     n = enc.max_token_value + 1
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240328 # magic
-    header[1] = 1 # tokenizer version = 1
+    header[1] = 2 # tokenizer version = 2 (1 -> 2: includes EOT token)
     header[2] = n # number of tokens
+    header[3] = enc.eot_token # EOT token
     with open(filename, "wb") as file:
         file.write(header.numpy().tobytes())
         for i in range(n):
@@ -389,6 +396,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
     parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
+    parser.add_argument("--flash", type=int, default=0, help="use flash attention")
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
     parser.add_argument("--batch_size", type=int, default=4, help="batch size")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -443,6 +451,10 @@ if __name__ == "__main__":
     # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
     if args.tensorcores:
         torch.set_float32_matmul_precision('high')
+
+    # turn on/off flash attention
+    assert args.flash in {0, 1}
+    FLASH = args.flash
 
     # init (and write) the tokenizer
     enc = tiktoken.get_encoding("gpt2")
@@ -544,9 +556,10 @@ if __name__ == "__main__":
         # time and print
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
+        tokens_per_second = ddp_world_size * B * T / (t1-t0)
+        print0(f"iteration {i}, loss: {loss.item():.4f}, time: {(t1-t0)*1000:.3f}ms, tok/s: {tokens_per_second:.2f}")
         if i > 0 and i > args.num_iterations - 20:
             timings.append(t1-t0)
-            print0(f"iteration {i}, loss: {loss.item()}, time: {(t1-t0)*1000:.3f}ms")
 
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
