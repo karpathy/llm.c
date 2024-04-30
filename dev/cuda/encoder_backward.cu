@@ -18,6 +18,8 @@ parallelizes over C, loops over B,T; much slower than version 1
 #include <cuda_runtime.h>
 #include "common.h"
 
+typedef __nv_bfloat16 floatX;
+
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -108,7 +110,7 @@ __global__ void encoder_backward_kernel3(__nv_bfloat16* dwte, __nv_bfloat16* dwp
     }
 }
 
-__device__ void atomicStochasticAdd(__nv_bfloat16* address, float val0, float val1) {
+__device__ void atomicNonStochasticAdd(__nv_bfloat16* address, float val0, float val1) {
     float2 val = make_float2(val0, val1);
     uint* address_as_uint = (uint*)address;
     uint old = *address_as_uint, assumed;
@@ -121,31 +123,34 @@ __device__ void atomicStochasticAdd(__nv_bfloat16* address, float val0, float va
     } while (assumed != old);
 }
 
-typedef __nv_bfloat16 floatX;
-__global__ void encoder_backward_kernel4(__nv_bfloat16* dwte, __nv_bfloat16* dwpe,
-                                        const __nv_bfloat16* dout, const int* inp,
+__device__ void atomicNonStochasticAdd(float* address, float val0, float val1) {
+    atomicAdd(address, val0);
+    atomicAdd(address + 1, val1);
+}
+
+__global__ void encoder_backward_kernel4(floatX* dwte, floatX* dwpe,
+                                        const floatX* dout, const int* inp,
                                         int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * T * C;
     idx *= 2; // 2 elements per thread
+    if (idx >= N) { return; }
 
-    if (idx < N) {
-        int bt = idx / C;
-        int b = bt / T;
-        int t = bt % T;
-        int c = idx % C;
+    int bt = idx / C;
+    int b = bt / T;
+    int t = bt % T;
+    int c = idx % C;
+    int ix = inp[b * T + t];
 
-        int ix = inp[b * T + t];
+    const floatX* dout_btc = dout + b * T * C + t * C + c;
+    floatX* dwte_ix = dwte + ix * C + c;
+    floatX* dwpe_tc = dwpe + t * C + c;
 
-        const __nv_bfloat16* dout_btc = dout + b * T * C + t * C + c;
-        __nv_bfloat16* dwte_ix = dwte + ix * C + c;
-        __nv_bfloat16* dwpe_tc = dwpe + t * C + c;
-
-        float2 dout_data = make_float2(dout_btc[0], dout_btc[1]);
-        atomicStochasticAdd(dwte_ix, dout_data.x, dout_data.y);
-        atomicStochasticAdd(dwpe_tc, dout_data.x, dout_data.y);
-    }
+    float2 dout_data = make_float2(dout_btc[0], dout_btc[1]);
+    atomicNonStochasticAdd(dwte_ix, dout_data.x, dout_data.y);
+    atomicNonStochasticAdd(dwpe_tc, dout_data.x, dout_data.y);
 }
+
 
 // ----------------------------------------------------------------------------
 // kernel launcher
@@ -184,7 +189,7 @@ void encoder_backward4(float* dwte, float* dwpe,
                     int B, int T, int C,
                     const int block_size) {
     const int N = B * T * C;
-    const int grid_size = ceil_div(N, block_size);
+    const int grid_size = ceil_div(N, block_size*2);
     encoder_backward_kernel4<<<grid_size, block_size>>>((__nv_bfloat16*)dwte, (__nv_bfloat16*)dwpe, (__nv_bfloat16*)dout, inp, B, T, C);
     cudaCheck(cudaGetLastError());
 }
