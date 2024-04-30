@@ -6,8 +6,8 @@ __kernel void matmul_forward(__global float* out, __global float* AMat,
                     int B, int T, int C, int OC, int use_bias)
 {
     // define local memory for AMat and BMat tiles with padding
-    __local float inp_tile[TILE_SIZE][TILE_SIZE + LOCAL_MEM_PADDING_SIZE];
-    __local float weight_tile[TILE_SIZE][TILE_SIZE + LOCAL_MEM_PADDING_SIZE];
+    __local float A_tile[TILE_SIZE][TILE_SIZE + LOCAL_MEM_PADDING_SIZE];
+    __local float B_tile[TILE_SIZE][TILE_SIZE + LOCAL_MEM_PADDING_SIZE];
 
     // get global and local IDs
     size_t global_id0 = get_global_id(0);
@@ -28,10 +28,10 @@ __kernel void matmul_forward(__global float* out, __global float* AMat,
         int col = t * TILE_SIZE + local_id1;
 
         // load input tile
-        inp_tile[local_id0][local_id1] = (row < C && global_id0 < B * C) ? AMat[global_id0 * C + col] : 0.0f;
+        A_tile[local_id0][local_id1] = (row < C && global_id0 < B * C) ? AMat[global_id0 * C + col] : 0.0f;
 
         // transpose BMat tile
-        weight_tile[local_id1][local_id0] = (col < C && global_id1 < OC) ? BMat[global_id1 * C + row] : 0.0f;
+        B_tile[local_id1][local_id0] = (col < C && global_id1 < OC) ? BMat[global_id1 * C + row] : 0.0f;
 
         // synchronize to make sure all data is loaded into local memory
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -39,21 +39,21 @@ __kernel void matmul_forward(__global float* out, __global float* AMat,
         // compute partial dot product
         #if MATMUL_VLOAD_SIZE == 4
             for (int i = 0; i < TILE_SIZE/4; i++) {
-                float4 inp_vec = vload4(i, inp_tile[local_id0]);
-                float4 weight_vec = vload4(i, weight_tile[local_id1]);
+                float4 inp_vec = vload4(i, A_tile[local_id0]);
+                float4 weight_vec = vload4(i, B_tile[local_id1]);
                 val += dot(inp_vec, weight_vec);
             }
         #elif MATMUL_VLOAD_SIZE == 8
             for (int i = 0; i < TILE_SIZE/8; i++) {
-                float8 inp_vec = vload8(i, inp_tile[local_id0]);
-                float8 weight_vec = vload8(i, weight_tile[local_id1]);
+                float8 inp_vec = vload8(i, A_tile[local_id0]);
+                float8 weight_vec = vload8(i, B_tile[local_id1]);
                 val += dot(inp_vec.lo, weight_vec.lo);
                 val += dot(inp_vec.hi, weight_vec.hi);
             }
         #elif MATMUL_VLOAD_SIZE == 16
             for (int i = 0; i < TILE_SIZE/16; i++) {
-                float16 inp_vec = vload16(i, inp_tile[local_id0]);
-                float16 weight_vec = vload16(i, weight_tile[local_id1]);
+                float16 inp_vec = vload16(i, A_tile[local_id0]);
+                float16 weight_vec = vload16(i, B_tile[local_id1]);
                 val += dot(inp_vec.lo.lo, weight_vec.lo.lo);
                 val += dot(inp_vec.lo.hi, weight_vec.lo.hi);
                 val += dot(inp_vec.hi.lo, weight_vec.hi.lo);
@@ -61,7 +61,7 @@ __kernel void matmul_forward(__global float* out, __global float* AMat,
             }
         #else
             for (int i = 0; i < TILE_SIZE; ++i) {
-                val += inp_tile[local_id0][i] * weight_tile[local_id1][i];
+                val += A_tile[local_id0][i] * B_tile[local_id1][i];
             }
         #endif
 
