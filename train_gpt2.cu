@@ -2083,6 +2083,7 @@ void error_usage() {
     fprintf(stderr, "  -b <int>    batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
     fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
+    fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
     fprintf(stderr, "  -m <int>    val_max_batches, up to how many val batches to estimate val loss? (default = 20)\n");
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
@@ -2107,6 +2108,7 @@ int main(int argc, char *argv[]) {
     int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
+    int max_steps = -1;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -2117,6 +2119,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
         else if (argv[i][1] == 'l') { learning_rate = atof(argv[i+1]); }
+        else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'm') { val_max_batches = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
@@ -2132,6 +2135,7 @@ int main(int argc, char *argv[]) {
     printf0("| batch size B          | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| learning rate         | %-50f |\n", learning_rate);
+    printf0("| max_steps             | %-50d |\n", max_steps);
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
     printf0("| val_max_batches       | %-50d |\n", val_max_batches);
     printf0("| sample_every          | %-50d |\n", sample_every);
@@ -2187,7 +2191,7 @@ int main(int argc, char *argv[]) {
     dataloader_init(&train_loader, &multi_gpu_config, train_tokens_filename, B, T);
     DataLoader val_loader;
     dataloader_init(&val_loader, &multi_gpu_config, val_tokens_filename, B, T);
-    int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default for now
+    int train_num_batches = (max_steps == -1) ? train_loader.num_batches : max_steps; // default = 1 epoch
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
     printf0("| train_num_batches     | %-50d |\n", train_num_batches);
     printf0("| val_num_batches       | %-50d |\n", val_num_batches);
