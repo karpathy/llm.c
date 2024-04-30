@@ -9,7 +9,7 @@ If encountering "error: identifier "M_PI" is undefined", add the following lines
 #define _USE_MATH_DEFINES
 #include <math.h>  OR  #include <cmath>
 
-version 1 is naive CPU port, for use in float
+version 1 is naive CPU port
 ./gelu_forward 1
 
 version 2 is bfloat16 with the Packed128 data structure
@@ -54,7 +54,7 @@ void gelu_forward_cpu(float* out, const float* inp, int N) {
 // GPU kernels
 
 // elementwise ops are nice and ez
-__global__ void gelu_forward_kernel1(float* out, const float* inp, int N) {
+__global__ void gelu_forward_kernel1(floatX* out, const floatX* inp, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) {
         float xi = inp[i];
@@ -83,14 +83,14 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-void gelu_forward1(float* out, const float* inp, int N, const int block_size) {
+void gelu_forward1(floatX* out, const floatX* inp, int N, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
     gelu_forward_kernel1<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
 
 void gelu_forward2(floatX* out, const floatX* inp, int N, const int block_size) {
-    const int grid_size = ceil_div(N, block_size)/x128::size;
+    const int grid_size = ceil_div(N, toIntCheck(block_size * x128::size));
     gelu_forward_kernel2<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
@@ -102,16 +102,12 @@ void gelu_forward(int kernel_num,
                   int B, int T, int C,
                   int block_size) {
     switch (kernel_num) {
-#if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
         case 1:
             gelu_forward1(out, inp, B * T * C, block_size);
             break;
-#endif
-#if defined(ENABLE_BF16)
         case 2:
             gelu_forward2(out, inp, B * T * C, block_size);
             break;
-#endif
         default:
             printf("Invalid kernel number\n");
             exit(1);
@@ -120,7 +116,7 @@ void gelu_forward(int kernel_num,
 
 // ----------------------------------------------------------------------------
 
-int main(int argc, char **argv) {
+int main(int argc, const char **argv) {
     srand(0);
 
     int B = 8;
@@ -165,11 +161,11 @@ int main(int argc, char **argv) {
         printf("Checking block size %d.\n", block_size);
         gelu_forward(kernel_num, d_out, d_inp, B, T, C, block_size);
 #if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
-        validate_result(d_out, out, "out", B * T * C, 1e-5f);
+        float tol = 1e-5;
+#else
+        float tol = 1e-2f;
 #endif
-#if defined(ENABLE_BF16)
-#endif
-        validate_result(d_out, out, "out", B * T * C, 1e-2f);
+        validate_result(d_out, out, "out", B * T * C, tol);
     }
 
     printf("All results match. Starting benchmarks.\n\n");
@@ -186,7 +182,7 @@ int main(int argc, char **argv) {
         // napkin math: estimate the memory bandwidth achieved
         // for each (B,T,C) output element, we do 1 read and 1 write, 4 bytes each
         // and e.g. A100 40GB PCIe is advertised at 1,555GB/s
-        long memory_ops = B * T * C * 2 * 4;
+        long memory_ops = B * T * C * 2 * (int)sizeof(floatX);
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
 
         printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
