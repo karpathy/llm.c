@@ -337,6 +337,16 @@ typedef struct {
     int process_rank;      // Rank of this process among all MPI processes. 0 if no multi-GPU.
     int num_processes;     // Total number of processes. 1 if no multi-GPU.
     int local_device_idx;  // This process GPU index on current machine. 0 if no multi-GPU.
+
+    // Zero optimization stage - https://fairscale.readthedocs.io/en/stable/deep_dive/oss_sdp_fsdp.html
+    // 0-Disabled
+    // 1-Optimizer State Sharding (OSS)
+    // 2-Optimizer + Gradient State Sharding (SDP)
+    // 3-Optimizer + Gradient + Horizontal Model Sharding (FSDP)
+    int zero_stage;
+    bool zero_active;
+    size_t shard_num_parameters;
+    size_t shard_offset;
 #ifdef MULTI_GPU
     ncclComm_t nccl_comm;  // NCCL communication primitive, used for collective multi-GPU work.
 #endif
@@ -1905,7 +1915,7 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
     // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
-
+    
     // lazily allocate the memory for m_memory and v_memory
     if (model->m_memory == NULL) {
         cudaCheck(cudaMalloc((void**)&model->m_memory, model->num_parameters * sizeof(float)));
@@ -2087,6 +2097,7 @@ void error_usage() {
     fprintf(stderr, "  -m <int>    val_max_batches, up to how many val batches to estimate val loss? (default = 20)\n");
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
+    fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     exit(EXIT_FAILURE);
 }
 
@@ -2105,6 +2116,7 @@ int main(int argc, char *argv[]) {
     int val_max_batches = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
+    int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training 
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -2119,6 +2131,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { val_max_batches = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else { error_usage(); }
     }
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -2190,7 +2203,9 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // pretty print in a table the multi-gpu configuration as well
+    set_zero_configs(&multi_gpu_config, zero_stage, model.num_parameters);
     printf0("| num_processes         | %-50d |\n", multi_gpu_config.num_processes);
+    printf0("| zero_stage            | %-50d |\n", multi_gpu_config.zero_stage);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // more prints related to allocations from gpt2_build_from_checkpoint down here to not mess up our table above
