@@ -959,16 +959,23 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
 }
 
 __global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     if (i < N) {
-        float x = (float)inp[i];
-        float cube = 0.044715f * x * x * x;
-        float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
-        float tanh_out = tanhf(tanh_arg);
-        float coshf_out = coshf(tanh_arg);
-        float sech_out = 1.0f / (coshf_out * coshf_out);
-        float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
-        dinp[i] = (floatX)(local_grad * (float)dout[i]);
+        x128 packed_dinp;
+        x128 packed_inp = load128cs(inp + i);
+        x128 packed_dout = load128cs(dout + i);
+        for (int k = 0; k < packed_inp.size; ++k) {
+            float x = (float)packed_inp[k];
+            float cube = 0.044715f * x * x * x;
+            float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
+            float tanh_out = tanhf(tanh_arg);
+            float coshf_out = coshf(tanh_arg);
+            float sech_out = 1.0f / (coshf_out * coshf_out);
+            float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
+            packed_dinp[k] = (floatX)(local_grad * (float)packed_dout[k]);
+        }
+
+        store128(dinp + i, packed_dinp);
     }
 }
 
@@ -1495,7 +1502,7 @@ void gelu_forward(floatX* out, const floatX* inp, int N) {
 
 void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
     const int block_size = 128;
-    const int grid_size = CEIL_DIV(N, block_size);
+    const int grid_size = CEIL_DIV(N/x128::size, block_size);
     gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout, N);
     cudaCheck(cudaGetLastError());
 }
