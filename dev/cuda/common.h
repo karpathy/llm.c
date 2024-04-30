@@ -52,9 +52,6 @@ struct alignas(16) Packed128 {
     __device__ const ElementType& operator[](int index) const {
         return payload[index];
     }
-    __device__ float fp32(int index) {
-        return static_cast<float>(payload[index]);
-    }
     __device__ int4 get_bits() const {
         int4 bits;
         static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
