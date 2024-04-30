@@ -489,7 +489,7 @@ __device__ void atomicStochasticAdd(__nv_bfloat16* address, float val0, float va
     } while (assumed != old);
 }
 
-__device__ void atomicStochasticAdd(float* address, float val0, float val1, uint seed, uint random) {
+__device__ void atomicStochasticAdd(float* address, float val0, float val1, uint seed) {
     atomicAdd(address, val0);
     atomicAdd(address + 1, val1);
 }
