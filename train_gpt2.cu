@@ -2089,6 +2089,7 @@ void error_usage() {
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
     fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
+    fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     exit(EXIT_FAILURE);
 }
 
@@ -2109,6 +2110,7 @@ int main(int argc, char *argv[]) {
     int genT = 64; // number of steps of inference we will do
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
     int max_steps = -1;
+    int override_enable_tf32 = 1;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -2125,6 +2127,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
         else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else { error_usage(); }
     }
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -2158,6 +2161,7 @@ int main(int argc, char *argv[]) {
 
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     int enable_tf32 = cuda_arch_major >= 8 ? 1 : 0;
+    if (override_enable_tf32 == 0) { enable_tf32 = 0; } // force to zero via arg
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
