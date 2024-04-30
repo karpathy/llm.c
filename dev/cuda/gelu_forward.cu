@@ -90,7 +90,7 @@ void gelu_forward1(floatX* out, const floatX* inp, int N, const int block_size) 
 }
 
 void gelu_forward2(floatX* out, const floatX* inp, int N, const int block_size) {
-    const int grid_size = ceil_div(N, toIntCheck(block_size * x128::size));
+    const int grid_size = ceil_div(N, block_size * x128::size);
     gelu_forward_kernel2<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }

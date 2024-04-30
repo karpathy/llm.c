@@ -673,13 +673,13 @@ __global__ void residual_forward_kernel(floatX* out, floatX* inp1, floatX* inp2,
 }
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__global__ void gelu_forward_kernel(floatX* out, const floatX* inp, int N) {
+__global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     if (i < N) {
         x128 packed_out;
         x128 packed_inp = load128cs(inp + i); // load and do not keep in cache
         for(int k = 0; k < packed_inp.size; ++k) {
-            float xi =(float)packed_inp[k];
+            float xi = (float)packed_inp[k];
             float cube = 0.044715f * xi * xi * xi;
             packed_out[k] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
         }
@@ -1204,9 +1204,9 @@ void residual_forward(floatX* out, floatX* inp1, floatX* inp2, int N) {
 }
 
 void gelu_forward(floatX* out, const floatX* inp, int N) {
-    const int block_size = 128;
-    const int grid_size = CEIL_DIV(N/x128::size, block_size);
-    gelu_forward_kernel<<<grid_size, block_size>>>(out, inp, N);
+    const int block_size = 512;
+    const int grid_size = CEIL_DIV(N, block_size * x128::size);
+    gelu_forward_kernel2<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2003,6 +2003,8 @@ void dataloader_init(DataLoader *loader, const MultiGpuConfig* multi_gpu_config,
     cudaMallocHost((void**)&loader->batch, (B * T + 1) * sizeof(int));
     loader->inputs = loader->batch;
     loader->targets = loader->batch + 1; // targets are shifted by one
+    // note: we definitely want to advance by B * T; That is the "stride" by which we move
+    // the window of tokens. We only load B * T + 1 tokens because our targets are offset by 1
     loader->num_batches = loader->file_size / (loader->num_processes * B * T * sizeof(int));
 }
 
@@ -2021,6 +2023,7 @@ void dataloader_next_batch(DataLoader *loader) {
     fseekCheck(loader->tokens_file, loader->current_position, SEEK_SET);
     freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
     // advance the current position by B*T*num_processes integers
+    // note: the "stride" of tokens by which we move each time is definitely B * T
     loader->current_position += loader->num_processes * B * T * sizeof(int);
 }
 
