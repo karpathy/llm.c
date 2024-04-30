@@ -2087,6 +2087,7 @@ void error_usage() {
     fprintf(stderr, "  -m <int>    val_max_batches, up to how many val batches to estimate val loss? (default = 20)\n");
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
+    fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
     exit(EXIT_FAILURE);
 }
 
@@ -2105,6 +2106,7 @@ int main(int argc, char *argv[]) {
     int val_max_batches = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
+    int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -2119,6 +2121,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { val_max_batches = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
         else { error_usage(); }
     }
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -2133,6 +2136,7 @@ int main(int argc, char *argv[]) {
     printf0("| val_max_batches       | %-50d |\n", val_max_batches);
     printf0("| sample_every          | %-50d |\n", sample_every);
     printf0("| genT                  | %-50d |\n", genT);
+    printf0("| overfit_single_batch  | %-50d |\n", overfit_single_batch);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // set up the device
@@ -2283,7 +2287,9 @@ int main(int argc, char *argv[]) {
 
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
-        dataloader_next_batch(&train_loader);
+        if (overfit_single_batch == 0 || (step == 0 && overfit_single_batch == 1)) {
+            dataloader_next_batch(&train_loader);
+        }
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
