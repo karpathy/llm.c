@@ -544,10 +544,10 @@ if __name__ == "__main__":
         with ctx:
             logits, loss = model(x, y)
             del logits
-            if not args.inference_only:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+        if not args.inference_only:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
         # wait on the CPU for all device work to end so we get accurate per-iteration timings below
         if device == "mps":
             torch.mps.synchronize()
