@@ -808,7 +808,7 @@ void gpt2_forward(GPT2_CL *gcl, GPT2 *model, int* inputs, int* targets, size_t B
     }
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    cl_matmul_forward(gcl, acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
+    cl_matmul_forward(gcl, acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp);
     softmax_forward(acts.probs, acts.logits, B, T, V, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
@@ -867,7 +867,7 @@ void gpt2_backward(GPT2_CL *gcl, GPT2 *model) {
     for (int i = 0; i < B*T; i++) { grads_acts.losses[i] = dloss_mean; }
 
     crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V, Vp);
-    matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, Vp);
+    cl_matmul_backward(gcl, grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, Vp);
     float* residual = acts.residual3 + (L-1) * B * T * C; // last layer's residual
     float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // write to last layer's residual
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
@@ -1117,7 +1117,7 @@ int main() {
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     const int genT = 64; // number of steps of inference we will do
 
-    cl_init(&gcl, B, T, model.config.channels, model.config.vocab_size);
+    cl_init(&gcl, B, T, model.config.channels, model.config.padded_vocab_size);
 
     // train
     struct timespec start, end;

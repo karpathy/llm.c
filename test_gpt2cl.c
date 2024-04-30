@@ -83,7 +83,7 @@ int main(int argc, char *argv[]) {
     fread(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
     fclose(state_file);
 
-    cl_init(&gcl, B, T, C, V);
+    cl_init(&gcl, B, T, C, Vp);
 
     // overall OK signal for the test
     int allok = 1;
