@@ -332,6 +332,7 @@ int main(int argc, char *argv[]) {
         cudaCheck(cudaFree(cudnn_workspace));
     }
     #endif
+    checkCudnnErr(cudnnDestroy(cudnn_handle));
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));

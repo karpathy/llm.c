@@ -1394,6 +1394,7 @@ int main(int argc, char **argv) {
     cublasDestroy(cublas_handle);
 
     #ifdef ENABLE_CUDNN
+    cudnnDestroy(cudnn_handle);
     if (cudnn_workspace_size > 0) {
         cudaCheck(cudaFree(cudnn_workspace));
     }
