@@ -752,7 +752,6 @@ __global__ void encoder_backward_kernel(floatX* dwte, floatX* dwpe,
     }
 }
 
-// currently reads FP32, outputs floatX(FP16/BF16/FP8)
 __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __restrict__ mean, floatX* __restrict__ rstd,
                                     const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
                                     const floatX* __restrict__ bias, int N, int C) {
