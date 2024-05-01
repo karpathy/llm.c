@@ -16,7 +16,7 @@ version 2 packs input into 128 bit memory reads
 #include "common.h"
 
 // turn on bf16 as default, done up here for now
-//#define ENABLE_BF16
+#define ENABLE_BF16
 
 #if defined(ENABLE_BF16)
 typedef __nv_bfloat16 floatX;
@@ -43,10 +43,10 @@ void residual_forward_cpu(float* out, const float* inp1, const float* inp2, int 
 // GPU kernels
 
 // elementwise ops are nice and ez
-__global__ void residual_forward_kernel1(float* out, const float* inp1, const float* inp2, int N) {
+__global__ void residual_forward_kernel1(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
-        out[idx] = inp1[idx] + inp2[idx];
+        out[idx] = (floatX)((float)inp1[idx] + (float)inp2[idx]);
     }
 }
 
@@ -67,14 +67,14 @@ __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const 
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-void residual_forward1(float* out, const float* inp1, const float* inp2, int N, const int block_size) {
+void residual_forward1(floatX* out, const floatX* inp1, const floatX* inp2, int N, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
     residual_forward_kernel1<<<grid_size, block_size>>>(out, inp1, inp2, N);
     cudaCheck(cudaGetLastError());
 }
 
 void residual_forward2(floatX* out, const floatX* inp1, const floatX* inp2, int N, const int block_size) {
-    const int grid_size = ceil_div(N, block_size)/x128::size;
+    const int grid_size = ceil_div(N, (int)(block_size * x128::size));
     residual_forward_kernel2<<<grid_size, block_size>>>(out, inp1, inp2, N);
     cudaCheck(cudaGetLastError());
 }
@@ -87,16 +87,12 @@ void residual_forward(int kernel_num,
                   int N,
                   int block_size) {
     switch (kernel_num) {
-#if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
         case 1:
             residual_forward1(out, inp1, inp2, N, block_size);
             break;
-#endif
-#if defined(ENABLE_BF16)
         case 2:
             residual_forward2(out, inp1, inp2, N, block_size);
             break;
-#endif
         default:
             printf("Invalid kernel number\n");
             exit(1);
@@ -158,11 +154,11 @@ int main(int argc, char **argv) {
         printf("Checking block size %d.\n", block_size);
         residual_forward(kernel_num, d_out, d_inp1, d_inp2, B * T * C, block_size);
 #if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
-        validate_result(d_out, out, "out", B * T * C, 1e-5f);
+        float tol = 1e-5;
+#else
+        float tol = 1e-2f;
 #endif
-#if defined(ENABLE_BF16)
-        validate_result(d_out, out, "out", B * T * C, 1e-2f);
-#endif
+        validate_result(d_out, out, "out", B * T * C, tol);
     }
 
     printf("All results match. Starting benchmarks.\n\n");
