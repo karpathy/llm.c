@@ -59,10 +59,10 @@ void gelu_backward_cpu(float* dinp, const float* inp, const float* dout, const i
 // GPU kernels
 
 // elementwise ops are nice and ez
-__global__ void gelu_backward1(float* dinp, const float* inp, const float* dout, int N) {
+__global__ void gelu_backward1(floatX* dinp, const floatX* inp, const floatX* dout, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) {
-        float x = inp[i];
+        float x = (float)inp[i];
         float cube = 0.044715f * x * x * x;
         float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
         float tanh_out = tanhf(tanh_arg);
@@ -97,14 +97,14 @@ __global__ void gelu_backward2(floatX* dinp, const floatX* inp, const floatX* do
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-void gelu_backward1(float* dinp, const float* inp, const float* dout, int N, const int block_size) {
+void gelu_backward1(floatX* dinp, const floatX* inp, const floatX* dout, int N, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
     gelu_backward1<<<grid_size, block_size>>>(dinp, inp, dout, N);
     cudaCheck(cudaGetLastError());
 }
 
 void gelu_backward2(floatX* dinp, const floatX* inp, const floatX* dout, int N, const int block_size) {
-    const int grid_size = ceil_div(N, block_size)/x128::size;
+    const int grid_size = ceil_div(N, block_size * x128::size);
     gelu_backward2<<<grid_size, block_size>>>(dinp, inp, dout, N);
     cudaCheck(cudaGetLastError());
 }
@@ -117,16 +117,12 @@ void gelu_backward(int kernel_num,
                   int B, int T, int C,
                   int block_size) {
     switch (kernel_num) {
-#if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
         case 1:
             gelu_backward1(dinp, inp, dout, B * T * C, block_size);
             break;
-#endif
-#if defined(ENABLE_BF16)
         case 2:
             gelu_backward2(dinp, inp, dout, B * T * C, block_size);
             break;
-#endif
         default:
             printf("Invalid kernel number\n");
             exit(1);
@@ -186,11 +182,11 @@ int main(int argc, char **argv) {
         printf("Checking block size %d.\n", block_size);
         gelu_backward(kernel_num, d_dinp, d_inp, d_dout, B, T, C, block_size);
 #if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
-        validate_result(d_dinp, dinp, "dinp", B * T * C, 1e-5f);
+        float tol = 1e-5;
+#else
+        float tol = 1e-2f;
 #endif
-#if defined(ENABLE_BF16)
-#endif
-        validate_result(d_dinp, dinp, "dinp", B * T * C, 1e-2f);
+        validate_result(d_dinp, dinp, "dinp", B * T * C, tol);
     }
 
     printf("All results match. Starting benchmarks.\n\n");
