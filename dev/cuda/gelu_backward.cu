@@ -132,14 +132,11 @@ void gelu_backward(int kernel_num,
 // ----------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
-    srand(0);
+    setup_main();
 
     int B = 8;
     int T = 1024;
     int C = 768;
-
-    int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
 
     // create host memory of random numbers
     float* dinp = (float*)malloc(B * T * C * sizeof(float));
@@ -164,16 +161,8 @@ int main(int argc, char **argv) {
     cudaCheck(cudaMalloc(&d_inp, B * T * C * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_dout, B * T * C * sizeof(floatX)));
 
-    floatX* inpX = (floatX*)malloc(B * T * C * sizeof(floatX));
-    floatX* doutX = (floatX*)malloc(B * T * C * sizeof(floatX));
-
-    for (int i = 0; i < B * T * C; i++) {
-        inpX[i] = (floatX)inp[i];
-        doutX[i] = (floatX)dout[i];
-    }
-
-    cudaCheck(cudaMemcpy(d_inp, inpX, B * T * C * sizeof(floatX), cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(d_dout, doutX, B * T * C * sizeof(floatX), cudaMemcpyHostToDevice));
+    cudaCheck(memcpy_convert(d_inp, inp, B * T * C));
+    cudaCheck(memcpy_convert(d_dout, dout, B * T * C));
 
     // time the kernel at different block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
@@ -213,8 +202,6 @@ int main(int argc, char **argv) {
     free(dinp);
     free(inp);
     free(dout);
-    free(inpX);
-    free(doutX);
     cudaCheck(cudaFree(d_dinp));
     cudaCheck(cudaFree(d_inp));
     cudaCheck(cudaFree(d_dout));
