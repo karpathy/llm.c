@@ -58,8 +58,9 @@ struct alignas(16) Packed128 {
         memcpy(&bits, &payload, sizeof(bits));
         return bits;
     }
-
-    static constexpr const size_t size = sizeof(int4) / sizeof(ElementType);
+    // e.g. sizeof(int4) is 16 (4 X 4 bytes), sizeof(bfloat16) = 2, so size = 8
+    // so in the case where ElementType = bfloat16, we store 8 elements in one Packed128
+    static constexpr const int size = sizeof(int4) / sizeof(ElementType);
     ElementType payload[size];
 };
 
