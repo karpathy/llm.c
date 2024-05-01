@@ -114,7 +114,7 @@ namespace fe = cudnn_frontend;
 #endif
 
 static cudnnHandle_t cudnn_handle;
-static size_t cudnn_workspace_size = 256 * 1024 * 1024; // maximum that cuDNN uses by default(!)
+static size_t cudnn_workspace_size = 0; // dynamically allocated as needed (up to 256MiB!)
 static void* cudnn_workspace = NULL;
 
 #define checkCudaErr(err) assert((int)err == 0);
@@ -643,14 +643,23 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
         variant_pack[softmax_stats] = stats;
     }
 
+    // Reallocate the workspace if the required size is greater than the current workspace
+    // By default, cuDNN uses up to 256MiB of workspace, so we don't want to just allocate the maximum
+    if (graph->get_workspace_size() > cudnn_workspace_size) {
+        if (cudnn_workspace_size > 0) {
+            cudaCheck(cudaFree(cudnn_workspace));
+        }
+        cudnn_workspace_size = graph->get_workspace_size();
+        cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
+    }
+
     // Execute graph
-    assert(graph->get_workspace_size() <= cudnn_workspace_size);
     assert(graph->execute(cudnn_handle, variant_pack, cudnn_workspace).is_good());
     cudaCheck(cudaGetLastError());
 }
 
-void attention_backward_cudnn(floatX* dout, floatX* dqkvr,           // outputs
-                              floatX* qkvr, floatX* o, float* stats, // inputs
+void attention_backward_cudnn(floatX* dqkvr,                                       // output
+                              floatX* dout, floatX* qkvr, floatX* o, float* stats, // inputs
                               int B, int T, int NH, int C) {
     int HS = C / NH; // number of features per head
 
@@ -677,9 +686,19 @@ void attention_backward_cudnn(floatX* dout, floatX* dqkvr,           // outputs
         {dQ, devPtrdQ}, {dK, devPtrdK}, {dV, devPtrdV},
         {attn_scale, &attn_scale_cpu}};
 
+    // Reallocate the workspace if the required size is greater than the current workspace
+    // By default, cuDNN uses up to 256MiB of workspace, so we don't want to just allocate the maximum
+    if (graph->get_workspace_size() > cudnn_workspace_size) {
+        if (cudnn_workspace_size > 0) {
+            cudaCheck(cudaFree(cudnn_workspace));
+        }
+        cudnn_workspace_size = graph->get_workspace_size();
+        cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
+    }
+
     // Execute graph
-    assert(graph->get_workspace_size() <= cudnn_workspace_size);
     assert(graph->execute(cudnn_handle, variant_pack, cudnn_workspace).is_good());
+    cudaCheck(cudaGetLastError());
 }
 #endif // ENABLE_CUDNN
 
@@ -1714,19 +1733,29 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
 // Backward pass is conceptually quite different from forward, because we can discard
 // the activations of a layer as soon as we're done with it. This lets us aggressively
 // reuse memory, so that we need far fewer tensors for backward state.
+#ifdef ENABLE_CUDNN
+#define NUM_BACKWARD_TENSORS 2
+#else
 #define NUM_BACKWARD_TENSORS 3
+#endif
+
 typedef struct {
     floatX* bt4c; // (B, T, 4*C)
-    floatX* preatt; // (B, NH, T, T)
     floatX* residual3; // (B, T, C)
+    #ifndef ENABLE_CUDNN
+    floatX* preatt; // (B, NH, T, T)
+    #endif
 } GradActTensors;
 
 void fill_in_grad_act_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config) {
-    size_t NH = config.num_heads;
     size_t C = config.channels;
     act_sizes[0] = B * T * 4 * C; // bt4c
-    act_sizes[1] = B * NH * T * T; // preatt
-    act_sizes[2] = B * T * C; // residual3
+    act_sizes[1] = B * T * C; // residual3
+
+    #ifndef ENABLE_CUDNN
+    size_t NH = config.num_heads;
+    act_sizes[2] = B * NH * T * T; // preatt
+    #endif
 }
 
 void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n) {
@@ -1756,7 +1785,10 @@ void* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_si
 
 void* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) {
     floatX** ptrs[] = {
-        &acts->bt4c, &acts->preatt, &acts->residual3
+        &acts->bt4c, &acts->residual3,
+        #ifndef ENABLE_CUDNN
+        &acts->preatt,
+        #endif
     };
     return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
@@ -2055,9 +2087,8 @@ void gpt2_backward(GPT2 *model) {
     ActivationTensors acts = model->acts;
     GradActTensors grads_acts = model->grads_acts;
 
-    // re-use scratch buffer of the forward pass
+    // re-use the output buffer of the forward pass as a scratchpad during backward pass
     float*  scratchF = (float*)acts.output;
-    floatX* scratchX = (floatX*)acts.output;
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // this was done in the fused classifier kernel as last step of forward pass
@@ -2115,7 +2146,6 @@ void gpt2_backward(GPT2 *model) {
         // so we can co-opt it here.
         floatX* dl_btc = (floatX*)acts.lnf;
         floatX* dl_bt4c = (floatX*)grads_acts.bt4c;
-        floatX* dl_preatt = (floatX*)grads_acts.preatt;
 
         // backprop this layer
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
@@ -2124,17 +2154,20 @@ void gpt2_backward(GPT2 *model) {
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
-        // we more B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
-        floatX* buffer_a = l_atty;
-        floatX* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
 
         #ifdef ENABLE_CUDNN
-        attention_backward_cudnn(dl_btc, dl_bt4c, l_qkvr, l_atty, (float*)l_att, B, T, NH, C);
+        attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C);
         #else
+        // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
+        floatX* buffer_a = l_atty;
+        floatX* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
+        floatX* dl_preatt = (floatX*)grads_acts.preatt; // dedicated scratchpad allocation
+        floatX* scratchX =  (floatX*)acts.output;
         attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
         #endif
-        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
 
+        // QKV parameter gradients
+        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
@@ -2423,8 +2456,6 @@ int main(int argc, char *argv[]) {
 
     #ifdef ENABLE_CUDNN
     checkCudnnErr(cudnnCreate(&cudnn_handle));
-    cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
-    printf("INIT CUDNN %d\n", (int)cudnn_workspace_size);
     #endif
 
     printf0("| device                | %-50s |\n", deviceProp.name);
@@ -2566,14 +2597,17 @@ int main(int argc, char *argv[]) {
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        total_sum_iteration_time_s += time_elapsed_s;
+
+        if (step > 0) { // consider the first batch to be a warmup (e.g. cuBLAS/cuDNN initialisation)
+            total_sum_iteration_time_s += time_elapsed_s;
+        }
         int tokens_per_second = multi_gpu_config.num_processes * (B * T) / time_elapsed_s;
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
         printf0("step %4d/%d: train loss %f (acc %f) (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, accumulated_loss, time_elapsed_s * 1000, tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
     }
-    // add a total average, for optimizations that are only mild improvements
-    printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / train_num_batches * 1000);
+    // add a total average, for optimizations that are only mild improvements (excluding 1st batch as warmup)
+    printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);
 
     // free
     dataloader_free(&train_loader);
@@ -2583,6 +2617,13 @@ int main(int argc, char *argv[]) {
     free(cpu_logits_raw);
     free(cpu_logits);
     free(gen_tokens);
+
+    #ifdef ENABLE_CUDNN
+    if (cudnn_workspace_size > 0) {
+        cudaCheck(cudaFree(cudnn_workspace));
+    }
+    #endif
+
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
