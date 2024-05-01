@@ -24,6 +24,13 @@ Also we're using TinyStories here for example as it is a bigger dataset
 
 Example launch using bfloat16 on 4 GPUs, same as above:
 mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
+
+If you'd like to see train_gpt2.cu produce identical results to
+`python train_gpt2.py`, you can run it like this:
+make train_gpt2cu PRECISION=FP32
+./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -f 0
+This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
+-a 1 is "overfit single batch", -x 10 is 10 iterations, and -f 0 disables tf32
 */
 #define ENABLE_CUDNN // can be enabled via nvcc "-DENABLE_CUDNN"
 
@@ -229,9 +236,6 @@ struct alignas(16) Packed128 {
     __device__ const ElementType& operator[](int index) const {
         return payload[index];
     }
-    __device__ float fp32(int index) {
-        return static_cast<float>(payload[index]);
-    }
     __device__ int4 get_bits() const {
         int4 bits;
         static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
@@ -245,6 +249,7 @@ struct alignas(16) Packed128 {
 
 // short-form typedef
 typedef Packed128<float> f128;
+typedef Packed128<floatX> x128;
 
 // load a Packed128 from an aligned memory address
 template<class ElementType>
@@ -839,7 +844,8 @@ __global__ void permute_kernel_backward(floatX* dinp,
 
 __global__ void unpermute_kernel(floatX* inp, floatX *out, int B, int N, int NH, int d) {
    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x);
     // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
     if (idx < B * NH * N * d) {
         int b = idx / (NH * N * d);
@@ -940,12 +946,19 @@ __global__ void residual_forward_kernel(floatX* out, floatX* inp1, floatX* inp2,
 }
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__global__ void gelu_forward_kernel(floatX* out, const floatX* inp, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     if (i < N) {
-        float xi = (float)inp[i];
-        float cube = 0.044715f * xi * xi * xi;
-        out[i] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
+        x128 packed_out;
+        x128 packed_inp = load128cs(inp + i); // load and do not keep in cache
+        for(int k = 0; k < packed_inp.size; ++k) {
+            float xi = (float)packed_inp[k];
+            float cube = 0.044715f * xi * xi * xi;
+            packed_out[k] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
+        }
+        // store instead of storecs (without cache streaming) in case it is useful for the
+        // data to be in the cache for the next operation after this GeLU
+        store128(out + i, packed_out);
     }
 }
 
@@ -1464,9 +1477,9 @@ void residual_forward(floatX* out, floatX* inp1, floatX* inp2, int N) {
 }
 
 void gelu_forward(floatX* out, const floatX* inp, int N) {
-    const int block_size = 128;
-    const int grid_size = CEIL_DIV(N, block_size);
-    gelu_forward_kernel<<<grid_size, block_size>>>(out, inp, N);
+    const int block_size = 512;
+    const int grid_size = CEIL_DIV(N, block_size * x128::size);
+    gelu_forward_kernel2<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2289,6 +2302,8 @@ void dataloader_init(DataLoader *loader, const MultiGpuConfig* multi_gpu_config,
     cudaMallocHost((void**)&loader->batch, (B * T + 1) * sizeof(int));
     loader->inputs = loader->batch;
     loader->targets = loader->batch + 1; // targets are shifted by one
+    // note: we definitely want to advance by B * T; That is the "stride" by which we move
+    // the window of tokens. We only load B * T + 1 tokens because our targets are offset by 1
     loader->num_batches = loader->file_size / (loader->num_processes * B * T * sizeof(int));
 }
 
@@ -2307,6 +2322,7 @@ void dataloader_next_batch(DataLoader *loader) {
     fseekCheck(loader->tokens_file, loader->current_position, SEEK_SET);
     freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
     // advance the current position by B*T*num_processes integers
+    // note: the "stride" of tokens by which we move each time is definitely B * T
     loader->current_position += loader->num_processes * B * T * sizeof(int);
 }
 
@@ -2382,10 +2398,13 @@ void error_usage() {
     fprintf(stderr, "  -b <int>    batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
     fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
+    fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
     fprintf(stderr, "  -m <int>    val_max_batches, up to how many val batches to estimate val loss? (default = 20)\n");
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
+    fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
+    fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     exit(EXIT_FAILURE);
 }
 
@@ -2404,6 +2423,9 @@ int main(int argc, char *argv[]) {
     int val_max_batches = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
+    int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
+    int max_steps = -1;
+    int override_enable_tf32 = 1;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -2414,10 +2436,13 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
         else if (argv[i][1] == 'l') { learning_rate = atof(argv[i+1]); }
+        else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'm') { val_max_batches = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else { error_usage(); }
     }
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -2427,11 +2452,13 @@ int main(int argc, char *argv[]) {
     printf0("| output log file       | %-50s |\n", output_log_file == NULL ? "NULL" : output_log_file);
     printf0("| batch size B          | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
-    printf0("| learning rate         | %-50f |\n", learning_rate);
+    printf0("| learning rate         | %-50e |\n", learning_rate);
+    printf0("| max_steps             | %-50d |\n", max_steps);
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
     printf0("| val_max_batches       | %-50d |\n", val_max_batches);
     printf0("| sample_every          | %-50d |\n", sample_every);
     printf0("| genT                  | %-50d |\n", genT);
+    printf0("| overfit_single_batch  | %-50d |\n", overfit_single_batch);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // set up the device
@@ -2449,6 +2476,7 @@ int main(int argc, char *argv[]) {
 
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     int enable_tf32 = cuda_arch_major >= 8 ? 1 : 0;
+    if (override_enable_tf32 == 0) { enable_tf32 = 0; } // force to zero via arg
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
@@ -2480,13 +2508,16 @@ int main(int argc, char *argv[]) {
     char train_tokens_filename[128];
     char val_tokens_filename[128];
     assert(strlen(input_dataset_prefix) < 100); // being bit lazy here, make sure we don't overflow
-    sprintf(train_tokens_filename, "%s_train.bin", input_dataset_prefix);
+    // if we're only overfitting a single batch for debugging, let's overfit the first batch
+    // from val instead of train split, because val is smaller and a bit faster
+    const char* train_split = (overfit_single_batch == 1) ? "val" : "train";
+    sprintf(train_tokens_filename, "%s_%s.bin", input_dataset_prefix, train_split);
     sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
     DataLoader train_loader;
     dataloader_init(&train_loader, &multi_gpu_config, train_tokens_filename, B, T);
     DataLoader val_loader;
     dataloader_init(&val_loader, &multi_gpu_config, val_tokens_filename, B, T);
-    int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default for now
+    int train_num_batches = (max_steps == -1) ? train_loader.num_batches : max_steps; // default = 1 epoch
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
     printf0("| train_num_batches     | %-50d |\n", train_num_batches);
     printf0("| val_num_batches       | %-50d |\n", val_num_batches);
@@ -2586,7 +2617,10 @@ int main(int argc, char *argv[]) {
 
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
-        dataloader_next_batch(&train_loader);
+        if (overfit_single_batch == 0 || (step == 0 && overfit_single_batch == 1)) {
+            // if we're overfitting a single batch, we'll only call this at step = 0
+            dataloader_next_batch(&train_loader);
+        }
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);

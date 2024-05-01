@@ -544,10 +544,10 @@ if __name__ == "__main__":
         with ctx:
             logits, loss = model(x, y)
             del logits
-            if not args.inference_only:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+        if not args.inference_only:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
         # wait on the CPU for all device work to end so we get accurate per-iteration timings below
         if device == "mps":
             torch.mps.synchronize()
@@ -557,7 +557,7 @@ if __name__ == "__main__":
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
         tokens_per_second = ddp_world_size * B * T / (t1-t0)
-        print0(f"iteration {i}, loss: {loss.item():.4f}, time: {(t1-t0)*1000:.3f}ms, tok/s: {tokens_per_second:.2f}")
+        print0(f"iteration {i+1}, loss: {loss.item():.4f}, time: {(t1-t0)*1000:.3f}ms, tok/s: {tokens_per_second:.2f}")
         if i > 0 and i > args.num_iterations - 20:
             timings.append(t1-t0)
 

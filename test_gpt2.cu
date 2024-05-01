@@ -115,7 +115,7 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
+    gpt2_build_from_checkpoint(&model, load_filename);
     size_t V = model.config.vocab_size;
     size_t Vp = model.config.padded_vocab_size;
     size_t maxT = model.config.max_seq_len;
@@ -286,7 +286,7 @@ int main(int argc, char *argv[]) {
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1);
 
         // print the timing information at the end
-        printf("step %d: loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
+        printf("step %d: loss %f (took %f ms)\n", step+1, model.mean_loss, time_elapsed_s * 1000);
         losses[step] = model.mean_loss;
     }
 
@@ -307,10 +307,10 @@ int main(int argc, char *argv[]) {
     // compare
     for (int i = 0; i < 10; i++) {
         if (fabsf(losses[i] - expected_losses[i]) >= loss_diff_threshold) {
-            printf("LOSS MISMATCH AT STEP %d: %f %f\n", i, losses[i], expected_losses[i]);
+            printf("LOSS MISMATCH AT STEP %d: %f %f\n", i+1, losses[i], expected_losses[i]);
             allok = 0;
         } else {
-            printf("loss ok at step %d: %f %f\n", i, losses[i], expected_losses[i]);
+            printf("loss ok at step %d: %f %f\n", i+1, losses[i], expected_losses[i]);
         }
     }
 
