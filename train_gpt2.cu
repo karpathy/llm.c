@@ -2269,6 +2269,7 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->grads_memory));
     cudaCheck(cudaFree(model->m_memory));
     cudaCheck(cudaFree(model->v_memory));
+    cudaCheck(cudaFree(model->master_weights));
     cudaCheck(cudaFree(model->acts_memory));
     cudaCheck(cudaFree(model->grads_acts_memory));
     cudaCheck(cudaFree(model->inputs));
@@ -2430,7 +2431,7 @@ void error_usage() {
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
     fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
-    fprintf(stderr, "  -c <int>    keep f32 copy of weights for the optimizer\n");
+    fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer\n");
     exit(EXIT_FAILURE);
 }
 
@@ -2470,7 +2471,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
         else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'c') { master_weights = (bool)atoi(argv[i+1]); }
+        else if (argv[i][1] == 'w') { master_weights = (bool)atoi(argv[i+1]); }
         else { error_usage(); }
     }
     printf0("+-----------------------+----------------------------------------------------+\n");
