@@ -1691,7 +1691,7 @@ typedef struct {
     floatX* ln1_mean; // (L, B, T)
     floatX* ln1_rstd; // (L, B, T)
     floatX* atty; // (L, B, T, C)
-    floatX* att; // (L, B, NH, T, T)
+    floatX* att; // (L, B, NH, T, T) (smaller with cuDNN)
     floatX* attproj; // (L, B, T, C)
     floatX* residual2; // (L, B, T, C)
     floatX* ln2; // (L, B, T, C)
@@ -1725,7 +1725,12 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     act_sizes[2] = L * B * T; // ln1_mean
     act_sizes[3] = L * B * T; // ln1_rstd
     act_sizes[4] = L * B * T * C; // atty
+    #ifdef ENABLE_CUDNN
+    // FP32 stats tensor for cuDNN to be passed to backward pass
+    act_sizes[5] = L * B * NH * T * (sizeof(float) / sizeof(floatX));
+    #else
     act_sizes[5] = L * B * NH * T * T; // att
+    #endif
     act_sizes[6] = L * B * T * C; // attproj
     act_sizes[7] = L * B * T * C; // residual2
     act_sizes[8] = L * B * T * C; // ln2
@@ -1997,7 +2002,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         floatX* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
-        floatX* l_att = acts.att + l * B * NH * T * T;
         floatX* l_attproj = acts.attproj + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
         floatX* l_ln2 = acts.ln2 + l * B * T * C;
@@ -2012,9 +2016,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
 
         #ifdef ENABLE_CUDNN
+        float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
         matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C);
         #else
+        floatX* l_att = acts.att + l * B * NH * T * T;
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         floatX* scratch = (floatX*)acts.output;
@@ -2144,7 +2150,6 @@ void gpt2_backward(GPT2 *model) {
         floatX* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
-        floatX* l_att = acts.att + l * B * NH * T * T;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
         floatX* l_ln2 = acts.ln2 + l * B * T * C;
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
@@ -2169,8 +2174,10 @@ void gpt2_backward(GPT2 *model) {
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
 
         #ifdef ENABLE_CUDNN
+        float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
         attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C);
         #else
+        floatX* l_att = acts.att + l * B * NH * T * T;
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
