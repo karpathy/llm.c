@@ -15,11 +15,6 @@ OMP_NUM_THREADS=32 ./matmul_backward 1
 #include "common.h"
 
 // ----------------------------------------------------------------------------
-// CUDA / cuBLAS setup
-
-static cublasHandle_t cublas_handle;
-
-// ----------------------------------------------------------------------------
 // CPU code reference
 
 void matmul_backward_cpu(float* dinp, float* dweight, float* dbias,

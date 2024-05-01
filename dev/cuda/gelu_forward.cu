@@ -145,14 +145,7 @@ int main(int argc, const char **argv) {
     floatX* d_inp;
     cudaCheck(cudaMalloc(&d_out, B * T * C * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_inp, B * T * C * sizeof(floatX)));
-
-    floatX* inpX = (floatX*)malloc(B * T * C * sizeof(floatX));
-
-    for (int i = 0; i < B * T * C; i++) {
-        inpX[i] = (floatX)inp[i];
-    }
-
-    cudaCheck(cudaMemcpy(d_inp, inpX, B * T * C * sizeof(floatX), cudaMemcpyHostToDevice));
+    cudaCheck(memcpy_convert(d_inp, inp, B * T * C));
 
     // time the kernel at different block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
@@ -191,7 +184,6 @@ int main(int argc, const char **argv) {
     // free memory
     free(out);
     free(inp);
-    free(inpX);
 
     cudaCheck(cudaFree(d_out));
     cudaCheck(cudaFree(d_inp));

@@ -19,10 +19,6 @@ version 2 moves a lot of reduction to shared memory over global memory
 #include <cooperative_groups/reduce.h>
 #include "common.h"
 
-// ----------------------------------------------------------------------------
-// CUDA settings
-int cuda_num_SMs = 0; // for persistent threads where we want 1 threadblock per SM
-
 // turn on bf16 as default, done up here for now
 #define ENABLE_BF16
 
@@ -757,17 +753,11 @@ void layernorm_backward(int kernel_num,
 // ----------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
-    srand(0);
+    setup_main();
 
     int B = 8;
     int T = 1024;
     int C = 768;
-
-    int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
-    cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, deviceIdx);
-    cuda_num_SMs = deviceProp.multiProcessorCount;
 
     // first do the forward pass in CPU
     float* out = (float*)malloc(B * T * C * sizeof(float));
