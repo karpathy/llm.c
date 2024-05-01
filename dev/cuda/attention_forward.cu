@@ -7,7 +7,9 @@ nvcc -O3 --use_fast_math attention_forward.cu -o attention_forward -lcublas
 version 1 is naive port from CPU code to kernel, parallelize over batch, time, heads only
 ./attention_forward 1
 
-version 2 is a naive implementation of flash attention, taken, adapted from
+version 2 is a naive implementation of flash attention 1, taken, adapted from
+https://github.com/leloykun/flash-hyperbolic-attention-minimal/blob/main/flash_attention_1.cu
+which was originally forked from
 https://github.com/tspeterkim/flash-attention-minimal
 and with help from
 https://github.com/leloykun/flash-hyperbolic-attention-minimal
@@ -23,6 +25,15 @@ this turns out to be ~20X faster than (1) nice
 version 4 is a further optimized kernel that fuses the scale operation,
 uses a directly autoregressive softmax, and uses the online softmax algorithm.
 ./attention_forward 4
+
+version 6 is a naive implementation of flash attention 2, taken, adapted from
+https://github.com/leloykun/flash-hyperbolic-attention-minimal/blob/main/flash_attention_2.cu
+which was originally forked from
+https://github.com/tspeterkim/flash-attention-minimal
+and with help from
+https://github.com/leloykun/flash-hyperbolic-attention-minimal
+./attention_forward 6
+This version is about 3X faster than the naive version (1), but still slower than the cuBLAS version (3).
 */
 
 #include <stdio.h>
@@ -649,6 +660,128 @@ __global__ void attention_forward_fused1(float* out, float* preatt, float* att,
     }
 }
 
+__global__
+void flash_attention_2_forward_kernel(
+    const float* Q,
+    const float* K,
+    const float* V,
+    const int N,
+    const int d,
+    const int Tc,
+    const int Tr,
+    const int Bc,
+    const int Br,
+    const float softmax_scale,
+    // L is used by the backward pass to calculate gradients. We don't need it here.
+    // float* L,
+    float* O
+) {
+    int tx = threadIdx.x;
+    int bx = blockIdx.x; int by = blockIdx.y;  // batch and head index
+    int bz = blockIdx.z;  // sequence index
+
+    // Offset into Q,K,V,O - different for each batch and head
+    int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d);  // gridDim.y = nh
+    // int lm_offset = (bx * gridDim.y * N) + (by * N);  // offset for L
+
+    // Define SRAM for Q,K,V,S
+    extern __shared__ float sram[];
+    const int tile_size = Bc * d;  // size of Qi, Kj, Vj
+    float* Qi = sram;
+    float* Kj = &sram[tile_size * 1];
+    float* Vj = &sram[tile_size * 2];
+    float* S = &sram[tile_size * 3];
+
+    float Oi[32 * 64] = {0.0f};
+
+    int i = bz;
+    if (i * Br + tx >= N)
+        return;  // break if we are done with the sequence
+    int n = Bc * i + tx;
+
+    // Load Qi from HBM to SRAM, l and m to registers
+    for (int x = 0; x < d; x++) {
+        Qi[(tx * d) + x] = Q[qkv_offset + ((Br * i + tx) * d) + x];
+    }
+    float row_m_prev = -INFINITY;
+    float row_l_prev = 0;
+
+    // Causal mask: j <= i
+    for (int j = 0; j <= i; ++j) {
+        __syncthreads();
+        // Load Kj, Vj from HBM to SRAM
+        for (int x = 0; x < d; x++) {
+            Kj[(tx * d) + x] = K[qkv_offset + ((Bc * j + tx) * d) + x];
+            Vj[(tx * d) + x] = V[qkv_offset + ((Bc * j + tx) * d) + x];
+        }
+
+        __syncthreads();
+
+        // S_i^j = softmax_scale * QiKj^T
+        // S_i^j[tx][y] = softmax_scale * Sum_{x = 0}^{d-1} Qi[tx][x] * Kj[y][x]
+        float new_row_m = row_m_prev;
+        for (int y = 0; y < Bc; y++) {
+            if (j * Bc + y >= N)
+                break;  // break if we are done with the sequence
+            float sum = 0;
+            for (int x = 0; x < d; x++)
+                sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
+            sum *= softmax_scale;
+            if (i * Br + tx < j * Bc + y)
+                sum = -INFINITY;
+            S[(Bc * tx) + y] = sum;
+
+            if (sum > new_row_m)
+                new_row_m = sum;
+        }
+
+        // P_i^j = exp(S_i^j - m_i^j)
+        // P_i^j[tx][y] = exp(S_i^j[tx][y] - m_i^j)
+        float row_l = 0;
+        for (int y = 0; y < Bc; y++) {
+            if (j * Bc + y >= N)
+                break;  // break if we are done with the sequence
+            if (i * Br + tx < j * Bc + y)
+                S[(Bc * tx) + y] = 0;
+            else
+                S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - new_row_m);
+            row_l += S[(Bc * tx) + y];
+        }
+
+        // l_i^j = (exp(m_i^j-1 - m_i^j) * l_i^j-1) + row_sum(P_i^j)
+        float row_m_exp = __expf(row_m_prev - new_row_m);
+
+        // O_i^j = diag(exp(m_i^j-1 - m_i^j))^-1 * O_i^j-1 + P_i^jVj
+        for (int x = 0; x < d; x++) {
+            float pv = 0;  // Pij * Vj
+            for (int y = 0; y < Bc; y++) {
+                if (j * Bc + y >= N)
+                    break;  // break if we are done with the sequence
+                pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
+            }
+            // O[qkv_offset + (tile_size * i) + (tx * d) + x] = \
+                row_m_exp * O[qkv_offset + (tile_size * i) + (tx * d) + x] + pv;
+            // Permute output dims here to reduce parallel calls
+            // O[(bx * gridDim.y * N * d) + ((n * gridDim.y + by) * d) + x] = \
+            //    row_m_exp * O[(bx * gridDim.y * N * d) + (n * gridDim.y * d) + (by * d) + x] + pv;
+            Oi[(tx * d) + x] = row_m_exp * Oi[(tx * d) + x] + pv;
+        }
+
+        // Update m and l
+        row_m_prev = new_row_m;
+        row_l_prev = (row_m_exp * row_l_prev) + row_l;
+    }
+
+    // O_i = diag(l_i^{Tc})^-1 * O_i^{Tc}
+    for (int x = 0; x < d; x++) {
+        // O[qkv_offset + (tile_size * i) + (tx * d) + x] /= row_l_prev;
+        // O[(bx * gridDim.y * N * d) + ((n * gridDim.y + by) * d) + x] /= row_l_prev;
+        O[(bx * gridDim.y * N * d) + ((n * gridDim.y + by) * d) + x] = Oi[(tx * d) + x] / row_l_prev;
+    }
+    // L_i = m_i^{Tc} + log(l_i^{Tc})
+    // L[lm_offset + (Br * i) + tx] = row_m_prev + __logf(row_l_prev);
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -871,6 +1004,58 @@ void attention_forward5(float* out, float* preatt, float* att,
     attention_forward_fused1<<<dim3(x_blocks, NH, B), block_size>>>(out, preatt, att, inp, B, T, C, NH);
 }
 
+void attention_forward6(float* out, float* qkvr, const float* inp,
+                        int B, int T, int C, int NH,
+                        const int block_size) {
+    // these are hardcoded to 32 for now
+    const int Bc = 32;
+    const int Br = 32;
+    // renaming these to be consistent with the kernel
+    // const int B = B;
+    const int nh = NH;
+    const int N = T;
+    const int d = C / NH;
+
+    // Uncomment this to check the shapes
+    // assert(B * T * C == B * N * nh * d);
+
+    // more
+    const int Tc = ceil((float) N / Bc);
+    const int Tr = ceil((float) N / Br);
+    const float softmax_scale = 1.0 / sqrt(d);
+
+    // calculate SRAM size needed per block
+    int col_tile_size = Bc * d;  // size of Kj, Vj
+    int row_tile_size = Br * d;  // size of Qi
+    const int sram_size =
+        (2 * col_tile_size * sizeof(float))  // SRAM size for Kj, Vj
+        + (row_tile_size * sizeof(float))  // SRAM size for Qi, Oi
+        + (Bc * Br * sizeof(float));  // SRAM size for S
+    // const int sram_size = (Bc * Br * sizeof(float));  // SRAM size for S
+    int max_sram_size;
+    cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
+    // printf("Max shared memory: %d, requested shared memory: %d \n", max_sram_size, sram_size);
+
+    float *q, *k, *v;
+    q = qkvr + 0 * B * T * C;
+    k = qkvr + 1 * B * T * C;
+    v = qkvr + 2 * B * T * C;
+    int total_threads = B * N * nh * d;
+    int num_blocks = ceil_div(total_threads, block_size);
+    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, N, nh, d);
+
+    // grid and block dims
+    dim3 grid_dim(B, nh, Tr);  // batch_size x num_heads x num_sequence_blocks
+    // dim3 block_dim(Br);  // Br threads per block
+
+    // now actually call the flash attention 2 kernel
+    flash_attention_2_forward_kernel<<<grid_dim, Br, sram_size>>>(
+        q, k, v,
+        N, d, Tc, Tr, Bc, Br, softmax_scale,
+        out
+    );
+}
+
 // kernel version dispatch
 void attention_forward(int kernel_num,
                        float* out, float* vaccum, float* qkvr, float* preatt, float* att,
@@ -892,6 +1077,9 @@ void attention_forward(int kernel_num,
             break;
         case 5:
             attention_forward5(out, preatt, att, inp, B, T, C, NH, block_size);
+            break;
+        case 6:
+            attention_forward6(out, qkvr, inp, B, T, C, NH, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -950,12 +1138,12 @@ int main(int argc, char **argv) {
         // all kernels should produce the correct output out
         validate_result(d_out, out, "out", B * T * C, 1e-4f);
         // but as for preatt and att, things get a bit more complicated:
-        if (kernel_num != 2) {
+        if (kernel_num != 2 && kernel_num != 6) {
             // kernel 2 (knowingly) fails att/preatt because it uses a different algorithm
             // that estimates the softmax online and never materializes preatt/att
             validate_result(d_att, att, "att", B * NH * T * T, 1e-4f);
         }
-        if (kernel_num != 2 && kernel_num != 4 && kernel_num != 5) {
+        if (kernel_num != 2 && kernel_num != 4 && kernel_num != 5 && kernel_num != 6) {
             // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
             // into the softmax, so preatt is off by 1.0f / sqrt(HS)
             // but att and out (checked below) should match.
