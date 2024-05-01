@@ -82,11 +82,9 @@ int main() {
     gpt2_free(&model);
 
     #ifdef ENABLE_CUDNN
-    if (cudnn_workspace != NULL) {
-        cudaCheck(cudaFree(cudnn_workspace));
-    }
-    #endif
+    if (cudnn_workspace != NULL) { cudaCheck(cudaFree(cudnn_workspace)); }
     checkCudnnErr(cudnnDestroy(cudnn_handle));
+    #endif
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
