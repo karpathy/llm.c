@@ -2258,7 +2258,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     }
 
     int block_size = 512;
-    int num_blocks = CEIL_DIV(model->num_parameters, block_size)/x128::size;
+    assert(model->num_parameters % 4 == 0 && f128::size <= x128::size); // asserting here to not require bounds check in kernel
+    int num_blocks = CEIL_DIV(model->num_parameters, (long) (block_size))/x128::size;
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);

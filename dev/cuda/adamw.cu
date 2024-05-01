@@ -24,9 +24,10 @@ thread coarsening/ILP
 #include <time.h>
 #include <cuda_runtime.h>
 #include "common.h"
+#include <assert.h>
 
 // turn on bf16 as default, done up here for now
-//#define ENABLE_BF16
+#define ENABLE_BF16
 
 #if defined(ENABLE_BF16)
 typedef __nv_bfloat16 floatX;
@@ -39,7 +40,7 @@ typedef float floatX;
 typedef float floatN;
 #endif
 
-typedef Packed128<float> x128;
+typedef Packed128<floatX> x128;
 
 
 // ----------------------------------------------------------------------------
@@ -156,23 +157,23 @@ __device__ inline float lerp(float start, float end, float weight) {
 }
 
 // naive fused kernel
-__global__ void adamw_kernel1(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+__global__ void adamw_kernel1(floatX* params_memory, const floatX* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
    int i = blockIdx.x * blockDim.x + threadIdx.x;
    if (i >= num_parameters) return;  // guard
    // update the first moment (momentum)
-   m_memory[i] = beta1 * m_memory[i] + (1.0f - beta1) * grads_memory[i];
+   m_memory[i] = beta1 * m_memory[i] + (1.0f - beta1) * (float) grads_memory[i];
    // update the second moment (RMSprop)
-   v_memory[i] = beta2 * v_memory[i] + (1.0f - beta2) * grads_memory[i] * grads_memory[i];
+   v_memory[i] = beta2 * v_memory[i] + (1.0f - beta2) * (float) grads_memory[i] * (float) grads_memory[i];
    float m_hat = m_memory[i] / beta1_correction;
    float v_hat = v_memory[i] / beta2_correction;
-   params_memory[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * params_memory[i]);
+   params_memory[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * (float) params_memory[i]);
 }
 
 // Slightly more optimized AdamW kernel by:
 // * loading data that is accessed more than once into registers,
 // * using optimized linear interpolation for the moment updates.
-__global__ void adamw_kernel2(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+__global__ void adamw_kernel2(floatX* params_memory, const floatX* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
    int i = blockIdx.x * blockDim.x + threadIdx.x;
    if (i >= num_parameters) return;  // guard
@@ -187,21 +188,43 @@ __global__ void adamw_kernel2(float* params_memory, const float* grads_memory, f
    v_memory[i] = v;
    m /= beta1_correction;  // m_hat
    v /= beta2_correction;  // v_hat
-   params_memory[i] -= learning_rate * (m / (sqrtf(v) + eps) + weight_decay * params_memory[i]);
+   params_memory[i] -= learning_rate * (m / (sqrtf(v) + eps) + weight_decay * (float) params_memory[i]);
+}
+
+// Optimized kernel to use lower precision data types for params memory and grads memory
+__global__ void adamw_kernel3(floatX* params_memory, const floatX* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
+                              unsigned int seed) {
+   int i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= num_parameters) return;  // guard
+   float grad = (float)grads_memory[i];
+   float m = m_memory[i];
+   float v = v_memory[i];
+   // update the first moment (momentum)
+   m = lerp(grad, m, beta1);
+   m_memory[i] = m;
+   // update the second moment (RMSprop)
+   v = lerp(grad * grad, v, beta2);
+   v_memory[i] = v;
+   m /= beta1_correction;  // m_hat
+   v /= beta2_correction;  // v_hat
+   // update the parameters (weight/bias)
+   float param = (float)params_memory[i] - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * (float)params_memory[i]));
+   unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+   // todo - explain stochastic rounding here
+   stochastic_rounding(param, &params_memory[i], random);
 }
 
 
-template <typename Tp, typename Tg>
-__global__ void adamw_kernel3(Tp* params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+__global__ void adamw_kernel4(floatX* params_memory, const floatX* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                               unsigned int seed) {
-   int i = (blockIdx.x * blockDim.x + threadIdx.x);
+   int i = blockIdx.x * blockDim.x + threadIdx.x;
    x128 packed_grads_memory = load128(grads_memory+(i*x128::size));
    x128 packed_params_memory = load128(params_memory+(i*x128::size));
    f128 packed_m_memory = load128(m_memory+(i*f128::size));
    f128 packed_v_memory = load128(v_memory+(i*f128::size));
    for(int k = 0; k < packed_v_memory.size; ++k){
-    if (i*4 + k >= num_parameters) return;  // guard
     float grad = (float)packed_grads_memory[k];
     float m = packed_m_memory[k];
     float v = packed_v_memory[k];
@@ -210,9 +233,9 @@ __global__ void adamw_kernel3(Tp* params_memory, Tg* grads_memory, float* m_memo
     packed_m_memory[k] = m;
     // update the second moment (RMSprop)
     v = lerp(grad * grad, v, beta2);
-    packed_v_memory[k] = v;
-    m /= beta1_correction;  // m_hat
-    v /= beta2_correction;  // v_hat
+    packed_v_memory[k] = v; 
+    m /= beta1_correction; // Setting these values explicitly due to compiler error for modifying 
+    v /= beta2_correction; // packed128 values when using
     // update the parameters (weight/bias)
     float param = (float)packed_params_memory[k] - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * (float)packed_params_memory[k]));
     unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
@@ -229,7 +252,7 @@ __global__ void adamw_kernel3(Tp* params_memory, Tg* grads_memory, float* m_memo
 // kernel launcher
 
 // version 1: naive dispatch to naive kernel
-void adamw_dispatch1(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+void adamw_dispatch1(floatX* params_memory, const floatX* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                      float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
     unsigned int block_size = 512;
     unsigned int num_blocks = ceil_div(num_parameters, (long) block_size);
@@ -239,7 +262,7 @@ void adamw_dispatch1(float* params_memory, const float* grads_memory, float* m_m
 }
 
 // version 2: naive dispatch to slightly optimized kernel
-void adamw_dispatch2(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+void adamw_dispatch2(floatX* params_memory, const floatX* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                      float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
     unsigned int block_size = 512;
     unsigned int num_blocks = ceil_div(num_parameters, (long) block_size);
@@ -248,19 +271,29 @@ void adamw_dispatch2(float* params_memory, const float* grads_memory, float* m_m
     cudaCheck(cudaGetLastError());
 }
 
-// version 2: naive dispatch to slightly optimized kernel
-void adamw_dispatch3(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+// version 3: Using floatX to be able to reduce amount data type size for params and grads
+void adamw_dispatch3(floatX* params_memory, const floatX* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                      float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
     unsigned int block_size = 512;
-    unsigned int num_blocks = ceil_div(num_parameters, (long) block_size)/f128::size;
+    unsigned int num_blocks = ceil_div(num_parameters, (long) block_size);
     adamw_kernel3<<<num_blocks, block_size>>>(params_memory, grads_memory, m_memory, v_memory, num_parameters,
                                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, 1337);
     cudaCheck(cudaGetLastError());
 }
 
+// version 4: using data packing to reduce the amount of amount of memory calls
+void adamw_dispatch4(floatX* params_memory, const floatX* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+                     float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+    unsigned int block_size = 512;
+    assert(num_parameters % 4 == 0 && f128::size <= x128::size); // asserting here to not require bounds check in kernel
+    unsigned int num_blocks = ceil_div(num_parameters, (long) (block_size)*x128::size);
+    adamw_kernel4<<<num_blocks, block_size>>>(params_memory, grads_memory, m_memory, v_memory, num_parameters,
+                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, 1337);
+    cudaCheck(cudaGetLastError());
+}
 
 void adamw(int kernel_num,
-           float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, int t, long num_parameters,
+           floatX* params_memory, const floatX* grads_memory, float* m_memory, float* v_memory, int t, long num_parameters,
            float learning_rate=1e-3, float beta1=0.9, float beta2=0.999, float eps=1e-8, float weight_decay=0.0) {
     // calculate the m_hat and v_hat correction terms once as they are the same for every param/thread
     float beta1_correction = 1.0f - powf(beta1, t);
@@ -276,6 +309,10 @@ void adamw(int kernel_num,
             break;
         case 3:
             adamw_dispatch3(params_memory, grads_memory, m_memory, v_memory, num_parameters,
+                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+            break;
+        case 4:
+            adamw_dispatch4(params_memory, grads_memory, m_memory, v_memory, num_parameters,
                             learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
             break;
         default:
@@ -305,16 +342,25 @@ int main(int argc, char **argv) {
     float* v_memory = make_random_float_01(num_parameters);
 
     // move to GPU
-    float* d_params_memory;
-    float* d_grads_memory;
+    floatX* d_params_memory;
+    floatX* d_grads_memory;
     float* d_m_memory;
     float* d_v_memory;
-    cudaCheck(cudaMalloc(&d_params_memory, num_parameters * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_grads_memory, num_parameters * sizeof(float)));
+
+    floatX* params_memoryX = (floatX*)malloc(num_parameters * sizeof(floatX));
+    floatX* grads_memoryX = (floatX*)malloc(num_parameters * sizeof(floatX));
+
+    for (int i = 0; i < num_parameters; i++) {
+        params_memoryX[i] = (floatX)params_memory[i];
+        grads_memoryX[i] = (floatX)grads_memory[i];
+    }
+
+    cudaCheck(cudaMalloc(&d_params_memory, num_parameters * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&d_grads_memory, num_parameters * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_m_memory, num_parameters * sizeof(float)));
     cudaCheck(cudaMalloc(&d_v_memory, num_parameters * sizeof(float)));
-    cudaCheck(cudaMemcpy(d_params_memory, params_memory, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(d_grads_memory, grads_memory, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(d_params_memory, params_memoryX, num_parameters * sizeof(floatX), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(d_grads_memory, grads_memoryX, num_parameters * sizeof(floatX), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(d_m_memory, m_memory, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(d_v_memory, v_memory, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
 
@@ -336,14 +382,21 @@ int main(int argc, char **argv) {
     // calculate the GPU version (using default hyperparams)
     adamw(kernel_num, d_params_memory, d_grads_memory, d_m_memory, d_v_memory, t, num_parameters);
 
+    // Setting the tolerance based on the data type
+#if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
+    float tol = 1e-5;
+#else
+    float tol = 1e-1f;
+#endif
+
     // compare
     printf("Checking correctness...\n");
     printf("parameters:\n");
-    validate_result(d_params_memory, params_memory, "params_memory", num_parameters);
+    validate_result(d_params_memory, params_memory, "params_memory", num_parameters, tol);
     printf("first moment:\n");
-    validate_result(d_m_memory, m_memory, "m_memory", num_parameters);
+    validate_result(d_m_memory, m_memory, "m_memory", num_parameters, tol);
     printf("second moment:\n");
-    validate_result(d_v_memory, v_memory, "v_memory", num_parameters);
+    validate_result(d_v_memory, v_memory, "v_memory", num_parameters, tol);
     printf("All results match.\n\n");
 
     // now benchmark the kernel
