@@ -18,6 +18,9 @@ NVCC_LDFLAGS = -lcublas -lcublasLt
 NVCC_INCLUDES =
 NVCC_LDLIBS =
 NCLL_INCUDES =
+# overridable flag for multi-GPU training. by default we won't build with cudnn
+# because it bloats up the compile time from a few seconds to ~minute
+USE_CUDNN ?= 0
 
 # autodect a lot of various supports on current platform
 $(info ---------------------------------------------)
@@ -64,17 +67,26 @@ endif
 
 # Check and include cudnn if available
 # Currently hard-coding a bunch of stuff here for Linux, todo make this better/nicer
-ifeq ($(SHELL_UNAME), Linux)
-  ifeq ($(shell [ -d ../cudnn-frontend/include ] && echo "exists"), exists)
-    $(info ✓ cuDNN found, will run with flash-attention)
-    NVCC_INCLUDES += -I../cudnn-frontend/include
-    NVCC_LDFLAGS += -lcudnn
-    CFLAGS += -DENABLE_CUDNN
+# You need cuDNN from: https://developer.nvidia.com/cudnn
+# Follow the apt-get instructions
+# And the cuDNN front-end from: https://github.com/NVIDIA/cudnn-frontend/tree/main
+# For this there is no installation, just download the repo to your home directory
+# and then we include it below (see currently hard-coded path ../cudnn-frontend)
+ifeq ($(USE_CUDNN), 1)
+  ifeq ($(SHELL_UNAME), Linux)
+    ifeq ($(shell [ -d ../cudnn-frontend/include ] && echo "exists"), exists)
+      $(info ✓ cuDNN found, will run with flash-attention)
+      NVCC_INCLUDES += -I../cudnn-frontend/include
+      NVCC_LDFLAGS += -lcudnn
+      NVCC_FLAGS += -DENABLE_CUDNN
+    else
+      $(error ✗ cuDNN not found. See the Makefile for our currently hard-coded paths / install instructions)
+    endif
   else
-    $(info ✗ cuDNN not found, disabling flash-attention)
-    $(info ---> You need cuDNN: https://developer.nvidia.com/cudnn)
-    $(info ---> And the cuDNN front-end: https://github.com/NVIDIA/cudnn-frontend/tree/main)
+    $(info → cuDNN is not supported right now outside of Linux)
   endif
+else
+  $(info → cuDNN is manually disabled by default, run make with `USE_CUDNN=1` to try to enable)
 endif
 
 # Check if OpenMP is available
