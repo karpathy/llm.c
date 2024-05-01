@@ -1285,7 +1285,8 @@ __global__ void fused_classifier_kernel3(floatX* logits, floatX* losses, floatX*
     }
 }
 
-__global__ void copy_kernel(float* dst, const floatX* src, size_t n) {
+__global__ void copy_and_cast_kernel(float* dst, const floatX* src, size_t n) {
+    // a small kernel to copy and cast, i.e. `dst <- (float) src`
     const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { dst[i] = (float)src[i]; }
 }
@@ -2249,7 +2250,9 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         if (model->use_master_weights == 1) {
             // allocate one more buffer to keep the master copy of weights as float, and copy the weights over
             cudaCheck(cudaMalloc((void**)&model->master_weights, model->num_parameters * sizeof(float)));
-            copy_kernel<<<CEIL_DIV(model->num_parameters, 512), 512>>>(model->master_weights, (floatX*)model->params_memory, model->num_parameters);
+            copy_and_cast_kernel<<<CEIL_DIV(model->num_parameters, 512), 512>>>(model->master_weights, (floatX*)model->params_memory, model->num_parameters);
+            cudaCheck(cudaGetLastError());
+            printf0("allocated %zu MiB for master copy of params\n", (model->num_parameters * sizeof(float)) >> 20);
         }
     }
 
