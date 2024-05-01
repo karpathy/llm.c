@@ -109,8 +109,6 @@ int main(int argc, char *argv[]) {
 
     #ifdef ENABLE_CUDNN
     checkCudnnErr(cudnnCreate(&cudnn_handle));
-    cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
-    printf("INIT CUDNN %d\n", cudnn_workspace_size);
     #endif
 
     // build the GPT-2 model from a checkpoint
@@ -328,6 +326,12 @@ int main(int argc, char *argv[]) {
     free(grads_memory_cpu);
     free(grads_memory_cpu_float);
     gpt2_free(&model);
+
+    #ifdef ENABLE_CUDNN
+    if (cudnn_workspace != NULL) {
+        cudaCheck(cudaFree(cudnn_workspace));
+    }
+    #endif
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));

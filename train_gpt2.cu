@@ -123,8 +123,6 @@ namespace fe = cudnn_frontend;
 static cudnnHandle_t cudnn_handle;
 static size_t cudnn_workspace_size = 0; // dynamically allocated as needed (up to 256MiB!)
 static void* cudnn_workspace = NULL;
-
-#define checkCudaErr(err) assert((int)err == 0);
 #define checkCudnnErr(err) assert((int)err == 0);
 #endif // ENABLE_CUDNN
 
@@ -2660,11 +2658,10 @@ int main(int argc, char *argv[]) {
     free(gen_tokens);
 
     #ifdef ENABLE_CUDNN
-    if (cudnn_workspace_size > 0) {
+    if (cudnn_workspace != NULL) {
         cudaCheck(cudaFree(cudnn_workspace));
     }
     #endif
-
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
