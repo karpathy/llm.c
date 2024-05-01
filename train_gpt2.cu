@@ -1206,8 +1206,6 @@ __global__ void norm_kernel(float* out, const T* data, size_t count) {
     // the maximum amount of work (so no fixed chunk, but instead iterating
     // until we run out of data), and then we reduce inside the block
     // and finally have just one atomic per block.
-    // TODO write a second version that just spams atomics in dev/cuda,
-    // often they are surprisingly fast
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
@@ -1711,7 +1709,7 @@ void fused_classifier(Type* logits, Type* losses,
 }
 
 template<typename T>
-void norm(float* out, const T* values, size_t count) {
+void global_norm(float* out, const T* values, size_t count) {
     const int block_size = 512;
     // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
     // having one block less than possible is a tiny performance hit, having
@@ -1720,7 +1718,7 @@ void norm(float* out, const T* values, size_t count) {
     // on all gpus, so the division really is going to be exact.
     const int grid_size = cuda_threads_per_SM * cuda_num_SMs / block_size;
     assert(grid_size > 0);      // gives a better error than letting the call below fail
-    norm_kernel<<<grid_size, 512>>>(out, values, count);
+    norm_kernel<<<grid_size, block_size>>>(out, values, count);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2428,7 +2426,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     float* grad_norm = (float*)model->acts.output;
 
     // global gradient norm
-    norm(grad_norm, (floatX*)model->grads_memory, model->num_parameters);
+    global_norm(grad_norm, (floatX*)model->grads_memory, model->num_parameters);
 
     int block_size = 512;
     int num_blocks = CEIL_DIV(num_parameters, block_size);
