@@ -117,14 +117,11 @@ void gelu_forward(int kernel_num,
 // ----------------------------------------------------------------------------
 
 int main(int argc, const char **argv) {
-    srand(0);
+    setup_main();
 
     int B = 8;
     int T = 1024;
     int C = 768;
-
-    int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * C * sizeof(float));
