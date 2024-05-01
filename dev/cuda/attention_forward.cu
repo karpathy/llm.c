@@ -54,7 +54,7 @@ version 11 is kernel 10 skipping FP16/FP32 conversions (requires fully FP16 netw
 
 // ----------------------------------------------------------------------------
 // Floating point precision setup
-typedef __nv_bfloat16 lowp_float; // half or __nv_bfloat16 (or float)
+typedef __nv_bfloat16 floatX; // half or __nv_bfloat16 (or float)
 #define CUBLAS_LOWP CUDA_R_16BF // CUDA_R_16F or CUDA_R_16BF (or CUDA_R_32F)
 // CUBLAS_COMPUTE_32F or CUBLAS_COMPUTE_16F (for CUDA_R_16F only, potentially slower?!)
 #define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
@@ -904,8 +904,8 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
 }
 
 
-__global__ void softmax_forward_kernel5_lowp(lowp_float* out, float inv_temperature,
-                                             const lowp_float* inp, int N, int T) {
+__global__ void softmax_forward_kernel5_lowp(floatX* out, float inv_temperature,
+                                             const floatX* inp, int N, int T) {
     // inp, out shape: (N, T, T), where N = B * NH
     // fuses the multiplication by scale inside attention
     // directly autoregressive, so we only compute the lower triangular part
@@ -922,7 +922,7 @@ __global__ void softmax_forward_kernel5_lowp(lowp_float* out, float inv_temperat
     int pos_by_4 = own_pos / 4;
 
     // one row of inp, i.e. inp[idx, :] of shape (T,)
-    const lowp_float* x = inp + idx * T;
+    const floatX* x = inp + idx * T;
 
     // not INF, so we don't get NaNs accidentally when subtracting two values.
     float maxval = -FLT_MAX;
@@ -957,11 +957,11 @@ __global__ void softmax_forward_kernel5_lowp(lowp_float* out, float inv_temperat
     for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
         // recalculation is faster than doing the round-trip through memory.
         float ev = expf(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
-        __stcs(out + idx * T + i, (lowp_float)(ev * norm));
+        __stcs(out + idx * T + i, (floatX)(ev * norm));
     }
 }
 
-__global__ void permute_kernel_lowp(lowp_float* q, lowp_float* k, lowp_float* v,
+__global__ void permute_kernel_lowp(floatX* q, floatX* k, floatX* v,
                                     const float* inp,
                                     int B, int N, int NH, int d) {
     // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
@@ -984,13 +984,13 @@ __global__ void permute_kernel_lowp(lowp_float* q, lowp_float* k, lowp_float* v,
             +          (nh_ * d)
             +                d_;
 
-        q[idx] = (lowp_float)inp[inp_idx];
-        k[idx] = (lowp_float)inp[inp_idx + NH * d];
-        v[idx] = (lowp_float)inp[inp_idx + 2 * (NH * d)];
+        q[idx] = (floatX)inp[inp_idx];
+        k[idx] = (floatX)inp[inp_idx + NH * d];
+        v[idx] = (floatX)inp[inp_idx + 2 * (NH * d)];
     }
 }
 
-__global__ void unpermute_kernel_lowp(const lowp_float* inp, float *out, int B, int N, int NH, int d) {
+__global__ void unpermute_kernel_lowp(const floatX* inp, float *out, int B, int N, int NH, int d) {
    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -1008,7 +1008,7 @@ __global__ void unpermute_kernel_lowp(const lowp_float* inp, float *out, int B, 
     }
 }
 
-void attention_forward5(float* out, lowp_float* vaccum, lowp_float* qkvr, lowp_float* preatt, lowp_float* att,
+void attention_forward5(float* out, floatX* vaccum, floatX* qkvr, floatX* preatt, floatX* att,
                         const float* inp,
                         int B, int T, int C, int NH,
                         const int block_size, bool skip_permute=false) {
@@ -1020,9 +1020,9 @@ void attention_forward5(float* out, lowp_float* vaccum, lowp_float* qkvr, lowp_f
 
     // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
     int HS = C / NH; // head size
-    lowp_float *q = qkvr + 0 * B * T * C;
-    lowp_float *k = qkvr + 1 * B * T * C;
-    lowp_float* v = qkvr + 2 * B * T * C;
+    floatX *q = qkvr + 0 * B * T * C;
+    floatX *k = qkvr + 1 * B * T * C;
+    floatX* v = qkvr + 2 * B * T * C;
 
     int total_threads = B * NH * T * HS;
     int num_blocks = ceil_div(total_threads, block_size);
@@ -1034,8 +1034,8 @@ void attention_forward5(float* out, lowp_float* vaccum, lowp_float* qkvr, lowp_f
     // But need FP16 scale for CUBLAS_COMPUTE_16F (no errors otherwise, just garbage results *sigh*)
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    const lowp_float alpha_lowp = (lowp_float)alpha;
-    const lowp_float beta_lowp = (lowp_float)beta;
+    const floatX alpha_lowp = (floatX)alpha;
+    const floatX beta_lowp = (floatX)beta;
     void* alpha_ptr = CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F ? (void*)&alpha_lowp : (void*)&alpha;
     void* beta_ptr = CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F ? (void*)&beta_lowp : (void*)&beta;
 
@@ -1233,13 +1233,13 @@ void attention_forward(int kernel_num,
             attention_forward4(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
             break;
         case 5:
-            attention_forward5(out, (lowp_float*)vaccum, (lowp_float*)qkvr,
-                               (lowp_float*)preatt, (lowp_float*)att,
+            attention_forward5(out, (floatX*)vaccum, (floatX*)qkvr,
+                               (floatX*)preatt, (floatX*)att,
                                inp, B, T, C, NH, block_size, false);
             break;
         case 6: // skip permutes for perf passes (to analyse perf as if in/out were truly 16-bit)
-            attention_forward5(out, (lowp_float*)vaccum, (lowp_float*)qkvr,
-                               (lowp_float*)preatt, (lowp_float*)att,
+            attention_forward5(out, (floatX*)vaccum, (floatX*)qkvr,
+                               (floatX*)preatt, (floatX*)att,
                                inp, B, T, C, NH, block_size, true);
             break;
         #ifdef ENABLE_CUDNN
