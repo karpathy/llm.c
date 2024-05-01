@@ -71,12 +71,14 @@ endif
 # Follow the apt-get instructions
 # And the cuDNN front-end from: https://github.com/NVIDIA/cudnn-frontend/tree/main
 # For this there is no installation, just download the repo to your home directory
-# and then we include it below (see currently hard-coded path ../cudnn-frontend)
+# and then we include it below (see currently hard-coded path assumed in home directory)
 ifeq ($(USE_CUDNN), 1)
   ifeq ($(SHELL_UNAME), Linux)
-    ifeq ($(shell [ -d ../cudnn-frontend/include ] && echo "exists"), exists)
+    # hard-coded path for now
+    CUDNN_FRONTEND_PATH := $(HOME)/cudnn-frontend/include
+    ifeq ($(shell [ -d $(CUDNN_FRONTEND_PATH) ] && echo "exists"), exists)
       $(info ✓ cuDNN found, will run with flash-attention)
-      NVCC_INCLUDES += -I../cudnn-frontend/include
+      NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
       NVCC_LDFLAGS += -lcudnn
       NVCC_FLAGS += -DENABLE_CUDNN
     else
