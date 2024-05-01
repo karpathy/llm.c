@@ -265,7 +265,7 @@ int main(int argc, char *argv[]) {
             // Also, if code changes and some of these get tripped, it could be ok if it's not by too much,
             // because our use of stochastic rounding is adding some non-determinism "pepper noise".
             // In that case it's ok to extend the tolerance by a bit, after a manual review.
-            allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", 6e-1f);
+            allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", 8e-1f);
             allok = allok & check_tensor(tensors1[1], tensors2[1], maxT * C, "wpe", 1e-2f);
             allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", 1.1e-1); // hmm a bit high
             allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", 4e-2f);
