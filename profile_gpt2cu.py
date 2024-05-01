@@ -50,6 +50,8 @@ reader = csv.reader(result.splitlines(keepends=True))
 # model config
 CLS_START = -1
 CLS_NUM = 6
+NORM_ID = 44
+ADAM_ID = 45
 N_LAYERS = 12
 
 summaries = defaultdict(lambda: 0.0)

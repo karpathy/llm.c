@@ -1151,11 +1151,31 @@ __device__ float lerp(float start, float end, float weight) {
 template <typename Tp, typename Tg>
 __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
+                              float* grad_norm, float max_grad_norm,
                               unsigned int seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_parameters) { return; }  // guard
+
+    float scale = 1.f;
+    if(!isfinite(*grad_norm)) {
+        // if we had a numerical problem (e.g, overflow)
+        // in our gradient calculation, don't mess up the
+        // existing weights.
+        // TODO increase a global counter somewhere so we actually know if/how often this happens
+        if(threadIdx.x == 0 &&  blockIdx.x == 0) {
+            printf("[WARNING] weight update skipped due to non-finite gradients!\n");
+        }
+        return;
+    }
+    if(*grad_norm > max_grad_norm) {
+        scale = max_grad_norm / *grad_norm;
+        // TODO just for debugging, remove this
+        if(threadIdx.x == 0 &&  blockIdx.x == 0) {
+            printf("[scale %f]\n", scale);
+        }
+    }
     // get the gradient, m, and v for this parameter
-    float grad = (float)grads_memory[idx];
+    float grad = scale * (float)grads_memory[idx];
     float m = m_memory[idx];
     float v = v_memory[idx];
     // update the first moment (momentum)
@@ -1178,6 +1198,40 @@ __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg
     // write the full, float version of the param into our master copy, if we maintain one
     // this will be used in the next update
     if (master_params_memory != NULL) { master_params_memory[idx] = param; }
+}
+
+template<class T>
+__global__ void norm_kernel(float* out, const T* data, size_t count) {
+    // we want as few atomics as possible, so each block tries to do
+    // the maximum amount of work (so no fixed chunk, but instead iterating
+    // until we run out of data), and then we reduce inside the block
+    // and finally have just one atomic per block.
+    // TODO write a second version that just spams atomics in dev/cuda,
+    // often they are surprisingly fast
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    __shared__ float block_result[32];
+
+    // out will be updated atomically from all thread blocks
+    size_t index = threadIdx.x + blockDim.x * blockIdx.x;
+    size_t grid_width = blockDim.x * gridDim.x;
+    float accumulator = 0.f;
+    for(size_t i = index; i < count; i += grid_width) {
+        accumulator += (float)data[i] * (float)data[i];
+    }
+    // warp-level reduce
+    float warp_result = cg::reduce(warp, accumulator, cg::plus<float>{});
+    block_result[warp.meta_group_rank()] = warp_result;
+    block.sync();
+    if(warp.meta_group_rank() == 0) {
+        float gather = warp.thread_rank() < warp.meta_group_size() ? block_result[warp.thread_rank()] : 0.f;
+        float block_sum = cg::reduce(warp, gather, cg::plus<float>{});
+        if(warp.thread_rank() ==  0) {
+            atomicAdd(out, block_sum);
+        }
+    }
 }
 
 struct SoftmaxParams {
@@ -1653,6 +1707,20 @@ void fused_classifier(Type* logits, Type* losses,
     const int N = B * T;
     const int grid_size = N;
     fused_classifier_kernel5<<<grid_size, block_size, 512>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
+    cudaCheck(cudaGetLastError());
+}
+
+template<typename T>
+void norm(float* out, const T* values, size_t count) {
+    const int block_size = 512;
+    // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
+    // having one block less than possible is a tiny performance hit, having
+    // one block too many is catastrophic, since it only can start once all the other
+    // blocks finish. anyway, I think cuda_threads_per_SM should be a multiple of 512
+    // on all gpus, so the division really is going to be exact.
+    const int grid_size = cuda_threads_per_SM * cuda_num_SMs / block_size;
+    assert(grid_size > 0);      // gives a better error than letting the call below fail
+    norm_kernel<<<grid_size, 512>>>(out, values, count);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2354,14 +2422,25 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         }
     }
 
+    // repurposing this buffer. We calculate the gradient norm on the GPU, and need it in the next kernel,
+    // so we _really_ don't want to transfer it here as an actual float. So we just pass around a pointer
+    // to this memory that is not otherwise needed during the update phase.
+    float* grad_norm = (float*)model->acts.output;
+
+    // global gradient norm
+    norm(grad_norm, (floatX*)model->grads_memory, model->num_parameters);
+
     int block_size = 512;
     int num_blocks = CEIL_DIV(num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
+    float max_grad_norm = 1.f;  // TODO figure out a good value
     unsigned int seed = random_u32(&model->rng_state);
     adamw_kernel3<<<num_blocks, block_size>>>(params_memory, model->master_weights, grads_memory,
                                                               model->m_memory, model->v_memory, num_parameters,
-                                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
+                                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
+                                              grad_norm, max_grad_norm,
+                                              seed);
     cudaCheck(cudaGetLastError());
 }
 
