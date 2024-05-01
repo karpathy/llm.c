@@ -409,11 +409,11 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
     return result;
 #else
     printf("Multi-GPU support is disabled. Using a single GPU.\n");
-    return MultiGpuConfig{
-        .process_rank = 0,
-        .num_processes = 1,
-        .local_device_idx = 0,
-    };
+    MultiGpuConfig result;
+    result.process_rank = 0;
+    result.num_processes = 1;
+    result.local_device_idx = 0;
+    return result;
 #endif
 }
 
@@ -765,7 +765,7 @@ __global__ void layernorm_backward_kernel6(floatX* dinp, floatX* dweight, floatX
        dbias_shared[i] = 0.0f;
        dweight_shared[i] = 0.0f;
     }
-    uint *tmp_flag = (uint*)(shared + C*2);
+    unsigned int *tmp_flag = (unsigned int*)(shared + C*2);
     __syncthreads();
 
     int warps_in_grid = gridDim.x * warp.meta_group_size();
@@ -818,7 +818,7 @@ __global__ void layernorm_backward_kernel6(floatX* dinp, floatX* dweight, floatX
     __syncthreads();
     float* scratch_dbias = scratch;
     float* scratch_dweight = scratch + C;
-    uint* scratchFlag = (uint*)(scratch + (2 * C));
+    unsigned int* scratchFlag = (unsigned int*)(scratch + (2 * C));
     for(int i = threadIdx.x; i < C; i+= blockDim.x) {
         atomicAdd(&scratch_dbias[i], dbias_shared[i]);
         atomicAdd(&scratch_dweight[i], dweight_shared[i]);
