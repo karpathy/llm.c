@@ -32,7 +32,6 @@ make train_gpt2cu PRECISION=FP32
 This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 -a 1 is "overfit single batch", -x 10 is 10 iterations, and -f 0 disables tf32
 */
-#define ENABLE_CUDNN // can be enabled via nvcc "-DENABLE_CUDNN"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -2474,11 +2473,11 @@ int main(int argc, char *argv[]) {
     cuda_arch_major = deviceProp.major;
     cuda_arch_minor = deviceProp.minor;
 
-    // setup cuBLAS and cuBLASLt
+    // set up cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
-
+    // setup compute precision settings for cublas
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     int enable_tf32 = cuda_arch_major >= 8 ? 1 : 0;
     if (override_enable_tf32 == 0) { enable_tf32 = 0; } // force to zero via arg
@@ -2487,6 +2486,7 @@ int main(int argc, char *argv[]) {
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
     if(cublas_compute_type); // unused in BF16 mode, avoid warning
 
+    // set up cuDNN
     #ifdef ENABLE_CUDNN
     checkCudnnErr(cudnnCreate(&cudnn_handle));
     #endif
@@ -2648,7 +2648,7 @@ int main(int argc, char *argv[]) {
     // add a total average, for optimizations that are only mild improvements (excluding 1st batch as warmup)
     printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);
 
-    // free
+    // free and destroy everything
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
@@ -2656,13 +2656,10 @@ int main(int argc, char *argv[]) {
     free(cpu_logits_raw);
     free(cpu_logits);
     free(gen_tokens);
-
     #ifdef ENABLE_CUDNN
-    if (cudnn_workspace != NULL) {
-        cudaCheck(cudaFree(cudnn_workspace));
-    }
-    #endif
+    if (cudnn_workspace != NULL) { cudaCheck(cudaFree(cudnn_workspace)); }
     checkCudnnErr(cudnnDestroy(cudnn_handle));
+    #endif
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));

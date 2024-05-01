@@ -14,10 +14,13 @@ CUDA_OUTPUT_FILE = -o $@
 # NVCC flags
 # -t=0 is short for --threads, 0 = number of CPUs on the machine
 NVCC_FLAGS = -O3 -t=0 --use_fast_math
-NVCC_LDFLAGS = -lcublas -lcublasLt -lcudnn
-NVCC_INCLUDES = -I../cudnn-frontend/include # TODO: Don't hardcode path
+NVCC_LDFLAGS = -lcublas -lcublasLt
+NVCC_INCLUDES =
 NVCC_LDLIBS =
 NCLL_INCUDES =
+
+# autodect a lot of various supports on current platform
+$(info ---------------------------------------------)
 
 ifneq ($(OS), Windows_NT)
   NVCC := $(shell which nvcc 2>/dev/null)
@@ -59,6 +62,21 @@ else
   endif
 endif
 
+# Check and include cudnn if available
+# Currently hard-coding a bunch of stuff here for Linux, todo make this better/nicer
+ifeq ($(SHELL_UNAME), Linux)
+  ifeq ($(shell [ -d ../cudnn-frontend/include ] && echo "exists"), exists)
+    $(info ✓ cuDNN found, will run with flash-attention)
+    NVCC_INCLUDES += -I../cudnn-frontend/include
+    NVCC_LDFLAGS += -lcudnn
+    CFLAGS += -DENABLE_CUDNN
+  else
+    $(info ✗ cuDNN not found, disabling flash-attention)
+    $(info ---> You need cuDNN: https://developer.nvidia.com/cudnn)
+    $(info ---> And the cuDNN front-end: https://github.com/NVIDIA/cudnn-frontend/tree/main)
+  endif
+endif
+
 # Check if OpenMP is available
 # This is done by attempting to compile an empty file with OpenMP flags
 # OpenMP makes the code a lot faster so I advise installing it
@@ -79,46 +97,47 @@ else
         LDFLAGS += -L/opt/homebrew/opt/libomp/lib
         LDLIBS += -lomp
         INCLUDES += -I/opt/homebrew/opt/libomp/include
-        $(info OpenMP found, compiling with OpenMP support)
+        $(info ✓ OpenMP found)
       else ifeq ($(shell [ -d /usr/local/opt/libomp/lib ] && echo "exists"), exists)
         # macOS with Homebrew on Intel
         CFLAGS += -Xclang -fopenmp -DOMP
         LDFLAGS += -L/usr/local/opt/libomp/lib
         LDLIBS += -lomp
         INCLUDES += -I/usr/local/opt/libomp/include
-        $(info OpenMP found, compiling with OpenMP support)
+        $(info ✓ OpenMP found)
       else
-        $(warning OpenMP not found, skipping OpenMP support)
+        $(info ✗ OpenMP not found)
       endif
     else
       # Check for OpenMP support in GCC or Clang on Linux
       ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
         CFLAGS += -fopenmp -DOMP
         LDLIBS += -lgomp
-        $(info OpenMP found, compiling with OpenMP support)
+        $(info ✓ OpenMP found)
       else
-        $(warning OpenMP not found, skipping OpenMP support)
+        $(info ✗ OpenMP not found)
       endif
     endif
   endif
 endif
 
+# Check if OpenMPI and NCCL are available, include them if so, for multi-GPU training
 ifeq ($(NO_MULTI_GPU), 1)
-  $(info Multi-GPU (OpenMPI + NCCL) is manually disabled)
+  $(info → Multi-GPU (OpenMPI + NCCL) is manually disabled)
 else
   ifneq ($(OS), Windows_NT)
     # Detect if running on macOS or Linux
     ifeq ($(SHELL_UNAME), Darwin)
-      $(warning Multi-GPU on CUDA on Darwin is not supported, skipping OpenMPI + NCCL support)
+      $(info ✗ Multi-GPU on CUDA on Darwin is not supported, skipping OpenMPI + NCCL support)
     else ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && [ -d /usr/lib/x86_64-linux-gnu/openmpi/include/ ] && echo "exists"), exists)
-      $(info OpenMPI found, adding support)
+      $(info ✓ OpenMPI found, OK to train with multiple GPUs)
       NVCC_INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
       NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
       NVCC_LDLIBS += -lmpi -lnccl
       NVCC_FLAGS += -DMULTI_GPU
     else
-      $(warning OpenMPI is not found, disabling multi-GPU support)
-      $(warning On Linux you can try install OpenMPI with `sudo apt install openmpi-bin openmpi-doc libopenmpi-dev`)
+      $(info ✗ OpenMPI is not found, disabling multi-GPU support)
+      $(info ---> On Linux you can try install OpenMPI with `sudo apt install openmpi-bin openmpi-doc libopenmpi-dev`)
     endif
   endif
 endif
@@ -145,11 +164,13 @@ TARGETS = train_gpt2 test_gpt2
 
 # Conditional inclusion of CUDA targets
 ifeq ($(NVCC),)
-    $(info nvcc not found, skipping CUDA builds)
+    $(info ✗ nvcc not found, skipping GPU/CUDA builds)
 else
-    $(info nvcc found, including CUDA builds)
+    $(info ✓ nvcc found, including GPU/CUDA support)
     TARGETS += train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu
 endif
+
+$(info ---------------------------------------------)
 
 all: $(TARGETS)
 
