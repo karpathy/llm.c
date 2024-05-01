@@ -1502,7 +1502,7 @@ void gelu_forward(floatX* out, const floatX* inp, int N) {
 
 void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
     const int block_size = 128;
-    const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
+    const int grid_size = CEIL_DIV(N, block_size * x128::size);
     gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout, N);
     cudaCheck(cudaGetLastError());
 }
