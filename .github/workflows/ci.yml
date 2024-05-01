@@ -12,15 +12,16 @@ jobs:
   build-and-test-cpu:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-
+    
       - name: Install OpenMP
+        shell: bash
         run: |
           if [ "${{ runner.os }}" == "Linux" ]; then
             sudo apt-get update && sudo apt-get install -y libomp-dev
@@ -37,16 +38,43 @@ jobs:
       - name: Train model
         run: python train_gpt2.py --device=cpu
 
+      - name: Download Win32 Make.exe
+        if: matrix.os == 'windows-latest'
+        run: |
+            $wc = New-Object System.Net.WebClient
+            $url = 'https://github.com/maweil/MakeForWindows/releases/download/v4.4.1/make-bin-win64.zip'
+            $output = './make-bin-win64.zip'
+            $wc.DownloadFile($url, $output)
+            unzip make-bin-win64.zip
+
       - name: Compile training and testing program
+        if: matrix.os != 'windows-latest'
         run: make test_gpt2 train_gpt2
 
+      - name: Compile training and testing program for Windows
+        if: matrix.os == 'windows-latest'
+        shell: cmd
+        run: |
+          call "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Auxiliary\\Build\\vcvars64.bat"        
+          make-4.4.1\dist\make WIN_CI_BUILD=1 test_gpt2 train_gpt2
+
       - name: Execute testing program (With OpenMP)
+        if: matrix.os != 'windows-latest'      
         run: OMP_NUM_THREADS=8 ./test_gpt2
 
+      - name: Execute Windows testing program (With OpenMP) 
+        if: matrix.os == 'windows-latest'      
+        shell: cmd
+        run: |
+          copy test_gpt2 test_gpt2.exe
+          test_gpt2.exe        
+
       - name: Compile training and testing program without OpenMP
+        if: matrix.os != 'windows-latest'      
         run: NO_OMP=1 make test_gpt2 train_gpt2
 
       - name: Execute testing program (No OpenMP)
+        if: matrix.os != 'windows-latest'      
         run: ./test_gpt2
 
   build-cuda-fp32:
