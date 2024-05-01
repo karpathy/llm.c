@@ -64,7 +64,6 @@ typedef __nv_bfloat16 floatX; // half or __nv_bfloat16 (or float)
 
 // ----------------------------------------------------------------------------
 // CUDA & cuDNN setup
-static cublasHandle_t cublas_handle;
 static bool first_run_validation = true; // always run e.g. permute on 1st run
 
 #ifdef ENABLE_CUDNN
@@ -1285,7 +1284,7 @@ void attention_forward(int kernel_num,
 // ----------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
-    srand(0);
+    setup_main();
 
     int B = 8;
     int T = 1024;
