@@ -1178,32 +1178,33 @@ template <typename Tp, typename Tg>
 __global__ void adamw_kernel3(Tp* params_memory, float* master_params, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                               unsigned int seed) {
-   int i = blockIdx.x * blockDim.x + threadIdx.x;
-   if (i >= num_parameters) return;  // guard
-   float grad = (float)grads_memory[i];
-   float m = m_memory[i];
-   float v = v_memory[i];
-   // update the first moment (momentum)
-   m = lerp(grad, m, beta1);
-   m_memory[i] = m;
-   // update the second moment (RMSprop)
-   v = lerp(grad * grad, v, beta2);
-   v_memory[i] = v;
-   m /= beta1_correction;  // m_hat
-   v /= beta2_correction;  // v_hat
-   // update the parameters (weight/bias)
-   float old_param = master_params != NULL ? master_params[i] : (float)params_memory[i];
-   float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * old_param));
-   // if we have master parameters, directly update the two weight copies
-    if (master_params != NULL) {
-        params_memory[i] = (floatX)param; // low-precision copy, for use in the forward pass
-        master_params[i] = param; // float copy, for use in the next parameter update
-    } else {
-        // without a master copy of params in float, do a direct update in low precision
-        // and use stochastic rounding to mitigate loss of training stability
-        unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
-        stochastic_rounding(param, &params_memory[i], random);
-    }
+   int i = (blockIdx.x * blockDim.x + threadIdx.x);
+   x128 packed_grads_memory = load128(grads_memory+(i*x128::size));
+   x128 packed_params_memory = load128(params_memory+(i*x128::size));
+   f128 packed_m_memory = load128(m_memory+(i*f128::size));
+   f128 packed_v_memory = load128(v_memory+(i*f128::size));
+   for(int k = 0; k < packed_v_memory.size; ++k){
+    if (i*4 + k >= num_parameters) return;  // guard
+    float grad = (float)packed_grads_memory[k];
+    float m = packed_m_memory[k];
+    float v = packed_v_memory[k];
+    // update the first moment (momentum)
+    m = lerp(grad, m, beta1);
+    packed_m_memory[k] = m;
+    // update the second moment (RMSprop)
+    v = lerp(grad * grad, v, beta2);
+    packed_v_memory[k] = v;
+    m /= beta1_correction;  // m_hat
+    v /= beta2_correction;  // v_hat
+    // update the parameters (weight/bias)
+    float param = (float)packed_params_memory[k] - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * (float)packed_params_memory[k]));
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+    // todo - explain stochastic rounding here
+    stochastic_rounding(param, &packed_params_memory[k], random);
+   }
+   store128(m_memory+(i*f128::size), packed_m_memory);
+   store128(v_memory+(i*f128::size), packed_v_memory);
+   store128(params_memory+(i*x128::size), packed_params_memory);
 }
 
 struct SoftmaxParams {
@@ -2286,7 +2287,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     }
 
     int block_size = 512;
-    int num_blocks = CEIL_DIV(model->num_parameters, block_size);
+    assert(model->num_parameters % 4 == 0 && f128::size <= x128::size); // asserting here to not require bounds check in kernel
+    int num_blocks = CEIL_DIV(model->num_parameters, (long) (block_size))/x128::size;
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
