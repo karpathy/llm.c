@@ -145,7 +145,7 @@ void adamw(int kernel_num,
 // ----------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
-    srand(0);
+    setup_main();
 
     const long num_parameters = 1048576;
     const int t = 10;
@@ -155,14 +155,6 @@ int main(int argc, char **argv) {
     const float beta2 = 0.999f;
     const float eps = 1e-8f;
     const float weight_decay = 0.0f;
-
-
-    // set up the device
-    int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
-    cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, deviceIdx);
-    printf("Device %d: %s\n", deviceIdx, deviceProp.name);
 
     // create random data on host (to be used for the CPU reference implementation)
     float* params_memory = make_random_float(num_parameters);
