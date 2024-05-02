@@ -140,13 +140,6 @@ int cuda_num_SMs = 0; // for persistent threads where we want 1 threadblock per 
 
 namespace cg = cooperative_groups;
 
-__device__ floatX warpReduceSum(floatX val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    }
-    return val;
-}
-
 // convenience macro for calculating grid/block dimensions for kernels
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
@@ -218,6 +211,13 @@ __device__ void atomicAddX(half* addr, half val) {
 
 __device__ void atomicAddX(float* addr, float val) {
     atomicAdd(addr, val);
+}
+
+__device__ floatX warpReduceSum(floatX val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
 }
 
 // warp-level reduction for summing values
