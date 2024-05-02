@@ -364,7 +364,6 @@ typedef struct {
     // 2-Optimizer + Gradient State Sharding (SDP)
     // 3-Optimizer + Gradient + Horizontal Model Sharding (FSDP)
     int zero_stage;
-    bool zero_active;
     size_t shard_num_parameters;
     size_t shard_offset;
 #ifdef MULTI_GPU
@@ -462,7 +461,6 @@ void printf0(const char *format, ...) {
 void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t total_parameters) {
 
     multi_gpu_config->zero_stage = 0;
-    multi_gpu_config->zero_active = false;
     multi_gpu_config->shard_num_parameters = total_parameters;
     multi_gpu_config->shard_offset = 0;
 
@@ -474,17 +472,18 @@ void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t t
         else if (zero_stage == 1) {
             if (total_parameters % multi_gpu_config->num_processes != 0) {
                 printf0("| Zero Optimization is disabled, Can't equally partition parameters          |\n");
+                multi_gpu_config->zero_stage = 0;
             }
             else {
                 printf0("| Zero Stage1 is enabled                                                     |\n");
                 multi_gpu_config->zero_stage = 1;
-                multi_gpu_config->zero_active = true;
                 multi_gpu_config->shard_num_parameters = total_parameters / multi_gpu_config->num_processes;
                 multi_gpu_config->shard_offset = multi_gpu_config->process_rank * (total_parameters / multi_gpu_config->num_processes);
             }
         }
         else{
             printf0("| Disabling Zero Optimization, Zero Stage2 and Stage3 are not yet supported  |\n");
+            multi_gpu_config->zero_stage = 0;
         }
 #endif
 }
@@ -2341,7 +2340,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
     cudaCheck(cudaGetLastError());
 
-    if (multi_gpu_config->zero_active) {
+    if (multi_gpu_config->zero_stage == 1) {
         // gather all parameter updates from each process
         if (model->use_master_weights == 1) {
             ncclCheck(ncclAllGather(master_weights, model->master_weights,
