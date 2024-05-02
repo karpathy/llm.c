@@ -102,7 +102,7 @@ void residual_forward(int kernel_num,
 // ----------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
-    set_main();
+    setup_main();
 
     int B = 8;
     int T = 1024;
