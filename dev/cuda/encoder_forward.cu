@@ -121,7 +121,7 @@ __global__ void encoder_forward_kernel3(floatX* out,
         x128 packed_out;
         x128 wte = load128cs(wte_ix);
         x128 wpe = load128cs(wpe_tc);
-        #pragma unroll wte.size
+        #pragma unroll
         for (int k = 0; k < wte.size; k++) {
             packed_out[k] = (floatX)((float)wte[k] + (float)wpe[k]);
         }
