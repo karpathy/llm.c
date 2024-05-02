@@ -390,6 +390,7 @@ if __name__ == "__main__":
     # if you'd like to e.g. time the forward pass only, call this script as:
     # python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024
     parser = argparse.ArgumentParser()
+    parser.add_argument("--input_bin", type=str, default="data/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
@@ -477,21 +478,15 @@ if __name__ == "__main__":
     # data loading related: long but it's just to get a single batch of data
 
     # load the tokens
-    # prefer to use tiny_shakespeare if it's available, otherwise use tiny_stories
-    # we're using val instead of train split just because it is smaller/faster
-    shake_tokens_bin = "data/tiny_shakespeare_val.bin"
-    story_tokens_bin = "data/TinyStories_val.bin"
-    assert os.path.isfile(shake_tokens_bin) or os.path.isfile(story_tokens_bin), "you must run prepro on some dataset"
-    tokens_bin = shake_tokens_bin if os.path.isfile(shake_tokens_bin) else story_tokens_bin
-    assert os.path.isfile(tokens_bin)
-    print0(f"loading cached tokens in {tokens_bin}")
-    with open(tokens_bin, "rb") as f:
+    # note we're using val by default instead of train split just because it is smaller/faster
+    assert os.path.isfile(args.input_bin)
+    print0(f"loading cached tokens in {args.input_bin}")
+    with open(args.input_bin, "rb") as f:
         tokens = np.frombuffer(f.read(), dtype=np.int32)
 
     # np -> tensor, long, on device
     tokens = torch.tensor(tokens)
     tokens = tokens.to(torch.long)
-    tokens = tokens.to(device)
 
     # lightweight dataloader
     def get_batch():
@@ -509,6 +504,8 @@ if __name__ == "__main__":
     # fetch one batch of data, which we will overfit to
     data_iter = iter(get_batch())
     x, y = next(data_iter) # we'll overfit this batch below
+    x = x.to(device)
+    y = y.to(device)
 
     # -------------------------------------------------------------------------
     # STAGE 1: weights / state logging for C to load later
@@ -544,10 +541,10 @@ if __name__ == "__main__":
         with ctx:
             logits, loss = model(x, y)
             del logits
-            if not args.inference_only:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+        if not args.inference_only:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
         # wait on the CPU for all device work to end so we get accurate per-iteration timings below
         if device == "mps":
             torch.mps.synchronize()
@@ -557,7 +554,7 @@ if __name__ == "__main__":
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
         tokens_per_second = ddp_world_size * B * T / (t1-t0)
-        print0(f"iteration {i}, loss: {loss.item():.4f}, time: {(t1-t0)*1000:.3f}ms, tok/s: {tokens_per_second:.2f}")
+        print0(f"iteration {i+1}, loss: {loss.item():.4f}, time: {(t1-t0)*1000:.3f}ms, tok/s: {tokens_per_second:.2f}")
         if i > 0 and i > args.num_iterations - 20:
             timings.append(t1-t0)
 
