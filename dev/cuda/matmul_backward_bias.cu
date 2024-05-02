@@ -8,6 +8,7 @@ nvcc -O3 matmul_backward_bias.cu -lineinfo -o matmul_backward_bias
 ./matmul_backward_bias 2
 ./matmul_backward_bias 3
 ./matmul_backward_bias 4
+./matmul_backward_bias 5
 
 ncu:
 sudo ncu --set full --import-source yes -o bias -f ./matmul_backward_bias 1
@@ -174,7 +175,7 @@ __global__ void matmul_backward_bias_kernel5(float* dbias, const float* dout, in
     for (int i = blockIdx.y; i < B * T; i += gridDim.y) {
         sum += dout[i * OC + oc];
     }
-    // and atomcially add everything together. atomics within one block are conflict-free!
+    // and atomically add everything together. atomics within one block are conflict-free!
     atomicAdd(dbias + oc, sum);
 }
 
