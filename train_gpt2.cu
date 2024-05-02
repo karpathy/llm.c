@@ -213,6 +213,22 @@ __device__ void atomicAddX(float* addr, float val) {
     atomicAdd(addr, val);
 }
 
+// warp-level reduction for summing values
+__device__ float warpReduceSum(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
+// warp-level reduction for finding the maximum value
+__device__ float warpReduceMax(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
+    }
+    return val;
+}
+
 // ----------------------------------------------------------------------------
 // Packed128 data structure, which forces the compiler to use 128-bit loads/stores
 // in GPUs that support (the LDG.128 and STS.128 instructions)
@@ -1195,8 +1211,7 @@ struct SoftmaxParams {
     float Offset;
 };
 
-__device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_tile<32>& warp,
-                                                   int idx, const floatX* inp, int V, int P) {
+__device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, int V, int P) {
     // same but not float4
     // one row of inp, i.e. inp[idx, :] of shape (V,)
 
@@ -1205,14 +1220,19 @@ __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_til
     float thread_sumval = 0.0f;
     // do the loop in reverse to maximise probability of L2 cache hits
     // so even small L2s get some hits on the 2nd read of the same thread
-    for (int i = V + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
-        float v = (float)x[i];
-        float old_maxval = thread_maxval;
-        thread_maxval = fmaxf(thread_maxval, v);
-        thread_sumval *= expf((old_maxval - thread_maxval));
-        thread_sumval += expf(v - thread_maxval);
+    for (int i = (V+x128::size-1)/x128::size + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
+        x128 packed_x = load128cs(x + i * x128::size); // load and do not keep in cache
+        for(int k = 0; k < packed_x.size; ++k) {
+            if (i*x128::size+k >= V) {  // bounds checking against real V
+                continue;
+            }
+            float v = (float)packed_x[k];
+            float old_maxval = thread_maxval;
+            thread_maxval = fmaxf(thread_maxval, v);
+            thread_sumval *= expf((old_maxval - thread_maxval));
+            thread_sumval += expf(v - thread_maxval);
+        }
     }
-
     // two reductions of up to 1024 threads:
     // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
     // this results in much cleaner assembly than a multi-warp cg::reduce
@@ -1223,7 +1243,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_til
     int lane_id = threadIdx.x % 32;
 
     // reduce maxval within each warp
-    float warp_maxval = cg::reduce(warp, thread_maxval, cg::greater<float>{});
+    float warp_maxval = warpReduceMax(thread_maxval);
     // thread 0 in each warp writes to shared memory
     if (lane_id == 0) { shared_maxval[warp_id] = warp_maxval; }
     __syncthreads();
@@ -1231,16 +1251,17 @@ __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_til
     // if the thread is "out of range" of data, use -FLT_MAX as the maxval
     warp_maxval = (lane_id < num_warps) ? shared_maxval[lane_id] : -FLT_MAX;
     // now reduce the maxval among the warp threads
-    float block_maxval = cg::reduce(warp, warp_maxval, cg::greater<float>{});
+    float block_maxval = warpReduceMax(warp_maxval);
     // each thread uses maxval to scale sumval to avoid numerical instability / overflow
     thread_sumval *= expf(thread_maxval - block_maxval);
     // (warp-level) reduce sumval, thread 0 in each warp saves result in shared memory
-    float warp_sumval = cg::reduce(warp, thread_sumval, cg::plus<float>{});
+    float warp_sumval = warpReduceSum(thread_sumval); //cg::reduce(warp, thread_sumval, cg::plus<float>{});
+
     if (lane_id == 0) { shared_sumval[warp_id] = warp_sumval; }
     __syncthreads();
     // same strategy, now reduce sumval across warps
     warp_sumval = (lane_id < num_warps) ? shared_sumval[lane_id] : 0.0f;
-    float block_sumval = cg::reduce(warp, warp_sumval, cg::plus<float>{});
+    float block_sumval = warpReduceSum(warp_sumval); //cg::reduce(warp, thread_sumval, cg::plus<float>{});
     // return the softmax parameters
     return SoftmaxParams{1.f / block_sumval, block_maxval};
 }
@@ -1250,19 +1271,16 @@ __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_til
 __global__ void fused_classifier_kernel3(floatX* logits, floatX* losses, floatX* probs,
                                          const floatX* dlosses, const int* targets,
                                          int B, int T, int V, int P) {
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int idx = blockIdx.x;
     int ix = targets[idx];
 
     // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
-    SoftmaxParams sp = prepare_softmax_blockwide_nofloat4(warp, idx, logits, V, P);
+    SoftmaxParams sp = prepare_softmax_blockwide(idx, logits, V, P);
 
     // calculate the probability needed for the loss and update (single-threaded)
     if(threadIdx.x == 0) {
         float prob = expf((float)logits[idx * P + ix] - sp.Offset) * sp.Scale;
-        losses[idx] = (floatX)(-logf(prob));
+        losses[idx] = (floatX)(-logf(prob)); 
     }
 
     // very sensible default for dlosses is 1/(B*T), which is the uniform loss
@@ -1270,18 +1288,29 @@ __global__ void fused_classifier_kernel3(floatX* logits, floatX* losses, floatX*
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
     const floatX* logits_vec = logits + idx * P;
-    // note that we use the padded dimension P to access data, but we only ever
-    // modify the elements up to V, ignoring the padded dimensions and leaving them at 0
-    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+    for (int i = threadIdx.x; i < (V+x128::size-1)/x128::size; i += blockDim.x) {
         // this is the 2nd read of logits after the one in prepare_softmax2
         // this data will never be needed again, so we reduce cache persistence
-        float v = (float)__ldcs(&logits_vec[i]);
-        float prob = expf(v - sp.Offset) * sp.Scale;
-        if (probs != NULL) {
-            probs[idx * P + i] = (floatX)prob;
+        x128 packed_logits_vec = load128cs(logits_vec + i * x128::size); // load and do not keep in cache
+        x128 packed_probs;
+        x128 packed_logits;
+        for(int k = 0; k < packed_logits_vec.size; ++k) {
+            int element = i*packed_logits_vec.size + k;
+            if (element >= V) {  // bounds checking against real V
+                continue;
+            }
+            float v = (float)packed_logits_vec[k];
+            float prob = expf(v - sp.Offset) * sp.Scale;
+            packed_probs[k] = (floatX)prob;
+            float indicator = (element == ix) ? 1.0f : 0.0f;
+            packed_logits[k] = (floatX)((prob - indicator) * dloss);
         }
-        float indicator = (i == ix) ? 1.0f : 0.0f;
-        logits[idx * P + i] = (floatX)((prob - indicator) * dloss);
+        if (logits != NULL){
+            store128(logits + idx * P + i * packed_logits_vec.size, packed_logits);
+        }
+        if (probs != NULL) {
+            store128(probs + idx * P + i * packed_logits_vec.size, packed_probs);
+        }
     }
 }
 
