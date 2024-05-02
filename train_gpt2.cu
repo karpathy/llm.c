@@ -1489,7 +1489,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 
 void residual_forward(floatX* out, floatX* inp1, floatX* inp2, int N) {
     const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
+    const int grid_size = CEIL_DIV(N, block_size * x128::size);
     residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
     cudaCheck(cudaGetLastError());
 }
