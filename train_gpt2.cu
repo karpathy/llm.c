@@ -2761,7 +2761,6 @@ int main(int argc, char *argv[]) {
             // if we're overfitting a single batch, we'll only call this at step = 0
             dataloader_next_batch(&train_loader);
         }
-        dataloader_next_batch(&train_loader);
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
