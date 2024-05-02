@@ -102,29 +102,17 @@ void residual_forward(int kernel_num,
 // ----------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
-    srand(0);
+    set_main();
 
     int B = 8;
     int T = 1024;
     int C = 768;
 
-    int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
-
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * C * sizeof(float));
     float* inp1 = make_random_float(B * T * C);
     float* inp2 = make_random_float(B * T * C);
-
-    // create X host memory of random numbers
-    floatX* inp1X = (floatX*)malloc(B * T * C * sizeof(float));
-    floatX* inp2X = (floatX*)malloc(B * T * C * sizeof(float));
-
-    for (int i = 0; i < B * T * C; i++) {
-        inp1X[i] = (floatX)inp1[i];
-        inp2X[i] = (floatX)inp2[i];
-    }
-
+    
     // move to GPU
     floatX* d_out;
     floatX* d_inp1;
@@ -132,8 +120,8 @@ int main(int argc, char **argv) {
     cudaCheck(cudaMalloc(&d_out, B * T * C * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_inp1, B * T * C * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_inp2, B * T * C * sizeof(floatX)));
-    cudaCheck(cudaMemcpy(d_inp1, inp1X, B * T * C * sizeof(floatX), cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(d_inp2, inp2X, B * T * C * sizeof(floatX), cudaMemcpyHostToDevice));
+    cudaCheck(memcpy_convert(d_inp1, inp1, B * T * C));
+    cudaCheck(memcpy_convert(d_inp2, inp2, B * T * C));
 
     // read kernel_num from command line
     int kernel_num = 1;
@@ -184,8 +172,6 @@ int main(int argc, char **argv) {
     free(out);
     free(inp1);
     free(inp2);
-    free(inp1X);
-    free(inp2X);
     cudaCheck(cudaFree(d_out));
     cudaCheck(cudaFree(d_inp1));
     cudaCheck(cudaFree(d_inp2));
