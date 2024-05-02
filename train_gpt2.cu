@@ -966,8 +966,7 @@ __global__ void residual_forward_kernel(floatX* out, floatX* inp1, floatX* inp2,
         x128 packed_inp1 = load128cs(inp1 + idx);
         x128 packed_inp2 = load128cs(inp2 + idx);
         #pragma unroll packed_inp1.size
-        for (int k = 0; k < packed_inp1.size; ++k)
-        {
+        for (int k = 0; k < packed_inp1.size; k++) {
             packed_out[k] = (floatX)((float)packed_inp1[k] + (float)packed_inp2[k]);
         }
         store128(out + idx, packed_out);
