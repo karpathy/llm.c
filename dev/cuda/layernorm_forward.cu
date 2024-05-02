@@ -447,14 +447,11 @@ void layernorm_forward(int kernel_num,
 // ----------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
-    srand(0);
+    setup_main();
 
     int B = 8;
     int T = 1024;
     int C = 768;
-
-    int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * C * sizeof(float));
@@ -463,20 +460,7 @@ int main(int argc, char **argv) {
     float* inp = make_random_float(B * T * C);
     float* weight = make_random_float(C);
     float* bias = make_random_float(C);    
-    
-    floatX* inpX = (floatX*)malloc(B * T * C * sizeof(floatX));
-    floatX* weightX = (floatX*)malloc(C * sizeof(floatX));
-    floatX* biasX = (floatX*)malloc(C * sizeof(floatX));
-
-    for (int i = 0; i < B * T * C; i++) {
-        inpX[i] = (floatX)inp[i];
-    }
-
-    for (int i = 0; i < C; i++) {
-        weightX[i] = (floatX)weight[i];
-        biasX[i] = (floatX)bias[i];
-    }
-
+        
     // move to GPU
     floatX* d_out;
     floatX* d_mean;
@@ -484,15 +468,16 @@ int main(int argc, char **argv) {
     floatX* d_inp;
     floatX* d_weight;
     floatX* d_bias;
+
     cudaCheck(cudaMalloc(&d_out, B * T * C * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_mean, B * T * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_rstd, B * T * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_inp, B * T * C * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_weight, C * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_bias, C * sizeof(floatX)));
-    cudaCheck(cudaMemcpy(d_inp, inpX, B * T * C * sizeof(floatX), cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(d_weight, weightX, C * sizeof(floatX), cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(d_bias, biasX, C * sizeof(floatX), cudaMemcpyHostToDevice));
+    cudaCheck(memcpy_convert(d_inp, inp, B * T * C));
+    cudaCheck(memcpy_convert(d_weight, weight, C));
+    cudaCheck(memcpy_convert(d_bias, bias, C));
 
     // read kernel_num from command line
     int kernel_num = 2;
@@ -543,9 +528,6 @@ int main(int argc, char **argv) {
     free(inp);
     free(weight);
     free(bias);
-    free(inpX);
-    free(weightX);
-    free(biasX);
     cudaCheck(cudaFree(d_out));
     cudaCheck(cudaFree(d_mean));
     cudaCheck(cudaFree(d_rstd));
