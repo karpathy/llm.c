@@ -18,6 +18,10 @@ OMP_NUM_THREADS=32 ./attention_backward 4
 
 version 5 reduces the amount of non-fp32 instructions needed by avoiding ifs
 OMP_NUM_THREADS=32 ./attention_backward 5
+
+version 9 removes the cooperative groups from version 8
+OMP_NUM_THREADS=32 ./attention_backward 9
+
 */
 
 #include <stdio.h>
@@ -181,6 +185,17 @@ void attention_backward_cpu(float* dinp, float* dpreatt, float* datt,
             }
         }
     }
+}
+
+// ----------------------------------------------------------------------------
+// Kernel Utils
+//
+
+__device__ float warpReduceSum(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
 }
 
 // ----------------------------------------------------------------------------
@@ -716,6 +731,55 @@ __global__ void softmax_autoregressive_backward_kernel8(float* dpreatt, const fl
     }
 }
 
+// Basically the same as kernel 8 but without cooperative groups
+template<int BlockSize>
+__global__ void softmax_autoregressive_backward_kernel9(float* dpreatt, const float* datt, const float* att,
+                                                        int B, int T, int C, float scale) {
+    constexpr int T_per_block = 4;
+    int warpSize = 32;
+    int laneId = threadIdx.x % warpSize;
+    int warpId = threadIdx.x / warpSize;
+    int warpsPerBlock = (blockDim.x / warpSize);
+    int thread_rank = warpId * warpSize + laneId;
+    __shared__ float block_acc[32];
+
+    int idx = blockIdx.y;
+    // go through blocks in reverse order, so the slowest block starts first
+    int t0 = T - 1 - T_per_block*blockIdx.x;
+
+    att += idx * T * T;
+    datt += idx * T * T;
+    dpreatt += idx * T * T;
+
+    if (warpId == 0) {
+        block_acc[laneId] = 0;
+    }
+
+    for(int to = 0; to < T_per_block; ++to) {
+        int t = t0 - to;
+        if(t < 0) return;
+        const float* att_bth = att + t * T;
+        const float* datt_bth = datt + t * T;
+        float* dpreatt_bth = dpreatt + t * T;
+
+        float local_sum = 0;
+        for (int t2 = thread_rank; t2 <= t; t2 += BlockSize) {
+            local_sum += att_bth[t2] * datt_bth[t2];
+        }
+
+        block_acc[warpId] = warpReduceSum(local_sum);
+        __syncthreads();
+        local_sum = warpReduceSum(block_acc[laneId]);
+
+        for (int t3 = thread_rank; t3 <= t; t3 += BlockSize) {
+            // don't touch the cache. Some parts will still be here from the previous loop, and
+            // we want to exploit those.
+            float acc = __ldcs(att_bth + t3) * (__ldcs(datt_bth + t3) - local_sum);
+            __stcs(dpreatt_bth + t3, scale * acc);
+        }
+    }
+}
+
 
 // ----------------------------------------------------------------------------
 // kernel launchers
@@ -850,6 +914,17 @@ void launch_softmax_8(float* dpreatt, float* datt, const float* att, int B, int 
     dispatch_launch(launch, block_size);
 }
 
+void launch_softmax_9(float* dpreatt, float* datt, const float* att, int B, int T, int C, int NH, int block_size) {
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    auto launch = [&](auto int_const) {
+        constexpr int block_size = int_const.value;
+        softmax_autoregressive_backward_kernel9<block_size><<<dim3(T / 4, B * NH), block_size>>>
+                                                              (dpreatt, datt, att, B, T, C, scale);
+    };
+    dispatch_launch(launch, block_size);
+}
+
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
 template<class SoftmaxKernel>
@@ -969,6 +1044,10 @@ void attention_backward(int kernel_num,
         case 8:
             attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
                                 launch_softmax_8, block_size);
+            break;
+        case 9:
+            attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
+                                launch_softmax_9, block_size);
             break;
         default:
             printf("Invalid kernel number\n");

@@ -1172,8 +1172,10 @@ __global__ void softmax_autoregressive_backward_kernel(floatX* dpreatt, const fl
                                                        int B, int T, int C, float scale) {
     constexpr const int BlockSize = 256;
     constexpr int T_per_block = 4;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int warpSize = 32;
+    int laneId = threadIdx.x % warpSize;
+    int warpId = threadIdx.x / warpSize;
+    int thread_rank = warpId * warpSize + laneId;
     __shared__ float block_acc[32];
 
     int idx = blockIdx.y;
@@ -1184,8 +1186,8 @@ __global__ void softmax_autoregressive_backward_kernel(floatX* dpreatt, const fl
     datt += idx * T * T;
     dpreatt += idx * T * T;
 
-    if (warp.meta_group_rank() == 0) {
-        block_acc[warp.thread_rank()] = 0;
+    if (warpId == 0) {
+        block_acc[laneId] = 0;
     }
 
     for(int to = 0; to < T_per_block; ++to) {
@@ -1196,15 +1198,15 @@ __global__ void softmax_autoregressive_backward_kernel(floatX* dpreatt, const fl
         floatX* dpreatt_bth = dpreatt + t * T;
 
         float local_sum = 0;
-        for (int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
+        for (int t2 = thread_rank; t2 <= t; t2 += BlockSize) {
             local_sum += (float)att_bth[t2] * (float)datt_bth[t2];
         }
 
-        block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
-        block.sync();
-        local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+        block_acc[warpId] = warpReduceSum(local_sum);
+        __syncthreads();
+        local_sum = warpReduceSum(block_acc[laneId]);
 
-        for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
+        for (int t3 = thread_rank; t3 <= t; t3 += BlockSize) {
             // don't touch the cache. Some parts will still be here from the previous loop, and
             // we want to exploit those.
             float acc = (float)__ldcs(att_bth + t3) * ((float)__ldcs(datt_bth + t3) - local_sum);
