@@ -213,13 +213,6 @@ __device__ void atomicAddX(float* addr, float val) {
     atomicAdd(addr, val);
 }
 
-__device__ floatX warpReduceSum(floatX val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    }
-    return val;
-}
-
 // warp-level reduction for summing values
 __device__ float warpReduceSum(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -235,6 +228,15 @@ __device__ float warpReduceMax(float val) {
     }
     return val;
 }
+
+#if defined(ENABLE_BF16) || defined(ENABLE_FP16)
+__device__ floatX warpReduceSum(floatX val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+#endif
 
 // ----------------------------------------------------------------------------
 // Packed128 data structure, which forces the compiler to use 128-bit loads/stores
