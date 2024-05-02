@@ -219,3 +219,18 @@ jobs:
 
       - name: Build project
         run: make -j4 -C dev/cuda
+
+  run-cpu-unit-tests:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build project
+        run: make -j4 -C test
+
+      - name: Run tests
+        run: ./test/bits

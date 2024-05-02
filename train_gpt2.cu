@@ -312,7 +312,9 @@ typedef struct {
     // buffers for the AdamW optimizer
     float* m_memory;
     float* v_memory;
-    float* master_weights;     // is NULL unless fp32 weights is enabled.
+    // master_weight_mantissas is NULL unless fp32 weights is enabled.
+    // otherwise, it contains only the missing information to get back from bfloat16 to float
+    unsigned short* master_weight_mantissas;
     // the activations of the model, and their sizes
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
@@ -358,7 +360,7 @@ void gpt2_init_common(GPT2 *model) {
     // memory lazily initialized in update()
     model->m_memory = NULL;
     model->v_memory = NULL;
-    model->master_weights = NULL;
+    model->master_weight_mantissas = NULL;
     // other default settings
     model->rng_state = 13371337; // used in stochastic rounding
     model->use_master_weights = 1; // safe default: do keep master weights in fp32
@@ -956,12 +958,11 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         cudaCheck(cudaMemset(model->m_memory, 0, shard_num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->v_memory, 0, shard_num_parameters * sizeof(float)));
     }
-
-    bool init_master_weights = false;
-    if (model->use_master_weights == 1 && model->master_weights == NULL) {
-        printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
-        cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
-        init_master_weights = true;
+    if (model->use_master_weights == 1 && model->master_weight_mantissas == NULL) {
+        // allocate one more buffer to keep the master copy of weights as float, and copy the weights over
+        printf0("allocating %zu MiB for master weight mantissa\n", (shard_num_parameters * sizeof(short) >> 20));
+        cudaCheck(cudaMalloc((void**)&model->master_weight_mantissas, shard_num_parameters * sizeof(short)));
+        cudaCheck(cudaMemset(model->master_weight_mantissas, 0, shard_num_parameters * sizeof(short)));
     }
 
     // gradient clipping
@@ -1038,14 +1039,8 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ?  local_offset_full : local_offset_partial;
         float* m_ptr = model->m_memory + opt_state_offset;
         float* v_ptr = model->v_memory + opt_state_offset;
-        float* master_ptr = NULL;
-        if (model->master_weights != NULL) { master_ptr = model->master_weights + opt_state_offset; }
-        if(init_master_weights) {
-            size_t grid_size = CEIL_DIV(shard.size, 512);
-            copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, param_ptr, shard.size,
-                                                                     shard.size, tensor.size);
-            cudaCheck(cudaGetLastError());
-        }
+        unsigned short* master_ptr = NULL;
+        if (model->master_weight_mantissas != NULL) { master_ptr = model->master_weight_mantissas + opt_state_offset; }
 
         // ok finally call the kernel
         adamw_update(param_ptr, master_ptr, grad_ptr,
@@ -1108,7 +1103,7 @@ void gpt2_free(GPT2 *model) {
     cudaFreeCheck(&model->grads_memory);
     cudaFreeCheck(&model->m_memory);
     cudaFreeCheck(&model->v_memory);
-    cudaFreeCheck(&model->master_weights);
+    cudaFreeCheck(&model->master_weight_mantissas);
     cudaFreeCheck(&model->acts_memory);
     cudaFreeCheck(&model->inputs);
     cudaFreeCheck(&model->targets);
@@ -1189,8 +1184,8 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     cudaCheck(cudaMemcpy(cpu_buffer, model->v_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     if (model->use_master_weights == 1) {
-        cudaCheck(cudaMemcpy(cpu_buffer, model->master_weights, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
-        fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+        cudaCheck(cudaMemcpy(cpu_buffer, model->master_weight_mantissas, shard_num_parameters * sizeof(short), cudaMemcpyDeviceToHost));
+        fwrite(cpu_buffer, sizeof(short), shard_num_parameters, state_file);
     }
     free(cpu_buffer);
     fclose(state_file);
@@ -1220,9 +1215,9 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
         cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
     }
-    if (state_header[4] == 1 && model->master_weights == NULL) {
-        printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
-        cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
+    if (state_header[4] == 1 && model->master_weight_mantissas == NULL) {
+        printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(short)) >> 20);
+        cudaCheck(cudaMalloc((void**)&model->master_weight_mantissas, shard_num_parameters * sizeof(short)));
     }
     float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
@@ -1230,8 +1225,8 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     cudaCheck(cudaMemcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     if (state_header[4] == 1) {  // if we used master weights during the state save
-        freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-        cudaCheck(cudaMemcpy(model->master_weights, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+        freadCheck(cpu_buffer, sizeof(short), shard_num_parameters, state_file);
+        cudaCheck(cudaMemcpy(model->master_weight_mantissas, cpu_buffer, shard_num_parameters * sizeof(short), cudaMemcpyHostToDevice));
     }
     free(cpu_buffer);
     fclose(state_file);
@@ -1448,6 +1443,7 @@ int main(int argc, char *argv[]) {
     printf0("| channels C            | %-50d |\n", model.config.channels);
     printf0("| num_parameters        | %-50zu |\n", model.num_parameters);
     printf0("+-----------------------+----------------------------------------------------+\n");
+    model.use_master_weights = true;
 
     // build DataLoaders for both train and val
     DataLoader train_loader, val_loader;

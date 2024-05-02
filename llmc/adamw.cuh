@@ -5,6 +5,7 @@ AdamW kernel
 // llmc internal imports
 #include "cuda_common.h"
 #include "cuda_utils.cuh"
+#include "bits.cuh"
 
 // ----------------------------------------------------------------------------
 // CUDA kernels
@@ -16,7 +17,7 @@ __device__ float lerp(float start, float end, float weight) {
 }
 
 template <typename Tp, typename Tg>
-__device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+__device__ void adamw_update(Tp* params_memory, unsigned short* mantissas, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                              float grad_scale, unsigned int seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -35,24 +36,47 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
     m /= beta1_correction;  // m_hat
     v /= beta2_correction;  // v_hat
     // fetch the old value of this parameter as a float, from either source
-    float old_param = (master_params_memory != NULL) ? master_params_memory[idx] : (float)params_memory[idx];
-    // update this parameter
+    float old_param;
+    if (mantissas != NULL) {
+        if constexpr (std::is_same_v<Tp, __nv_bfloat16>) {
+            old_param = assemble_float(params_memory[idx], mantissas[idx]);
+        } else {
+            assert(false && "Master params are only implemented for bf16.");
+        }
+    } else {
+        old_param = (float)params_memory[idx];
+    }
+    // update this parameter in 32-bit precision
     float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * old_param));
+
     // update our low precision version of the parameters using stochastic rounding
     // this will be used in the next forward pass
-    stochastic_rounding(param, &params_memory[idx], seed);
-    // write the full, float version of the param into our master copy, if we maintain one
-    // this will be used in the next update
-    if (master_params_memory != NULL) { master_params_memory[idx] = param; }
+    // TODO: simply doing `params_memory[i] = (floatX)param;` breaks everything (why?)
+
+    // If we keep master parameter "copies", make sure to store the missing bits in the 'mantissas' array,
+    // otherwise we can directly go for stochastic rounding.
+    if (mantissas != NULL) {
+        if constexpr (std::is_same_v<Tp, __nv_bfloat16>) {
+            unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
+            unsigned int threshold = random & 0xFFFFu;
+            SplitFloatResult split = split_float(param, threshold);
+            mantissas[idx] = split.bits;
+            params_memory[idx] = split.b_float;
+        } else {
+            assert(false && "Master params are only implemented for bf16.");
+        }
+    } else {
+        stochastic_rounding(param, &params_memory[idx], seed);
+    }
 }
 
 template <typename Tp, typename Tg>
-__global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+__global__ void adamw_kernel3(Tp* params_memory, unsigned short* mantissas, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                               ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                               float grad_scale, unsigned int seed) {
     adamw_update(params_memory + blockIdx.y * w_stride,
-                 master_params_memory ? master_params_memory + blockIdx.y * s_stride : NULL,
+                 mantissas ? mantissas + blockIdx.y * s_stride : NULL,
                  grads_memory + blockIdx.y * g_stride,
                  m_memory + blockIdx.y * s_stride,
                  v_memory + blockIdx.y * s_stride,
@@ -62,7 +86,7 @@ __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg
 }
 
 template <typename Tp, typename Tg>
-void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+void adamw_update(Tp* params_memory, unsigned short* mantissas, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                   ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride,  int num_slices, float learning_rate, float beta1, float beta2, int t, float eps, float weight_decay,
                   float grad_scale, unsigned int seed, cudaStream_t stream) {
     // AdamW update
@@ -70,7 +94,7 @@ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memo
     int num_blocks = CEIL_DIV(num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
-    adamw_kernel3<<<dim3(num_blocks, num_slices), block_size, 0, stream>>>(params_memory, master_params_memory, grads_memory,
+    adamw_kernel3<<<dim3(num_blocks, num_slices), block_size, 0, stream>>>(params_memory, mantissas, grads_memory,
                                                          m_memory, v_memory, num_parameters, w_stride, g_stride, s_stride,
                                                          learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
                                                          grad_scale, seed);

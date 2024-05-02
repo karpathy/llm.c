@@ -305,11 +305,11 @@ int main(int argc, char *argv[]) {
 
     // compare
     for (int i = 0; i < 10; i++) {
-        if (fabsf(losses[i] - expected_losses[i]) >= loss_diff_threshold) {
+        if (fabsf(losses[i] - expected_losses[i]) < loss_diff_threshold && isfinite(losses[i])) {
+            printf("loss ok at step %d: %f %f\n", i+1, losses[i], expected_losses[i]);
+        } else {
             printf("LOSS MISMATCH AT STEP %d: %f %f\n", i+1, losses[i], expected_losses[i]);
             allok = 0;
-        } else {
-            printf("loss ok at step %d: %f %f\n", i+1, losses[i], expected_losses[i]);
         }
     }
 
