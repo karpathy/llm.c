@@ -10,6 +10,7 @@ nvcc -O3 --use_fast_math classifier_fused.cu -o classifier_fused
 ./classifier_fused 1
 ./classifier_fused 2
 ./classifier_fused 3
+./classifier_fused 4
 */
 
 #include <stdio.h>
@@ -448,7 +449,7 @@ __global__ void fused_classifier_kernel4(float* dlogits, float* losses, float* p
     // calculate the probability needed for the loss and update (single-threaded)
     if(threadIdx.x == 0) {
         float prob = expf(logits[idx * P + ix] - sp.Offset) * sp.Scale;
-        losses[idx] = -logf(prob); 
+        losses[idx] = -logf(prob);
     }
 
     // very sensible default for dlosses is 1/(B*T), which is the uniform loss
