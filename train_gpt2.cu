@@ -140,6 +140,13 @@ int cuda_num_SMs = 0; // for persistent threads where we want 1 threadblock per 
 
 namespace cg = cooperative_groups;
 
+__device__ floatX warpReduceSum(floatX val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
 // convenience macro for calculating grid/block dimensions for kernels
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
@@ -1028,17 +1035,15 @@ __global__ void matmul_backward_bias_kernel4(floatX* dbias, const floatX* dout, 
     }
 }
 
-// single FP32 scratchpad shared by all the threadblocks (based on kernels 3 & 5)
-__global__ void layernorm_backward_kernel6(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+__global__ void layernorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                         const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
                         int B, int T, int C) {
     extern __shared__ float shared[]; // size = 2 * C + 1
-
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int base_idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-
+    int warpId = threadIdx.x / warpSize; // warp index within a block
+    int warpsInBlock = blockDim.x / warpSize; //number of warps in block
+    int baseIdx = blockIdx.x * warpsInBlock + warpId;
+    int warpThreadIdx = threadIdx.x % warpSize; // Thread index within the warp
+    int warpsInGrid = gridDim.x * warpsInBlock;
 
     // the first half of shared memory is bias, second is weight
     float* dbias_shared = shared;
@@ -1053,8 +1058,7 @@ __global__ void layernorm_backward_kernel6(floatX* dinp, floatX* dweight, floatX
     unsigned int *tmp_flag = (unsigned int*)(shared + C*2);
     __syncthreads();
 
-    int warps_in_grid = gridDim.x * warp.meta_group_size();
-    for (int idx = base_idx; idx < B * T; idx += warps_in_grid) {
+    for (int idx = baseIdx; idx < B * T; idx += warpsInGrid) {
         int b = idx / T;
         int t = idx % T;
 
@@ -1067,19 +1071,19 @@ __global__ void layernorm_backward_kernel6(floatX* dinp, floatX* dweight, floatX
         // first: two reduce operations
         float dnorm_mean = 0.0f;
         float dnorm_norm_mean = 0.0f;
-        for (int i = warp.thread_rank(); i < C; i  += warp.size()) {
+        for (int i = warpThreadIdx; i < C; i  += warpSize) {
             float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
             float dnorm_i = (float)weight[i] * (float)dout_bt[i];
             dnorm_mean += dnorm_i;
             dnorm_norm_mean += dnorm_i * norm_bti;
         }
-        dnorm_mean = cg::reduce(warp, dnorm_mean, cg::plus<float>{});
-        dnorm_norm_mean = cg::reduce(warp, dnorm_norm_mean, cg::plus<float>{});
+        dnorm_mean = warpReduceSum(dnorm_mean);
+        dnorm_norm_mean = warpReduceSum(dnorm_norm_mean);
         dnorm_mean = dnorm_mean / C;
         dnorm_norm_mean = dnorm_norm_mean / C;
 
         // now iterate again and accumulate all the gradients
-        for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+        for (int i = warpThreadIdx; i < C; i += warpSize) {
             float dout_i = (float)__ldcs(&dout_bt[i]);
             float norm_bti = ((float)__ldcs(&inp_bt[i]) - mean_bt) * rstd_bt;
             float dnorm_i = (float)weight[i] * dout_i;
@@ -1558,7 +1562,7 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     const int grid_size = 1 * cuda_num_SMs;
     size_t shared_mem_size = (2 * C + 1) * sizeof(float);
     cudaMemset(scratch, 0, (2 * C + 1) * sizeof(float)); // todo - memset in parallel with previous kernels using streams
-    layernorm_backward_kernel6<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+    layernorm_backward_kernel7<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
