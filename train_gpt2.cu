@@ -358,7 +358,7 @@ typedef struct {
     int num_processes;     // Total number of processes. 1 if no multi-GPU.
     int local_device_idx;  // This process GPU index on current machine. 0 if no multi-GPU.
 
-    // Zero optimization stage - https://fairscale.readthedocs.io/en/stable/deep_dive/oss_sdp_fsdp.html
+    // Zero Redundancy Optimizer stage - https://fairscale.readthedocs.io/en/stable/deep_dive/oss_sdp_fsdp.html
     // 0-Disabled
     // 1-Optimizer State Sharding (OSS)
     // 2-Optimizer + Gradient State Sharding (SDP)
@@ -1325,10 +1325,37 @@ __global__ void fused_classifier_kernel3(floatX* logits, floatX* losses, floatX*
     }
 }
 
-__global__ void copy_and_cast_kernel(float* dst, const floatX* src, size_t n) {
-    // a small kernel to copy and cast, i.e. `dst <- (float) src`
-    const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) { dst[i] = (float)src[i]; }
+// device functions and the kernel to cast data between types
+template<typename Td, typename Ts>
+__device__ Td cast_value(Ts val);
+
+template<>
+__device__ float cast_value<float, half>(half val) {
+    return __half2float(val);
+}
+
+template<>
+__device__ half cast_value<half, float>(float val) {
+    return __float2half(val);
+}
+
+template<>
+__device__ __nv_bfloat16 cast_value<__nv_bfloat16, float>(float val) {
+    return __float2bfloat16(val);
+}
+
+template<>
+__device__ float cast_value<float, __nv_bfloat16>(__nv_bfloat16 val) {
+    return __bfloat162float(val);
+} 
+
+template<typename Td, typename Ts>
+__global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+    // need to try grid stride looping for more perf later
+    if (idx < n) {
+        dst[idx] = cast_value<Td, Ts>(src[idx]);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -2282,10 +2309,6 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     size_t offset = multi_gpu_config->shard_offset;
     floatX* params_memory = (floatX*)model->params_memory + offset;
     floatX* grads_memory = (floatX*)model->grads_memory + offset;
-    float* master_params = NULL;
-    if (model->use_master_weights == 1) {
-        master_weights = model->master_weights + offset;
-    }
 
     // lazily allocate the memory for m_memory and v_memory
     if (model->m_memory == NULL) {
@@ -2304,6 +2327,11 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         }
     }
 
+    float* master_weights = NULL;
+    if (model->use_master_weights == 1) {
+        master_weights = model->master_weights + offset;
+    }
+
     int block_size = 512;
     int num_blocks = CEIL_DIV(num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
@@ -2314,17 +2342,13 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     cudaCheck(cudaGetLastError());
 
     if (multi_gpu_config->zero_active) {
-        // gather all parameter updates from each process, should use 2 cudastreams in future
-        ncclCheck(ncclAllGather(params_memory, (floatX*)model->params_memory,
-                                num_parameters, ncclFloatX,
-                                multi_gpu_config->nccl_comm, 0));
+        // gather all parameter updates from each process
         if (model->use_master_weights == 1) {
             ncclCheck(ncclAllGather(master_weights, model->master_weights,
                                     num_parameters, ncclFloat,
                                     multi_gpu_config->nccl_comm, 0));
-            // Fix and generalize the kernel
-            // copy_and_cast_kernel<<<CEIL_DIV(model->num_parameters, 512), 512>>>((floatX*)model->params_memory, model->master_weights, model->num_parameters);
-            
+            // Copy and cast gathered master weights to params 
+            copy_and_cast_kernel<<<CEIL_DIV(model->num_parameters, 512), 512>>>((floatX*)model->params_memory, model->master_weights, model->num_parameters);
         }
         else {
             ncclCheck(ncclAllGather(params_memory, (floatX*)model->params_memory,
