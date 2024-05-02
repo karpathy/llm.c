@@ -477,6 +477,15 @@ void crossentropy_softmax_backward(float* dlogits,
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
 
+typedef struct {
+    int max_seq_len; // max sequence length, e.g. 1024
+    int vocab_size; // vocab size, e.g. 50257
+    int padded_vocab_size; // padded to e.g. %128==0, 50304
+    int num_layers; // number of layers, e.g. 12
+    int num_heads; // number of heads in attention, e.g. 12
+    int channels; // number of channels, e.g. 768
+} GPT2Config;
+
 // the parameters of the model
 #define NUM_PARAMETER_TENSORS 16
 typedef struct {
@@ -497,6 +506,29 @@ typedef struct {
     float* lnfw; // (C)
     float* lnfb; // (C)
 } ParameterTensors;
+
+void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
+    size_t Vp = config.padded_vocab_size;
+    size_t C = config.channels;
+    size_t maxT = config.max_seq_len;
+    size_t L = config.num_layers;
+    param_sizes[0] = Vp * C; // wte
+    param_sizes[1] = maxT * C; // wpe
+    param_sizes[2] = L * C; // ln1w
+    param_sizes[3] = L * C; // ln1b
+    param_sizes[4] = L * (3 * C) * C; // qkvw
+    param_sizes[5] = L * (3 * C); // qkvb
+    param_sizes[6] = L * C * C; // attprojw
+    param_sizes[7] = L * C; // attprojb
+    param_sizes[8] = L * C; // ln2w
+    param_sizes[9] = L * C; // ln2b
+    param_sizes[10] = L * (4 * C) * C; // fcw
+    param_sizes[11] = L * (4 * C); // fcb
+    param_sizes[12] = L * C * (4 * C); // fcprojw
+    param_sizes[13] = L * C; // fcprojb
+    param_sizes[14] = C; // lnfw
+    param_sizes[15] = C; // lnfb
+}
 
 // allocate memory for the parameters and point the individual tensors to the right places
 float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes) {
@@ -568,15 +600,6 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
 }
 
 typedef struct {
-    int max_seq_len; // max sequence length, e.g. 1024
-    int vocab_size; // vocab size, e.g. 50257
-    int padded_vocab_size; // padded to e.g. %128==0, 50304
-    int num_layers; // number of layers, e.g. 12
-    int num_heads; // number of heads in attention, e.g. 12
-    int channels; // number of channels, e.g. 768
-} GPT2Config;
-
-typedef struct {
     GPT2Config config;
     // the weights (parameters) of the model, and their sizes
     ParameterTensors params;
@@ -636,22 +659,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     printf("channels: %zu\n", C);
 
     // allocate space for all the parameters and read them in
-    model->param_sizes[0] = Vp * C; // wte
-    model->param_sizes[1] = maxT * C; // wpe
-    model->param_sizes[2] = L * C; // ln1w
-    model->param_sizes[3] = L * C; // ln1b
-    model->param_sizes[4] = L * (3 * C) * C; // qkvw
-    model->param_sizes[5] = L * (3 * C); // qkvb
-    model->param_sizes[6] = L * C * C; // attprojw
-    model->param_sizes[7] = L * C; // attprojb
-    model->param_sizes[8] = L * C; // ln2w
-    model->param_sizes[9] = L * C; // ln2b
-    model->param_sizes[10] = L * (4 * C) * C; // fcw
-    model->param_sizes[11] = L * (4 * C); // fcb
-    model->param_sizes[12] = L * C * (4 * C); // fcprojw
-    model->param_sizes[13] = L * C; // fcprojb
-    model->param_sizes[14] = C; // lnfw
-    model->param_sizes[15] = C; // lnfb
+    fill_in_parameter_sizes(model->param_sizes,  model->config);
 
     // count the number of parameters
     size_t num_parameters = 0;

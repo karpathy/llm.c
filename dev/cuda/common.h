@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 
 
 template<class T>
@@ -33,6 +34,21 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
 
 // ----------------------------------------------------------------------------
+// cuBLAS setup
+// these will be initialized by setup_main
+
+// cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
+static size_t cublaslt_workspace_size = 32 * 1024 * 1024;
+static void* cublaslt_workspace = NULL;
+static cublasComputeType_t cublas_compute_type;
+cublasHandle_t cublas_handle;
+cublasLtHandle_t cublaslt_handle;
+int cuda_arch_major = 0;
+int cuda_arch_minor = 0;
+int cuda_num_SMs = 0; // for persistent threads where we want 1 threadblock per SM
+int cuda_threads_per_SM = 0;    // needed to calculate how many blocks to launch to fill up the GPU
+
+// ----------------------------------------------------------------------------
 // Packed128 data structure, which forces the compiler to use 128-bit loads/stores
 // in GPUs that support (the LDG.128 and STS.128 instructions)
 // This is a bit similar to the use of float4 in the case of 32-bit floats, but
@@ -58,8 +74,9 @@ struct alignas(16) Packed128 {
         memcpy(&bits, &payload, sizeof(bits));
         return bits;
     }
-
-    static constexpr const size_t size = sizeof(int4) / sizeof(ElementType);
+    // e.g. sizeof(int4) is 16 (4 X 4 bytes), sizeof(bfloat16) = 2, so size = 8
+    // so in the case where ElementType = bfloat16, we store 8 elements in one Packed128
+    static constexpr const int size = sizeof(int4) / sizeof(ElementType);
     ElementType payload[size];
 };
 
@@ -133,6 +150,50 @@ float* make_ones_float(size_t N) {
 
 // ----------------------------------------------------------------------------
 // testing and benchmarking utils
+
+template<class TargetType>
+[[nodiscard]] cudaError_t memcpy_convert(TargetType* d_ptr, float* h_ptr, size_t count) {
+    // copy from host to device with data type conversion.
+    TargetType* converted = (TargetType*)malloc(count * sizeof(TargetType));
+    for (int i = 0; i < count; i++) {
+        converted[i] = (TargetType)h_ptr[i];
+    }
+
+    cudaError_t status = cudaMemcpy(d_ptr, converted, count * sizeof(TargetType), cudaMemcpyHostToDevice);
+    free(converted);
+
+    // instead of checking the status at cudaMemcpy, we return it from here. This way, we
+    // still need to use our checking macro, and get better line info as to where the error
+    // happened.
+    return status;
+}
+
+void setup_main() {
+    srand(0);   // determinism
+
+    // set up the device
+    int deviceIdx = 0;
+    cudaCheck(cudaSetDevice(deviceIdx));
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, deviceIdx);
+    cuda_num_SMs = deviceProp.multiProcessorCount;
+    cuda_threads_per_SM = deviceProp.maxThreadsPerMultiProcessor;
+    cuda_arch_major = deviceProp.major;
+    cuda_arch_minor = deviceProp.minor;
+
+    // setup cuBLAS and cuBLASLt
+    cublasCheck(cublasCreate(&cublas_handle));
+    cublasCheck(cublasLtCreate(&cublaslt_handle));
+    cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
+
+    // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
+    int enable_tf32 = cuda_arch_major >= 8 ? 1 : 0;
+    // TODO implement common CLI for all tests/benchmarks
+    // if (override_enable_tf32 == 0) { enable_tf32 = 0; } // force to zero via arg
+    cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
+    cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
+}
 
 template<class D, class T>
 void validate_result(D* device_result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance=1e-4) {

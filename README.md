@@ -215,6 +215,14 @@ make test_gpt2cu
 
 If you have the latest CUDA you should expect this to compile OK, and you should see ~2X improved speed (~1.86X to be precise).
 
+**Flash Attention**. As of May 1, 2024 we now support the Flash Attention from cuDNN. Because cuDNN bloats the compile time from a few seconds to ~minute and this code path is right now very new, this is disabled by default. You can enable it by compiling like this:
+
+```bash
+make train_gpt2cu USE_CUDNN=1
+```
+
+This will try to compile with cudnn and run it. You have to have cuDNN installed on your system. Follow the [cuDNN installation instructions](https://developer.nvidia.com/cudnn) to install cuDNN with apt-get. On top of this you need the [cuDNN frontend](https://github.com/NVIDIA/cudnn-frontend/tree/main), but this is just header files. So simply download the repo to your disk, currently assumed to be in your home directory (i.e. the Makefile looks for `~/cudnn-frontend/include`).
+
 **Multi-GPU training**. As of April 26, 2024 there is now also support for multi-GPU training using MPI and NCCL. Make sure you install MPI, e.g. on Linux:
 
 ```bash
@@ -292,6 +300,10 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 
 - C#
   - [llm.cs](https://github.com/azret/llm.cs) by @[azret](https://github.com/azret): a C# port of this project
+
+- CUDA C++
+  - [llm.cpp](https://github.com/gevtushenko/llm.c) by @[gevtushenko](https://github.com/gevtushenko): a port of this project using the [CUDA C++ Core Libraries](https://github.com/NVIDIA/cccl)
+     - A presentation this fork was covered in [this lecture](https://www.youtube.com/watch?v=WiB_3Csfj_Q) in the [CUDA MODE Discord Server](https://discord.gg/cudamode)
 
 - Go
   - [llm.go](https://github.com/joshcarp/llm.go) by @[joshcarp](https://github.com/joshcarp): a Go port of this project

@@ -32,11 +32,6 @@ OMP_NUM_THREADS=32 ./attention_backward 5
 #include "common.h"
 
 // ----------------------------------------------------------------------------
-// CUDA setup
-
-static cublasHandle_t cublas_handle;
-
-// ----------------------------------------------------------------------------
 // CPU code reference
 
 /*
@@ -984,18 +979,13 @@ void attention_backward(int kernel_num,
 // ----------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
-    srand(0); // reproducibility
+    setup_main();
 
     // hyperparameters
     int B = 4;
     int T = 1024;
     int C = 768;
     int NH = 12;
-
-    // set up CUDA / cuBLAS
-    int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
-    cublasCreate(&cublas_handle);
 
     // read kernel_num from command line
     int kernel_num = 1;
@@ -1032,9 +1022,9 @@ int main(int argc, char **argv) {
 
     // check that preatt, att, and out match between the CPU and GPU versions
     printf("Checking the forward pass CPU <-> GPU...\n");
-    printf("[preatt]\n"); validate_result(d_preatt, preatt, "preatt", B * T * C, 1e-4f);
-    printf("[att]\n");    validate_result(d_att, att, "att", B * T * C, 1e-4f);
-    printf("[out]\n");    validate_result(d_out, out, "out", B * T * C, 1e-4f);
+    printf("[preatt]\n"); validate_result(d_preatt, preatt, "preatt", B * T * C, 5e-3f);
+    printf("[att]\n");    validate_result(d_att, att, "att", B * T * C, 1e-3f);
+    printf("[out]\n");    validate_result(d_out, out, "out", B * T * C, 1e-3f);
 
     // set up the memory for the backward pass
     float* dout = make_random_float(B * T * C); // the gradients on the output
@@ -1072,9 +1062,9 @@ int main(int argc, char **argv) {
     // the gradients at qkvr and vaccum will remain unchecked, but are
     // assumed to be correct if the other gradients are correct
     printf("Checking the backward pass CPU <-> GPU...\n");
-    printf("[datt]\n");    validate_result(d_datt, datt, "datt", B * NH * T * T, 1e-4f);
-    printf("[dpreatt]\n"); validate_result(d_dpreatt, dpreatt, "dpreatt", B * NH * T * T, 1e-4f);
-    printf("[dinp]\n");    validate_result(d_dinp, dinp, "dinp", B * T * 3 * C, 1e-4f);
+    printf("[datt]\n");    validate_result(d_datt, datt, "datt", B * NH * T * T, 5e-3f);
+    printf("[dpreatt]\n"); validate_result(d_dpreatt, dpreatt, "dpreatt", B * NH * T * T, 1e-3f);
+    printf("[dinp]\n");    validate_result(d_dinp, dinp, "dinp", B * T * 3 * C, 1e-3f);
 
     // also let's manually step through the gradients here
     float* h_dinp = (float*)malloc(B * T * 3 * C * sizeof(float));
