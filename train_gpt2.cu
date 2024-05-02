@@ -960,9 +960,17 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
 }
 
 __global__ void residual_forward_kernel(floatX* out, floatX* inp1, floatX* inp2, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     if (idx < N) {
-        out[idx] = (floatX)((float)__ldcs(&inp1[idx]) + (float)__ldcs(&inp2[idx]));
+        x128 packed_out;
+        x128 packed_inp1 = load128cs(inp1 + idx);
+        x128 packed_inp2 = load128cs(inp2 + idx);
+        #pragma unroll packed_inp1.size
+        for (int k = 0; k < packed_inp1.size; ++k)
+        {
+            packed_out[k] = (floatX)((float)packed_inp1[k] + (float)packed_inp2[k]);
+        }
+        store128(out + idx, packed_out);
     }
 }
 
@@ -1523,7 +1531,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 
 void residual_forward(floatX* out, floatX* inp1, floatX* inp2, int N) {
     const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
+    const int grid_size = CEIL_DIV(N, block_size * x128::size);
     residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
     cudaCheck(cudaGetLastError());
 }
