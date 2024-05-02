@@ -1175,35 +1175,35 @@ __device__ inline float lerp(float start, float end, float weight) {
 
 // Termplate type T instead of floatx
 template <typename Tp, typename Tg>
-__global__ void adamw_kernel3(Tp* params_memory, float* master_params, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+__global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                               unsigned int seed) {
-   int i = blockIdx.x * blockDim.x + threadIdx.x;
-   if (i >= num_parameters) return;  // guard
-   float grad = (float)grads_memory[i];
-   float m = m_memory[i];
-   float v = v_memory[i];
-   // update the first moment (momentum)
-   m = lerp(grad, m, beta1);
-   m_memory[i] = m;
-   // update the second moment (RMSprop)
-   v = lerp(grad * grad, v, beta2);
-   v_memory[i] = v;
-   m /= beta1_correction;  // m_hat
-   v /= beta2_correction;  // v_hat
-   // update the parameters (weight/bias)
-   float old_param = master_params != NULL ? master_params[i] : (float)params_memory[i];
-   float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * old_param));
-   // if we have master parameters, directly update the two weight copies
-    if (master_params != NULL) {
-        params_memory[i] = (floatX)param; // low-precision copy, for use in the forward pass
-        master_params[i] = param; // float copy, for use in the next parameter update
-    } else {
-        // without a master copy of params in float, do a direct update in low precision
-        // and use stochastic rounding to mitigate loss of training stability
-        unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
-        stochastic_rounding(param, &params_memory[i], random);
-    }
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_parameters) return;  // guard
+    // get the gradient, m, and v for this parameter
+    float grad = (float)grads_memory[i];
+    float m = m_memory[i];
+    float v = v_memory[i];
+    // update the first moment (momentum)
+    m = lerp(grad, m, beta1);
+    m_memory[i] = m;
+    // update the second moment (RMSprop)
+    v = lerp(grad * grad, v, beta2);
+    v_memory[i] = v;
+    m /= beta1_correction;  // m_hat
+    v /= beta2_correction;  // v_hat
+    // fetch the old value of this parameter as a float, from either source
+    float old_param = (master_params_memory != NULL) ? master_params_memory[i] : (float)params_memory[i];
+    // update this parameter
+    float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * old_param));
+    // update our low precision version of the parameters using stochastic rounding
+    // this will be used in the next forward pass
+    // TODO: simply doing `params_memory[i] = (floatX)param;` breaks everything (why?)
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+    stochastic_rounding(param, &params_memory[i], random);
+    // write the full, float version of the param into our master copy, if we maintain one
+    // this will be used in the next update
+    if (master_params_memory != NULL) { master_params_memory[i] = param; }
 }
 
 struct SoftmaxParams {
@@ -1280,7 +1280,7 @@ __global__ void fused_classifier_kernel3(floatX* logits, floatX* losses, floatX*
     // calculate the probability needed for the loss and update (single-threaded)
     if(threadIdx.x == 0) {
         float prob = expf((float)logits[idx * P + ix] - sp.Offset) * sp.Scale;
-        losses[idx] = (floatX)(-logf(prob)); 
+        losses[idx] = (floatX)(-logf(prob));
     }
 
     // very sensible default for dlosses is 1/(B*T), which is the uniform loss
