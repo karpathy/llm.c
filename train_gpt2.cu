@@ -732,12 +732,11 @@ void attention_backward_cudnn(floatX* dqkvr,                                    
 // ----------------------------------------------------------------------------
 // all the kernels
 
-__global__ void encoder_forward_kernel2(floatX* out,
-                               int* inp, floatX* wte, floatX* wpe,
+__global__ void encoder_forward_kernel3(floatX* out,
+                               const int* inp, const floatX* wte, const floatX* wpe,
                                int B, int T, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     int N = B * T * C;
-
     if (idx < N) {
         int bt = idx / C;
         int b = bt / T;
@@ -747,9 +746,17 @@ __global__ void encoder_forward_kernel2(floatX* out,
         int ix = inp[b * T + t];
 
         floatX* out_btc = out + b * T * C + t * C + c;
-        floatX* wte_ix = wte + ix * C + c;
-        floatX* wpe_tc = wpe + t * C + c;
-        *out_btc = (floatX)((float)*wte_ix + (float)*wpe_tc);
+        const floatX* wte_ix = wte + ix * C + c;
+        const floatX* wpe_tc = wpe + t * C + c;
+
+        x128 packed_out;
+        x128 wte = load128cs(wte_ix);
+        x128 wpe = load128cs(wpe_tc);
+        #pragma unroll wte.size
+        for (int k = 0; k < wte.size; k++) {
+            packed_out[k] = (floatX)((float)wte[k] + (float)wpe[k]);
+        }
+        store128(out_btc, packed_out);
     }
 }
 
@@ -1344,12 +1351,12 @@ __global__ void copy_and_cast_kernel(float* dst, const floatX* src, size_t n) {
 // kernel launchers
 
 void encoder_forward(floatX* out,
-                     int* inp, floatX* wte, floatX* wpe,
+                     const int* inp, const floatX* wte, const floatX* wpe,
                      int B, int T, int C) {
-    const int N = B * T * C;
     const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
-    encoder_forward_kernel2<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
+    const int N = B * T * C;
+    const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
+    encoder_forward_kernel3<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
