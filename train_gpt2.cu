@@ -639,6 +639,7 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
                              float* stats, // output for backward pass: (B, NH, T)
                              floatX* inp,  // input: (B, T, 3, NH, HS) QKV
                              int B, int T, int NH, int C) {
+    NVTX_RANGE_FN();
     int HS = C / NH; // number of features per head
     bool is_inference_only = (stats == nullptr);
 
@@ -680,6 +681,7 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
 void attention_backward_cudnn(floatX* dqkvr,                                       // output
                               floatX* dout, floatX* qkvr, floatX* o, float* stats, // inputs
                               int B, int T, int NH, int C) {
+    NVTX_RANGE_FN();
     int HS = C / NH; // number of features per head
 
     // Get graph and tensors from cache (or generate it on first use)
@@ -2725,11 +2727,14 @@ int main(int argc, char *argv[]) {
         printf0("step %4d/%d: train loss %f (acc %f) (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, accumulated_loss, time_elapsed_ms, tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
 
+        if (step == 10) {
+            cudaProfilerStop();
+        }
+
     }
     // add a total average, for optimizations that are only mild improvements (excluding 1st batch as warmup)
     printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);
 
-    cudaProfilerStop();
 
     // free and destroy everything
     cudaCheck(cudaEventDestroy(end));
