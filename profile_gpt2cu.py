@@ -160,7 +160,7 @@ for rid, row in kernel_profile_data:
         total['l2_write'] += l2_write
         total['inst'] += inst
 
-    pass_info = f"{pass_name}✗{multiplier}"
+    pass_info = f"{pass_name}×{multiplier}"
     print(f"{kid:02} {pass_info:7} {fn_name:<40} {time:8.2f} {read:8.2f} {write:8.2f} {l2_read:8.2f} {l2_write:8.2f} {inst:8.2f}")
 
 total_time = total['time']
