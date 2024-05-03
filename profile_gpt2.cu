@@ -52,6 +52,7 @@ int main() {
 
     // setup cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
+    cublasCheck(cublasSetStream(cublas_handle, main_stream));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;

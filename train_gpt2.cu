@@ -1491,7 +1491,7 @@ void matmul_forward_cublaslt(floatX* out,
     cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
         alpha_ptr, weight, weightLayout, inp, inputLayout, beta_ptr,
         out, outputLayout, out, outputLayout, &heuristic.algo,
-        cublaslt_workspace, cublaslt_workspace_size, 0));
+        cublaslt_workspace, cublaslt_workspace_size, main_stream));
 
     // cleanups
     cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
@@ -2691,6 +2691,7 @@ int main(int argc, char *argv[]) {
 
     // set up cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
+    cublasCheck(cublasSetStream(cublas_handle, main_stream));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
     // setup compute precision settings for cublas
