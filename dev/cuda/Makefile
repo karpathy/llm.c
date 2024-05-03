@@ -9,7 +9,9 @@ ifeq ($(NVCC),)
 endif
 
 # get GPU compute capability utility value
-GPU_COMPUTE_CAPABILITY = $(shell __nvcc_device_query) # assume if NVCC is present, then this likely is
+ifeq ($(MAKELEVEL),0) # detect if we are in CI or not
+	GPU_COMPUTE_CAPABILITY = $(shell __nvcc_device_query) # assume if NVCC is present, then this likely is too
+endif
 
 # Compiler flags
 ifeq ($(GPU_COMPUTE_CAPABILITY),) # set to defaults if: make GPU_COMPUTE_CAPABILITY= 
