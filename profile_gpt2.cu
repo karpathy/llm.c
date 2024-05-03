@@ -35,6 +35,7 @@ int main() {
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
     cuda_num_SMs = deviceProp.multiProcessorCount;
+    cuda_threads_per_SM = deviceProp.maxThreadsPerMultiProcessor;
     printf("[System]\n");
     printf("Device %d: %s\n", deviceIdx, deviceProp.name);
 
@@ -58,7 +59,7 @@ int main() {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
 
-    int B = 4;
+    int B = 24;
     int T = 1024;
     printf("batch size: %d\n", B);
     printf("sequence length: %d\n", T);

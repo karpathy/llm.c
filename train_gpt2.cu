@@ -156,6 +156,10 @@ int cuda_arch_minor = 0;
 int cuda_num_SMs = 0; // for persistent threads where we want 1 threadblock per SM
 int cuda_threads_per_SM = 0;
 
+constexpr int num_parallel_streams = 4; // + 1 primary "stream" (+ default stream)
+cudaStream_t parallel_streams[num_parallel_streams];
+cudaStream_t stream;
+
 namespace cg = cooperative_groups;
 
 // convenience macro for calculating grid/block dimensions for kernels
@@ -255,6 +259,23 @@ __device__ floatX warpReduceSum(floatX val) {
     return val;
 }
 #endif
+
+using reduction_func_t = float (*) (float);
+__device__ float blockReduce(float val, reduction_func_t warp_reduction) {
+    __shared__ float shared_val[32];
+    int lane_id = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    int num_warps = blockDim.x / 32;
+
+    float warp_val = warp_reduction(val);
+    if (lane_id == 0) { shared_val[warp_id] = warp_val; }
+    __syncthreads();
+    // same strategy, now reduce across warps
+    warp_val = (lane_id < num_warps) ? shared_val[lane_id] : 0.0f;
+    float block_val = warp_reduction(warp_val);
+    return block_val;
+}
+
 
 // ----------------------------------------------------------------------------
 // Packed128 data structure, which forces the compiler to use 128-bit loads/stores
@@ -1264,26 +1285,11 @@ __device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, i
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
 
-    // reduce maxval within each warp
-    float warp_maxval = warpReduceMax(thread_maxval);
-    // thread 0 in each warp writes to shared memory
-    if (lane_id == 0) { shared_maxval[warp_id] = warp_maxval; }
-    __syncthreads();
-    // each thread now loads the maxval across previous warps
-    // if the thread is "out of range" of data, use -FLT_MAX as the maxval
-    warp_maxval = (lane_id < num_warps) ? shared_maxval[lane_id] : -FLT_MAX;
-    // now reduce the maxval among the warp threads
-    float block_maxval = warpReduceMax(warp_maxval);
-    // each thread uses maxval to scale sumval to avoid numerical instability / overflow
+    // Block Max Reduction -> Maths -> Block Sum Reduction
+    float block_maxval = blockReduce(thread_maxval, warpReduceMax);
     thread_sumval *= expf(thread_maxval - block_maxval);
-    // (warp-level) reduce sumval, thread 0 in each warp saves result in shared memory
-    float warp_sumval = warpReduceSum(thread_sumval); //cg::reduce(warp, thread_sumval, cg::plus<float>{});
+    float block_sumval = blockReduce(thread_sumval, warpReduceSum);
 
-    if (lane_id == 0) { shared_sumval[warp_id] = warp_sumval; }
-    __syncthreads();
-    // same strategy, now reduce sumval across warps
-    warp_sumval = (lane_id < num_warps) ? shared_sumval[lane_id] : 0.0f;
-    float block_sumval = warpReduceSum(warp_sumval); //cg::reduce(warp, thread_sumval, cg::plus<float>{});
     // return the softmax parameters
     return SoftmaxParams{1.f / block_sumval, block_maxval};
 }
@@ -1358,7 +1364,7 @@ void encoder_forward(floatX* out,
     const int block_size = 256;
     const int N = B * T * C;
     const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
-    encoder_forward_kernel3<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
+    encoder_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, inp, wte, wpe, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1369,7 +1375,7 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
     const int N = B * T * C;
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
-    encoder_backward_kernel<<<grid_size, block_size>>>(dwte, dwpe, dout, inp, B, T, C);
+    encoder_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwte, dwpe, dout, inp, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1380,7 +1386,7 @@ void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
     const int block_size = 512;
     const int N = B * T;
     const int grid_size = CEIL_DIV(N * 32, block_size);
-    layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
+    layernorm_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1488,7 +1494,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     v = qkvr + 2 * B * T * C;
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
-    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+    permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 
     // IMPORTANT: alpha/beta are FP32 for CUBLAS_COMPUTE_32F even if FP16 inputs/outputs
@@ -1516,7 +1522,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
     int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
-    softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
+    softmax_forward_kernel5<<<grid_size, softmax_block_size, 0, stream>>>(att, scale, preatt, B * NH, T);
     cudaCheck(cudaGetLastError());
 
     // new approach: first cuBLAS another batched matmul
@@ -1537,7 +1543,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+    unpermute_kernel<<<num_blocks, block_size, 0, stream>>>(vaccum, out, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1545,7 +1551,7 @@ void residual_forward(floatX* out, floatX* inp1, floatX* inp2, int N) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
+    residual_forward_kernel<<<grid_size, block_size, 0, stream>>>(out, inp1, inp2, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1553,7 +1559,7 @@ void gelu_forward(floatX* out, const floatX* inp, int N) {
     NVTX_RANGE_FN();
     const int block_size = 512;
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_forward_kernel2<<<grid_size, block_size>>>(out, inp, N);
+    gelu_forward_kernel2<<<grid_size, block_size, 0, stream>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1561,7 +1567,7 @@ void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const in
     NVTX_RANGE_FN();
     const int block_size = 128;
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout, N);
+    gelu_backward_kernel<<<grid_size, block_size, 0, stream>>>(dinp, inp, dout, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1586,9 +1592,9 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
         const int grid_size_x = CEIL_DIV(OC, block_size);
         const int grid_size_y = max(1, cuda_threads_per_SM * cuda_num_SMs / block_size);
         cudaMemset(dbias_buffer, 0, OC * sizeof(float));
-        matmul_backward_bias_kernel5<<<dim3(grid_size_x, grid_size_y), dim3(block_size)>>>(dbias_buffer, dout, B, T, OC);
+        matmul_backward_bias_kernel5<<<dim3(grid_size_x, grid_size_y), dim3(block_size), 0, stream>>>(dbias_buffer, dout, B, T, OC);
         cudaCheck(cudaGetLastError());
-        cast_and_add_kernel<<<CEIL_DIV(OC, 256), 256>>>(dbias, dbias_buffer, OC);
+        cast_and_add_kernel<<<CEIL_DIV(OC, 256), 256, 0, stream>>>(dbias, dbias_buffer, OC);
         cudaCheck(cudaGetLastError());
     }
 }
@@ -1601,7 +1607,7 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     const int grid_size = 1 * cuda_num_SMs;
     size_t shared_mem_size = (2 * C + 1) * sizeof(float);
     cudaMemset(scratch, 0, (2 * C + 1) * sizeof(float)); // todo - memset in parallel with previous kernels using streams
-    layernorm_backward_kernel7<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+    layernorm_backward_kernel7<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1635,7 +1641,7 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* da
 
     // backward through the unpermute operation
     int num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel_backward<<<num_blocks, block_size>>>(scratch, dout, B, T, NH, HS);
+    unpermute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(scratch, dout, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
     // backward into datt
 
@@ -1651,7 +1657,7 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* da
     // backward into preatt
     int hs = C / NH; // head size
     float scale = 1.0f / sqrtf(hs);
-    softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, C, scale);
+    softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256, 256, stream>>>(dpreatt, datt, att, B, T, C, scale);
     cudaCheck(cudaGetLastError());
     // backward into q
     cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, alpha_ptr,
@@ -1663,7 +1669,7 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* da
                                            dk, CUBLAS_LOWP, HS, T * HS, B * NH, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT));
     // backward into inp
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
-    permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
+    permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dinp, dq, dk, dv, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1676,7 +1682,7 @@ void fused_classifier3(Type* logits, Type* losses,
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = N;
-    fused_classifier_kernel3<<<grid_size, block_size>>>(logits, losses, (Type*)NULL, dlosses, targets, B, T, V, P);
+    fused_classifier_kernel3<<<grid_size, block_size, 512, stream>>>(logits, losses, (Type*)NULL, dlosses, targets, B, T, V, P);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2332,7 +2338,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         if (model->use_master_weights == 1) {
             // allocate one more buffer to keep the master copy of weights as float, and copy the weights over
             cudaCheck(cudaMalloc((void**)&model->master_weights, model->num_parameters * sizeof(float)));
-            copy_and_cast_kernel<<<CEIL_DIV(model->num_parameters, 512), 512>>>(model->master_weights, (floatX*)model->params_memory, model->num_parameters);
+            copy_and_cast_kernel<<<CEIL_DIV(model->num_parameters, 512), 512, 0, stream>>>(model->master_weights, (floatX*)model->params_memory, model->num_parameters);
             cudaCheck(cudaGetLastError());
             printf0("allocated %zu MiB for master copy of params\n", (model->num_parameters * sizeof(float)) >> 20);
         }
@@ -2343,7 +2349,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
-    adamw_kernel3<<<num_blocks, block_size>>>((floatX*)model->params_memory, model->master_weights,
+    adamw_kernel3<<<num_blocks, block_size, 0, stream>>>((floatX*)model->params_memory, model->master_weights,
                                               (floatX*)model->grads_memory, model->m_memory, model->v_memory,
                                               model->num_parameters,
                                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
@@ -2586,6 +2592,11 @@ int main(int argc, char *argv[]) {
     cuda_threads_per_SM = deviceProp.maxThreadsPerMultiProcessor;
     cuda_arch_major = deviceProp.major;
     cuda_arch_minor = deviceProp.minor;
+
+    cudaCheck(cudaStreamCreate(&stream));
+    for (int i = 0; i < num_parallel_streams; i++) {
+        cudaCheck(cudaStreamCreate(&parallel_streams[i]));
+    }
 
     // set up cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
