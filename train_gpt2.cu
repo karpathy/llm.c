@@ -2874,8 +2874,8 @@ int main(int argc, char *argv[]) {
         printf0("step %4d/%d: train loss %f (acc %f) (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, accumulated_loss, time_elapsed_ms, tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
 
-        // disable the profiler after 10 steps of optimization
-        if (step == 10) { cudaProfilerStop(); }
+        // disable the profiler after 3 steps of optimization
+        if (step == 3) { cudaProfilerStop(); }
     }
     // add a total average, for optimizations that are only mild improvements (excluding 1st batch as warmup)
     printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);
