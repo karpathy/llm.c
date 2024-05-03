@@ -8,8 +8,7 @@ ifeq ($(NVCC),)
 		$(error nvcc not found.)
 endif
 
-# get GPU compute capability utility value
-ifeq ($(MAKELEVEL),0) # detect if we are in CI or not
+ifneq ($(CI),true) # if not in CI, then use the GPU query
 	GPU_COMPUTE_CAPABILITY = $(shell __nvcc_device_query) # assume if NVCC is present, then this likely is too
 endif
 
