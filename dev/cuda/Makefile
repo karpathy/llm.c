@@ -8,8 +8,16 @@ ifeq ($(NVCC),)
 		$(error nvcc not found.)
 endif
 
+# get GPU compute capability utility value
+GPU_COMPUTE_CAPABILITY = $(shell __nvcc_device_query) # assume if NVCC is present, then this likely is
+
 # Compiler flags
-CFLAGS = -O3 --use_fast_math
+ifeq ($(GPU_COMPUTE_CAPABILITY),) # set to defaults if: make GPU_COMPUTE_CAPABILITY= 
+	CFLAGS = -O3 --use_fast_math 
+else
+	CFLAGS = -O3 --use_fast_math --generate-code=arch=compute_$(GPU_COMPUTE_CAPABILITY),code=[compute_$(GPU_COMPUTE_CAPABILITY),sm_$(GPU_COMPUTE_CAPABILITY)]
+endif
+
 NVCCFLAGS = -lcublas -lcublasLt
 MPI_PATHS = -I/usr/lib/x86_64-linux-gnu/openmpi/include -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
 
