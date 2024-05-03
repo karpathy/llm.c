@@ -14,13 +14,13 @@ NCU = shutil.which("ncu")
 if NCU is None:
     NCU = "/usr/local/cuda/bin/ncu"
 
-# build the exe
-subprocess.check_call(["make", "profile_gpt2cu"])
+# build the executable
+subprocess.check_call(["make", "profile_gpt2cu", "NO_MULTI_GPU=1", "USE_CUDNN=1"])
 
 # record metrics
 # --full and --import-source are entirely superfluous for this script, but you might want to
 # manually inspect `profile.ncu-rep`, so we keep it here
-cmd = [NCU, "--set", "full", "--import-source", "yes", "-o", "profile", "-f", "./profile_gpt2cu"]
+cmd = ["sudo", NCU, "--set", "full", "--import-source", "yes", "-o", "profile", "-f", "./profile_gpt2cu"]
 subprocess.check_call(cmd)
 
 # generate csv
@@ -129,6 +129,9 @@ print("Kernel type summaries:")
 print(f"  {'name':<40} {'time':>6} {'frac':>6}")
 ordered = sorted(summaries.items(), key=lambda x: x[1], reverse=True)
 for entry, value in ordered:
+    # crop entry to be at most 40 characters
+    if len(entry) > 40:
+        entry = entry[:37] + "..."
     print(f"  {entry:<40} {value:6.2f} {100*value / total_time:6.2f}%")
 
 
