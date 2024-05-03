@@ -33,7 +33,6 @@ tri4
 #include <cooperative_groups/reduce.h>
 #include "common.h"
 
-static cublasHandle_t cublas_handle;
 static float* d_qkvr;   // scratch for the cublas kernel
 
 /*                    ** Chapter I - Introduction **
@@ -532,16 +531,12 @@ void trimul_gpu(int kernel_num,
 
 
 int main(int argc, char **argv) {
-    srand(0);
+    setup_main();
 
     int B = 8;
     int T = 1024;
     int C = 768;
     int NH = 12;
-
-    int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
-    cublasCreate(&cublas_handle);
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * NH * T * T * sizeof(float));
