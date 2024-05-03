@@ -125,6 +125,7 @@ for rid, row in kernel_profile_data:
         write *= N_LAYERS
         l2_read *= N_LAYERS
         l2_write *= N_LAYERS
+        inst *= N_LAYERS
 
     # split at "(" -- argument list
     fn_name = kernel.split("(")[0]
