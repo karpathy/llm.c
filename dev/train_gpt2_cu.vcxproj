@@ -64,7 +64,8 @@
       <Defines>ENABLE_BF16</Defines>
       <AdditionalCompilerOptions>
       </AdditionalCompilerOptions>
-      <AdditionalOptions>-std=c++20 -Xcompiler "/std:c++20"</AdditionalOptions>
+      <AdditionalOptions>
+      </AdditionalOptions>
       <FastMath>false</FastMath>
       <Optimization>O3</Optimization>
       <RuntimeChecks>Default</RuntimeChecks>
@@ -95,8 +96,8 @@
       <FastMath>true</FastMath>
       <Optimization>O3</Optimization>
       <Defines>ENABLE_BF16</Defines>
-      <AdditionalOptions>-std=c++20 -Xcompiler "/std:c++20" %(AdditionalOptions)</AdditionalOptions>
       <GPUDebugInfo>false</GPUDebugInfo>
+      <SplitCompile>MaxThreads</SplitCompile>
     </CudaCompile>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

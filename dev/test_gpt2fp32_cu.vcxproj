@@ -59,7 +59,6 @@
     <CudaCompile>
       <TargetMachinePlatform>64</TargetMachinePlatform>
       <Include>.</Include>
-      <AdditionalOptions>-std=c++20 -Xcompiler "/std:c++20" %(AdditionalOptions)</AdditionalOptions>
       <GPUDebugInfo>false</GPUDebugInfo>
     </CudaCompile>
   </ItemDefinitionGroup>
@@ -81,7 +80,6 @@
     <CudaCompile>
       <TargetMachinePlatform>64</TargetMachinePlatform>
       <Include>.</Include>
-      <AdditionalOptions>-std=c++20 -Xcompiler "/std:c++20" %(AdditionalOptions)</AdditionalOptions>
     </CudaCompile>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
