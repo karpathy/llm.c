@@ -27,8 +27,8 @@ mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 
 If you'd like to see train_gpt2.cu produce identical results to
 `python train_gpt2.py`, you can run it like this:
-make train_gpt2cu PRECISION=FP32
-./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -f 0
+make train_gpt2cu && ./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -f 0
+make train_gpt2cu PRECISION=FP32 && ./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -f 0
 This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 -a 1 is "overfit single batch", -x 10 is 10 iterations, and -f 0 disables tf32
 */
@@ -154,6 +154,7 @@ cublasLtHandle_t cublaslt_handle;
 int cuda_arch_major = 0;
 int cuda_arch_minor = 0;
 int cuda_num_SMs = 0; // for persistent threads where we want 1 threadblock per SM
+int cuda_threads_per_SM = 0;
 
 namespace cg = cooperative_groups;
 
@@ -1037,44 +1038,19 @@ __global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floa
     }
 }
 
-// this kernel performs a column-wise reduction over dout, in PyTorch equivalent to:
-// dbias = dout.sum((0,1))
-// the idea is to employ one block to reduce along several columns,
-// where each block has a width of 32 columns to ensure coalesced access.
-// at the end we accumulate the reductions performed by the warps in each block via shared memory
-__global__ void matmul_backward_bias_kernel4(floatX* dbias, const floatX* dout, int B, int T, int OC) {
-    // this kernel is launched with 1D grid_dim of OC/32
-    // for example let's say block_size is 128
-    extern __shared__ float smem[]; // of size block_size (128)
-    const int warp_id = threadIdx.x / warpSize; // warp index in the block, 0,1,2,3
-    const int lane_id = threadIdx.x % warpSize; // thread index in the warp, 0,1,2,...,31
-    const int tl = blockIdx.x * warpSize; // pointer to the start column for this block
-    const int vstep = blockDim.x / warpSize; // number of warps in a block, e.g. 4
-
-    // pointer to the start of the column for one lane of threads
-    // so e.g. 4 threads (of the same lane_id) will reduce this one column
-    const floatX* dout_col = dout + tl + lane_id;
-
-    // column reductions by looping through the rows
-    // each of the 4 threads offsets by its warp_id and then skips by vstep
-    // together these 4 threads cover all B*T rows of this (lane_id) column
-    // importantly, consecutive threads (in threadId) are processing adjacent columns,
-    // leading to a coalesced memory access pattern
-    float dout_sum = 0.0f;
-    for (int row = warp_id; row < B * T; row += vstep) {
-        dout_sum += (float)dout_col[row * OC];
+__global__ void matmul_backward_bias_kernel5(float* dbias, const floatX* dout, int B, int T, int OC) {
+    // note: this kernel reads in floatX, but it writes to float!
+    // this is because we're using atomics, which are super slow in < fp32 precision on < H100 GPUs
+    // so the trick is do fp32 atomics to a buffer, and then copy_and_cast the result to floatX
+    int oc = blockIdx.x * blockDim.x + threadIdx.x;
+    if(oc >= OC) return;
+    float sum = 0.0;
+    // grid-wide loop for maximum parallelism
+    for (int i = blockIdx.y; i < B * T; i += gridDim.y) {
+        sum += (float)dout[i * OC + oc];
     }
-    smem[lane_id + warp_id * warpSize] = dout_sum;
-    __syncthreads();
-
-    // warp_id 0 reduces the shared memory column-wise, linearly
-    dout_sum = 0.0f;
-    if (warp_id == 0) {
-        for (int j = 0; j < vstep; j++) {
-            dout_sum += smem[lane_id + j * warpSize];
-        }
-        dbias[tl + lane_id] = (floatX)dout_sum;
-    }
+    // and atomically add everything together. atomics within one block are conflict-free!
+    atomicAdd(dbias + oc, sum);
 }
 
 __global__ void layernorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
@@ -1366,6 +1342,12 @@ __global__ void copy_and_cast_kernel(float* dst, const floatX* src, size_t n) {
     if (i < n) { dst[i] = (float)src[i]; }
 }
 
+__global__ void cast_and_add_kernel(floatX* dst, const float* src, size_t n) {
+    // used only for matmul_backward_bias kernel, a little bit embarassing TODO delete later
+    const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { dst[i] += (floatX)src[i]; } // have to += because dbias is a paramater
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -1585,6 +1567,7 @@ void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const in
 
 void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
                      floatX* dout, floatX* inp, floatX* weight,
+                     float* dbias_buffer,
                      int B, int T, int C, int OC) {
     NVTX_RANGE_FN();
     float one = 1.0f;
@@ -1599,9 +1582,13 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
                              dweight, CUBLAS_LOWP, C, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     // backward to bias, if given, does a +=
     if (dbias != NULL) {
-        const int block_size = 1024;
-        const int grid_size = OC / 32; // for now, OC must be divisible by 32 for this kernel to work
-        matmul_backward_bias_kernel4<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
+        const int block_size = 128;
+        const int grid_size_x = CEIL_DIV(OC, block_size);
+        const int grid_size_y = max(1, cuda_threads_per_SM * cuda_num_SMs / block_size);
+        cudaMemset(dbias_buffer, 0, OC * sizeof(float));
+        matmul_backward_bias_kernel5<<<dim3(grid_size_x, grid_size_y), dim3(block_size)>>>(dbias_buffer, dout, B, T, OC);
+        cudaCheck(cudaGetLastError());
+        cast_and_add_kernel<<<CEIL_DIV(OC, 256), 256>>>(dbias, dbias_buffer, OC);
         cudaCheck(cudaGetLastError());
     }
 }
@@ -2212,14 +2199,14 @@ void gpt2_backward(GPT2 *model) {
     GradActTensors grads_acts = model->grads_acts;
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
-    float*  scratchF = (float*)acts.output;
+    float* scratchF = (float*)acts.output;
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // this was done in the fused classifier kernel as last step of forward pass
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, Vp);
+    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     floatX* dresidual = (floatX*)grads_acts.residual3; // the main buffer holding the gradient in the backward pass
@@ -2273,12 +2260,12 @@ void gpt2_backward(GPT2 *model) {
         floatX* dl_bt4c = (floatX*)grads_acts.bt4c;
 
         // backprop this layer
-        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
+        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C);
         gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C);
-        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, B, T, C, 4 * C);
+        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
-        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
+        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C);
 
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
@@ -2294,7 +2281,7 @@ void gpt2_backward(GPT2 *model) {
         #endif
 
         // QKV parameter gradients
-        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
+        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
@@ -2596,6 +2583,7 @@ int main(int argc, char *argv[]) {
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, multi_gpu_config.local_device_idx);
     cuda_num_SMs = deviceProp.multiProcessorCount;
+    cuda_threads_per_SM = deviceProp.maxThreadsPerMultiProcessor;
     cuda_arch_major = deviceProp.major;
     cuda_arch_minor = deviceProp.minor;
 
