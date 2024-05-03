@@ -45,7 +45,7 @@ jobs:
 # Install CUDA Toolkit - note the hardcoded version number. Only install certain packages.
     - name: Run Cuda executable
       run: |
-        Start-Process cuda_12.4.1_551.78_windows.exe -ArgumentList ' -s -n cudart_12.4 cuxxfilt_12.4 nvcc_12.4 nvfatbin_12.4 nvjitlink_12.4 nvrtc_12.4 nvrtc_dev_12.4 cublas_12.4 cublas_dev_12.4 visual_studio_integration_12.4 cuda-cupti-dev-12-4' -NoNewWindow -Wait
+        Start-Process cuda_12.4.1_551.78_windows.exe -ArgumentList ' -s -n cudart_12.4 cuxxfilt_12.4 nvcc_12.4 nvfatbin_12.4 nvjitlink_12.4 nvrtc_12.4 nvrtc_dev_12.4 cublas_12.4 cublas_dev_12.4 visual_studio_integration_12.4 cuda-cupti-dev-12.4' -NoNewWindow -Wait
 
 # Default installation path for CUDA Toolkit is C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4
     - name: Add Path
