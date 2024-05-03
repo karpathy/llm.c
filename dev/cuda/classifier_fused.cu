@@ -10,6 +10,7 @@ nvcc -O3 --use_fast_math classifier_fused.cu -o classifier_fused
 ./classifier_fused 1
 ./classifier_fused 2
 ./classifier_fused 3
+./classifier_fused 4
 */
 
 #include <stdio.h>
@@ -81,6 +82,25 @@ void crossentropy_softmax_backward_cpu(float* dlogits,
             }
         }
     }
+}
+
+// ----------------------------------------------------
+// Kernel Utils
+
+// warp-level reduction for summing values
+__device__ float warpReduceSum(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
+// warp-level reduction for finding the maximum value
+__device__ float warpReduceMax(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
+    }
+    return val;
 }
 
 // ----------------------------------------------------------------------------
@@ -362,6 +382,105 @@ __global__ void fused_classifier_kernel3(float* dlogits, float* losses, float* p
     }
 }
 
+__device__ SoftmaxParams prepare_softmax_blockwide2(int idx, const float* inp, int V, int P) {
+    // one row of inp, i.e. inp[idx, :] of shape (V,)
+
+    const float* x = inp + idx * P;
+    float thread_maxval = -INFINITY;
+    float thread_sumval = 0.0f;
+    // do the loop in reverse to maximise probability of L2 cache hits
+    // so even small L2s get some hits on the 2nd read of the same thread
+    for (int i = (V+3)/4 + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
+        f128 packed_x = load128cs(x + i * f128::size); // load and do not keep in cache
+        for(int k = 0; k < packed_x.size; ++k) {
+            if (i*4+k >= V) {  // bounds checking against real V
+                continue;
+            }
+            float v = (float)packed_x[k];
+            float old_maxval = thread_maxval;
+            thread_maxval = fmaxf(thread_maxval, v);
+            thread_sumval *= expf((old_maxval - thread_maxval));
+            thread_sumval += expf(v - thread_maxval);
+        }
+    }
+    // two reductions of up to 1024 threads:
+    // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
+    // this results in much cleaner assembly than a multi-warp cg::reduce
+    __shared__ float shared_maxval[32];
+    __shared__ float shared_sumval[32];
+    int num_warps = blockDim.x / 32;
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+
+    // reduce maxval within each warp
+    float warp_maxval = warpReduceMax(thread_maxval);
+    // thread 0 in each warp writes to shared memory
+    if (lane_id == 0) { shared_maxval[warp_id] = warp_maxval; }
+    __syncthreads();
+    // each thread now loads the maxval across previous warps
+    // if the thread is "out of range" of data, use -FLT_MAX as the maxval
+    warp_maxval = (lane_id < num_warps) ? shared_maxval[lane_id] : -FLT_MAX;
+    // now reduce the maxval among the warp threads
+    float block_maxval = warpReduceMax(warp_maxval);
+    // each thread uses maxval to scale sumval to avoid numerical instability / overflow
+    thread_sumval *= expf(thread_maxval - block_maxval);
+    // (warp-level) reduce sumval, thread 0 in each warp saves result in shared memory
+    float warp_sumval = warpReduceSum(thread_sumval); //cg::reduce(warp, thread_sumval, cg::plus<float>{});
+
+    if (lane_id == 0) { shared_sumval[warp_id] = warp_sumval; }
+    __syncthreads();
+    // same strategy, now reduce sumval across warps
+    warp_sumval = (lane_id < num_warps) ? shared_sumval[lane_id] : 0.0f;
+    float block_sumval = warpReduceSum(warp_sumval); //cg::reduce(warp, thread_sumval, cg::plus<float>{});
+    // return the softmax parameters
+    return SoftmaxParams{1.f / block_sumval, block_maxval};
+}
+
+// same as 2 but not using float4
+__global__ void fused_classifier_kernel4(float* dlogits, float* losses, float* probs,
+                                         const float* logits, const float* dlosses, const int* targets,
+                                         int B, int T, int V, int P) {
+    int idx = blockIdx.x;
+    int ix = targets[idx];
+
+    // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
+    SoftmaxParams sp = prepare_softmax_blockwide2(idx, logits, V, P);
+
+    // calculate the probability needed for the loss and update (single-threaded)
+    if(threadIdx.x == 0) {
+        float prob = expf(logits[idx * P + ix] - sp.Offset) * sp.Scale;
+        losses[idx] = -logf(prob);
+    }
+
+    // very sensible default for dlosses is 1/(B*T), which is the uniform loss
+    float dloss = dlosses != NULL ? dlosses[idx] : 1.0f / (B*T);
+    // calculate the gradients directly, saves bandwidth from probs during training
+    // but also supports writing probs for inference-only and debugging
+    const float* logits_vec = logits + idx * P;
+    for (int i = threadIdx.x; i < (V+f128::size-1)/f128::size; i += blockDim.x) {
+        // this is the 2nd read of logits after the one in prepare_softmax2
+        // this data will never be needed again, so we reduce cache persistence
+        f128 packed_logits_vec = load128cs(logits_vec + i * f128::size); // load and do not keep in cache
+        f128 packed_probs;
+        f128 packed_dlogits;
+        for(int k = 0; k < packed_logits_vec.size; ++k) {
+            int element = i*packed_logits_vec.size + k;
+            if (element >= V) {  // bounds checking against real V
+                continue;
+            }
+            float v = packed_logits_vec[k];
+            float prob = expf(v - sp.Offset) * sp.Scale;
+            packed_probs[k] = prob;
+            float indicator = (element == ix) ? 1.0f : 0.0f;
+            packed_dlogits[k] = (prob - indicator) * dloss;
+        }
+        store128(dlogits + idx * P + i * packed_logits_vec.size, packed_dlogits);
+        if (probs != NULL) {
+            store128(probs + idx * P + i * packed_logits_vec.size, packed_probs);
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -395,6 +514,15 @@ void fused_classifier3(float* dlogits, float* losses,
     cudaCheck(cudaGetLastError());
 }
 
+void fused_classifier4(float* dlogits, float* losses,
+                      const float* logits, const float* dlosses, const int* targets,
+                      int B, int T, int V, int P, int block_size) {
+    const int N = B * T;
+    const int grid_size = N;
+    fused_classifier_kernel4<<<grid_size, block_size>>>(dlogits, losses, NULL, logits, dlosses, targets, B, T, V, P);
+    cudaCheck(cudaGetLastError());
+}
+
 void fused_classifier(int kernel_num, float* dlogits, float* losses,
                       const float* logits, const float* dlosses, const int* targets,
                       int B, int T, int V, int P, int block_size) {
@@ -407,6 +535,9 @@ void fused_classifier(int kernel_num, float* dlogits, float* losses,
             break;
         case 3:
             fused_classifier3(dlogits, losses, logits, dlosses, targets, B, T, V, P, block_size);
+            break;
+        case 4:
+            fused_classifier4(dlogits, losses, logits, dlosses, targets, B, T, V, P, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
