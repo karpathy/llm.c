@@ -260,8 +260,13 @@ __device__ floatX warpReduceSum(floatX val) {
 }
 #endif
 
+// requires all 32 threads in the warp to be active, but should work for any block size
+// uses non-dynamic shared memory so every call increases shared memory requirements by 128 bytes
+// the fact it's unique shared memory allows us to avoid an extra __syncthreads() call at the end
+// but if called inside a loop, the shared memory will be implicitly reused, so set final_sync to 1
 using reduction_func_t = float (*) (float);
-__device__ float blockReduce(float val, reduction_func_t warp_reduction, bool final_sync=false) {
+template<reduction_func_t warp_reduction>
+__device__ float blockReduce(float val, bool final_sync=false, float out_of_bounds=0.0f) {
     // two reductions of up to 1024 threads:
     // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
     __shared__ float shared_val[32];
@@ -273,7 +278,7 @@ __device__ float blockReduce(float val, reduction_func_t warp_reduction, bool fi
     if (lane_id == 0) { shared_val[warp_id] = warp_val; }
     __syncthreads();
     // same strategy, now reduce across warps
-    warp_val = (lane_id < num_warps) ? shared_val[lane_id] : 0.0f;
+    warp_val = (lane_id < num_warps) ? shared_val[lane_id] : out_of_bounds;
     float block_val = warp_reduction(warp_val);
 
     if (final_sync) {
@@ -1236,7 +1241,7 @@ __global__ void softmax_autoregressive_backward_kernel(floatX* dpreatt, const fl
             local_sum += (float)att_bth[t2] * (float)datt_bth[t2];
         }
 
-        local_sum = blockReduce(local_sum, warpReduceSum);
+        local_sum = blockReduce<warpReduceSum>(local_sum);
 
         for (int t3 = threadIdx.x; t3 <= t; t3 += BlockSize) {
             // don't touch the cache. Some parts will still be here from the previous loop, and
@@ -1315,9 +1320,9 @@ __device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, i
     }
 
     // Block Max Reduction -> Maths -> Block Sum Reduction
-    float block_maxval = blockReduce(thread_maxval, warpReduceMax);
+    float block_maxval = blockReduce<warpReduceMax>(thread_maxval);
     thread_sumval *= expf(thread_maxval - block_maxval);
-    float block_sumval = blockReduce(thread_sumval, warpReduceSum);
+    float block_sumval = blockReduce<warpReduceSum>(thread_sumval);
 
     // return the softmax parameters
     return SoftmaxParams{1.f / block_sumval, block_maxval};
