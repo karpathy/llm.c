@@ -76,7 +76,7 @@ int main() {
     gpt2_forward(&model, x, y, B, T);
     gpt2_zero_grad(&model);
     gpt2_backward(&model);
-    gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, 1);
+    gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, 1, model.num_parameters, 0);
     cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
     // free
     gpt2_free(&model);
