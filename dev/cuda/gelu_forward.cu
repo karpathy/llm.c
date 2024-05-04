@@ -154,10 +154,10 @@ int IMPLEMENT_TEST(int kernel_num) {
         // and e.g. A100 40GB PCIe is advertised at 1,555GB/s
         long memory_ops = B * T * C * 2 * (int)sizeof(floatX);
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
-        float toks_per_sec = B * T / elapsed_time / 1e3;
+        float toks_per_msec = B * T / elapsed_time / 1e3;
 
         printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s | elements: %.2f ktok/ms\n",
-               block_size, elapsed_time, memory_bandwidth, toks_per_sec);
+               block_size, elapsed_time, memory_bandwidth, toks_per_msec);
     }
 
     // free memory
