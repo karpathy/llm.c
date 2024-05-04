@@ -21,22 +21,6 @@ version 2 is bfloat16 with the Packed128 data structure
 #include <cuda_runtime.h>
 #include "common.h"
 
-// turn on bf16 as default, done up here for now
-#define ENABLE_BF16
-
-#if defined(ENABLE_BF16)
-typedef __nv_bfloat16 floatX;
-typedef __nv_bfloat16 floatN;
-#elif defined(ENABLE_FP16)
-typedef half floatX;
-typedef half floatN;
-#else
-typedef float floatX;
-typedef float floatN;
-#endif
-
-typedef Packed128<floatX> x128;
-
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -53,26 +37,30 @@ void gelu_forward_cpu(float* out, const float* inp, int N) {
 // ----------------------------------------------------------------------------
 // GPU kernels
 
-// elementwise ops are nice and ez
-__global__ void gelu_forward_kernel1(floatX* out, const floatX* inp, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < N) {
-        float xi = inp[i];
-        float cube = 0.044715f * xi * xi * xi;
-        out[i] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
-    }
+__device__  float gelu(float x)  {
+    float cube = 0.044715f * x * x * x;
+    return 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
 }
 
 // elementwise ops are nice and ez
+template<typename floatX>
+__global__ void gelu_forward_kernel1(floatX* out, const floatX* inp, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        out[i] = gelu(inp[i]);
+    }
+}
+
+// vectorized load and store
+template<typename floatX>
 __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
+    using x128 = Packed128<floatX>;
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     if (i < N) {
         x128 packed_out;
         x128 packed_inp = load128cs(inp + i); // load and do not keep in cache
         for(int k = 0; k < packed_inp.size; ++k) {
-            float xi = (float)packed_inp[k];
-            float cube = 0.044715f * xi * xi * xi;
-            packed_out[k] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
+            packed_out[k] = gelu(packed_inp[k]);
         }
         // store instead of storecs (without cache streaming) in case it is useful for the
         // data to be in the cache for the next operation after this GeLU
@@ -83,19 +71,22 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
 // ----------------------------------------------------------------------------
 // kernel launcher
 
+template<typename floatX>
 void gelu_forward1(floatX* out, const floatX* inp, int N, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
     gelu_forward_kernel1<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
 
+template<typename floatX>
 void gelu_forward2(floatX* out, const floatX* inp, int N, const int block_size) {
-    const int grid_size = ceil_div(N, block_size * x128::size);
+    const int grid_size = ceil_div(N, block_size * Packed128<floatX>::size);
     gelu_forward_kernel2<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
 
 // kernel version dispatch
+template<typename floatX>
 void gelu_forward(int kernel_num,
                   floatX* out,
                   const floatX* inp,
@@ -116,9 +107,9 @@ void gelu_forward(int kernel_num,
 
 // ----------------------------------------------------------------------------
 
-int main(int argc, const char **argv) {
-    setup_main();
+DECLARE_TEST(gelu_forward);
 
+int IMPLEMENT_TEST(int kernel_num) {
     int B = 8;
     int T = 1024;
     int C = 768;
@@ -126,13 +117,6 @@ int main(int argc, const char **argv) {
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * C * sizeof(float));
     float* inp = make_random_float(B * T * C);
-
-    // read kernel_num from command line
-    int kernel_num = 1;
-    if (argc > 1) {
-        kernel_num = atoi(argv[1]);
-    }
-    printf("Using kernel %d\n", kernel_num);
 
     // first check the correctness of the kernel
     gelu_forward_cpu(out, inp, B * T * C);
@@ -150,11 +134,7 @@ int main(int argc, const char **argv) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
         gelu_forward(kernel_num, d_out, d_inp, B, T, C, block_size);
-#if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
-        float tol = 1e-5;
-#else
-        float tol = 1e-2f;
-#endif
+        float tol = std::is_same_v<floatX, float> ? 1e-5 : 1e-2;
         validate_result(d_out, out, "out", B * T * C, tol);
     }
 
@@ -174,8 +154,10 @@ int main(int argc, const char **argv) {
         // and e.g. A100 40GB PCIe is advertised at 1,555GB/s
         long memory_ops = B * T * C * 2 * (int)sizeof(floatX);
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
+        float toks_per_sec = B * T / elapsed_time / 1e3;
 
-        printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
+        printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s | elements: %.2f ktok/ms\n",
+               block_size, elapsed_time, memory_bandwidth, toks_per_sec);
     }
 
     // free memory
