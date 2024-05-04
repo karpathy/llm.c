@@ -106,10 +106,8 @@ int main(int argc, char *argv[]) {
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
-
-    #ifdef ENABLE_CUDNN
-    checkCudnnErr(cudnnCreate(&cudnn_handle));
-    #endif
+    // set up cuDNN (noop if not available)
+    create_cudnn();
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
@@ -326,10 +324,7 @@ int main(int argc, char *argv[]) {
     free(grads_memory_cpu);
     free(grads_memory_cpu_float);
     gpt2_free(&model);
-    #ifdef ENABLE_CUDNN
-    if (cudnn_workspace != NULL) { cudaCheck(cudaFree(cudnn_workspace)); }
-    checkCudnnErr(cudnnDestroy(cudnn_handle));
-    #endif
+    destroy_cudnn();
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));

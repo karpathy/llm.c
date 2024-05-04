@@ -203,14 +203,14 @@ train_gpt2cu: train_gpt2.cu cudnn_att.o
 train_gpt2fp32cu: train_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
-test_gpt2cu: test_gpt2.cu
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+test_gpt2cu: test_gpt2.cu cudnn_att.o
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE) cudnn_att.o
 
 test_gpt2fp32cu: test_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
-profile_gpt2cu: profile_gpt2.cu
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE)
+profile_gpt2cu: profile_gpt2.cu cudnn_att.o
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE) cudnn_att.o
 
 clean:
 	$(REMOVE_FILES) $(TARGETS)

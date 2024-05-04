@@ -49,9 +49,7 @@ int main() {
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
     // setup the (global) cuBLASLt workspace
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
-    #ifdef ENABLE_CUDNN
-    checkCudnnErr(cudnnCreate(&cudnn_handle));
-    #endif
+    create_cudnn();
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
@@ -81,10 +79,7 @@ int main() {
 
     // free
     gpt2_free(&model);
-    #ifdef ENABLE_CUDNN
-    if (cudnn_workspace != NULL) { cudaCheck(cudaFree(cudnn_workspace)); }
-    checkCudnnErr(cudnnDestroy(cudnn_handle));
-    #endif
+    destroy_cudnn();
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
