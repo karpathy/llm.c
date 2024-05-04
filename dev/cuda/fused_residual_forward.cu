@@ -395,8 +395,9 @@ __global__ void fused_residual_forward_kernel6(floatX* residual, floatX* normed,
     // the block-level reductions will cause sync before the first time we read these
     // => no syncthreads needed here
 
+
     // loop over all tokens
-    for(int tidx = blockIdx.x * blockDim.z + blockIdx.z; tidx < N; tidx += gridDim.x * blockDim.z) {
+    for(int tidx = blockIdx.x * blockDim.z + threadIdx.z; tidx < N; tidx += gridDim.x * blockDim.z) {
         // adjust pointers to current token
         floatX* residual_bt = residual + C * tidx;
         floatX* normed_bt = normed + C * tidx;
@@ -542,7 +543,7 @@ void fused_residual_forward6(floatX* residual, floatX* normed, floatX* mean, flo
                              const floatX* inp1, const floatX* inp2,
                              const floatX* weight, const floatX* bias,
                              int N, int C, const int block_size) {
-    int warps_per_token = max(1, C / Packed128<floatX>::size / 32 / 2);
+    int warps_per_token = max(1, C / Packed128<floatX>::size / 32);
     int total_warps = block_size / 32;
     int block_z = max(1, total_warps / warps_per_token);
     int block_y = max(1, total_warps / block_z);
@@ -647,6 +648,7 @@ int IMPLEMENT_TEST(int kernel_num) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
+        cudaCheck(cudaMemset(d_residual, 0, B * T * C * sizeof(floatX)));
         fused_residual_forward(kernel_num, d_residual, d_normed, d_mean, d_rstd, d_inp1, d_inp2, d_weight, d_bias,
                                B*T, C, block_size);
         float tol = std::is_same_v<floatX, float> ? 1e-5 : 5e-2;
