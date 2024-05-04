@@ -1582,7 +1582,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
                              dweight, CUBLAS_LOWP, C, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     // backward to bias, if given, does a +=
     if (dbias != NULL) {
-        const int block_size = 128;
+        const int block_size = 1024;
         const int grid_size_x = CEIL_DIV(OC, block_size);
         const int grid_size_y = max(1, cuda_threads_per_SM * cuda_num_SMs / block_size);
         cudaMemset(dbias_buffer, 0, OC * sizeof(float));
