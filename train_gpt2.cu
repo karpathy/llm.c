@@ -1388,10 +1388,11 @@ void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
 // https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtSgemm/sample_cublasLt_LtSgemm.cu
 void matmul_forward_cublaslt(floatX* out,
-                     floatX* inp, floatX* weight, floatX* bias,
+                     floatX* inp, floatX* weight, floatX* bias, floatX* post_gelu,
                      int B, int T, int C, int OC) {
     NVTX_RANGE_FN();
-    int has_bias = (bias != NULL);
+    bool has_bias = (bias != NULL);
+    bool has_gelu = (post_gelu != NULL);
 
     // check bias alignment
     if(((uintptr_t)bias % 16) != 0) {
@@ -1419,17 +1420,24 @@ void matmul_forward_cublaslt(floatX* out,
     // create the operation descriptor
     cublasOperation_t opNoTranspose = CUBLAS_OP_N;
     cublasOperation_t opTranspose = CUBLAS_OP_T;
-    cublasLtEpilogue_t epilogueBias = CUBLASLT_EPILOGUE_BIAS;
+    cublasLtEpilogue_t epilogue;
 
     cudaDataType_t scale_type = (CUBLAS_LOWP_COMPUTE == CUBLAS_COMPUTE_16F) ? CUDA_R_16F : CUDA_R_32F;
     cublasCheck(cublasLtMatmulDescCreate(&operationDesc, CUBLAS_LOWP_COMPUTE, scale_type));
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opNoTranspose, sizeof(opNoTranspose)));
-    if(has_bias) {
-        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias,
-                                                   sizeof(epilogueBias)));
+
+    if (has_gelu) {
+        int64_t gelu_ld = OC;
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD, &gelu_ld, sizeof(gelu_ld)));
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER, &out, sizeof(out)));
+        out = post_gelu; // AUX is the pre-GELU output,
+
+        epilogue = has_bias ? CUBLASLT_EPILOGUE_GELU_AUX_BIAS : CUBLASLT_EPILOGUE_GELU_AUX;
+    } else {
+        epilogue = has_bias ? CUBLASLT_EPILOGUE_BIAS : CUBLASLT_EPILOGUE_DEFAULT;
     }
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
 
     // define matrix layouts
     cublasCheck(cublasLtMatrixLayoutCreate(&weightLayout, CUBLAS_LOWP, C, OC, C));
@@ -1546,14 +1554,6 @@ void residual_forward(floatX* out, floatX* inp1, floatX* inp2, int N) {
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
     residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2, N);
-    cudaCheck(cudaGetLastError());
-}
-
-void gelu_forward(floatX* out, const floatX* inp, int N) {
-    NVTX_RANGE_FN();
-    const int block_size = 512;
-    const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_forward_kernel2<<<grid_size, block_size>>>(out, inp, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2114,22 +2114,21 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         floatX* scratch = (floatX*)acts.output;
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, NULL, B, T, C, 3*C);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
         #endif
 
-        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, NULL, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
-        gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, l_fch_gelu, B, T, C, 4*C);
+        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, NULL, B, T, 4*C, C);
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, NULL, B, T, C, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
