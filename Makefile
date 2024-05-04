@@ -18,6 +18,7 @@ NVCC_LDFLAGS = -lcublas -lcublasLt
 NVCC_INCLUDES =
 NVCC_LDLIBS =
 NCLL_INCUDES =
+NVCC_CUDNN =
 # overridable flag for multi-GPU training. by default we won't build with cudnn
 # because it bloats up the compile time from a few seconds to ~minute
 USE_CUDNN ?= 0
@@ -81,6 +82,7 @@ ifeq ($(USE_CUDNN), 1)
       NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
       NVCC_LDFLAGS += -lcudnn
       NVCC_FLAGS += -DENABLE_CUDNN
+      NVCC_CUDNN = cudnn_att.o
     else
       $(error ✗ cuDNN not found. See the Makefile for our currently hard-coded paths / install instructions)
     endif
@@ -197,20 +199,20 @@ test_gpt2: test_gpt2.c
 cudnn_att.o: cudnn_att.cu
 	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)
 
-train_gpt2cu: train_gpt2.cu cudnn_att.o
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE) cudnn_att.o
+train_gpt2cu: train_gpt2.cu $(NVCC_CUDNN)
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE) $(NVCC_CUDNN)
 
 train_gpt2fp32cu: train_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
-test_gpt2cu: test_gpt2.cu cudnn_att.o
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE) cudnn_att.o
+test_gpt2cu: test_gpt2.cu $(NVCC_CUDNN)
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE) $(NVCC_CUDNN)
 
 test_gpt2fp32cu: test_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
-profile_gpt2cu: profile_gpt2.cu cudnn_att.o
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE) cudnn_att.o
+profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE) $(NVCC_CUDNN)
 
 clean:
 	$(REMOVE_FILES) $(TARGETS)
