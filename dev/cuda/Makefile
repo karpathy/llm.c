@@ -29,6 +29,7 @@ encoder_forward: encoder_forward.cu
 gelu_backward: gelu_backward.cu
 gelu_forward: gelu_forward.cu
 layernorm_forward: layernorm_forward.cu
+fused_residual_forward: fused_residual_forward.cu
 residual_forward: residual_forward.cu
 softmax_forward: softmax_forward.cu
 trimat_forward: trimat_forward.cu
