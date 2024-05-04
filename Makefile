@@ -211,7 +211,7 @@ test_gpt2fp32cu: test_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) $(CUDA_OUTPUT_FILE)
 
 profile_gpt2cu: profile_gpt2.cu
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $< $(NVCC_LDFLAGS) $(CUDA_OUTPUT_FILE)
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) $(CUDA_OUTPUT_FILE)
 
 train_gpt2cl: train_gpt2cl.c
 	$(CC) $(CFLAGS) $(CLCFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) $(CLLDFLAGS) $(OUTPUT_FILE)
