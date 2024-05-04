@@ -57,25 +57,35 @@ static size_t cudnn_workspace_size = 0; // dynamically allocated as needed (up t
 static void* cudnn_workspace = NULL;
 #define checkCudnnErr(err) assert((int)err == 0);
 
+static void checkCudnnFE(fe::error_object e, const char *file, int line) {
+    if(!e.is_good()) {
+        printf("[CUDNN ERROR] at file %s:%d:\n%s\n", file, line, e.err_msg.c_str());
+        exit(EXIT_FAILURE);
+    }
+}
+#define checkCudnnFE(err) checkCudnnFE(err, __FILE__, __LINE__)
+
 using graph_tensors_fwd = std::tuple<std::shared_ptr<fe::graph::Graph>,
-std::shared_ptr<fe::graph::Tensor_attributes>,  // Q,
-std::shared_ptr<fe::graph::Tensor_attributes>,  // K,
-std::shared_ptr<fe::graph::Tensor_attributes>,  // V,
-std::shared_ptr<fe::graph::Tensor_attributes>,  // Attn_scale,
-std::shared_ptr<fe::graph::Tensor_attributes>,  // O
-std::shared_ptr<fe::graph::Tensor_attributes>>; // Stats
+    std::shared_ptr<fe::graph::Tensor_attributes>,  // Q,
+    std::shared_ptr<fe::graph::Tensor_attributes>,  // K,
+    std::shared_ptr<fe::graph::Tensor_attributes>,  // V,
+    std::shared_ptr<fe::graph::Tensor_attributes>,  // Attn_scale,
+    std::shared_ptr<fe::graph::Tensor_attributes>,  // O
+    std::shared_ptr<fe::graph::Tensor_attributes> // Stats
+>;
 
 using graph_tensors_bwd = std::tuple<std::shared_ptr<fe::graph::Graph>,
-std::shared_ptr<fe::graph::Tensor_attributes>,  // Q,
-std::shared_ptr<fe::graph::Tensor_attributes>,  // K,
-std::shared_ptr<fe::graph::Tensor_attributes>,  // V,
-std::shared_ptr<fe::graph::Tensor_attributes>,  // O
-std::shared_ptr<fe::graph::Tensor_attributes>,  // dO
-std::shared_ptr<fe::graph::Tensor_attributes>,  // Stats
-std::shared_ptr<fe::graph::Tensor_attributes>,  // Attn_scale,
-std::shared_ptr<fe::graph::Tensor_attributes>,  // dQ,
-std::shared_ptr<fe::graph::Tensor_attributes>,  // dK,
-std::shared_ptr<fe::graph::Tensor_attributes>>; // dV
+    std::shared_ptr<fe::graph::Tensor_attributes>,  // Q,
+    std::shared_ptr<fe::graph::Tensor_attributes>,  // K,
+    std::shared_ptr<fe::graph::Tensor_attributes>,  // V,
+    std::shared_ptr<fe::graph::Tensor_attributes>,  // O
+    std::shared_ptr<fe::graph::Tensor_attributes>,  // dO
+    std::shared_ptr<fe::graph::Tensor_attributes>,  // Stats
+    std::shared_ptr<fe::graph::Tensor_attributes>,  // Attn_scale,
+    std::shared_ptr<fe::graph::Tensor_attributes>,  // dQ,
+    std::shared_ptr<fe::graph::Tensor_attributes>,  // dK,
+    std::shared_ptr<fe::graph::Tensor_attributes> // dV
+>;
 
 // Need a cache because graph->build_operation_graph() is slow but everything else seems fast
 using cache_type_fwd = std::unordered_map<std::size_t, graph_tensors_fwd>;
@@ -130,7 +140,7 @@ auto lookup_cache_or_build_graph_fwd(Args... args) {
             .set_stride({H * T, T, 1, 1});
     }
 
-    assert(graph->validate().is_good());
+    checkCudnnFE(graph->validate());
     auto key = graph->key();
     auto it = user_maintained_cache_fwd.find(key);
     if (it != user_maintained_cache_fwd.end()) {
@@ -138,10 +148,10 @@ auto lookup_cache_or_build_graph_fwd(Args... args) {
     }
 
     // Build the operation graph and execution part (this is the VERY SLOW PART)
-    assert(graph->build_operation_graph(cudnn_handle).is_good());
+    checkCudnnFE(graph->build_operation_graph(cudnn_handle));
     auto plans = graph->create_execution_plans({fe::HeurMode_t::A});
-    assert(graph->check_support(cudnn_handle).is_good());
-    assert(graph->build_plans(cudnn_handle).is_good());
+    checkCudnnFE(graph->check_support(cudnn_handle));
+    checkCudnnFE(graph->build_plans(cudnn_handle));
 
     auto tuple = std::make_tuple(graph, Q, K, V, attn_scale, O, stats);
     user_maintained_cache_fwd.insert({key, tuple});
@@ -204,7 +214,7 @@ auto lookup_cache_or_build_graph_bwd(Args... args) {
     dK->set_output(true).set_dim({B, NH, T, HS}).set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1});
     dV->set_output(true).set_dim({B, NH, T, HS}).set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1});
 
-    assert(graph->validate().is_good());
+    checkCudnnFE(graph->validate());
     auto key = graph->key();
     auto it = user_maintained_cache_bwd.find(key);
     if (it != user_maintained_cache_bwd.end()) {
@@ -212,10 +222,10 @@ auto lookup_cache_or_build_graph_bwd(Args... args) {
     }
 
     // Build the operation graph and execution part (this is the VERY SLOW PART)
-    assert(graph->build_operation_graph(cudnn_handle).is_good());
+    checkCudnnFE(graph->build_operation_graph(cudnn_handle));
     auto plans = graph->create_execution_plans({fe::HeurMode_t::A});
-    assert(graph->check_support(cudnn_handle).is_good());
-    assert(graph->build_plans(cudnn_handle).is_good());
+    checkCudnnFE(graph->check_support(cudnn_handle));
+    checkCudnnFE(graph->build_plans(cudnn_handle));
 
     auto tuple = std::make_tuple(graph, Q, K, V, O, dO, stats, attn_scale, dQ, dK, dV);
     user_maintained_cache_bwd.insert({key, tuple});
@@ -261,7 +271,7 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
     }
 
     // Execute graph
-    assert(graph->execute(cudnn_handle, variant_pack, cudnn_workspace).is_good());
+    checkCudnnFE(graph->execute(cudnn_handle, variant_pack, cudnn_workspace));
     cudaCheck(cudaGetLastError());
 }
 
@@ -305,7 +315,7 @@ void attention_backward_cudnn(floatX* dqkvr,                                    
     }
 
     // Execute graph
-    assert(graph->execute(cudnn_handle, variant_pack, cudnn_workspace).is_good());
+    checkCudnnFE(graph->execute(cudnn_handle, variant_pack, cudnn_workspace));
     cudaCheck(cudaGetLastError());
 }
 
