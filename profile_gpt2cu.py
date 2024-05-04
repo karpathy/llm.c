@@ -31,7 +31,7 @@ metrics = [
     "dram__bytes_write.sum",                    # DRAM writes
     "lts__t_sectors_srcunit_tex_op_read.sum",   # L2 reads (sectors -- 32B)
     "lts__t_sectors_srcunit_tex_op_write.sum",  # L2 reads (sectors -- 32B)
-    "sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_active", # todo - tensor core %
+    "smsp__inst_executed.sum",                   # instructions
 ]
 cmd = [NCU, "-i", "profile.ncu-rep", "--csv", "--page", "raw", "--metrics", ",".join(metrics)]
 result = subprocess.check_output(cmd, text=True).strip()
@@ -55,11 +55,11 @@ print("Kernel calls:")
 for rid, row in enumerate(reader):
     if rid == 0:
         #  headings
-        print(f"id pass {'name':<70} {'time':>8} {'RAM BW':>8} {'RAM rd':>8} {'RAM wt':>8} {'L2 rd':>8} {'L2 wt':>8} {'inst':>8}")
+        print(f"id pass {'name':<40} {'time':>8} {'RAM rd':>8} {'RAM wt':>8} {'L2 rd':>8} {'L2 wt':>8} {'inst':>8}")
         continue
     if rid == 1:
         # units
-        units = f"        {'':<70} {'ms':>8} {'GB/s':>8} {'GiB':>8} {'GiB':>8} {'GiB':>8} {'GiB':>8} {'MInst':>8}"
+        units = f"        {'':<40} {'ms':>8} {'GiB':>8} {'GiB':>8} {'GiB':>8} {'GiB':>8} {'MInst':>8}"
         print(units)
         print("." * len(units))
         continue
@@ -74,7 +74,7 @@ for rid, row in enumerate(reader):
     write = float(row[12])
     l2_read = float(row[14])
     l2_write = float(row[15])
-    inst = float(row[16])
+    inst = float(row[16]) / 1e6
 
     kid = rid - 2
 
@@ -118,21 +118,18 @@ for rid, row in enumerate(reader):
     total['l2_write'] += l2_write
     total['inst'] += inst
 
-    dram_bw = (read + write) / (time / 1000.0);
-
-    print(f"{kid:02} {pass_name:4} {fn_name:<70} {time:8.2f} {dram_bw:8.1f} {read:8.2f} {write:8.2f} {l2_read:8.2f} {l2_write:8.2f} {inst:8.2f}")
+    print(f"{kid:02} {pass_name:4} {fn_name:<40} {time:8.2f} {read:8.2f} {write:8.2f} {l2_read:8.2f} {l2_write:8.2f} {inst:8.2f}")
 
 total_time = total['time']
-total_dram_bw = (total['read'] + total['write']) / (total_time / 1000.0);
 print("." * len(units))
-print(f"        {'Total':<70} {total['time']:8.2f} {total_dram_bw:8.1f} {total['read']:8.2f} {total['write']:8.2f} {total['l2_read']:8.2f} {total['l2_write']:8.2f} {total['inst']:8.2f}")
+print(f"        {'Total':<40} {total['time']:8.2f} {total['read']:8.2f} {total['write']:8.2f} {total['l2_read']:8.2f} {total['l2_write']:8.2f} {total['inst']:8.2f}")
 
 print()
 print("Kernel type summaries:")
-print(f"  {'name':<70} {'time':>6} {'frac':>6}")
+print(f"  {'name':<40} {'time':>6} {'frac':>6}")
 ordered = sorted(summaries.items(), key=lambda x: x[1], reverse=True)
 for entry, value in ordered:
-    print(f"  {entry:<70} {value:6.2f} {100*value / total_time:6.2f}%")
+    print(f"  {entry:<40} {value:6.2f} {100*value / total_time:6.2f}%")
 
 
 ts = total_time / 1000
