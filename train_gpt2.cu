@@ -1626,20 +1626,11 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
 
         assert((OC % OC_per_warp) == 0); // there is no bounds checking in the kernel to maximise performance
 
-        // Run the memset on a parallel stream then immediately wait on it (runs in parallel with previous kernel)
-        cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float), parallel_streams[0]);
-        cudaEventRecord(parallel_events[0], parallel_streams[0]);
-        cudaStreamWaitEvent(main_stream, parallel_events[0], 0);
-
+        cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float), main_stream);
         matmul_backward_bias_kernel6<<<dim3(grid_size_x, grid_size_y),
                                        dim3(block_size_x, block_size_y),
                                        OC_per_warp * sizeof(float), main_stream>>>(dbias_buffer, dout, B, T, OC);
-        cudaEventRecord(main_event, main_stream);
-        cudaStreamWaitEvent(parallel_streams[0], main_event, 0); // cast_and_add_kernel is dependent on this
-
-        // run cast_and_add kernel on separate stream so it can run in parallel with the matmuls
-        cast_and_add_kernel<<<CEIL_DIV(OC, 256), 256, 0, parallel_streams[0]>>>(dbias, dbias_buffer, OC);
-        cudaEventRecord(parallel_events[0], parallel_streams[0]);
+        cast_and_add_kernel<<<CEIL_DIV(OC, 256), 256, 0, main_stream>>>(dbias, dbias_buffer, OC);
         cudaCheck(cudaGetLastError());
     }
 
@@ -1651,11 +1642,6 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
     cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &one,
                              inp, CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &one,
                              dweight, CUBLAS_LOWP, C, CUBLAS_LOWP_COMPUTE, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-
-    if (dbias != NULL) {
-        // make sure cast_and_add_kernel is done (hopefully finished in parallel with the matmuls)
-        cudaStreamWaitEvent(main_stream, parallel_events[0], 0);
-    }
 }
 
 void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
@@ -1666,16 +1652,10 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     const int grid_size = 1 * cuda_num_SMs;
     size_t shared_mem_size = (2 * C + 1) * sizeof(float);
 
-    cudaMemsetAsync(scratch, 0, (2 * C + 1) * sizeof(float), parallel_streams[0]);
-    cudaEventRecord(parallel_events[0], parallel_streams[0]);
-    cudaStreamWaitEvent(main_stream, parallel_events[0], 0); // cast_and_add_kernel is dependent on this
+    cudaMemsetAsync(scratch, 0, (2 * C + 1) * sizeof(float), main_stream);
 
     layernorm_backward_kernel7<<<grid_size, block_size, shared_mem_size, main_stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
-
-    // create a dependency between this kernel and future uses of the scratch buffer (e.g. in matmul_backward)
-    cudaEventRecord(main_event, main_stream);
-    cudaStreamWaitEvent(parallel_streams[0], main_event, 0); // cast_and_add_kernel is dependent on this
 }
 
 // the sequence of transformations in this compound op is:
@@ -2129,8 +2109,10 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     }
 
     // copy inputs/targets to the model
-    cudaCheck(cudaMemcpyAsync(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice, main_stream));
+    // todo - inputs is copied on default stream so this synchronises CPU/GPU for now
+    cudaCheck(cudaMemcpyAsync(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice, 0));
     if (targets != NULL) {
+        // memcpy targets in parallel then wait for them before fused_classifier
         cudaCheck(cudaMemcpyAsync(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice, parallel_streams[0]));
         cudaEventRecord(parallel_events[0], parallel_streams[0]);
     }
@@ -2208,7 +2190,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         NvtxRange classifier_and_loss_range("classifier_and_loss");
-        // wait on memcpy of targets (it definitely finished by now, but better safe than sorry)
+        // wait on memcpy of targets (definitely finished by now, but better safe than sorry)
         cudaStreamWaitEvent(main_stream, parallel_events[0], 0);
         // fused classifier: does the forward pass and first part of the backward pass
         // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
@@ -2283,9 +2265,6 @@ void gpt2_backward(GPT2 *model) {
     // allow the memset to run in parallel with the forward pass, but create a dependency with everything after
     cudaEventRecord(parallel_events[0], parallel_streams[0]);
     cudaStreamWaitEvent(main_stream, parallel_events[0], 0);
-    // synchronise the other way around as well to avoid read-after-write hazards for the scratch buffer
-    cudaEventRecord(main_event, main_stream);
-    cudaStreamWaitEvent(parallel_streams[0], main_event, 0); // cast_and_add_kernel is dependent on this
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
     float* scratchF = (float*)acts.output;
