@@ -140,9 +140,9 @@ int IMPLEMENT_TEST(int kernel_num) {
                                               );
 
         // napkin math: estimate the memory bandwidth achieved
-        // for each (B,T,C) output element, we do 2 read and 1 write, 4 bytes each
+        // for each (B,T,C) output element, we do 2 read and 1 write
         // and e.g. A100 40GB PCIe is advertised at 1,555GB/s
-        long memory_ops = B * T * C * 3 * 4;
+        long memory_ops = B * T * C * 3 * sizeof(floatX);
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
         float toks_per_msec = B * T / elapsed_time / 1e3;
 

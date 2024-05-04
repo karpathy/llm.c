@@ -20,22 +20,6 @@ version 3 is like version 2 but uses float4 reads/writes
 #include "common.h"
 #include <cassert>
 
-// turn on bf16 as default, done up here for now
-#define ENABLE_BF16
-
-#if defined(ENABLE_BF16)
-typedef __nv_bfloat16 floatX;
-typedef __nv_bfloat16 floatN;
-#elif defined(ENABLE_FP16)
-typedef half floatX;
-typedef half floatN;
-#else
-typedef float floatX;
-typedef float floatN;
-#endif
-
-typedef Packed128<floatX> x128;
-
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -60,6 +44,7 @@ void encoder_forward_cpu(float* out,
 // GPU kernels
 
 // naive implementation into kernel, parallelize over B,T, loop over C
+template<typename floatX>
 __global__ void encoder_forward_kernel1(floatX* out,
                                const int* inp, const floatX* wte, const floatX* wpe,
                                int B, int T, int C) {
@@ -80,6 +65,7 @@ __global__ void encoder_forward_kernel1(floatX* out,
 }
 
 // optimized implementation: parallelize over all of B,T,C
+template<typename floatX>
 __global__ void encoder_forward_kernel2(floatX* out,
                                const int* inp, const floatX* wte, const floatX* wpe,
                                int B, int T, int C) {
@@ -101,9 +87,11 @@ __global__ void encoder_forward_kernel2(floatX* out,
     }
 }
 
+template<typename floatX>
 __global__ void encoder_forward_kernel3(floatX* out,
                                const int* inp, const floatX* wte, const floatX* wpe,
                                int B, int T, int C) {
+    using x128 = Packed128<floatX>;
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     int N = B * T * C;
     if (idx < N) {
@@ -132,6 +120,7 @@ __global__ void encoder_forward_kernel3(floatX* out,
 // ----------------------------------------------------------------------------
 // kernel launcher
 
+template<typename floatX>
 void encoder_forward1(floatX* out,
                      const int* inp, const floatX* wte, const floatX* wpe,
                      int B, int T, int C,
@@ -142,6 +131,7 @@ void encoder_forward1(floatX* out,
     cudaCheck(cudaGetLastError());
 }
 
+template<typename floatX>
 void encoder_forward2(floatX* out,
                      const int* inp, const floatX* wte, const floatX* wpe,
                      int B, int T, int C,
@@ -152,17 +142,19 @@ void encoder_forward2(floatX* out,
     cudaCheck(cudaGetLastError());
 }
 
+template<typename floatX>
 void encoder_forward3(floatX* out,
                      const int* inp, const floatX* wte, const floatX* wpe,
                      int B, int T, int C,
                      const int block_size) {
     const int N = B * T * C;
-    const int grid_size = ceil_div(N, (int)(block_size * x128::size));
+    const int grid_size = ceil_div(N, (int)(block_size * Packed128<floatX>::size));
     encoder_forward_kernel3<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
 // kernel version dispatch
+template<typename floatX>
 void encoder_forward(int kernel_num,
                      floatX* out,
                      const int* inp, const floatX* wte, const floatX* wpe,
@@ -186,16 +178,13 @@ void encoder_forward(int kernel_num,
 
 // ----------------------------------------------------------------------------
 
-int main(int argc, char **argv) {
-    setup_main();
+DECLARE_TEST(encoder_forward);
 
+int IMPLEMENT_TEST(int kernel_num) {
     int B = 8;
     int T = 1024;
     int C = 768;
     int V = 50257;
-
-    int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * C * sizeof(float));
@@ -216,13 +205,6 @@ int main(int argc, char **argv) {
     cudaCheck(memcpy_convert(d_wte, wte, V * C));
     cudaCheck(memcpy_convert(d_wpe, wpe, T * C));
 
-    // read kernel_num from command line
-    int kernel_num = 2;
-    if (argc > 1) {
-        kernel_num = atoi(argv[1]);
-    }
-    printf("Using kernel %d\n", kernel_num);
-
     // first check the correctness of the kernel
     encoder_forward_cpu(out, inp, wte, wpe, B, T, C);
 
@@ -233,11 +215,7 @@ int main(int argc, char **argv) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
         encoder_forward(kernel_num, d_out, d_inp, d_wte, d_wpe, B, T, C, block_size);
-#if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
-        float tol = 1e-5;
-#else
-        float tol = 1e-2f;
-#endif
+        float tol = std::is_same_v<floatX, float> ? 1e-5 : 1e-2;
         validate_result(d_out, out, "out", B * T * C, tol);
     }
 
@@ -252,12 +230,14 @@ int main(int argc, char **argv) {
                                               );
 
         // napkin math: estimate the memory bandwidth achieved
-        // for each (B,T,C) output element, we do 3 reads and 1 write, 4 bytes each
+        // for each (B,T,C) output element, we do 3 reads and 1 write
         // and e.g. A100 40GB PCIe is advertised at 1,555GB/s
-        long memory_ops = B * T * C * 4 * 4;
+        long memory_ops = B * T * C * 4 * sizeof(floatX);
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
+        float toks_per_msec = B * T / elapsed_time / 1e3;
 
-        printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
+        printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s | elements: %.2f ktok/ms\n",
+               block_size, elapsed_time, memory_bandwidth, toks_per_msec);
     }
 
     // free memory
