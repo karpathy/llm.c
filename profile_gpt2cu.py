@@ -14,13 +14,21 @@ NCU = shutil.which("ncu")
 if NCU is None:
     NCU = "/usr/local/cuda/bin/ncu"
 
-# build the exe
-subprocess.check_call(["make", "profile_gpt2cu"])
+# build the executable
+subprocess.check_call(["make", "profile_gpt2cu", "NO_MULTI_GPU=1", "USE_CUDNN=1"])
+
+# try to see if profiling is allowed for non-root:
+options = subprocess.check_output(["modprobe", "-c", "nvidia"], text=True)
+can_profile = len([l for l in options.splitlines() if "NVreg_RestrictProfilingToAdminUsers=0" in l]) != 0
 
 # record metrics
 # --full and --import-source are entirely superfluous for this script, but you might want to
 # manually inspect `profile.ncu-rep`, so we keep it here
 cmd = [NCU, "--set", "full", "--import-source", "yes", "-o", "profile", "-f", "./profile_gpt2cu"]
+# do we need to run under sudo
+if not can_profile:
+    print("NVreg_RestrictProfilingToAdminUsers=1, running with sudo")
+    cmd = ["sudo"] + cmd
 subprocess.check_call(cmd)
 
 # generate csv
@@ -39,32 +47,45 @@ result = subprocess.check_output(cmd, text=True).strip()
 reader = csv.reader(result.splitlines(keepends=True))
 
 # model config
-CLS_START = 15
+CLS_START = -1
 CLS_NUM = 6
-ADAM_ID = 44
 N_LAYERS = 12
 
 summaries = defaultdict(lambda: 0.0)
+counts = defaultdict(lambda: 0)
 passes = defaultdict(lambda: 0.0)
 total = defaultdict(lambda: 0.0)
 no_cutlass = 0.0
 CC = ""
+phase = "fwd"
+
+kernel_profile_data = list(enumerate(reader))
+
+for rid, row in kernel_profile_data:
+    if rid <= 2:
+        continue
+    kernel = row[4]
+    kid = rid - 2
+    if "fused_classifier" in kernel:
+        #  classifier: layernorm -> matmul -> fused -> bw matmul (x2) -> bw layernorm
+        CLS_START = kid - 2
+
+assert CLS_START != -1
 
 print()
 print("Kernel calls:")
-for rid, row in enumerate(reader):
+for rid, row in kernel_profile_data:
     if rid == 0:
         #  headings
-        print(f"id pass {'name':<40} {'time':>8} {'RAM rd':>8} {'RAM wt':>8} {'L2 rd':>8} {'L2 wt':>8} {'inst':>8}")
+        print(f"id pass    {'name':<40} {'time':>8} {'RAM rd':>8} {'RAM wt':>8} {'L2 rd':>8} {'L2 wt':>8} {'inst':>8}")
         continue
     if rid == 1:
         # units
-        units = f"        {'':<40} {'ms':>8} {'GiB':>8} {'GiB':>8} {'GiB':>8} {'GiB':>8} {'MInst':>8}"
+        units = f"           {'':<40} {'ms':>8} {'GiB':>8} {'GiB':>8} {'GiB':>8} {'GiB':>8} {'MInst':>8}"
         print(units)
         print("." * len(units))
         continue
     if rid == 2:
-
         CC = row[10]
 
     # actual data
@@ -78,30 +99,49 @@ for rid, row in enumerate(reader):
 
     kid = rid - 2
 
-    if kid == 0 or kid == ADAM_ID - 1:
+    multiplier = 1
+    if "encoder" in kernel:
         pass_name = "enc"
+        if phase == "bwd":
+            phase = "bwd-enc"
     elif CLS_START <= kid < CLS_START + CLS_NUM:
         # the classifier part, counts only once
         pass_name = "cls"
-    elif kid == ADAM_ID:
+        phase = "bwd"
+    elif "adamw" in kernel:
         # encoder layer or adam
         pass_name = "opt"
+    # before the first optimizer run, we create weight copies.
+    # they aren't part of regular processing, so they get a multiplier
+    # of zero
+    elif phase == "bwd-enc":
+        pass_name = "init"
+        multiplier = 0
     else:
-        pass_name = "fwd" if kid < CLS_START else "bwd"
+        pass_name = phase
+        multiplier = N_LAYERS
         time *= N_LAYERS
         read *= N_LAYERS
         write *= N_LAYERS
         l2_read *= N_LAYERS
         l2_write *= N_LAYERS
+        inst *= N_LAYERS
 
     # split at "(" -- argument list
     fn_name = kernel.split("(")[0]
     # some names include the return value, others don't?
     if " " in fn_name:
         fn_name = fn_name.split(" ")[1]
-    if "cutlass" in fn_name:
+    if "<" in fn_name:
         fn_name = fn_name.split("<")[0]
+
+    # group together matmul kernels
+    if "cutlass" in fn_name:
         pass
+    elif fn_name.startswith("ampere_bf16"):
+        fn_name = "ampere_bf16"
+    elif fn_name.startswith("cudnn_generated_fort_native_sdpa"):
+        fn_name = "cudnn_generated_fort_native_sdpa"
     else:
         no_cutlass += time
 
@@ -110,26 +150,34 @@ for rid, row in enumerate(reader):
     l2_write = l2_write * 32 / 1024 / 1024 / 1024
 
     summaries[fn_name] += time
+    counts[fn_name] += multiplier
     passes[pass_name] += time
-    total['time'] += time
-    total['read'] += read
-    total['write'] += write
-    total['l2_read'] += l2_read
-    total['l2_write'] += l2_write
-    total['inst'] += inst
+    if pass_name != "init":
+        total['time'] += time
+        total['read'] += read
+        total['write'] += write
+        total['l2_read'] += l2_read
+        total['l2_write'] += l2_write
+        total['inst'] += inst
 
-    print(f"{kid:02} {pass_name:4} {fn_name:<40} {time:8.2f} {read:8.2f} {write:8.2f} {l2_read:8.2f} {l2_write:8.2f} {inst:8.2f}")
+    pass_info = f"{pass_name}×{multiplier}"
+    print(f"{kid:02} {pass_info:7} {fn_name:<40} {time:8.2f} {read:8.2f} {write:8.2f} {l2_read:8.2f} {l2_write:8.2f} {inst:8.2f}")
 
 total_time = total['time']
 print("." * len(units))
-print(f"        {'Total':<40} {total['time']:8.2f} {total['read']:8.2f} {total['write']:8.2f} {total['l2_read']:8.2f} {total['l2_write']:8.2f} {total['inst']:8.2f}")
+print(f"           {'Total':<40} {total['time']:8.2f} {total['read']:8.2f} {total['write']:8.2f} {total['l2_read']:8.2f} {total['l2_write']:8.2f} {total['inst']:8.2f}")
 
 print()
 print("Kernel type summaries:")
-print(f"  {'name':<40} {'time':>6} {'frac':>6}")
-ordered = sorted(summaries.items(), key=lambda x: x[1], reverse=True)
-for entry, value in ordered:
-    print(f"  {entry:<40} {value:6.2f} {100*value / total_time:6.2f}%")
+print(f"  {'name':<40} {'time':>6} {'frac':>6}  {'count':>6}")
+ordered_time = sorted(summaries.items(), key=lambda x: x[1], reverse=True)
+for entry, value in ordered_time:
+    # crop entry to be at most 40 characters
+    if len(entry) > 40:
+        entry_text = entry[:37] + "..."
+    else:
+        entry_text = entry
+    print(f"  {entry_text:<40} {value:6.2f} {100*value / total_time:6.2f}% {counts[entry]:>6d}")
 
 
 ts = total_time / 1000
