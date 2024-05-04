@@ -44,7 +44,7 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #include <float.h>
 #include <string.h>
 #include <unistd.h>
-#include <assert.h>
+
 // GPU / CUDA related
 #include <cublas_v2.h>
 #include <cuda_profiler_api.h>
