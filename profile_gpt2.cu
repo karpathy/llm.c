@@ -34,12 +34,25 @@ int main() {
     cudaCheck(cudaSetDevice(deviceIdx));
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
-    cuda_num_SMs = deviceProp.multiProcessorCount;
     printf("[System]\n");
     printf("Device %d: %s\n", deviceIdx, deviceProp.name);
 
+    cuda_num_SMs = deviceProp.multiProcessorCount;
+    cuda_threads_per_SM = deviceProp.maxThreadsPerMultiProcessor;
+    cuda_arch_major = deviceProp.major;
+    cuda_arch_minor = deviceProp.minor;
+
+    cudaCheck(cudaStreamCreate(&main_stream));
+    cudaEventCreateWithFlags(&main_event, cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&loss_event, cudaEventDisableTiming);
+    for (int i = 0; i < num_parallel_streams; i++) {
+        cudaCheck(cudaStreamCreate(&parallel_streams[i]));
+        cudaEventCreateWithFlags(&parallel_events[i], cudaEventDisableTiming);
+    }
+
     // setup cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
+    cublasCheck(cublasSetStream(cublas_handle, main_stream));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
