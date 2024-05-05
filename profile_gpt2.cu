@@ -28,7 +28,7 @@ the profile.ncu-rep from a cloud box to local to pretty view.
 #include "train_gpt2.cu"
 
 int main() {
-    common_start();
+    common_start(true, true);
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;

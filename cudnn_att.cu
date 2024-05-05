@@ -34,15 +34,17 @@ static void cudaCheck(cudaError_t error, const char *file, int line) {
 #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
 
 // Profiler utils
-class NvtxRange {
- public:
-    NvtxRange(const char* s) { nvtxRangePush(s); }
-    NvtxRange(const std::string& base_str, int number) {
-        std::string range_string = base_str + " " + std::to_string(number);
-        nvtxRangePush(range_string.c_str());
-    }
-    ~NvtxRange() { nvtxRangePop(); }
-};
+namespace {
+    class NvtxRange {
+    public:
+        NvtxRange(const char* s) { nvtxRangePush(s); }
+        NvtxRange(const std::string& base_str, int number) {
+            std::string range_string = base_str + " " + std::to_string(number);
+            nvtxRangePush(range_string.c_str());
+        }
+        ~NvtxRange() { nvtxRangePop(); }
+    };
+}
 #define NVTX_RANGE_FN() NvtxRange nvtx_range(__FUNCTION__)
 
 static cudnnHandle_t cudnn_handle;

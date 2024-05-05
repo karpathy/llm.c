@@ -473,19 +473,21 @@ __global__ void encoder_forward_kernel3(floatX* out,
     store128(out_btc, packed_out);
 }
 
-__device__ void atomicStochasticAdd(__nv_bfloat16* address, float val0, float val1, uint seed) {
+template <typename T>
+__device__ void atomicStochasticAdd(T* address, float val0, float val1, uint seed) {
+    static_assert(sizeof(T) == 2, "Only 16-bit atomicStochasticAdd supported.");
     float2 val = make_float2(val0, val1);
     uint* address_as_uint = (uint*)address;
     uint old = *address_as_uint, assumed;
     uint random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
     do {
         assumed = old;
-        float2 old_fp32 = __bfloat1622float2(*(__nv_bfloat162*)&old);
-        float2 new_fp32 = make_float2(old_fp32.x + val.x, old_fp32.y + val.y);
-        __nv_bfloat162 new_bf16;
-        stochastic_rounding(new_fp32.x, &new_bf16.x, random);
-        stochastic_rounding(new_fp32.y, &new_bf16.y, random >> 16);
-        old = atomicCAS(address_as_uint, assumed, *(uint*)&new_bf16);
+        float2 new_fp32 = make_float2((float)(reinterpret_cast<T*>(&old)[0]) + val.x,
+                                      (float)(reinterpret_cast<T*>(&old)[1]) + val.y);
+        T new_rounded[2];
+        stochastic_rounding(new_fp32.x, &new_rounded[0], random);
+        stochastic_rounding(new_fp32.y, &new_rounded[1], random >> 16);
+        old = atomicCAS(address_as_uint, assumed, *(uint*)&new_rounded);
     } while (assumed != old);
 }
 __device__ void atomicStochasticAdd(float* address, float val0, float val1, uint seed) {
@@ -2074,12 +2076,14 @@ void gpt2_free(GPT2 *model) {
 
 // ----------------------------------------------------------------------------
 // common init & free code for train/test/profile
-void common_start(bool override_enable_tf32 = true) {
+void common_start(bool override_enable_tf32 = true, bool print_device_info = true) {
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
-    printf("[System]\n");
-    printf("Device %d: %s\n", deviceIdx, deviceProp.name);
+    if (print_device_info) {
+        printf("[System]\n");
+        printf("Device %d: %s\n", deviceIdx, deviceProp.name);
+    }
 
     cudaCheck(cudaStreamCreate(&main_stream));
     cudaEventCreateWithFlags(&main_event, cudaEventDisableTiming);
@@ -2335,7 +2339,7 @@ int main(int argc, char *argv[]) {
     printf0("| use_master_weights    | %-50s |\n", use_master_weights ? "enabled" : "disabled");
     printf0("+-----------------------+----------------------------------------------------+\n");
 
-    common_start(override_enable_tf32); // common init code for train/test/profile
+    common_start(override_enable_tf32, false); // common init code for train/test/profile
 
     const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")

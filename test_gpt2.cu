@@ -83,7 +83,7 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
 }
 
 int main(int argc, char *argv[]) {
-    common_start(false);
+    common_start(false, true);
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
