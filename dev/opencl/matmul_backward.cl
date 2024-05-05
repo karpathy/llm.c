@@ -172,9 +172,17 @@ __kernel void matmul_backward3(__global float* AMat, __global float* bias,
 
     if(global_id0 >= OC) return;
 
+    __global float *A_ptr = AMat + global_id0;
     float val = 0.0f;
     for(int bt=0; bt<(B * T); bt++) {
-        val += AMat[bt * OC + global_id0];
+
+        #if DO_PRELOAD == 1
+            if((bt + 1) < (B * T)) {
+                prefetch(A_ptr + ((bt + 1) * OC), 1);
+            }
+        #endif
+
+        val += A_ptr[bt * OC];
     }
 
     bias[global_id0] += val;
