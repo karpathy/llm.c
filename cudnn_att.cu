@@ -5,18 +5,22 @@
 #include <cudnn_frontend.h>
 #include <cuda_bf16.h>
 #include <nvtx3/nvToolsExt.h>
+namespace fe = cudnn_frontend;
 
 // Specific configurations based on the enabled precision
 #if defined(ENABLE_FP32)
 typedef float floatX;
-
+static_assert(false, "cuDNN is not supported in FP32 mode.")
 // use fp16 (note: this may require gradient scaler, currently not implemented!)
+
 #elif defined(ENABLE_FP16)
 typedef half floatX;
 #define CUBLAS_LOWP CUDA_R_16F
-
+#define CUDNN_16BIT fe::DataType_t::HALF
 #else // Default to bfloat16
+
 typedef __nv_bfloat16 floatX;
+#define CUDNN_16BIT fe::DataType_t::BFLOAT16
 #endif
 
 // CUDA error checking
@@ -30,27 +34,16 @@ static void cudaCheck(cudaError_t error, const char *file, int line) {
 #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
 
 // Profiler utils
-namespace {
-    class NvtxRange {
-    public:
-        NvtxRange(const char* s) { nvtxRangePush(s); }
-
-        NvtxRange(const std::string& base_str, int number) {
-            std::string range_string = base_str + " " + std::to_string(number);
-            nvtxRangePush(range_string.c_str());
-        }
-
-        ~NvtxRange() { nvtxRangePop(); }
-    };
-}
+class NvtxRange {
+ public:
+    NvtxRange(const char* s) { nvtxRangePush(s); }
+    NvtxRange(const std::string& base_str, int number) {
+        std::string range_string = base_str + " " + std::to_string(number);
+        nvtxRangePush(range_string.c_str());
+    }
+    ~NvtxRange() { nvtxRangePop(); }
+};
 #define NVTX_RANGE_FN() NvtxRange nvtx_range(__FUNCTION__)
-
-namespace fe = cudnn_frontend;
-#if CUBLAS_LOWP == CUDA_R_16BF
-#define CUDNN_16BIT fe::DataType_t::BFLOAT16
-#else
-#define CUDNN_16BIT fe::DataType_t::HALF
-#endif
 
 static cudnnHandle_t cudnn_handle;
 static size_t cudnn_workspace_size = 0; // dynamically allocated as needed (up to 256MiB!)
@@ -99,28 +92,24 @@ auto lookup_cache_or_build_graph_fwd(Args... args) {
 
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(CUDNN_16BIT)
-        .set_intermediate_data_type(fe::DataType_t::FLOAT)
-        .set_compute_data_type(fe::DataType_t::FLOAT);
+          .set_intermediate_data_type(fe::DataType_t::FLOAT)
+          .set_compute_data_type(fe::DataType_t::FLOAT);
 
     // QKV is (B, T, 3, NH, HS) which cuDNN can handle directly without an external permute
-    auto Q = graph->tensor(fe::graph::Tensor_attributes()
-                               .set_name("Q")
+    auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q")
                                .set_dim({B, H, T, HS})
                                .set_stride({3 * H * HS * T,  HS, 3 * H * HS, 1}));
-    auto K = graph->tensor(fe::graph::Tensor_attributes()
-                               .set_name("K")
+    auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K")
                                .set_dim({B, H, T, HS})
                                .set_stride({3 * H * HS * T, HS, 3 * H * HS, 1}));
-    auto V = graph->tensor(fe::graph::Tensor_attributes()
-                               .set_name("V")
+    auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V")
                                .set_dim({B, H, T, HS})
                                .set_stride({3 * H * HS * T, HS, 3 * H * HS, 1}));
-    auto attn_scale = graph->tensor(fe::graph::Tensor_attributes()
-                                        .set_name("attn_scale")
-                                        .set_dim({1, 1, 1, 1})
-                                        .set_stride({1, 1, 1, 1})
-                                        .set_is_pass_by_value(true)
-                                        .set_data_type(fe::DataType_t::FLOAT));
+    auto attn_scale = graph->tensor(fe::graph::Tensor_attributes().set_name("attn_scale")
+                                .set_dim({1, 1, 1, 1})
+                                .set_stride({1, 1, 1, 1})
+                                .set_is_pass_by_value(true)
+                                .set_data_type(fe::DataType_t::FLOAT));
 
     auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention");
     sdpa_options.set_is_inference(is_inference_only);
@@ -136,8 +125,8 @@ auto lookup_cache_or_build_graph_fwd(Args... args) {
     assert(stats == nullptr || is_inference_only == false);
     if (is_inference_only == false) {
         stats->set_output(true).set_data_type(fe::DataType_t::FLOAT)
-            .set_dim({B, H, T, 1})
-            .set_stride({H * T, T, 1, 1});
+                               .set_dim({B, H, T, 1})
+                               .set_stride({H * T, T, 1, 1});
     }
 
     checkCudnnFE(graph->validate());
@@ -152,6 +141,7 @@ auto lookup_cache_or_build_graph_fwd(Args... args) {
     auto plans = graph->create_execution_plans({fe::HeurMode_t::A});
     checkCudnnFE(graph->check_support(cudnn_handle));
     checkCudnnFE(graph->build_plans(cudnn_handle));
+    assert(graph->get_workspace_size() <= cudnn_workspace_size); // fwd shouldn't need workspace
 
     auto tuple = std::make_tuple(graph, Q, K, V, attn_scale, O, stats);
     user_maintained_cache_fwd.insert({key, tuple});
@@ -165,47 +155,39 @@ auto lookup_cache_or_build_graph_bwd(Args... args) {
 
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(CUDNN_16BIT)
-        .set_intermediate_data_type(fe::DataType_t::FLOAT)
-        .set_compute_data_type(fe::DataType_t::FLOAT);
+          .set_intermediate_data_type(fe::DataType_t::FLOAT)
+          .set_compute_data_type(fe::DataType_t::FLOAT);
 
     // (B, N, 3, NH, HS)
     // must come from inp (which means we also need to convert THAT to FP16)
-    auto Q = graph->tensor(fe::graph::Tensor_attributes()
-                               .set_name("Q")
-                               .set_dim({B, NH, T, HS})
-                               .set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1}));
-    auto K = graph->tensor(fe::graph::Tensor_attributes()
-                               .set_name("K")
-                               .set_dim({B, NH, T, HS})
-                               .set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1}));
-    auto V = graph->tensor(fe::graph::Tensor_attributes()
-                               .set_name("V")
-                               .set_dim({B, NH, T, HS})
-                               .set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1}));
-    auto O = graph->tensor(fe::graph::Tensor_attributes()
-                               .set_name("O")
-                               .set_dim({B, NH, T, HS})
-                               .set_stride({NH * HS * T, HS, NH * HS, 1}));
-    auto dO = graph->tensor(fe::graph::Tensor_attributes()
-                                .set_name("dO")
-                                .set_dim({B, NH, T, HS})
-                                .set_stride({NH * HS * T, HS, NH * HS, 1}));
+    auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q")
+                            .set_dim({B, NH, T, HS})
+                            .set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1}));
+    auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K")
+                            .set_dim({B, NH, T, HS})
+                            .set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1}));
+    auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V")
+                            .set_dim({B, NH, T, HS})
+                            .set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1}));
+    auto O = graph->tensor(fe::graph::Tensor_attributes().set_name("O")
+                            .set_dim({B, NH, T, HS})
+                            .set_stride({NH * HS * T, HS, NH * HS, 1}));
+    auto dO = graph->tensor(fe::graph::Tensor_attributes().set_name("dO")
+                            .set_dim({B, NH, T, HS})
+                            .set_stride({NH * HS * T, HS, NH * HS, 1}));
 
-    auto stats = graph->tensor(fe::graph::Tensor_attributes()
-                                   .set_name("stats")
-                                   .set_dim({B, NH, T, 1})
-                                   .set_stride({NH * T, T, 1, 1})
-                                   .set_data_type(fe::DataType_t::FLOAT));
-    auto attn_scale = graph->tensor(fe::graph::Tensor_attributes()
-                                        .set_name("attn_scale")
-                                        .set_dim({1, 1, 1, 1})
-                                        .set_stride({1, 1, 1, 1})
-                                        .set_is_pass_by_value(true)
-                                        .set_data_type(fe::DataType_t::FLOAT));
-    auto sdpa_backward_options = fe::graph::SDPA_backward_attributes()
-        .set_name("flash_attention_backward")
-        .set_causal_mask(true)
-        .set_attn_scale(attn_scale);
+    auto stats = graph->tensor(fe::graph::Tensor_attributes().set_name("stats")
+                            .set_dim({B, NH, T, 1})
+                            .set_stride({NH * T, T, 1, 1})
+                            .set_data_type(fe::DataType_t::FLOAT));
+    auto attn_scale = graph->tensor(fe::graph::Tensor_attributes().set_name("attn_scale")
+                            .set_dim({1, 1, 1, 1})
+                            .set_stride({1, 1, 1, 1})
+                            .set_is_pass_by_value(true)
+                            .set_data_type(fe::DataType_t::FLOAT));
+    auto sdpa_backward_options = fe::graph::SDPA_backward_attributes().set_name("flash_attention_backward")
+                            .set_causal_mask(true)
+                            .set_attn_scale(attn_scale);
 
     // Create the graph operation and get the output tensors back
     auto [dQ, dK, dV] = graph->sdpa_backward(Q, K, V, O, dO, stats, sdpa_backward_options);
@@ -226,6 +208,16 @@ auto lookup_cache_or_build_graph_bwd(Args... args) {
     auto plans = graph->create_execution_plans({fe::HeurMode_t::A});
     checkCudnnFE(graph->check_support(cudnn_handle));
     checkCudnnFE(graph->build_plans(cudnn_handle));
+
+    // Reallocate the workspace if the required size is greater than the current workspace
+    // By default, cuDNN uses up to 256MiB of workspace, so we don't want to just allocate the maximum
+    if (graph->get_workspace_size() > cudnn_workspace_size) {
+        if (cudnn_workspace_size > 0) {
+            cudaCheck(cudaFree(cudnn_workspace));
+        }
+        cudnn_workspace_size = graph->get_workspace_size();
+        cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
+    }
 
     auto tuple = std::make_tuple(graph, Q, K, V, O, dO, stats, attn_scale, dQ, dK, dV);
     user_maintained_cache_bwd.insert({key, tuple});
@@ -258,16 +250,6 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
     // Add the stats tensor unless we are only doing inference (only needed for backward pass)
     if (is_inference_only == false) {
         variant_pack[softmax_stats] = stats;
-    }
-
-    // Reallocate the workspace if the required size is greater than the current workspace
-    // By default, cuDNN uses up to 256MiB of workspace, so we don't want to just allocate the maximum
-    if (graph->get_workspace_size() > cudnn_workspace_size) {
-        if (cudnn_workspace_size > 0) {
-            cudaCheck(cudaFree(cudnn_workspace));
-        }
-        cudnn_workspace_size = graph->get_workspace_size();
-        cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
     }
 
     // Execute graph
@@ -303,16 +285,6 @@ void attention_backward_cudnn(floatX* dqkvr,                                    
         {Q, devPtrQ}, {K, devPtrK}, {V, devPtrV}, {O, devPtrO}, {dO, devPtrdO}, {Stats, devPtrStats},
         {dQ, devPtrdQ}, {dK, devPtrdK}, {dV, devPtrdV},
         {attn_scale, &attn_scale_cpu}};
-
-    // Reallocate the workspace if the required size is greater than the current workspace
-    // By default, cuDNN uses up to 256MiB of workspace, so we don't want to just allocate the maximum
-    if (graph->get_workspace_size() > cudnn_workspace_size) {
-        if (cudnn_workspace_size > 0) {
-            cudaCheck(cudaFree(cudnn_workspace));
-        }
-        cudnn_workspace_size = graph->get_workspace_size();
-        cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
-    }
 
     // Execute graph
     checkCudnnFE(graph->execute(cudnn_handle, variant_pack, cudnn_workspace));
