@@ -34,8 +34,8 @@ int main() {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
 
-    int B = 24;
-    int T = 1024;
+    int B = 24; // if program OOMs decrease this number, e.g. all the way down to 4 or etc
+    int T = 1024; // if even that OOMs move on to this one. keep them nice and powers of 2
     printf("batch size: %d\n", B);
     printf("sequence length: %d\n", T);
 
@@ -46,6 +46,7 @@ int main() {
         y[i] = i % model.config.vocab_size;
     }
 
+    // override number of layers to 1 because all layers repeat the same kernels, only profile once
     model.config.num_layers = 1;
 
     // do a training step

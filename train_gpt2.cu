@@ -1,5 +1,6 @@
 /*
 GPT-2 Transformer Neural Net trained in raw CUDA
+GPT-2 Transformer Neural Net trained in raw CUDA
 Non-trivial notes to be aware of:
 
 We are being clever in the backward pass to conserve memory.
@@ -91,19 +92,6 @@ const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights specific filen
 const ncclDataType_t ncclFloatX = ncclBfloat16;
 #endif
 #endif
-
-#ifdef ENABLE_CUDNN
-#include <cudnn_frontend.h>
-namespace fe = cudnn_frontend;
-#if CUBLAS_LOWP == CUDA_R_16BF
-#define CUDNN_16BIT fe::DataType_t::BFLOAT16
-#else
-#define CUDNN_16BIT fe::DataType_t::HALF
-#endif
-static cudnnHandle_t cudnn_handle;
-static size_t cudnn_workspace_size = 0; // dynamically allocated as needed (up to 256MiB!)
-static void* cudnn_workspace = NULL;
-#endif // ENABLE_CUDNN
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -439,237 +427,20 @@ void printf0(const char *format, ...) {
 // ----------------------------------------------------------------------------
 // cuDNN path
 #ifdef ENABLE_CUDNN
-
-using graph_tensors_fwd = std::tuple<std::shared_ptr<fe::graph::Graph>,
-                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Q,
-                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // K,
-                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // V,
-                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Attn_scale,
-                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // O
-                                     std::shared_ptr<fe::graph::Tensor_attributes>>; // Stats
-
-using graph_tensors_bwd = std::tuple<std::shared_ptr<fe::graph::Graph>,
-                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Q,
-                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // K,
-                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // V,
-                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // O
-                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // dO
-                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Stats
-                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Attn_scale,
-                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // dQ,
-                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // dK,
-                                     std::shared_ptr<fe::graph::Tensor_attributes>>; // dV
-
-// Need a cache because graph->build_operation_graph() is slow but everything else seems fast
-using cache_type_fwd = std::unordered_map<std::size_t, graph_tensors_fwd>;
-using cache_type_bwd = std::unordered_map<std::size_t, graph_tensors_bwd>;
-
-// Loosely based on cuDNN frontend samples functions and massively simplified
-template <typename... Args>
-auto lookup_cache_or_build_graph_fwd(Args... args) {
-    static cache_type_fwd user_maintained_cache_fwd;
-    auto [B, H, T, HS, is_inference_only] = std::make_tuple(args...);
-
-    auto graph = std::make_shared<fe::graph::Graph>();
-    graph->set_io_data_type(CUDNN_16BIT)
-          .set_intermediate_data_type(fe::DataType_t::FLOAT)
-          .set_compute_data_type(fe::DataType_t::FLOAT);
-
-    // QKV is (B, T, 3, NH, HS) which cuDNN can handle directly without an external permute
-    auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q")
-                               .set_dim({B, H, T, HS})
-                               .set_stride({3 * H * HS * T,  HS, 3 * H * HS, 1}));
-    auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K")
-                               .set_dim({B, H, T, HS})
-                               .set_stride({3 * H * HS * T, HS, 3 * H * HS, 1}));
-    auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V")
-                               .set_dim({B, H, T, HS})
-                               .set_stride({3 * H * HS * T, HS, 3 * H * HS, 1}));
-    auto attn_scale = graph->tensor(fe::graph::Tensor_attributes().set_name("attn_scale")
-                                .set_dim({1, 1, 1, 1})
-                                .set_stride({1, 1, 1, 1})
-                                .set_is_pass_by_value(true)
-                                .set_data_type(fe::DataType_t::FLOAT));
-
-    auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention");
-    sdpa_options.set_is_inference(is_inference_only);
-    sdpa_options.set_attn_scale(attn_scale);
-    sdpa_options.set_causal_mask(true);
-
-    // Create the graph operation and get the output tensors back
-    auto [O, stats] = graph->sdpa(Q, K, V, sdpa_options);
-
-    // Output is (B, T, NH, HS) BF16/FP16 and stats for backward pass is (B, NH, T) FP32
-    O->set_output(true).set_dim({B, H, T, HS}).set_stride({H * HS * T, HS, H * HS, 1});
-
-    assert(stats == nullptr || is_inference_only == false);
-    if (is_inference_only == false) {
-        stats->set_output(true).set_data_type(fe::DataType_t::FLOAT)
-                               .set_dim({B, H, T, 1})
-                               .set_stride({H * T, T, 1, 1});
-    }
-
-    assert(graph->validate().is_good());
-    auto key = graph->key();
-    auto it = user_maintained_cache_fwd.find(key);
-    if (it != user_maintained_cache_fwd.end()) {
-        return it->second;
-    }
-
-    // Build the operation graph and execution part (this is the VERY SLOW PART)
-    assert(graph->build_operation_graph(cudnn_handle).is_good());
-    auto plans = graph->create_execution_plans({fe::HeurMode_t::A});
-    assert(graph->check_support(cudnn_handle).is_good());
-    assert(graph->build_plans(cudnn_handle).is_good());
-    assert(graph->get_workspace_size() <= cudnn_workspace_size); // fwd shouldn't need workspace
-
-    auto tuple = std::make_tuple(graph, Q, K, V, attn_scale, O, stats);
-    user_maintained_cache_fwd.insert({key, tuple});
-    return tuple;
-}
-
-template <typename... Args>
-auto lookup_cache_or_build_graph_bwd(Args... args) {
-    static cache_type_bwd user_maintained_cache_bwd;
-    auto [B, NH, T, HS] = std::make_tuple(args...);
-
-    auto graph = std::make_shared<fe::graph::Graph>();
-    graph->set_io_data_type(CUDNN_16BIT)
-          .set_intermediate_data_type(fe::DataType_t::FLOAT)
-          .set_compute_data_type(fe::DataType_t::FLOAT);
-
-    // (B, N, 3, NH, HS)
-    // must come from inp (which means we also need to convert THAT to FP16)
-    auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q")
-                            .set_dim({B, NH, T, HS})
-                            .set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1}));
-    auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K")
-                            .set_dim({B, NH, T, HS})
-                            .set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1}));
-    auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V")
-                            .set_dim({B, NH, T, HS})
-                            .set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1}));
-    auto O = graph->tensor(fe::graph::Tensor_attributes().set_name("O")
-                            .set_dim({B, NH, T, HS})
-                            .set_stride({NH * HS * T, HS, NH * HS, 1}));
-    auto dO = graph->tensor(fe::graph::Tensor_attributes().set_name("dO")
-                            .set_dim({B, NH, T, HS})
-                            .set_stride({NH * HS * T, HS, NH * HS, 1}));
-
-    auto stats = graph->tensor(fe::graph::Tensor_attributes().set_name("stats")
-                            .set_dim({B, NH, T, 1})
-                            .set_stride({NH * T, T, 1, 1})
-                            .set_data_type(fe::DataType_t::FLOAT));
-    auto attn_scale = graph->tensor(fe::graph::Tensor_attributes().set_name("attn_scale")
-                            .set_dim({1, 1, 1, 1})
-                            .set_stride({1, 1, 1, 1})
-                            .set_is_pass_by_value(true)
-                            .set_data_type(fe::DataType_t::FLOAT));
-    auto sdpa_backward_options = fe::graph::SDPA_backward_attributes().set_name("flash_attention_backward")
-                            .set_causal_mask(true)
-                            .set_attn_scale(attn_scale);
-
-    // Create the graph operation and get the output tensors back
-    auto [dQ, dK, dV] = graph->sdpa_backward(Q, K, V, O, dO, stats, sdpa_backward_options);
-
-    dQ->set_output(true).set_dim({B, NH, T, HS}).set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1});
-    dK->set_output(true).set_dim({B, NH, T, HS}).set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1});
-    dV->set_output(true).set_dim({B, NH, T, HS}).set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1});
-
-    assert(graph->validate().is_good());
-    auto key = graph->key();
-    auto it = user_maintained_cache_bwd.find(key);
-    if (it != user_maintained_cache_bwd.end()) {
-        return it->second;
-    }
-
-    // Build the operation graph and execution part (this is the VERY SLOW PART)
-    assert(graph->build_operation_graph(cudnn_handle).is_good());
-    auto plans = graph->create_execution_plans({fe::HeurMode_t::A});
-    assert(graph->check_support(cudnn_handle).is_good());
-    assert(graph->build_plans(cudnn_handle).is_good());
-
-    // Reallocate the workspace if the required size is greater than the current workspace
-    // By default, cuDNN uses up to 256MiB of workspace, so we don't want to just allocate the maximum
-    if (graph->get_workspace_size() > cudnn_workspace_size) {
-        if (cudnn_workspace_size > 0) {
-            cudaCheck(cudaFree(cudnn_workspace));
-        }
-        cudnn_workspace_size = graph->get_workspace_size();
-        cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
-    }
-
-    auto tuple = std::make_tuple(graph, Q, K, V, O, dO, stats, attn_scale, dQ, dK, dV);
-    user_maintained_cache_bwd.insert({key, tuple});
-    return tuple;
-}
-
+// functions defined in cudnn_att.cu
+void create_cudnn();
+void destroy_cudnn();
 void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
                              float* stats, // output for backward pass: (B, NH, T)
                              floatX* inp,  // input: (B, T, 3, NH, HS) QKV
-                             int B, int T, int NH, int C) {
-    NVTX_RANGE_FN();
-    int HS = C / NH; // number of features per head
-    bool is_inference_only = (stats == nullptr);
-
-    // Get graph and tensors from cache (or generate it on first use)
-    auto [graph, Q, K, V, attn_scale, O, softmax_stats] =
-        lookup_cache_or_build_graph_fwd(B, NH, T, HS, is_inference_only);
-
-    // Prepare all the tensor pointers for executing the graph
-    void* devPtrQ = inp;
-    void* devPtrK = (inp + C);
-    void* devPtrV = (inp + 2 * C);
-    float attn_scale_cpu = 1.0 / sqrtf(HS);
-    void* devPtrO = out;
-
-    // Build variant pack
-    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
-        {Q, devPtrQ}, {K, devPtrK}, {V, devPtrV}, {attn_scale, &attn_scale_cpu}, {O, devPtrO}};
-
-    // Add the stats tensor unless we are only doing inference (only needed for backward pass)
-    if (is_inference_only == false) {
-        variant_pack[softmax_stats] = stats;
-    }
-
-    // Execute graph
-    assert(graph->execute(cudnn_handle, variant_pack, cudnn_workspace).is_good());
-    cudaCheck(cudaGetLastError());
-}
+                             int B, int T, int NH, int C);
 
 void attention_backward_cudnn(floatX* dqkvr,                                       // output
                               floatX* dout, floatX* qkvr, floatX* o, float* stats, // inputs
-                              int B, int T, int NH, int C) {
-    NVTX_RANGE_FN();
-    int HS = C / NH; // number of features per head
-
-    // Get graph and tensors from cache (or generate it on first use)
-    auto [graph, Q, K, V, O, dO, Stats, attn_scale, dQ, dK, dV] =
-        lookup_cache_or_build_graph_bwd(B, NH, T, HS);
-
-    // Prepare all the tensor pointers for executing the graph
-    void* devPtrQ = qkvr;
-    void* devPtrK = (qkvr + NH * HS);
-    void* devPtrV = (qkvr + 2 * NH * HS);
-    void* devPtrO = o;
-    void* devPtrdO = dout;
-    void* devPtrStats = stats;
-    float attn_scale_cpu = 1.0 / sqrtf(HS);
-
-    void* devPtrdQ = dqkvr;
-    void* devPtrdK = (dqkvr + NH * HS);
-    void* devPtrdV = (dqkvr + 2 * NH * HS);
-
-    // Build variant pack that links each tensor to its data pointer
-    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
-        {Q, devPtrQ}, {K, devPtrK}, {V, devPtrV}, {O, devPtrO}, {dO, devPtrdO}, {Stats, devPtrStats},
-        {dQ, devPtrdQ}, {dK, devPtrdK}, {dV, devPtrdV},
-        {attn_scale, &attn_scale_cpu}};
-
-    // Execute graph
-    assert(graph->execute(cudnn_handle, variant_pack, cudnn_workspace).is_good());
-    cudaCheck(cudaGetLastError());
-}
+                              int B, int T, int NH, int C);
+#else
+void create_cudnn() {}
+void destroy_cudnn() {}
 #endif // ENABLE_CUDNN
 
 // ----------------------------------------------------------------------------
@@ -1912,7 +1683,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->use_master_weights = 1; // keep master weights copy in float for optim update?
 }
 
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
+void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bool get_loss=true) {
     NVTX_RANGE_FN();
     // targets are optional and could be NULL
     // in this function we must be careful and use size_t instead of int, otherwise
@@ -2063,6 +1834,13 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     } else {
         // if we don't have targets, we don't have loss
         model->mean_loss = -1.0f;
+    }
+
+    // accumulate the loss immediately if we are not going to run gpt2_backward(), e.g. inference
+    if (get_loss) {
+        cudaCheck(cudaEventSynchronize(loss_event)); // hopefully finished long ago
+        for (int i=0; i<B*T; i++) { model->mean_loss += (float)(model->cpu_losses[i]); }
+        model->mean_loss /= B*T;
     }
 }
 
@@ -2316,16 +2094,15 @@ void common_start(bool override_enable_tf32 = true) {
     cublasCheck(cublasSetStream(cublas_handle, main_stream));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
-    #ifdef ENABLE_CUDNN
-    checkCudnnErr(cudnnCreate(&cudnn_handle));
-    #endif
+    
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     bool enable_tf32 = PRECISION_MODE == PRECISION_FP32 && deviceProp.major >= 8 && override_enable_tf32;
     cublasCheck(cublasSetMathMode(cublas_handle, enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
     cublas_compute = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
-
     // setup the (global) cuBLASLt workspace
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
+    
+    create_cudnn();
 }
 
 void common_free(GPT2 &model) {
@@ -2338,13 +2115,10 @@ void common_free(GPT2 &model) {
     cudaCheck(cudaStreamDestroy(main_stream));
 
     gpt2_free(&model);
-    #ifdef ENABLE_CUDNN
-    if (cudnn_workspace != NULL) { cudaCheck(cudaFree(cudnn_workspace)); }
-    checkCudnnErr(cudnnDestroy(cudnn_handle));
-    #endif
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
+    create_cudnn();
 }
 
 #ifndef TESTING
@@ -2628,6 +2402,7 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaEventCreate(&end));
     cudaCheck(cudaProfilerStart());
     double total_sum_iteration_time_s = 0.0;
+    float ema_tokens_per_second = 0.0f;
     for (int step = 0; step <= train_num_batches; step++) {
         NvtxRange step_range("Train step", step);
 
@@ -2706,7 +2481,7 @@ int main(int argc, char *argv[]) {
             // if we're overfitting a single batch, we'll only call this at step = 0
             dataloader_next_batch(&train_loader);
         }
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, false);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
         if (multi_gpu_config.num_processes > 1) {
@@ -2720,12 +2495,18 @@ int main(int argc, char *argv[]) {
         cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
         cudaCheck(cudaEventElapsedTime(&time_elapsed_ms, start, end));
 
+        float tokens_per_second = multi_gpu_config.num_processes * (B * T) / time_elapsed_ms * 1000.0;
+        float bias_corrected_ema_tokens_per_second = tokens_per_second; // by default set to non-ema version
         if (step > 0) { // consider the first batch to be a warmup (e.g. cuBLAS/cuDNN initialisation)
             total_sum_iteration_time_s += time_elapsed_ms / 1000.0;
+            // smooth out the tok/s with an exponential moving average, and bias correct just like in AdamW
+            ema_tokens_per_second = 0.95f * ema_tokens_per_second + 0.05f * tokens_per_second;
+            bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
-        int tokens_per_second = multi_gpu_config.num_processes * (B * T) / time_elapsed_ms * 1000.0;
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
-        printf0("step %4d/%d: train loss %f (acc %f) (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, accumulated_loss, time_elapsed_ms, tokens_per_second);
+        printf0("step %4d/%d: train loss %f (acc %f) (%f ms, %0f tok/s)\n",
+                step + 1, train_num_batches, model.mean_loss, accumulated_loss,
+                time_elapsed_ms, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
 
         // disable the profiler after 3 steps of optimization
