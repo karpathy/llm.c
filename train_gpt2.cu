@@ -2765,6 +2765,7 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaEventCreate(&end));
     cudaCheck(cudaProfilerStart());
     double total_sum_iteration_time_s = 0.0;
+    float ema_tokens_per_second = 0.0f;
     for (int step = 0; step <= train_num_batches; step++) {
         NvtxRange step_range("Train step", step);
 
@@ -2857,12 +2858,18 @@ int main(int argc, char *argv[]) {
         cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
         cudaCheck(cudaEventElapsedTime(&time_elapsed_ms, start, end));
 
+        float tokens_per_second = multi_gpu_config.num_processes * (B * T) / time_elapsed_ms * 1000.0;
+        float bias_corrected_ema_tokens_per_second = tokens_per_second; // by default set to non-ema version
         if (step > 0) { // consider the first batch to be a warmup (e.g. cuBLAS/cuDNN initialisation)
             total_sum_iteration_time_s += time_elapsed_ms / 1000.0;
+            // smooth out the tok/s with an exponential moving average, and bias correct just like in AdamW
+            ema_tokens_per_second = 0.95f * ema_tokens_per_second + 0.05f * tokens_per_second;
+            bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
-        int tokens_per_second = multi_gpu_config.num_processes * (B * T) / time_elapsed_ms * 1000.0;
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
-        printf0("step %4d/%d: train loss %f (acc %f) (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, accumulated_loss, time_elapsed_ms, tokens_per_second);
+        printf0("step %4d/%d: train loss %f (acc %f) (%f ms, %0f tok/s)\n",
+                step + 1, train_num_batches, model.mean_loss, accumulated_loss,
+                time_elapsed_ms, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
 
         // disable the profiler after 3 steps of optimization
