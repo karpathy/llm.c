@@ -1,6 +1,6 @@
 MSTRINGIFY(
 
-inline float perform_dot(__local float A_tile[TILE_SIZE][TILE_SIZE+LOCAL_MEM_PADDING_SIZE],
+float perform_dot(__local float A_tile[TILE_SIZE][TILE_SIZE+LOCAL_MEM_PADDING_SIZE],
             __local float B_tile[TILE_SIZE][TILE_SIZE+LOCAL_MEM_PADDING_SIZE],
             size_t local_id0, size_t local_id1) {
     float val = 0.0f;
