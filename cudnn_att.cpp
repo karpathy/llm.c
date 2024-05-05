@@ -302,8 +302,9 @@ void attention_backward_cudnn(floatX* dqkvr,                                    
     cudaCheck(cudaGetLastError());
 }
 
-void create_cudnn() {
+void create_cudnn(cudaStream_t stream) {
     checkCudnnErr(cudnnCreate(&cudnn_handle));
+    checkCudnnErr(cudnnSetStream(cudnn_handle, stream));
 }
 
 void destroy_cudnn() {
