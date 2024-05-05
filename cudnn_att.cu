@@ -106,10 +106,10 @@ auto lookup_cache_or_build_graph_fwd(Args... args) {
                                .set_dim({B, H, T, HS})
                                .set_stride({3 * H * HS * T, HS, 3 * H * HS, 1}));
     auto attn_scale = graph->tensor(fe::graph::Tensor_attributes().set_name("attn_scale")
-                                .set_dim({1, 1, 1, 1})
-                                .set_stride({1, 1, 1, 1})
-                                .set_is_pass_by_value(true)
-                                .set_data_type(fe::DataType_t::FLOAT));
+                               .set_dim({1, 1, 1, 1})
+                               .set_stride({1, 1, 1, 1})
+                               .set_is_pass_by_value(true)
+                               .set_data_type(fe::DataType_t::FLOAT));
 
     auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention");
     sdpa_options.set_is_inference(is_inference_only);
