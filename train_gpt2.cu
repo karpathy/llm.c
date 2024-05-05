@@ -2059,7 +2059,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->use_master_weights = 1; // keep master weights copy in float for optim update?
 }
 
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
+void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bool get_loss=true) {
     NVTX_RANGE_FN();
     // targets are optional and could be NULL
     // in this function we must be careful and use size_t instead of int, otherwise
@@ -2210,6 +2210,13 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     } else {
         // if we don't have targets, we don't have loss
         model->mean_loss = -1.0f;
+    }
+
+    // accumulate the loss immediately if we are not going to run gpt2_backward(), e.g. inference
+    if (get_loss) {
+        cudaCheck(cudaEventSynchronize(loss_event)); // hopefully finished long ago
+        for (int i=0; i<B*T; i++) { model->mean_loss += (float)(model->cpu_losses[i]); }
+        model->mean_loss /= B*T;
     }
 }
 
@@ -2836,7 +2843,7 @@ int main(int argc, char *argv[]) {
             // if we're overfitting a single batch, we'll only call this at step = 0
             dataloader_next_batch(&train_loader);
         }
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, false);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
         if (multi_gpu_config.num_processes > 1) {
