@@ -13,14 +13,13 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <ctype.h>
 #include <math.h>
 #include <time.h>
 #include <assert.h>
 #include <float.h>
 #include <string.h>
 #include <unistd.h>
-#include <assert.h>
+
 // GPU / CUDA related
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
