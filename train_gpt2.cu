@@ -167,6 +167,21 @@ void mpi_check(int status, const char *file, int line) {
 #define mpiCheck(err) (mpi_check(err, __FILE__, __LINE__))
 #endif
 
+// older nvcc does not provide __ldcs and __stcs for bfloat16, despite these actually just being unsigned shorts.
+// we need to be careful here to only define our own versions if none already exist, otherwise the compiler will
+// complain.
+// If not, you easily get "no viable overload" (for sm52) and "function already exists" (sm_80)
+#if defined(ENABLE_BF16) and __CUDACC_VER_MAJOR__ < 12 and not(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+__device__ floatX __ldcs(const floatX* address) {
+    unsigned short bf = __ldcs(reinterpret_cast<const unsigned short*>(address));
+    return __nv_bfloat16_raw{bf};
+}
+
+__device__ void __stcs(floatX* address, floatX value) {
+    __stcs(reinterpret_cast<unsigned short*>(address), ((__nv_bfloat16_raw)value).x);
+}
+#endif
+
 // warp-level reduction for summing values
 __device__ float warpReduceSum(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -1056,7 +1071,7 @@ __global__ void copy_and_cast_kernel(float* dst, const floatX* src, size_t n) {
 __global__ void cast_and_add_kernel(floatX* dst, const float* src, size_t n) {
     // used only for matmul_backward_bias kernel, a little bit embarassing TODO delete later
     const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) { dst[idx] += (floatX)src[idx]; } // have to += because dbias is a paramater
+    if (idx < n) { dst[idx] = (floatX)((float)dst[idx] + src[idx]); } // have to += because dbias is a paramater
 }
 
 // ----------------------------------------------------------------------------
