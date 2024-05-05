@@ -5,7 +5,7 @@ much of a restriction: In pretraining, it is just a constant 1/batch_size tensor
 out the input prompt, but that is known in advance.
 
 Compile example:
-nvcc -O3 --use_fast_math classifier_fused.cu -o classifier_fused
+nvcc -O3 --use_fast_math -lcublas -lcublasLt classifier_fused.cu -o classifier_fused
 
 ./classifier_fused 1
 ./classifier_fused 2
@@ -198,7 +198,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide(cg::thread_block_tile<32>& wa
     float thread_sumval = 0.0f;
     // do the loop in reverse to maximise probability of L2 cache hits
     // so even small L2s get some hits on the 2nd read of the same thread
-    for (int i = (V+3)/4 + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
+    for (int i = ceil_div(V, 4) + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
         float4 v4 = x_vec4[i];
         #pragma unroll
         for(int k = 0; k < 4; k++) {
@@ -207,7 +207,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide(cg::thread_block_tile<32>& wa
             }
             float old_maxval = thread_maxval;
             thread_maxval = fmaxf(thread_maxval, vec_at(v4, k));
-            thread_sumval *= expf((old_maxval - thread_maxval));
+            thread_sumval *= expf(old_maxval - thread_maxval);
             thread_sumval += expf(vec_at(v4, k) - thread_maxval);
         }
     }
@@ -270,7 +270,7 @@ __global__ void fused_classifier_kernel2(float* dlogits, float* losses, float* p
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
     const float4* logits_vec4 = reinterpret_cast<const float4*>(logits + idx * P);
-    for (int i = threadIdx.x; i < (V+3)/4; i += blockDim.x) {
+    for (int i = threadIdx.x; i < ceil_div(V, 4); i += blockDim.x) {
         // this is the 2nd read of logits after the one in prepare_softmax2
         // this data will never be needed again, so we reduce cache persistence
         float4 v4 = __ldcs(&logits_vec4[i]);
@@ -307,7 +307,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_til
         float v = x[i];
         float old_maxval = thread_maxval;
         thread_maxval = fmaxf(thread_maxval, v);
-        thread_sumval *= expf((old_maxval - thread_maxval));
+        thread_sumval *= expf(old_maxval - thread_maxval);
         thread_sumval += expf(v - thread_maxval);
     }
 
@@ -390,16 +390,16 @@ __device__ SoftmaxParams prepare_softmax_blockwide2(int idx, const float* inp, i
     float thread_sumval = 0.0f;
     // do the loop in reverse to maximise probability of L2 cache hits
     // so even small L2s get some hits on the 2nd read of the same thread
-    for (int i = (V+3)/4 + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
+    for (int i = ceil_div(V, f128::size) + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
         f128 packed_x = load128cs(x + i * f128::size); // load and do not keep in cache
         for(int k = 0; k < packed_x.size; ++k) {
-            if (i*4+k >= V) {  // bounds checking against real V
+            if (i*f128::size+k >= V) {  // bounds checking against real V
                 continue;
             }
             float v = (float)packed_x[k];
             float old_maxval = thread_maxval;
             thread_maxval = fmaxf(thread_maxval, v);
-            thread_sumval *= expf((old_maxval - thread_maxval));
+            thread_sumval *= expf(old_maxval - thread_maxval);
             thread_sumval += expf(v - thread_maxval);
         }
     }
@@ -457,7 +457,7 @@ __global__ void fused_classifier_kernel4(float* dlogits, float* losses, float* p
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
     const float* logits_vec = logits + idx * P;
-    for (int i = threadIdx.x; i < (V+f128::size-1)/f128::size; i += blockDim.x) {
+    for (int i = threadIdx.x; i < ceil_div(V , f128::size); i += blockDim.x) {
         // this is the 2nd read of logits after the one in prepare_softmax2
         // this data will never be needed again, so we reduce cache persistence
         f128 packed_logits_vec = load128cs(logits_vec + i * f128::size); // load and do not keep in cache
