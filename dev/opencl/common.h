@@ -16,6 +16,7 @@
 const char *build_options = "-cl-fast-relaxed-math -cl-mad-enable";
 
 const char *KernelSource =
+#include "utils.cl"
 #include "matmul_forward.cl"
 #include "matmul_backward.cl"
 ;
