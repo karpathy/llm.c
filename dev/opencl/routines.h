@@ -7,10 +7,10 @@ void cl_matmul_forward(GPT2_CL *gcl, float* out,
     // out will be (B,T,OC)
     cl_int err = 0;
 
-    err = clEnqueueWriteBuffer(gcl->queue, gcl->matmul_A, CL_TRUE, 0, sizeof(float) * B * T * C, inp, 0, NULL, NULL);
-    err |= clEnqueueWriteBuffer(gcl->queue, gcl->matmul_B, CL_TRUE, 0, sizeof(float) * OC * C, weight, 0, NULL, NULL);
+    err = clEnqueueWriteBuffer(gcl->queue, gcl->matmul_A, CL_FALSE, 0, sizeof(float) * B * T * C, inp, 0, NULL, NULL);
+    err |= clEnqueueWriteBuffer(gcl->queue, gcl->matmul_B, CL_FALSE, 0, sizeof(float) * OC * C, weight, 0, NULL, NULL);
     if(bias != NULL) {
-        err |= clEnqueueWriteBuffer(gcl->queue, gcl->matmul_bias, CL_TRUE, 0, sizeof(float) * OC, bias, 0, NULL, NULL);
+        err |= clEnqueueWriteBuffer(gcl->queue, gcl->matmul_bias, CL_FALSE, 0, sizeof(float) * OC, bias, 0, NULL, NULL);
     }
     if (err != CL_SUCCESS)
     {
@@ -41,7 +41,6 @@ void cl_matmul_forward(GPT2_CL *gcl, float* out,
         printf("error: failed to execute kernel! %d\n", err);
         exit(1);
     }
-    clFinish(gcl->queue);
 
     err = clEnqueueReadBuffer(gcl->queue, gcl->matmul_out, CL_TRUE, 0, sizeof(float) * B * T * OC, out, 0, NULL, NULL );
     if (err != CL_SUCCESS)
@@ -49,6 +48,7 @@ void cl_matmul_forward(GPT2_CL *gcl, float* out,
         printf("error: failed to read output array! %d\n", err);
         exit(1);
     }
+    clFinish(gcl->queue);
 }
 
 void cl_matmul_backward(GPT2_CL *gcl, float* dinp, float* dweight, float* dbias,
@@ -60,9 +60,9 @@ void cl_matmul_backward(GPT2_CL *gcl, float* dinp, float* dweight, float* dbias,
 
     cl_int err = 0;
 
-    err = clEnqueueWriteBuffer(gcl->queue, gcl->matmul_A, CL_TRUE, 0, sizeof(float) * B * T * OC, dout, 0, NULL, NULL);
-    err |= clEnqueueWriteBuffer(gcl->queue, gcl->matmul_B, CL_TRUE, 0, sizeof(float) * OC * C, weight, 0, NULL, NULL);
-    err |= clEnqueueWriteBuffer(gcl->queue, gcl->matmul_out, CL_TRUE, 0, sizeof(float) * B * T * C, dinp, 0, NULL, NULL);
+    err = clEnqueueWriteBuffer(gcl->queue, gcl->matmul_A, CL_FALSE, 0, sizeof(float) * B * T * OC, dout, 0, NULL, NULL);
+    err |= clEnqueueWriteBuffer(gcl->queue, gcl->matmul_B, CL_FALSE, 0, sizeof(float) * OC * C, weight, 0, NULL, NULL);
+    err |= clEnqueueWriteBuffer(gcl->queue, gcl->matmul_out, CL_FALSE, 0, sizeof(float) * B * T * C, dinp, 0, NULL, NULL);
     if (err != CL_SUCCESS)
     {
         printf("error: failed to write to source array!\n");
@@ -90,7 +90,6 @@ void cl_matmul_backward(GPT2_CL *gcl, float* dinp, float* dweight, float* dbias,
         printf("error: failed to execute kernel! %d\n", err);
         exit(1);
     }
-    clFinish(gcl->queue);
 
     err = clEnqueueReadBuffer(gcl->queue, gcl->matmul_out, CL_TRUE, 0, sizeof(float) * B * T * C, dinp, 0, NULL, NULL );
     if (err != CL_SUCCESS)
@@ -98,14 +97,17 @@ void cl_matmul_backward(GPT2_CL *gcl, float* dinp, float* dweight, float* dbias,
         printf("error: failed to read output array! %d\n", err);
         exit(1);
     }
+    clFinish(gcl->queue);
 
-    // inp is (B,T,C), dout is (B,T,OC)
+    // dout is (B,T,OC), inp is (B,T,C)
     // dweight will be (OC,C)
     // dweight += dout^T * inp
 
-    err = clEnqueueWriteBuffer(gcl->queue, gcl->matmul_A, CL_TRUE, 0, sizeof(float) * B * T * OC, dout, 0, NULL, NULL);
-    err |= clEnqueueWriteBuffer(gcl->queue, gcl->matmul_B, CL_TRUE, 0, sizeof(float) * B * T * C, inp, 0, NULL, NULL);
-    err |= clEnqueueWriteBuffer(gcl->queue, gcl->matmul_out, CL_TRUE, 0, sizeof(float) * OC * C, dweight, 0, NULL, NULL);
+    // already copied in prev step
+    // err = clEnqueueWriteBuffer(gcl->queue, gcl->matmul_A, CL_FALSE, 0, sizeof(float) * B * T * OC, dout, 0, NULL, NULL);
+
+    err = clEnqueueWriteBuffer(gcl->queue, gcl->matmul_B, CL_FALSE, 0, sizeof(float) * B * T * C, inp, 0, NULL, NULL);
+    err |= clEnqueueWriteBuffer(gcl->queue, gcl->matmul_out, CL_FALSE, 0, sizeof(float) * OC * C, dweight, 0, NULL, NULL);
     if (err != CL_SUCCESS)
     {
         printf("error: failed to write to source array!\n");
@@ -132,7 +134,6 @@ void cl_matmul_backward(GPT2_CL *gcl, float* dinp, float* dweight, float* dbias,
         printf("error: failed to execute kernel! %d\n", err);
         exit(1);
     }
-    clFinish(gcl->queue);
 
     err = clEnqueueReadBuffer(gcl->queue, gcl->matmul_out, CL_TRUE, 0, sizeof(float) * OC * C, dweight, 0, NULL, NULL );
     if (err != CL_SUCCESS)
@@ -140,11 +141,14 @@ void cl_matmul_backward(GPT2_CL *gcl, float* dinp, float* dweight, float* dbias,
         printf("error: failed to read output array! %d\n", err);
         exit(1);
     }
+    clFinish(gcl->queue);
 
     // dbias will be (OC)
     if(dbias != NULL) {
-        err = clEnqueueWriteBuffer(gcl->queue, gcl->matmul_A, CL_TRUE, 0, sizeof(float) * B * T * OC, dout, 0, NULL, NULL);
-        err |= clEnqueueWriteBuffer(gcl->queue, gcl->matmul_bias, CL_TRUE, 0, sizeof(float) * OC, dbias, 0, NULL, NULL);
+        // already copied in prev step
+        // err = clEnqueueWriteBuffer(gcl->queue, gcl->matmul_A, CL_FALSE, 0, sizeof(float) * B * T * OC, dout, 0, NULL, NULL);
+
+        err = clEnqueueWriteBuffer(gcl->queue, gcl->matmul_bias, CL_FALSE, 0, sizeof(float) * OC, dbias, 0, NULL, NULL);
         if (err != CL_SUCCESS)
         {
             printf("error: failed to write to source array!\n");
@@ -171,7 +175,6 @@ void cl_matmul_backward(GPT2_CL *gcl, float* dinp, float* dweight, float* dbias,
             printf("error: failed to execute kernel! %d\n", err);
             exit(1);
         }
-        clFinish(gcl->queue);
 
         err = clEnqueueReadBuffer(gcl->queue, gcl->matmul_bias, CL_TRUE, 0, sizeof(float) * OC, dbias, 0, NULL, NULL );
         if (err != CL_SUCCESS)
@@ -179,5 +182,6 @@ void cl_matmul_backward(GPT2_CL *gcl, float* dinp, float* dweight, float* dbias,
             printf("error: failed to read output array! %d\n", err);
             exit(1);
         }
+        clFinish(gcl->queue);
     }
 }
