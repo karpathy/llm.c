@@ -22,13 +22,6 @@ NVCC_CUDNN =
 # overridable flag for multi-GPU training. by default we won't build with cudnn
 # because it bloats up the compile time from a few seconds to ~minute
 USE_CUDNN ?= 0
-# on linux, try to use nvidia-smi to detect the user's GPU and compile for that specific architecture
-ifeq ($(SHELL_UNAME), Linux)
-    NVCC_ARCH := $(shell which nvidia-smi > /dev/null 2>&1 && nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits | head -n 1 | sed 's/\.//g')
-    ifdef NVCC_ARCH
-        NVCC_FLAGS += -gencode arch=compute_$(NVCC_ARCH),code=compute_$(NVCC_ARCH) -gencode arch=compute_$(NVCC_ARCH),code=sm_$(NVCC_ARCH)
-    endif
-endif
 
 # autodect a lot of various supports on current platform
 $(info ---------------------------------------------)
