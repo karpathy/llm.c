@@ -11,14 +11,14 @@ namespace fe = cudnn_frontend;
 #if defined(ENABLE_FP32)
 typedef float floatX;
 static_assert(false, "cuDNN is not supported in FP32 mode.")
-// use fp16 (note: this may require gradient scaler, currently not implemented!)
 
+// use fp16 (note: this may require gradient scaler, currently not implemented!)
 #elif defined(ENABLE_FP16)
 typedef half floatX;
 #define CUBLAS_LOWP CUDA_R_16F
 #define CUDNN_16BIT fe::DataType_t::HALF
-#else // Default to bfloat16
 
+#else // Default to bfloat16
 typedef __nv_bfloat16 floatX;
 #define CUDNN_16BIT fe::DataType_t::BFLOAT16
 #endif

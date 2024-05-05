@@ -13,9 +13,7 @@ CUDA_OUTPUT_FILE = -o $@
 
 # NVCC flags
 # -t=0 is short for --threads, 0 = number of CPUs on the machine
-# include PTX for both SM52 (Maxwell) and SM80 (Ampere, our main optimisation target at the moment) + native SASS for current GPU
-# this increases compile time by ~5%, but we need >=SM70 PTX for some optimisations, and it allows "cuobjdump --dump-sass" to work
-NVCC_FLAGS = -O3 -t=0 --use_fast_math -gencode=arch=compute_52,code=compute_52 -gencode=arch=compute_80,code=sm_80
+NVCC_FLAGS = -O3 -t=0 --use_fast_math
 NVCC_LDFLAGS = -lcublas -lcublasLt
 NVCC_INCLUDES =
 NVCC_LDLIBS =
@@ -24,6 +22,13 @@ NVCC_CUDNN =
 # overridable flag for multi-GPU training. by default we won't build with cudnn
 # because it bloats up the compile time from a few seconds to ~minute
 USE_CUDNN ?= 0
+# on linux, try to use nvidia-smi to detect the user's GPU and compile for that specific architecture
+ifeq ($(SHELL_UNAME), Linux)
+    NVCC_ARCH := $(shell which nvidia-smi > /dev/null 2>&1 && nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits | head -n 1 | sed 's/\.//g')
+    ifdef NVCC_ARCH
+        NVCC_FLAGS += -gencode arch=compute_$(NVCC_ARCH),code=sm_$(NVCC_ARCH)
+    endif
+endif
 
 # autodect a lot of various supports on current platform
 $(info ---------------------------------------------)
