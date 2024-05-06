@@ -15,7 +15,7 @@ CUDA_OUTPUT_FILE = -o $@
 # -t=0 is short for --threads, 0 = number of CPUs on the machine
 NVCC_FLAGS = -O3 -t=0 --use_fast_math
 NVCC_LDFLAGS = -lcublas -lcublasLt
-NVCC_INCLUDES =
+NVCC_INCLUDES = -I/usr/local/cuda/targets/x86_64-linux/include/
 NVCC_LDLIBS =
 NCLL_INCUDES =
 NVCC_CUDNN =
@@ -196,8 +196,8 @@ train_gpt2: train_gpt2.c
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) $(OUTPUT_FILE)
 
-cudnn_att.o: cudnn_att.cu
-	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)
+cudnn_att.o: cudnn_att.cpp
+	$(CC) -c $(CFLAGS) $< $(NVCC_INCLUDES) 
 
 train_gpt2cu: train_gpt2.cu $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE) $(NVCC_CUDNN)
@@ -215,4 +215,4 @@ profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE) $(NVCC_CUDNN)
 
 clean:
-	$(REMOVE_FILES) $(TARGETS)
+	$(REMOVE_FILES) $(TARGETS) cudnn_att.o
