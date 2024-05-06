@@ -94,23 +94,33 @@ endif
 # and then we include it below (see currently hard-coded path assumed in home directory)
 ifeq ($(USE_CUDNN), 1)
   ifeq ($(SHELL_UNAME), Linux)
-    # hard-coded path for now
-    CUDNN_FRONTEND_PATH ?= $(HOME)/cudnn-frontend/include
-    ifeq ($(shell [ -d $(CUDNN_FRONTEND_PATH) ] && echo "exists"), exists)
+    # hard-coded path for now in either . or ($HOME) directory 
+    # this can be overridden by setting CUDNN_FRONTEND_PATH on the command line
+    ifeq ($(shell [ -d $(HOME)/cudnn-frontend/include ] && echo "exists"), exists)
       $(info ✓ cuDNN found, will run with flash-attention)
-      NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
-      NVCC_LDFLAGS += -lcudnn
-      NVCC_FLAGS += -DENABLE_CUDNN
-      NVCC_CUDNN = cudnn_att.o
+      CUDNN_FRONTEND_PATH ?= $(HOME)/cudnn-frontend/include
+    else ifeq ($(shell [ -d cudnn-frontend/include ] && echo "exists"),)
+      $(info ✓ cuDNN found, will run with flash-attention)
+      CUDNN_FRONTEND_PATH ?= cudnn-frontend/include
     else
       $(error ✗ cuDNN not found. See the Makefile for our currently hard-coded paths / install instructions)
     endif
-  else
+    NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
+    NVCC_LDFLAGS += -lcudnn
+    NVCC_FLAGS += -DENABLE_CUDNN
+    NVCC_CUDNN = cudnn_att.o
+  else 
     ifneq ($(OS), Windows_NT)
       $(info → cuDNN is not supported on MAC OS right now)
     else
       $(info ✓ Windows cuDNN found, will run with flash-attention)
-      CUDNN_FRONTEND_PATH ?= ..\..\cudnn-frontend\include #override on command line if different location
+      ifeq ($(shell if exist "$(HOMEDRIVE)$(HOMEPATH)\cudnn-frontend\include" (echo exists)),exists)
+        CUDNN_FRONTEND_PATH ?= $(HOMEDRIVE)$(HOMEPATH)\cudnn-frontend\include #override on command line if different location
+      else ifeq ($(shell if exist "cudnn-frontend\include" (echo exists)),exists)
+        CUDNN_FRONTEND_PATH ?= cudnn-frontend\include #override on command line if different location
+      else
+        $(error ✗ cuDNN not found. See the Makefile for our currently hard-coded paths / install instructions) 
+      endif
       CUDNN_INCLUDE_PATH ?= -I"C:\Program Files\NVIDIA\CUDNN\v9.1\include\12.4"
       CUDNN_FRONTEND_PATH += $(CUDNN_INCLUDE_PATH)
       NVCC_FLAGS += --std c++20 -Xcompiler "/std:c++20" -Xcompiler "/EHsc /W0 /nologo /Ox /FS" -maxrregcount=0 --machine 64
@@ -214,7 +224,7 @@ ifeq ($(NVCC),)
     $(info ✗ nvcc not found, skipping GPU/CUDA builds)
 else
     $(info ✓ nvcc found, including GPU/CUDA support)
-    TARGETS += train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu
+    TARGETS += train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu $(NVCC_CUDNN)
 endif
 
 $(info ---------------------------------------------)
