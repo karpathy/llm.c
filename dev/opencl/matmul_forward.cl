@@ -24,7 +24,7 @@ __kernel void matmul_forward(__global float* out, __global float* AMat,
                         (((wg_id1 * TILE_SIZE) + TILE_SIZE - 1) >= OC);
 
     // initialize output value
-    float val = use_bias? bias[global_id1] : 0.0f;
+    float val = (use_bias && is_valid_g1)? bias[global_id1] : 0.0f;
 
     // wgs with most conditionals
     if(is_tail_wg) {

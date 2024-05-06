@@ -31,7 +31,7 @@ float perform_dot(__local float A_tile[TILE_SIZE][TILE_SIZE+LOCAL_MEM_PADDING_SI
             val += dot(A_vec.hi.hi, B_vec.hi.hi);
         }
     #else
-        for (int i = 0; i < TILE_SIZE; ++i) {
+        for (int i = 0; i < TILE_SIZE; i++) {
             val += A_tile[local_id0][i] * B_tile[local_id1][i];
         }
     #endif
