@@ -56,13 +56,13 @@ __kernel void matmul_backward1(__global float* out, __global float* AMat, __glob
 
         for (t = 0; (t+TILE_SIZE-1) < OC; t+=TILE_SIZE) {
 
-            #if DO_PRELOAD == 1
+            \n#if DO_PRELOAD == 1\n
                 // prefetch next tile
                 if(t+TILE_SIZE < OC) {
                     prefetch(A_ptr + TILE_SIZE + l0ocl1, 1);
                     prefetch(B_ptr + (C * TILE_SIZE) + l0cl1, 1);
                 }
-            #endif
+            \n#endif\n
 
             // load current tile
             A_tile[local_id0][local_id1] = A_ptr[l0ocl1];
@@ -146,13 +146,13 @@ __kernel void matmul_backward2(__global float* out, __global float* AMat, __glob
 
         for (t = 0; (t+TILE_SIZE-1) < bt; t+=TILE_SIZE) {
 
-            #if DO_PRELOAD == 1
+            \n#if DO_PRELOAD == 1\n
                 // prefetch next tile
                 if(t+TILE_SIZE < bt) {
                     prefetch(A_ptr + (OC * TILE_SIZE) + l0ocl1, 1);
                     prefetch(B_ptr + (C * TILE_SIZE) + l0cl1, 1);
                 }
-            #endif
+            \n#endif\n
 
             // load current tile
             A_tile[local_id1][local_id0] = A_ptr[l0ocl1];
@@ -191,11 +191,11 @@ __kernel void matmul_backward3(__global float* AMat, __global float* bias,
     float val = 0.0f;
     for(int bt=0; bt<(B * T); bt++) {
 
-        #if DO_PRELOAD == 1
+        \n#if DO_PRELOAD == 1\n
             if((bt + 1) < (B * T)) {
                 prefetch(A_ptr + ((bt + 1) * OC), 1);
             }
-        #endif
+        \n#endif\n
 
         val += A_ptr[bt * OC];
     }

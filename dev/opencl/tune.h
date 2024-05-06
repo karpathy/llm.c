@@ -24,4 +24,4 @@
   set it to 1 to enable preload
   set it to 0 to disable
 */
-#define DO_PRELOAD 1
+#define MATMUL_DO_PRELOAD 1

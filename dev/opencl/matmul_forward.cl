@@ -56,13 +56,13 @@ __kernel void matmul_forward(__global float* out, __global float* AMat,
 
         for (t = 0; (t+TILE_SIZE-1) < C; t+=TILE_SIZE) {
 
-            #if DO_PRELOAD == 1
+            \n#if DO_PRELOAD == 1\n
                 // prefetch next tile
                 if(t+TILE_SIZE < C) {
                     prefetch(A_ptr + TILE_SIZE + l0cl1, 1);
                     prefetch(B_ptr + TILE_SIZE + l0cl1, 1);
                 }
-            #endif
+            \n#endif\n
 
             // load current tile
             A_tile[local_id0][local_id1] = A_ptr[l0cl1];

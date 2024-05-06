@@ -8,20 +8,20 @@ float perform_dot(__local float A_tile[TILE_SIZE][TILE_SIZE+LOCAL_MEM_PADDING_SI
     // synchronize to make sure all data is loaded into local memory
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    #if MATMUL_VLOAD_SIZE == 4
+    \n#if VLOAD_SIZE == 4\n
         for (int i = 0; i < TILE_SIZE/4; i++) {
             float4 A_vec = vload4(i, A_tile[local_id0]);
             float4 B_vec = vload4(i, B_tile[local_id1]);
             val += dot(A_vec, B_vec);
         }
-    #elif MATMUL_VLOAD_SIZE == 8
+    \n#elif VLOAD_SIZE == 8\n
         for (int i = 0; i < TILE_SIZE/8; i++) {
             float8 A_vec = vload8(i, A_tile[local_id0]);
             float8 B_vec = vload8(i, B_tile[local_id1]);
             val += dot(A_vec.lo, B_vec.lo);
             val += dot(A_vec.hi, B_vec.hi);
         }
-    #elif MATMUL_VLOAD_SIZE == 16
+    \n#elif VLOAD_SIZE == 16\n
         for (int i = 0; i < TILE_SIZE/16; i++) {
             float16 A_vec = vload16(i, A_tile[local_id0]);
             float16 B_vec = vload16(i, B_tile[local_id1]);
@@ -30,11 +30,11 @@ float perform_dot(__local float A_tile[TILE_SIZE][TILE_SIZE+LOCAL_MEM_PADDING_SI
             val += dot(A_vec.hi.lo, B_vec.hi.lo);
             val += dot(A_vec.hi.hi, B_vec.hi.hi);
         }
-    #else
+    \n#else\n
         for (int i = 0; i < TILE_SIZE; i++) {
             val += A_tile[local_id0][i] * B_tile[local_id1][i];
         }
-    #endif
+    \n#endif\n
 
     // synchronize before loading next tile
     barrier(CLK_LOCAL_MEM_FENCE);
