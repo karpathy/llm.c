@@ -595,8 +595,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
     const floatX* logits_vec = logits + idx * P;
-    int i = threadIdx.x;
-    for (; i < V/x128::size; i += blockDim.x) {
+    for (int i = threadIdx.x; i < V/x128::size; i += blockDim.x) {
         // this is the 2nd read of logits after the one in prepare_softmax2
         // it will be overwritten by the logits gradients which is when we reduce cache persistence
         x128 packed_logits_vec = load128(logits_vec + i * x128::size); // rely on cs of store128cs
@@ -620,8 +619,8 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
 
     // handle remaining elements after the last multiple of x128::size
     // e.g. if V = 8003, and x128::size = 8, we need to handle the last 3 elements
-    i *= x128::size;
-    for (; i < V; i++) {
+    int unaligned_start = V & ~(x128::size - 1); // round down to multiple of x128::size
+    for (int i = threadIdx.x + unaligned_start; i < V; i++) {
         float prob = expf((float)logits_vec[i] - sp.Offset) * sp.Scale;
         float indicator = (i == ix) ? 1.0f : 0.0f;
         float dlogit = (prob - indicator) * dloss;

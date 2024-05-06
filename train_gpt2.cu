@@ -806,12 +806,12 @@ __global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, i
         accumulators[k] = 0.0f;
     }
     int thread_id = threadIdx.y * block_size_x + threadIdx.x;
-    for (int i = thread_id; i < OC_per_warp; i += block_size) {
-        shared[i] = 0.0f;
+    for (int idx = thread_id; idx < OC_per_warp; idx += block_size) {
+        shared[idx] = 0.0f;
     }
     __syncthreads();
-    for (int i = blockIdx.y*block_size_y + threadIdx.y; i < B * T; i += gridDim.y*block_size_y) {
-        x128 packed_dout = load128(dout + global_oc + i*OC);
+    for (int idx = blockIdx.y*block_size_y + threadIdx.y; idx < B * T; idx += gridDim.y*block_size_y) {
+        x128 packed_dout = load128(dout + global_oc + idx*OC);
         for (int k = 0; k < x128::size; k++) {
             accumulators[k] += (float)packed_dout[k];
         }
@@ -1107,8 +1107,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
     const floatX* logits_vec = logits + idx * P;
-    int i = threadIdx.x;
-    for (; i < V/x128::size; i += blockDim.x) {
+    for (int i = threadIdx.x; i < V/x128::size; i += blockDim.x) {
         // this is the 2nd read of logits after the one in prepare_softmax2
         // it will be overwritten by the logits gradients which is when we reduce cache persistence
         x128 packed_logits_vec = load128(logits_vec + i * x128::size); // rely on cs of store128cs
@@ -1132,8 +1131,8 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
 
     // handle remaining elements after the last multiple of x128::size
     // e.g. if V = 8003, and x128::size = 8, we need to handle the last 3 elements
-    i *= x128::size;
-    for (; i < V; i++) {
+    int unaligned_start = V & ~(x128::size - 1); // round down to multiple of x128::size
+    for (int i = threadIdx.x + unaligned_start; i < V; i++) {
         float prob = expf((float)logits_vec[i] - sp.Offset) * sp.Scale;
         float indicator = (i == ix) ? 1.0f : 0.0f;
         float dlogit = (prob - indicator) * dloss;
