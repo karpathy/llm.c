@@ -34,6 +34,7 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 -a 1 is "overfit single batch", -x 10 is 10 iterations, and -f 0 disables tf32
 */
 
+#include <unistd.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string>
@@ -53,6 +54,7 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #include "utils.h"
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
 #include "tokenizer.h"
+#undef FLT_MAX
 
 // ----------------------------------------------------------------------------
 // CUDA precision settings
@@ -171,7 +173,7 @@ void mpi_check(int status, const char *file, int line) {
 // we need to be careful here to only define our own versions if none already exist, otherwise the compiler will
 // complain.
 // If not, you easily get "no viable overload" (for sm52) and "function already exists" (sm_80)
-#if defined(ENABLE_BF16) and __CUDACC_VER_MAJOR__ < 12 and not(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+#if defined(ENABLE_BF16) && (__CUDACC_VER_MAJOR__ < 12) && !((__CUDA_ARCH__ >= 800) || !defined(__CUDA_ARCH__))
 __device__ floatX __ldcs(const floatX* address) {
     unsigned short bf = __ldcs(reinterpret_cast<const unsigned short*>(address));
     return __nv_bfloat16_raw{bf};
@@ -489,12 +491,12 @@ __global__ void encoder_forward_kernel3(floatX* out,
 }
 
 template <typename T>
-__device__ void atomicStochasticAdd(T* address, float val0, float val1, uint seed) {
+__device__ void atomicStochasticAdd(T* address, float val0, float val1, unsigned int seed) {
     static_assert(sizeof(T) == 2, "Only 16-bit atomicStochasticAdd supported.");
     float2 val = make_float2(val0, val1);
-    uint* address_as_uint = (uint*)address;
-    uint old = *address_as_uint, assumed;
-    uint random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+    unsigned int* address_as_uint = (unsigned int*)address;
+    unsigned int old = *address_as_uint, assumed;
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
     do {
         assumed = old;
         float2 new_fp32 = make_float2((float)(reinterpret_cast<T*>(&old)[0]) + val.x,
@@ -502,17 +504,17 @@ __device__ void atomicStochasticAdd(T* address, float val0, float val1, uint see
         T new_rounded[2];
         stochastic_rounding(new_fp32.x, &new_rounded[0], random);
         stochastic_rounding(new_fp32.y, &new_rounded[1], random >> 16);
-        old = atomicCAS(address_as_uint, assumed, *(uint*)&new_rounded);
+        old = atomicCAS(address_as_uint, assumed, *(unsigned int*)&new_rounded);
     } while (assumed != old);
 }
-__device__ void atomicStochasticAdd(float* address, float val0, float val1, uint seed) {
+__device__ void atomicStochasticAdd(float* address, float val0, float val1, unsigned int seed) {
     atomicAdd(address, val0);
     atomicAdd(address + 1, val1);
 }
 
 __global__ void encoder_backward_kernel(floatX* dwte, floatX* dwpe,
                                         const floatX* dout, const int* inp,
-                                        int B, int T, int C, uint seed) {
+                                        int B, int T, int C, unsigned int seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * T * C;
     idx *= 2; // 2 elements per thread
@@ -1090,7 +1092,7 @@ void encoder_forward(floatX* out,
 
 void encoder_backward(floatX* dwte, floatX* dwpe,
                     const floatX* dout, const int* inp,
-                    int B, int T, int C, uint seed) {
+                    int B, int T, int C, unsigned int seed) {
     NVTX_RANGE_FN();
     const int N = B * T * C;
     const int block_size = 256;
