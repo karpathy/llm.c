@@ -48,7 +48,7 @@ for size in models:
     assert max_length == 1024 # being defensive for now, shouldn't be an issue
     seq_len = tokens.nelement()
 
-    # DEBUG CROP
+    # DEBUG CROP, TODO REMOVE LATER
     seq_len = 8192
 
     # ref
@@ -66,7 +66,7 @@ for size in models:
         target_ids[:, :-trg_len] = -100
 
         with torch.no_grad():
-            outputs = model(input_ids, target_ids)
+            outputs = model(input_ids, labels=target_ids)
             neg_log_likelihood = outputs.loss
 
         nlls.append(neg_log_likelihood)
