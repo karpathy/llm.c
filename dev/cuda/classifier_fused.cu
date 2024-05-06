@@ -23,10 +23,6 @@ nvcc -O3 --use_fast_math -lcublas -lcublasLt classifier_fused.cu -o classifier_f
 
 // todo - this file does not properly support anything but FP32
 // kernel 5 can be run in fp16/bf16 to test performance, but the outputs will be wrong
-#undef ENABLE_BF16
-#undef ENABLE_FP16
-#define ENABLE_BF16
-
 #if defined(ENABLE_BF16)
 typedef __nv_bfloat16 floatX;
 #elif defined(ENABLE_FP16)
