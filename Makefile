@@ -23,6 +23,23 @@ NVCC_CUDNN =
 # because it bloats up the compile time from a few seconds to ~minute
 USE_CUDNN ?= 0
 
+# Function to check if a file exists in the PATH
+define file_exists_in_path
+  $(shell where $(1) 2>nul || which $(1) 2>/dev/null)
+endef
+
+ifndef GPU_COMPUTE_CAPABILITY # set to defaults if: make GPU_COMPUTE_CAPABILITY= 
+  ifneq ($(call file_exists_in_path, __nvcc_device_query),)
+    GPU_COMPUTE_CAPABILITY = $(shell __nvcc_device_query) 
+    GPU_COMPUTE_CAPABILITY := $(strip $(GPU_COMPUTE_CAPABILITY))
+  endif
+endif
+
+# set to defaults if - make GPU_COMPUTE_CAPABILITY= otherwise use the compute capability detected above
+ifneq ($(GPU_COMPUTE_CAPABILITY),) 
+  NVCC_FLAGS += --generate-code arch=compute_$(GPU_COMPUTE_CAPABILITY),code=[compute_$(GPU_COMPUTE_CAPABILITY),sm_$(GPU_COMPUTE_CAPABILITY)]
+endif
+
 # autodect a lot of various supports on current platform
 $(info ---------------------------------------------)
 
