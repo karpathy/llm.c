@@ -255,7 +255,7 @@ int main(int argc, char *argv[]) {
             allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", 3e-2f);
         }
 
-        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1, model.num_parameters, 0);
+        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1);
 
         // print the timing information at the end
         printf("step %d: loss %f (took %f ms)\n", step+1, model.mean_loss, time_elapsed_s * 1000);

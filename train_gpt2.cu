@@ -2088,6 +2088,7 @@ void gpt2_backward(GPT2 *model) {
 // Compute a mean of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
 float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
+    if (multi_gpu_config->num_processes == 1) return value;
     // MPI doesn't support all reduce with mean, so we sum up, then divide.
     float result;
     mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
@@ -2104,11 +2105,7 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
     // Average all losses.
     model->accumulated_mean_loss = multi_gpu_cpu_float_mean(model->mean_loss, multi_gpu_config);
 #ifdef MULTI_GPU
-    // all gather is only required when num_processes > 1
-    if (multi_gpu_config->num_processes == 1) {
-        return;
-    }
-
+    if (multi_gpu_config->num_processes == 1) return;
     // Average all gradients.
     ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
         model->num_parameters,
@@ -2119,18 +2116,18 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 #endif
 }
 
-void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t, size_t shard_num_parameters, size_t shard_offset) {
+void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
     NVTX_RANGE_FN();
     // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
 
-    // lazily allocate the memory for m_memory and v_memory according to shard configs
+    // lazily allocate the memory for m_memory and v_memory
     if (model->m_memory == NULL) {
-        cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
-        cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->m_memory, 0, shard_num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, shard_num_parameters * sizeof(float)));
-        printf0("allocated %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
-        printf0("allocated %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
+        cudaCheck(cudaMalloc((void**)&model->m_memory, model->num_parameters * sizeof(float)));
+        cudaCheck(cudaMalloc((void**)&model->v_memory, model->num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->m_memory, 0, model->num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->v_memory, 0, model->num_parameters * sizeof(float)));
+        printf0("allocated %zu MiB for AdamW optimizer state m\n", (model->num_parameters * sizeof(float)) >> 20);
+        printf0("allocated %zu MiB for AdamW optimizer state v\n", (model->num_parameters * sizeof(float)) >> 20);
         if (model->use_master_weights == 1) {
             // allocate one more buffer to keep the master copy of weights as float, and copy the weights over
             cudaCheck(cudaMalloc((void**)&model->master_weights, model->num_parameters * sizeof(float)));
@@ -2140,19 +2137,49 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         }
     }
 
-    floatX* params_memory = (floatX*)model->params_memory + shard_offset;
-    floatX* grads_memory = (floatX*)model->grads_memory + shard_offset;
-    float* master_weights = NULL;
-    if (model->use_master_weights == 1) {
-        master_weights = model->master_weights + shard_offset;
-    }
-
     int block_size = 512;
-    int num_blocks = CEIL_DIV(shard_num_parameters, block_size);
+    int num_blocks = CEIL_DIV(model->num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
-    adamw_kernel3<<<num_blocks, block_size, 0, main_stream>>>(params_memory, master_weights, grads_memory, model->m_memory, model->v_memory, shard_num_parameters,
+    adamw_kernel3<<<num_blocks, block_size, 0, main_stream>>>((floatX*)model->params_memory, model->master_weights,
+                                              (floatX*)model->grads_memory, model->m_memory, model->v_memory,
+                                              model->num_parameters,
+                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
+    cudaCheck(cudaGetLastError());
+}
+
+void gpt2_multi_gpu_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t, MultiGpuConfig* multi_gpu_config) {
+    NVTX_RANGE_FN();
+    if (model->m_memory == NULL) {
+        cudaCheck(cudaMalloc((void**)&model->m_memory, multi_gpu_config->shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMalloc((void**)&model->v_memory, multi_gpu_config->shard_num_parameters* sizeof(float)));
+        cudaCheck(cudaMemset(model->m_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->v_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
+        printf0("allocated %zu MiB for AdamW optimizer state m\n", (multi_gpu_config->shard_num_parameters * sizeof(float)) >> 20);
+        printf0("allocated %zu MiB for AdamW optimizer state v\n", (multi_gpu_config->shard_num_parameters * sizeof(float)) >> 20);
+        if (model->use_master_weights == 1) {
+            cudaCheck(cudaMalloc((void**)&model->master_weights, model->num_parameters * sizeof(float)));
+            copy_and_cast_kernel<<<CEIL_DIV(model->num_parameters, 512), 512, 0, main_stream>>>(model->master_weights, (floatX*)model->params_memory, model->num_parameters);
+            cudaCheck(cudaGetLastError());
+            printf0("allocated %zu MiB for master copy of params\n", (model->num_parameters * sizeof(float)) >> 20);
+        }
+    }
+
+    floatX* params_memory = (floatX*)model->params_memory + multi_gpu_config->shard_offset;
+    floatX* grads_memory = (floatX*)model->grads_memory + multi_gpu_config->shard_offset;
+    float* master_weights = NULL;
+    if (model->use_master_weights == 1) {
+        master_weights = model->master_weights + multi_gpu_config->shard_offset;
+    }
+
+    int block_size = 512;
+    int num_blocks = CEIL_DIV(multi_gpu_config->shard_num_parameters, block_size);
+    float beta1_correction = 1.0f - powf(beta1, t);
+    float beta2_correction = 1.0f - powf(beta2, t);
+    unsigned int seed = random_u32(&model->rng_state);
+    adamw_kernel3<<<num_blocks, block_size, 0, main_stream>>>(params_memory, master_weights, grads_memory,
+                                                              model->m_memory, model->v_memory, multi_gpu_config->shard_num_parameters,
                                                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
     cudaCheck(cudaGetLastError());
 }
@@ -2160,10 +2187,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 void gpt2_multi_gpu_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
 {
 #ifdef MULTI_GPU
-    // all gather is only required when num_processes > 1
-    if (multi_gpu_config->num_processes == 1) {
-        return;
-    }
+    if (multi_gpu_config->num_processes == 1) return;
 
     if (multi_gpu_config->zero_stage == 1) {
         // gather all parameter updates from each process
@@ -2616,9 +2640,13 @@ int main(int argc, char *argv[]) {
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, false);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
+#ifndef MULTI_GPU        
+        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
+#else
         gpt2_multi_gpu_accumulate(&model, &multi_gpu_config);
-        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1, multi_gpu_config.shard_num_parameters, multi_gpu_config.shard_offset);
+        gpt2_multi_gpu_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1, &multi_gpu_config);
         gpt2_multi_gpu_gather(&model, &multi_gpu_config);
+#endif
 
         // todo - move or double-buffer all of this timing logic to avoid idling the GPU at this point!
         cudaEventRecord(end);
