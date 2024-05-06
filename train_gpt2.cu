@@ -108,6 +108,14 @@ class NvtxRange {
 };
 #define NVTX_RANGE_FN() NvtxRange nvtx_range(__FUNCTION__)
 
+// try to make sure that 2 blocks fit on A100/H100 to maximise latency tolerance
+// this needs to be defines rather than queried to be used for __launch_bounds__
+#if __CUDA_ARCH__ == 800 || __CUDA_ARCH__ >= 900
+#define MAX_1024_THREADS_BLOCKS 2
+#else
+#define MAX_1024_THREADS_BLOCKS 1
+#endif
+
 // cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
 const size_t cublaslt_workspace_size = 32 * 1024 * 1024;
 void* cublaslt_workspace = NULL;
@@ -270,6 +278,11 @@ __device__ void store128(ElementType* target, Packed128<ElementType> value) {
 template<class ElementType>
 __device__ void store128cs(ElementType* target, Packed128<ElementType> value) {
     __stcs(reinterpret_cast<int4*>(target), value.get_bits());
+}
+// store a Packed128 to an aligned memory address while caching in L2 but bypassing L1
+template<class ElementType>
+__device__ void store128cg(ElementType* target, Packed128<ElementType> value) {
+    __stcg(reinterpret_cast<int4*>(target), value.get_bits());
 }
 
 // short-form typedefs
@@ -772,7 +785,7 @@ __global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floa
     store128(dinp + idx, packed_dinp);
 }
 
-__global__ void matmul_backward_bias_kernel6(float* dbias, const floatX* dout, int B, int T, int OC) {
+__global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, int B, int T, int OC) {
     // note: this kernel reads in floatX, but it writes to float!
     // this is because we're using atomics, which are super slow in < fp32 precision on < H100 GPUs
     // so the trick is do fp32 atomics to a buffer, and then copy_and_cast the result to floatX
@@ -793,36 +806,48 @@ __global__ void matmul_backward_bias_kernel6(float* dbias, const floatX* dout, i
         accumulators[k] = 0.0f;
     }
     int thread_id = threadIdx.y * block_size_x + threadIdx.x;
-    for (int idx = thread_id; idx < OC_per_warp; idx += block_size) {
-        shared[idx] = 0.0f;
+    for (int i = thread_id; i < OC_per_warp; i += block_size) {
+        shared[i] = 0.0f;
     }
     __syncthreads();
-    for (int idx = blockIdx.y*block_size_y + threadIdx.y; idx < B * T; idx += gridDim.y*block_size_y) {
-        x128 packed_dout = load128(dout + global_oc + idx*OC);
+    for (int i = blockIdx.y*block_size_y + threadIdx.y; i < B * T; i += gridDim.y*block_size_y) {
+        x128 packed_dout = load128(dout + global_oc + i*OC);
         for (int k = 0; k < x128::size; k++) {
             accumulators[k] += (float)packed_dout[k];
         }
     }
+    // we need to avoid shared memory bank conflicts for the atomicAdd to maximise performance
+    // so we accumulate in a conflict-free order, then reorder to match the global memory order
     for (int k = 0; k < x128::size; k++) {
-        atomicAdd(shared + local_oc + k, accumulators[k]);
+        atomicAdd(shared + threadIdx.x + (k * block_size_x), accumulators[k]);
     }
+    if (threadIdx.y >= x128::size) { return; } // only need this many warps to reorder the data
     __syncthreads();
-    if (threadIdx.y == 0) {
-        for (int idx = threadIdx.x; idx < OC_per_warp; idx += block_size_x) {
-            atomicAdd(dbias + idx + blockIdx.x*OC_per_warp, shared[idx]);
-        }
-    }
+    // read the accumulated values in the conflict-free order
+    int i = threadIdx.x + (threadIdx.y * block_size_x);
+    float tmp = shared[i];
+    __syncthreads();
+    // write them back to shared memory in the global memory order
+    // 8-way bank conflict for BF16 x128, but only 8x per threadblock (rather than 8x per warp)
+    shared[local_oc + threadIdx.y] = tmp;
+    __syncthreads();
+    // now we do a perfectly coalesced atomic add to global memory (1x 128-byte cacheline per warp)
+    atomicAdd(dbias + i + blockIdx.x*OC_per_warp, shared[i]);
 }
 
-__global__ void layernorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
-                        const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
-                        int B, int T, int C) {
+__global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
+                layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+                                            const floatX* dout, const floatX* inp, const floatX* weight,
+                                            const floatX* mean, const floatX* rstd,
+                                            int B, int T, int C) {
     extern __shared__ float shared[]; // size = 2 * C + 1
     int warpId = threadIdx.x / warpSize; // warp index within a block
     int warpsInBlock = blockDim.x / warpSize; //number of warps in block
     int baseIdx = blockIdx.x * warpsInBlock + warpId;
     int warpThreadIdx = threadIdx.x % warpSize; // Thread index within the warp
     int warpsInGrid = gridDim.x * warpsInBlock;
+    int C_per_iteration = warpSize * x128::size;
+    int iterations_C = C / C_per_iteration;
 
     // the first half of shared memory is bias, second is weight
     float* dbias_shared = shared;
@@ -849,56 +874,85 @@ __global__ void layernorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX
         // first: two reduce operations
         float dnorm_mean = 0.0f;
         float dnorm_norm_mean = 0.0f;
-        for (int i = warpThreadIdx; i < C; i  += warpSize) {
-            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
-            float dnorm_i = (float)weight[i] * (float)dout_bt[i];
-            dnorm_mean += dnorm_i;
-            dnorm_norm_mean += dnorm_i * norm_bti;
+        for (int i = warpThreadIdx * x128::size; i < C; i += warpSize * x128::size) {
+            x128 dout128_i   = load128(dout_bt + i);
+            x128 inp128_i    = load128(inp_bt  + i);
+            x128 weight128_i = load128(weight  + i);
+            for (int k = 0; k < x128::size; k++) {
+                float norm_bti = ((float)inp128_i[k] - mean_bt) * rstd_bt;
+                float dnorm_i = (float)weight128_i[k] * (float)dout128_i[k];
+                dnorm_mean += dnorm_i;
+                dnorm_norm_mean += dnorm_i * norm_bti;
+            }
         }
         dnorm_mean = warpReduceSum(dnorm_mean) / C;
         dnorm_norm_mean = warpReduceSum(dnorm_norm_mean) / C;
 
         // now iterate again and accumulate all the gradients
-        // todo - use x128 for this loop to improve performance
-        for (int i = warpThreadIdx; i < C; i += warpSize) {
-            float dout_i = (float)__ldcs(&dout_bt[i]);
-            float norm_bti = ((float)__ldcs(&inp_bt[i]) - mean_bt) * rstd_bt;
-            float dnorm_i = (float)weight[i] * dout_i;
-            // gradient contribution to bias
-            atomicAdd(&dbias_shared[i], dout_i);
-            // gradient contribution to weight
-            atomicAdd(&dweight_shared[i], norm_bti * dout_i);
-            // gradient contribution to input
-            float dval = 0.0f;
-            dval += dnorm_i; // term 1
-            dval -= dnorm_mean; // term 2
-            dval -= norm_bti * dnorm_norm_mean; // term 3
-            dval *= rstd_bt; // final scale
-            dinp_bt[i] = (floatX)((float)dinp_bt[i] + dval);
+        // unfortunately we cannot use the same index for x128 arrays and shared memory
+        // as atomics can only be 32-bit rather than 128-bit (at least pre-SM90/Hopper)
+        // so this would result in an 8-way bank conflict, and kill performance
+        // so instead, we use a shared memory friendly index, and reorder before the final write
+        for (int i = 0; i < iterations_C; i++) {
+            int global_index = (warpThreadIdx * x128::size) + (i * C_per_iteration);
+            int shared_index = warpThreadIdx + (i * C_per_iteration);
+            x128 dout128   = load128cs(dout_bt + global_index);
+            x128 inp128    = load128cs(inp_bt  + global_index);
+            x128 dinp128   = load128(dinp_bt   + global_index);
+            x128 weight128 = load128(weight    + global_index);
+
+            for (int x = 0; x < x128::size; x++) {
+                float dout_i = (float)dout128[x];
+                float norm_bti = ((float)inp128[x] - mean_bt) * rstd_bt;
+                float dnorm_i = (float)weight128[x] * dout_i;
+                // gradient contribution to bias (using shared memory friendly index)
+                atomicAdd(&dbias_shared[shared_index + x*warpSize], dout_i);
+                // gradient contribution to weight (using shared memory friendly index)
+                atomicAdd(&dweight_shared[shared_index + x*warpSize], norm_bti * dout_i);
+                // gradient contribution to input
+                float dval = 0.0f;
+                dval += dnorm_i; // term 1
+                dval -= dnorm_mean; // term 2
+                dval -= norm_bti * dnorm_norm_mean; // term 3
+                dval *= rstd_bt; // final scale
+                dinp128[x] = (floatX)((float)dinp128[x] + dval);
+            }
+            // cache in L2 as this is read by the next kernel, but bypass L1 to minimise thrashing
+            store128cg(dinp_bt + global_index, dinp128);
         }
     }
-
     // Accumulate into a FP32 scratchpad
     // BF16 atomics are potentially much slower... and this is more precise!
-    // todo - could avoid the extra copy if floatX is FP32, fairly negligible though
+    // todo - could potentially avoid the extra copy if floatX is FP32, fairly negligible though
     __syncthreads();
     float* scratch_dbias = scratch;
     float* scratch_dweight = scratch + C;
     unsigned int* scratchFlag = (unsigned int*)(scratch + (2 * C));
     for(int i = threadIdx.x; i < C; i+= blockDim.x) {
+        // global atomics in the same "shared memory banking friendly" order
         atomicAdd(&scratch_dbias[i], dbias_shared[i]);
         atomicAdd(&scratch_dweight[i], dweight_shared[i]);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        *tmp_flag = atomicAdd(scratchFlag, 1);
+        *tmp_flag = atomicInc(scratchFlag, gridDim.x);
     }
     __syncthreads();
     if (*tmp_flag == gridDim.x-1) {
-        for(int i = threadIdx.x; i < C; i+= blockDim.x) {
-            // todo - potentially do stochastic rounding here as well
-            dbias[i] = (floatX)scratch_dbias[i];
-            dweight[i] = (floatX)scratch_dweight[i];
+        for (int i = warpId; i < iterations_C; i += warpsInBlock) {
+            // reorder from atomic/shared memory-friendly index to real global memory index
+            // and convert from float/FP32 to floatX/BF16 for the final write
+            int global_index = (warpThreadIdx * x128::size) + (i * C_per_iteration);
+            int shared_index = warpThreadIdx + (i * C_per_iteration);
+
+            x128 dbias128;
+            x128 dweight128;
+            for (int x = 0; x < x128::size; x++) {
+                dbias128[x] = (floatX)scratch_dbias[shared_index + x*warpSize];
+                dweight128[x] = (floatX)scratch_dweight[shared_index + x*warpSize];
+            }
+            store128(dbias + global_index, dbias128);
+            store128(dweight + global_index, dweight128);
         }
     }
 }
@@ -982,21 +1036,35 @@ struct SoftmaxParams {
     float Offset;
 };
 
-__device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, int V, int P) {
+__device__ SoftmaxParams prepare_softmax_blockwide3(int idx, const floatX* inp, int V, int P) {
     // same but not float4
     // one row of inp, i.e. inp[idx, :] of shape (V,)
 
     const floatX* x = inp + idx * P;
     float thread_maxval = -INFINITY;
     float thread_sumval = 0.0f;
-    // do the loop in reverse to maximise probability of L2 cache hits
-    // so even small L2s get some hits on the 2nd read of the same thread
-    for (int i = (V+x128::size-1)/x128::size + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
-        x128 packed_x = load128(x + i * x128::size); // try to keep in cache until next read
-        for(int k = 0; k < packed_x.size; ++k) {
-            if (i*x128::size+k >= V) {  // bounds checking against real V
-                continue;
+    int i = (V+x128::size-1)/x128::size + threadIdx.x - blockDim.x;
+
+    // special-case loop to handle the unaligned elements at the end of the array
+    // this lets us skip the bounds check in the main loop below, which improves performance
+    while ((i+1)*x128::size > V) {
+        for(int k = 0; k < x128::size; ++k) {
+            if (i*x128::size+k >= V) {
+                break; // bounds checking against real V (rather than padded P)
             }
+            float v = (float)x[i*x128::size+k];
+            float old_maxval = thread_maxval;
+            thread_maxval = fmaxf(thread_maxval, v);
+            thread_sumval *= expf((old_maxval - thread_maxval));
+            thread_sumval += expf(v - thread_maxval);
+        }
+        i -= blockDim.x;
+    }
+
+    // main loop for the bulk of the iterations (no bounds checking required!)
+    for (; i >= 0; i -= blockDim.x) {
+        x128 packed_x = load128(x + i * x128::size); // load and keep in cache until fused_classifier loop
+        for(int k = 0; k < x128::size; ++k) {
             float v = (float)packed_x[k];
             float old_maxval = thread_maxval;
             thread_maxval = fmaxf(thread_maxval, v);
@@ -1006,7 +1074,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, i
     }
 
     // Block Max Reduction -> Maths -> Block Sum Reduction
-    float block_maxval = blockReduce<warpReduceMax>(thread_maxval);
+    float block_maxval = blockReduce<warpReduceMax>(thread_maxval, false, -INFINITY);
     thread_sumval *= expf(thread_maxval - block_maxval);
     float block_sumval = blockReduce<warpReduceSum>(thread_sumval);
 
@@ -1014,16 +1082,19 @@ __device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, i
     return SoftmaxParams{1.f / block_sumval, block_maxval};
 }
 
-// same as 2 but not using float4 (see dev/cuda/classifier_fused.cu)
 // will _update_ logits to logit gradients
-__global__ void fused_classifier_kernel3(floatX* logits, floatX* losses, floatX* probs,
+// uses template to decide whether to write logits and probs
+// split both loops in "multiple-of-x128-size" and "bounds-checked remainder" parts
+template <bool WriteLogits = true, bool WriteProbs = false>
+__global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
+                fused_classifier_kernel5(floatX* logits, floatX* losses, floatX* probs,
                                          const floatX* dlosses, const int* targets,
                                          int B, int T, int V, int P) {
     int idx = gridDim.x - (blockIdx.x+1); // reverse order for cache hits on matmul data
     int ix = targets[idx];
 
     // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
-    SoftmaxParams sp = prepare_softmax_blockwide(idx, logits, V, P);
+    SoftmaxParams sp = prepare_softmax_blockwide3(idx, logits, V, P);
 
     // calculate the probability needed for the loss and update (single-threaded)
     if(threadIdx.x == 0) {
@@ -1036,28 +1107,41 @@ __global__ void fused_classifier_kernel3(floatX* logits, floatX* losses, floatX*
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
     const floatX* logits_vec = logits + idx * P;
-    for (int i = threadIdx.x; i < (V+x128::size-1)/x128::size; i += blockDim.x) {
+    int i = threadIdx.x;
+    for (; i < V/x128::size; i += blockDim.x) {
         // this is the 2nd read of logits after the one in prepare_softmax2
-        // this data will never be needed again, so we reduce cache persistence
-        x128 packed_logits_vec = load128cs(logits_vec + i * x128::size); // load and do not keep in cache
+        // it will be overwritten by the logits gradients which is when we reduce cache persistence
+        x128 packed_logits_vec = load128(logits_vec + i * x128::size); // rely on cs of store128cs
         x128 packed_probs;
-        x128 packed_logits;
-        for(int k = 0; k < packed_logits_vec.size; ++k) {
-            int element = i*packed_logits_vec.size + k;
-            if (element >= V) {  // bounds checking against real V
-                continue;
-            }
-            float v = (float)packed_logits_vec[k];
-            float prob = expf(v - sp.Offset) * sp.Scale;
+        for(int k = 0; k < x128::size; ++k) {
+            int element = i*x128::size + k;
+            float prob = expf((float)packed_logits_vec[k] - sp.Offset) * sp.Scale;
             packed_probs[k] = (floatX)prob;
             float indicator = (element == ix) ? 1.0f : 0.0f;
-            packed_logits[k] = (floatX)((prob - indicator) * dloss);
+            packed_logits_vec[k] = (floatX)((prob - indicator) * dloss);
         }
-        if (logits != NULL){
-            store128(logits + idx * P + i * packed_logits_vec.size, packed_logits);
+        if (WriteLogits){
+            // reduce cache persistence for the overwritten logits
+            // to maximise probability that logits remain in cache between prepare_softmax and here
+            store128cs(logits + idx * P + i * x128::size, packed_logits_vec);
         }
-        if (probs != NULL) {
-            store128(probs + idx * P + i * packed_logits_vec.size, packed_probs);
+        if (WriteProbs) {
+            store128(probs + idx * P + i * x128::size, packed_probs);
+        }
+    }
+
+    // handle remaining elements after the last multiple of x128::size
+    // e.g. if V = 8003, and x128::size = 8, we need to handle the last 3 elements
+    i *= x128::size;
+    for (; i < V; i++) {
+        float prob = expf((float)logits_vec[i] - sp.Offset) * sp.Scale;
+        float indicator = (i == ix) ? 1.0f : 0.0f;
+        float dlogit = (prob - indicator) * dloss;
+        if (WriteLogits){
+            __stcs(logits + idx * P + i, (floatX)dlogit);
+        }
+        if (WriteProbs) {
+            probs[idx * P + i] = (floatX)prob;
         }
     }
 }
@@ -1286,9 +1370,10 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
                                      / (block_size * grid_size_x)); // full GPU!
 
         assert((OC % OC_per_warp) == 0); // there is no bounds checking in the kernel to maximise performance
+        assert(block_size_y >= x128::size); // part of the kernel assumes this is large enough to avoid loops
 
         cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float), main_stream);
-        matmul_backward_bias_kernel6<<<dim3(grid_size_x, grid_size_y),
+        matmul_backward_bias_kernel7<<<dim3(grid_size_x, grid_size_y),
                                        dim3(block_size_x, block_size_y),
                                        OC_per_warp * sizeof(float), main_stream>>>(dbias_buffer, dout, B, T, OC);
         cast_and_add_kernel<<<CEIL_DIV(OC, 256), 256, 0, main_stream>>>(dbias, dbias_buffer, OC);
@@ -1310,13 +1395,14 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
                         int B, int T, int C) {
     NVTX_RANGE_FN();
     const int block_size = 1024;
-    const int grid_size = deviceProp.multiProcessorCount;
+    const int grid_size = MAX_1024_THREADS_BLOCKS * deviceProp.multiProcessorCount;
     size_t shared_mem_size = (2 * C + 1) * sizeof(float);
 
     cudaMemsetAsync(scratch, 0, (2 * C + 1) * sizeof(float), main_stream);
-    layernorm_backward_kernel7<<<grid_size, block_size, shared_mem_size, main_stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+    layernorm_backward_kernel8<<<grid_size, block_size, shared_mem_size, main_stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
+
 
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
@@ -1370,14 +1456,14 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* da
 
 // replaces logits with logit gradients
 template <typename Type>
-void fused_classifier3(Type* logits, Type* losses,
+void fused_classifier(Type* logits, Type* losses,
                       const Type* dlosses, const int* targets,
                       int B, int T, int V, int P) {
     NVTX_RANGE_FN();
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = N;
-    fused_classifier_kernel3<<<grid_size, block_size, 512, main_stream>>>(logits, losses, (Type*)NULL, dlosses, targets, B, T, V, P);
+    fused_classifier_kernel5<<<grid_size, block_size, 512, main_stream>>>(logits, losses, (Type*)NULL, dlosses, targets, B, T, V, P);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1840,7 +1926,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bo
         cudaStreamWaitEvent(main_stream, parallel_events[0], 0);
         // fused classifier: does the forward pass and first part of the backward pass
         // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
-        fused_classifier3(acts.output, model->cpu_losses, (floatX*)NULL, model->targets, B, T, V, Vp);
+        fused_classifier(acts.output, model->cpu_losses, (floatX*)NULL, model->targets, B, T, V, Vp);
 
         // the GPU now writes the losses directly to the CPU buffer allocated with cudaMallocHost()
         // we accumulate cpu_losses at the end of gpt2_backward() waiting on this event
