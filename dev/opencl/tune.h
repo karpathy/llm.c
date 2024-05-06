@@ -18,7 +18,13 @@
   set it to 0 to disable
   note: MATMUL_TILE_SIZE must be multiple of this value
 */
-#define MATMUL_VLOAD_SIZE 8
+#define MATMUL_VLOAD_SIZE 4
+
+/*
+  set it to 1 to enable dot product
+  set it to 0 to use mad
+*/
+#define MATMUL_USE_DOT_PRODUCT 0
 
 /*
   set it to 1 to enable preload
