@@ -38,7 +38,6 @@ attention_forward: attention_forward.cu
 classifier_fused: classifier_fused.cu
 crossentropy_forward: crossentropy_forward.cu
 encoder_forward: encoder_forward.cu
-gelu_backward: gelu_backward.cu
 gelu_forward: gelu_forward.cu
 layernorm_forward: layernorm_forward.cu
 residual_forward: residual_forward.cu
@@ -52,6 +51,7 @@ matmul_forward: matmul_forward.cu
 attention_backward: attention_backward.cu
 crossentropy_softmax_backward: crossentropy_softmax_backward.cu
 encoder_backward: encoder_backward.cu
+gelu_backward: gelu_backward.cu
 layernorm_backward: layernorm_backward.cu
 matmul_backward_bias: matmul_backward_bias.cu
 matmul_backward: matmul_backward.cu
