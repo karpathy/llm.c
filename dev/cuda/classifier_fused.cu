@@ -139,13 +139,13 @@ __device__ SoftmaxParams prepare_softmax(cg::thread_block_tile<32>& warp,
         float old_maxval = maxval;
         // online softmax recurrence from "Online normalizer calculation for softmax" paper
         maxval = fmaxf(maxval, v);
-        sumval *= expf((old_maxval - maxval));
+        sumval *= expf(old_maxval - maxval);
         sumval += expf(v - maxval);
     }
     // warp-level reduction to get the maxval across the 32 threads
     float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
     // all 32 threads do a final shift of the sum considering the global max in this row
-    sumval *= expf((maxval - global_maxval));
+    sumval *= expf(maxval - global_maxval);
     // warp-level reduction to get the sumval across the 32 threads
     float global_sumval = cg::reduce(warp, sumval, cg::plus<float>{});
     // the final normalization factor
@@ -192,11 +192,6 @@ __global__ void fused_classifier_kernel1(float* dlogits, float* losses,
         float indicator = i == ix ? 1.0f : 0.0f;
         dlogits_bt[i] = (prob - indicator) * dloss;
     }
-}
-
-
-__device__ float vec_at(const float4& vec, int index) {
-    return reinterpret_cast<const float*>(&vec)[index];
 }
 
 __device__ SoftmaxParams prepare_softmax_blockwide(cg::thread_block_tile<32>& warp,
@@ -539,7 +534,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int idx, const floatX* inp, 
             float v = (float)x[i*x128::size+k];
             float old_maxval = thread_maxval;
             thread_maxval = fmaxf(thread_maxval, v);
-            thread_sumval *= expf((old_maxval - thread_maxval));
+            thread_sumval *= expf(old_maxval - thread_maxval);
             thread_sumval += expf(v - thread_maxval);
         }
         i -= blockDim.x;
@@ -552,7 +547,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int idx, const floatX* inp, 
             float v = (float)packed_x[k];
             float old_maxval = thread_maxval;
             thread_maxval = fmaxf(thread_maxval, v);
-            thread_sumval *= expf((old_maxval - thread_maxval));
+            thread_sumval *= expf(old_maxval - thread_maxval);
             thread_sumval += expf(v - thread_maxval);
         }
     }
