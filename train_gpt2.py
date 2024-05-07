@@ -128,7 +128,7 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, return_logits=True):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -151,6 +151,10 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+
+        # there are performance reasons why not returning logits is prudent, if not needed
+        if not return_logits:
+            logits = None
 
         return logits, loss
 
@@ -539,8 +543,7 @@ if __name__ == "__main__":
     for i in range(args.num_iterations):
         t0 = time.time()
         with ctx:
-            logits, loss = model(x, y)
-            del logits
+            _, loss = model(x, y, return_logits=False)
         if not args.inference_only:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
