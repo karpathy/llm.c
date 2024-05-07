@@ -1201,18 +1201,13 @@ __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg
 }
 
 template<class T>
-__global__ void norm_kernel(float* out, const T* data, size_t count) {
+__global__ void global_norm_kernel(float* out, const T* data, size_t count) {
     // we want as few atomics as possible, so each block tries to do
     // the maximum amount of work (so no fixed chunk, but instead iterating
     // until we run out of data), and then we reduce inside the block
     // and finally have just one atomic per block.
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-
-    __shared__ float block_result[32];
-
-    // out will be updated atomically from all thread blocks
+    // out will be updated atomically from all thread blocks. It is a float, so the
+    // atomic op is unproblematic
     size_t index = threadIdx.x + blockDim.x * blockIdx.x;
     size_t grid_width = blockDim.x * gridDim.x;
     float accumulator = 0.f;
@@ -1220,15 +1215,9 @@ __global__ void norm_kernel(float* out, const T* data, size_t count) {
         accumulator += (float)data[i] * (float)data[i];
     }
     // warp-level reduce
-    float warp_result = cg::reduce(warp, accumulator, cg::plus<float>{});
-    block_result[warp.meta_group_rank()] = warp_result;
-    block.sync();
-    if(warp.meta_group_rank() == 0) {
-        float gather = warp.thread_rank() < warp.meta_group_size() ? block_result[warp.thread_rank()] : 0.f;
-        float block_sum = cg::reduce(warp, gather, cg::plus<float>{});
-        if(warp.thread_rank() ==  0) {
-            atomicAdd(out, block_sum);
-        }
+    float block_sum = blockReduce<warpReduceSum>(accumulator);
+    if(threadIdx.x == 0) {
+        atomicAdd(out, block_sum);
     }
 }
 
@@ -1716,9 +1705,9 @@ void global_norm(float* out, const T* values, size_t count) {
     // one block too many is catastrophic, since it only can start once all the other
     // blocks finish. anyway, I think cuda_threads_per_SM should be a multiple of 512
     // on all gpus, so the division really is going to be exact.
-    const int grid_size = cuda_threads_per_SM * cuda_num_SMs / block_size;
+    const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
     assert(grid_size > 0);      // gives a better error than letting the call below fail
-    norm_kernel<<<grid_size, block_size>>>(out, values, count);
+    global_norm_kernel<<<grid_size, block_size>>>(out, values, count);
     cudaCheck(cudaGetLastError());
 }
 
