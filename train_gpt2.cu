@@ -835,7 +835,7 @@ __global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, i
     atomicAdd(dbias + i + blockIdx.x*OC_per_warp, shared[i]);
 }
 
-__global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
+__global__ void __launch_bounds__(512, 3) // todo - any warnings on Turing with only 1024 threads?
                 layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                                             const floatX* dout, const floatX* inp, const floatX* weight,
                                             const floatX* mean, const floatX* rstd,
@@ -1393,8 +1393,11 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
                         const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
                         int B, int T, int C) {
     NVTX_RANGE_FN();
-    const int block_size = 1024;
-    const int grid_size = MAX_1024_THREADS_BLOCKS * deviceProp.multiProcessorCount;
+    // todo - forcing 3 x 512 threads per SM maximum is a bit hacky, but more than that results in
+    // cache thrashing and lower performance on A100... is there a better way?
+    const int block_size = 512;
+    const int blocks_per_sm = min(3, (deviceProp.maxThreadsPerMultiProcessor / 1024));
+    const int grid_size = blocks_per_sm * deviceProp.multiProcessorCount;
     size_t shared_mem_size = (2 * C + 1) * sizeof(float);
 
     cudaMemsetAsync(scratch, 0, (2 * C + 1) * sizeof(float), main_stream);
