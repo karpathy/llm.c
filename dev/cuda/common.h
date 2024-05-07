@@ -49,6 +49,14 @@ int cuda_num_SMs = 0; // for persistent threads where we want 1 threadblock per 
 int cuda_threads_per_SM = 0;    // needed to calculate how many blocks to launch to fill up the GPU
 
 // ----------------------------------------------------------------------------
+// to make sure that 2 blocks fit on A100/H100 to maximise latency tolerance
+#if __CUDA_ARCH__ == 800 || __CUDA_ARCH__ >= 900
+#define MAX_1024_THREADS_BLOCKS 2
+#else
+#define MAX_1024_THREADS_BLOCKS 1
+#endif
+
+// ----------------------------------------------------------------------------
 // Packed128 data structure, which forces the compiler to use 128-bit loads/stores
 // in GPUs that support (the LDG.128 and STS.128 instructions)
 // This is a bit similar to the use of float4 in the case of 32-bit floats, but
@@ -88,23 +96,25 @@ template<class ElementType>
 __device__ Packed128<ElementType> load128(const ElementType* address) {
     return Packed128<ElementType>{*reinterpret_cast<const int4*>(address)};
 }
-
 // load a Packed128 from an aligned memory address with streaming cache hint
 template<class ElementType>
 __device__ Packed128<ElementType> load128cs(const ElementType* address) {
     return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
 }
-
 // store a Packed128 to an aligned memory address
 template<class ElementType>
 __device__ void store128(ElementType* target, Packed128<ElementType> value) {
     *reinterpret_cast<int4*>(target) = value.get_bits();
 }
-
 // store a Packed128 to an aligned memory address with streaming cache hint
 template<class ElementType>
 __device__ void store128cs(ElementType* target, Packed128<ElementType> value) {
     __stcs(reinterpret_cast<int4*>(target), value.get_bits());
+}
+// store a Packed128 to an aligned memory address while caching in L2 but bypassing L1
+template<class ElementType>
+__device__ void store128cg(ElementType* target, Packed128<ElementType> value) {
+    __stcg(reinterpret_cast<int4*>(target), value.get_bits());
 }
 
 // ----------------------------------------------------------------------------
