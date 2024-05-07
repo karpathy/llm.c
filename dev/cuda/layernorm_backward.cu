@@ -32,6 +32,7 @@ typedef half floatN;
 typedef float floatX;
 typedef float floatN;
 #endif
+typedef Packed128<floatX> x128;
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -125,7 +126,7 @@ void layernorm_backward_cpu(float* dinp, float* dweight, float* dbias,
 // GPU kernels
 
 // GPU helper functions for atomicAdd on smaller than 32-bit types
-__device__ floatX warpReduceSum(floatX val) {
+__device__ float warpReduceSum(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
         val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
     }
@@ -751,6 +752,128 @@ __global__ void layernorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX
     }
 }
 
+__global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
+                layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+                                            const floatX* dout, const floatX* inp, const floatX* weight,
+                                            const floatX* mean, const floatX* rstd,
+                                            int B, int T, int C) {
+    extern __shared__ float shared[]; // size = 2 * C + 1
+    int warpId = threadIdx.x / warpSize; // warp index within a block
+    int warpsInBlock = blockDim.x / warpSize; //number of warps in block
+    int baseIdx = blockIdx.x * warpsInBlock + warpId;
+    int warpThreadIdx = threadIdx.x % warpSize; // Thread index within the warp
+    int warpsInGrid = gridDim.x * warpsInBlock;
+    int C_per_iteration = warpSize * x128::size;
+    int iterations_C = C / C_per_iteration;
+
+    // the first half of shared memory is bias, second is weight
+    float* dbias_shared = shared;
+    float* dweight_shared = shared + C;
+
+    // init shared memory to zero
+    for(int i = threadIdx.x; i < C; i+= blockDim.x){
+       dbias_shared[i] = 0.0f;
+       dweight_shared[i] = 0.0f;
+    }
+    unsigned int *tmp_flag = (unsigned int*)(shared + C*2);
+    __syncthreads();
+
+    for (int idx = baseIdx; idx < B * T; idx += warpsInGrid) {
+        int b = idx / T;
+        int t = idx % T;
+
+        const floatX* dout_bt = dout + b * T * C + t * C;
+        const floatX* inp_bt = inp + b * T * C + t * C;
+        floatX* dinp_bt = dinp + b * T * C + t * C;
+        const float mean_bt = (float)mean[b * T + t];
+        const float rstd_bt = (float)rstd[b * T + t];
+
+        // first: two reduce operations
+        float dnorm_mean = 0.0f;
+        float dnorm_norm_mean = 0.0f;
+        for (int i = warpThreadIdx * x128::size; i < C; i += warpSize * x128::size) {
+            x128 dout128_i   = load128(dout_bt + i);
+            x128 inp128_i    = load128(inp_bt  + i);
+            x128 weight128_i = load128(weight  + i);
+            for (int k = 0; k < x128::size; k++) {
+                float norm_bti = ((float)inp128_i[k] - mean_bt) * rstd_bt;
+                float dnorm_i = (float)weight128_i[k] * (float)dout128_i[k];
+                dnorm_mean += dnorm_i;
+                dnorm_norm_mean += dnorm_i * norm_bti;
+            }
+        }
+        dnorm_mean = warpReduceSum(dnorm_mean) / C;
+        dnorm_norm_mean = warpReduceSum(dnorm_norm_mean) / C;
+
+        // now iterate again and accumulate all the gradients
+        // unfortunately we cannot use the same index for x128 arrays and shared memory
+        // as atomics can only be 32-bit rather than 128-bit (at least pre-SM90/Hopper)
+        // so this would result in an 8-way bank conflict, and kill performance
+        // so instead, we use a shared memory friendly index, and reorder before the final write
+        for (int i = 0; i < iterations_C; i++) {
+            int global_index = (warpThreadIdx * x128::size) + (i * C_per_iteration);
+            int shared_index = warpThreadIdx + (i * C_per_iteration);
+            x128 dout128   = load128cs(dout_bt + global_index);
+            x128 inp128    = load128cs(inp_bt  + global_index);
+            x128 dinp128   = load128(dinp_bt   + global_index);
+            x128 weight128 = load128(weight    + global_index);
+
+            for (int x = 0; x < x128::size; x++) {
+                float dout_i = (float)dout128[x];
+                float norm_bti = ((float)inp128[x] - mean_bt) * rstd_bt;
+                float dnorm_i = (float)weight128[x] * dout_i;
+                // gradient contribution to bias (using shared memory friendly index)
+                atomicAdd(&dbias_shared[shared_index + x*warpSize], dout_i);
+                // gradient contribution to weight (using shared memory friendly index)
+                atomicAdd(&dweight_shared[shared_index + x*warpSize], norm_bti * dout_i);
+                // gradient contribution to input
+                float dval = 0.0f;
+                dval += dnorm_i; // term 1
+                dval -= dnorm_mean; // term 2
+                dval -= norm_bti * dnorm_norm_mean; // term 3
+                dval *= rstd_bt; // final scale
+                dinp128[x] = (floatX)((float)dinp128[x] + dval);
+            }
+            // cache in L2 as this is read by the next kernel, but bypass L1 to minimise thrashing
+            store128cg(dinp_bt + global_index, dinp128);
+        }
+    }
+    // Accumulate into a FP32 scratchpad
+    // BF16 atomics are potentially much slower... and this is more precise!
+    // todo - could potentially avoid the extra copy if floatX is FP32, fairly negligible though
+    __syncthreads();
+    float* scratch_dbias = scratch;
+    float* scratch_dweight = scratch + C;
+    unsigned int* scratchFlag = (unsigned int*)(scratch + (2 * C));
+    for(int i = threadIdx.x; i < C; i+= blockDim.x) {
+        // global atomics in the same "shared memory banking friendly" order
+        atomicAdd(&scratch_dbias[i], dbias_shared[i]);
+        atomicAdd(&scratch_dweight[i], dweight_shared[i]);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *tmp_flag = atomicInc(scratchFlag, gridDim.x);
+    }
+    __syncthreads();
+    if (*tmp_flag == gridDim.x-1) {
+        for (int i = warpId; i < iterations_C; i += warpsInBlock) {
+            // reorder from atomic/shared memory-friendly index to real global memory index
+            // and convert from float/FP32 to floatX/BF16 for the final write
+            int global_index = (warpThreadIdx * x128::size) + (i * C_per_iteration);
+            int shared_index = warpThreadIdx + (i * C_per_iteration);
+
+            x128 dbias128;
+            x128 dweight128;
+            for (int x = 0; x < x128::size; x++) {
+                dbias128[x] = (floatX)scratch_dbias[shared_index + x*warpSize];
+                dweight128[x] = (floatX)scratch_dweight[shared_index + x*warpSize];
+            }
+            store128(dbias + global_index, dbias128);
+            store128(dweight + global_index, dweight128);
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -828,6 +951,20 @@ void layernorm_backward7(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* s
         layernorm_backward_kernel7<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
 }
 
+template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
+void layernorm_backward8(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+                        const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+                        int B, int T, int C, int block_size) {
+        const int grid_size = (1024/block_size) * cuda_num_SMs;
+        size_t shared_mem_size = (2 * C + 1) * sizeof(float);
+
+        // Including this as part of the timing until we can parallelise it
+        // It should fully hide the cost and improve kernel perf by >5% if done in parallel using CUDA streams
+        cudaMemset(scratch, 0, (1 + 2 * C) * sizeof(float));
+
+        layernorm_backward_kernel8<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+}
+
 // kernel version dispatch
 void layernorm_backward(int kernel_num,
                         floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
@@ -859,6 +996,9 @@ void layernorm_backward(int kernel_num,
             break;
         case 7:
             layernorm_backward7(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            break;
+        case 8:
+            layernorm_backward8(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
     default:
             printf("Invalid kernel number\n");
