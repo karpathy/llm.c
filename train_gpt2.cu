@@ -54,7 +54,6 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #include "utils.h"
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
 #include "tokenizer.h"
-#undef FLT_MAX
 
 // ----------------------------------------------------------------------------
 // CUDA precision settings
@@ -683,8 +682,8 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     const floatX* x = inp + idx * T;
 
     // not INF, so we don't get NaNs accidentally when subtracting two values.
-    const float FLT_MAX = 340282346638528859811704183484516925440.0f; // to avoid including float.h
-    float maxval = -FLT_MAX;
+    const float flt_max = 340282346638528859811704183484516925440.0f; // to avoid including float.h
+    float maxval = -flt_max;
     float sumval = 0.0f;
 
     const floatX* x_aligned = reinterpret_cast<const floatX*>(__builtin_assume_aligned(x, 16));
