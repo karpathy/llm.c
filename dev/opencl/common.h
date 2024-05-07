@@ -196,7 +196,7 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     }
 
     size = MAX(4 * C, V);
-    gcl->matmul_bias = clCreateBuffer(gcl->context, CL_MEM_READ_ONLY, sizeof(float) * size, NULL, &err);
+    gcl->matmul_bias = clCreateBuffer(gcl->context, CL_MEM_READ_WRITE, sizeof(float) * size, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl buffer: %d\n", err);
         exit(1);
@@ -205,7 +205,7 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     size = MAX(B * T * 4 * C, B * T * V);
     size = MAX(size, 4 * C * C);
     size = MAX(size, V * C);
-    gcl->matmul_out = clCreateBuffer(gcl->context, CL_MEM_WRITE_ONLY, sizeof(float) * size, NULL, &err);
+    gcl->matmul_out = clCreateBuffer(gcl->context, CL_MEM_READ_WRITE, sizeof(float) * size, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl buffer: %d\n", err);
         exit(1);
