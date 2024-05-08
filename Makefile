@@ -237,7 +237,7 @@ train_gpt2: train_gpt2.c
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
-$(NVCC_CUDNN): cudnn_att.cu
+$(NVCC_CUDNN): cudnn_att.cpp
 	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_INCLUDES) 
 
 train_gpt2cu: train_gpt2.cu $(NVCC_CUDNN)
@@ -256,4 +256,4 @@ profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE) 
 
 clean:
-	$(REMOVE_FILES) $(TARGETS)
+	$(REMOVE_FILES) $(TARGETS) $(NVCC_CUDNN)
