@@ -85,8 +85,16 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
 int main(int argc, char *argv[]) {
     common_start(false, true);
 
+    // set the right paths
+    #if defined(ENABLE_BF16)
+    const char* load_filename = "gpt2_124M_bf16.bin";
+    #else
+    const char* load_filename = "gpt2_124M.bin";
+    #endif
+
     // build the GPT-2 model from a checkpoint
     GPT2 model;
+
     gpt2_build_from_checkpoint(&model, load_filename);
     size_t V = model.config.vocab_size;
     size_t Vp = model.config.padded_vocab_size;
