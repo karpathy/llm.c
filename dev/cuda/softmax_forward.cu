@@ -514,6 +514,88 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
     }
 }
 
+__global__ void softmax_forward_online_kernel8(float* out, const float* inp, int N, int C) {
+    // do the same job as softmax_forward_online_kernel1()
+    // further combines unrolling, shared memory and warp reduce utilities in CUDA
+    extern __shared__ float shared[];
+    const int UNROLL_FACTOR = 8;
+    // FAKE_MAXVAL is set empirically to mimic the maxval that would appear in real situation
+    const float FAKE_MAXVAL = 10.f; 
+    const int warpsPerBlock = blockDim.x / warpSize;
+    int idx = blockIdx.x;
+    int tid = threadIdx.x;
+    int laneId = tid % warpSize;
+    int warpId = tid / warpSize;
+    float* maxvals = shared;
+    float* sumvals = &shared[warpsPerBlock];
+
+    if (tid >= C) {
+        maxvals[warpId] = -INFINITY;
+        sumvals[warpId] = 0.0f;
+        return;
+    }
+    
+    const float* x = inp + idx * C;
+    float* y = out + idx * C;
+
+    // each thread computes partial maxval and sumval in range [::blockDim.x]
+    // after finished this part, each thread in block-0 holds partial maxval and sumval
+    float maxval = -INFINITY, sumval = 0.0f;
+    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
+        #pragma unroll
+        for (int j = 0; j < UNROLL_FACTOR && i + j * blockDim.x < C; ++j) {   
+            maxval = fmaxf(maxval, x[i + j * blockDim.x]);
+            // using FAKE_MAXVAL to avoid keeping updating inter-maxvals
+            sumval += expf(x[i + j * blockDim.x] - FAKE_MAXVAL);
+        }
+    }
+    sumval *= expf(FAKE_MAXVAL - maxval);
+
+    // computes sumval and maxval of each warp (32 threads)
+    // after finished this part, shared memory holds maxval and sumval of each warp
+    
+    float offset_maxval, offset_sumval, tmp_maxval;
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        offset_maxval = __shfl_down_sync(0xFFFFFFFF, maxval, offset);
+        offset_sumval = __shfl_down_sync(0xFFFFFFFF, sumval, offset);
+        tmp_maxval = fmaxf(maxval, offset_maxval);
+        sumval = sumval * expf(maxval - tmp_maxval) +
+                offset_sumval * expf(offset_maxval - tmp_maxval);
+        maxval = tmp_maxval;
+    }
+    if (laneId == 0) {
+        sumvals[warpId] = sumval;
+        maxvals[warpId] = maxval;
+    }
+    __syncthreads();
+
+    // computes the global maxval and sumval of row `idx`
+    if (tid < warpsPerBlock / 2) {
+        #pragma unroll
+        for (int offset = warpsPerBlock / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) {
+                tmp_maxval = fmaxf(maxvals[tid], maxvals[tid + offset]);
+                sumvals[tid] = sumvals[tid] * expf(maxvals[tid] - tmp_maxval) +
+                            sumvals[tid + offset] *
+                                expf(maxvals[tid + offset] - tmp_maxval);
+                maxvals[tid] = tmp_maxval;
+            }
+        }
+    }
+    __syncthreads();
+
+    // write the final results into `out`
+    maxval = maxvals[0];
+    float sum = sumvals[0];
+    for (int i = tid; i < C; i += blockDim.x * UNROLL_FACTOR) {
+        #pragma unroll
+        for (int j = 0; j < UNROLL_FACTOR && i + j * blockDim.x < C; ++j) {
+            // __stcs(&y[i + j * blockDim.x], expf(x[i + j * blockDim.x] - maxval) / sum);
+            y[i + j * blockDim.x] = expf(x[i + j * blockDim.x] - maxval) / sum;
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -560,6 +642,13 @@ void softmax_forward7(float* out, const float* inp, int N, int C, int block_size
     softmax_forward_kernel7<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
 }
 
+void softmax_forward_online8(float* out, const float* inp, int N, int C, int block_size) {
+    const int grid_size = N;
+    size_t shared_mem_size = 2 * block_size / 32 * sizeof(float);
+    softmax_forward_online_kernel8<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void softmax_forward(int kernel_num, float* out, const float* inp, int N, int C, const int block_size) {
     switch (kernel_num) {
@@ -583,6 +672,9 @@ void softmax_forward(int kernel_num, float* out, const float* inp, int N, int C,
             break;
         case 7:
             softmax_forward7(out, inp, N, C, block_size);
+            break;
+        case 8:
+            softmax_forward_online8(out, inp, N, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
