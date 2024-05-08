@@ -87,11 +87,7 @@ endif
 
 # Check and include cudnn if available
 # You can override the path to cudnn frontend by setting CUDNN_FRONTEND_PATH=your_path on the make command line
-# You need cuDNN from: https://developer.nvidia.com/cudnn
-# Follow the apt-get instructions or Windows instructions to install the cuDNN library
-# And the cuDNN front-end from: https://github.com/NVIDIA/cudnn-frontend/tree/main
-# For this there is no installation, just download the repo to your home directory or directory of your choice
-# and then we include it below (see currently hard-coded path assumed in home directory)
+# Refer to the README for cuDNN install instructions
 ifeq ($(USE_CUDNN), 1)
   ifeq ($(SHELL_UNAME), Linux)
     # hard-coded path for now in either . or ($HOME) directory 
@@ -103,7 +99,7 @@ ifeq ($(USE_CUDNN), 1)
       $(info ✓ cuDNN found, will run with flash-attention)
       CUDNN_FRONTEND_PATH ?= cudnn-frontend/include
     else
-      $(error ✗ cuDNN not found. See the Makefile for our currently hard-coded paths / install instructions)
+      $(error ✗ cuDNN not found. See the README for install instructions and the Makefile for hard-coded paths)
     endif
     NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
     NVCC_LDFLAGS += -lcudnn
@@ -119,7 +115,7 @@ ifeq ($(USE_CUDNN), 1)
       else ifeq ($(shell if exist "cudnn-frontend\include" (echo exists)),exists)
         CUDNN_FRONTEND_PATH ?= cudnn-frontend\include #override on command line if different location
       else
-        $(error ✗ cuDNN not found. See the Makefile for our currently hard-coded paths / install instructions) 
+        $(error ✗ cuDNN not found. See the README for install instructions and the Makefile for hard-coded paths) 
       endif
       CUDNN_INCLUDE_PATH ?= -I"C:\Program Files\NVIDIA\CUDNN\v9.1\include\12.4"
       CUDNN_FRONTEND_PATH += $(CUDNN_INCLUDE_PATH)
