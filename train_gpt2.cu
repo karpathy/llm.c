@@ -69,7 +69,6 @@ enum PrecisionMode {
 typedef float floatX;
 #define CUBLAS_LOWP CUDA_R_32F
 #define PRECISION_MODE PRECISION_FP32
-const char* load_filename = "gpt2_124M.bin";
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclFloat;
 #endif
@@ -79,7 +78,6 @@ const ncclDataType_t ncclFloatX = ncclFloat;
 typedef half floatX;
 #define CUBLAS_LOWP CUDA_R_16F
 #define PRECISION_MODE PRECISION_FP16
-const char* load_filename = "gpt2_124M.bin";
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclHalf;
 #endif
@@ -88,7 +86,6 @@ const ncclDataType_t ncclFloatX = ncclHalf;
 typedef __nv_bfloat16 floatX;
 #define CUBLAS_LOWP CUDA_R_16BF
 #define PRECISION_MODE PRECISION_BF16
-const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights specific filename
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclBfloat16;
 #endif
@@ -1744,6 +1741,17 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
         fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
         exit(EXIT_FAILURE);
     }
+    if (PRECISION_MODE == PRECISION_BF16 && version != 5) {
+        fprintf(stderr, "Precision is configured as BF16 but model at %s is not.\n", checkpoint_path);
+        fprintf(stderr, "---> HINT: are you sure you're loading a _bf16.bin file?\n");
+        exit(EXIT_FAILURE);
+    }
+    if (PRECISION_MODE == PRECISION_FP32 && version != 3) {
+        fprintf(stderr, "Precision is configured as FP32 but model at %s is not.\n", checkpoint_path);
+        fprintf(stderr, "---> HINT: to turn on FP32 you have to compile like: `make train_gpt2cu PRECISION=FP32`\n");
+        fprintf(stderr, "---> HINT: are you sure you're loading a .bin file without any _bf16 in the name?\n");
+        exit(EXIT_FAILURE);
+    }
 
     // read in hyperparameters
     model->config.max_seq_len = model_header[2];
@@ -2370,6 +2378,7 @@ void error_usage() {
     fprintf(stderr, "Example: ./train_gpt2cu -i data/TinyStories -v 100 -s 100 -g 144 -o stories.log\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -i <string> input dataset prefix (default = data/tiny_shakespeare)\n");
+    fprintf(stderr, "  -e <string> input model filename (default = gpt2_124M_bf16.bin)\n");
     fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
     fprintf(stderr, "  -b <int>    batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
@@ -2392,6 +2401,7 @@ int main(int argc, char *argv[]) {
 
     // read in the (optional) command line arguments
     const char* input_dataset_prefix = "data/tiny_shakespeare"; // or e.g. data/TinyStories
+    const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* output_log_file = NULL;
     int B = 4; // batch size
     int T = 1024; // sequence length max
@@ -2410,6 +2420,7 @@ int main(int argc, char *argv[]) {
         if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
         // read in the args
         if (argv[i][1] == 'i') { input_dataset_prefix = argv[i+1]; }
+        else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
         else if (argv[i][1] == 'o') { output_log_file = argv[i+1]; }
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
