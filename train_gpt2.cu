@@ -812,16 +812,18 @@ __global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, i
         shared[idx] = 0.0f;
     }
     __syncthreads();
-    for (int idx = blockIdx.y*block_size_y + threadIdx.y; idx < B * T; idx += gridDim.y*block_size_y) {
-        x128 packed_dout = load128(dout + global_oc + idx*OC);
-        for (int k = 0; k < x128::size; k++) {
-            accumulators[k] += (float)packed_dout[k];
-        }
-    }
-    // we need to avoid shared memory bank conflicts for the atomicAdd to maximise performance
-    // so we accumulate in a conflict-free order, then reorder to match the global memory order
-    for (int k = 0; k < x128::size; k++) {
-        atomicAdd(shared + threadIdx.x + (k * block_size_x), accumulators[k]);
+    if(global_oc < OC) {
+        for (int idx = blockIdx.y*block_size_y + threadIdx.y; idx < B * T; idx += gridDim.y*block_size_y) {
+            x128 packed_dout = load128(dout + global_oc + idx*OC);
+            for (int k = 0; k < x128::size; k++) {
+                accumulators[k] += (float)packed_dout[k];
+            }
+	}
+	// we need to avoid shared memory bank conflicts for the atomicAdd to maximise performance
+	// so we accumulate in a conflict-free order, then reorder to match the global memory order
+	for (int k = 0; k < x128::size; k++) {
+            atomicAdd(shared + threadIdx.x + (k * block_size_x), accumulators[k]);
+	}
     }
     if (threadIdx.y >= x128::size) { return; } // only need this many warps to reorder the data
     __syncthreads();
@@ -834,7 +836,9 @@ __global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, i
     shared[local_oc + threadIdx.y] = tmp;
     __syncthreads();
     // now we do a perfectly coalesced atomic add to global memory (1x 128-byte cacheline per warp)
-    atomicAdd(dbias + i + blockIdx.x*OC_per_warp, shared[i]);
+    if (i + blockIdx.x*OC_per_warp < OC) {
+        atomicAdd(dbias + i + blockIdx.x*OC_per_warp, shared[i]);
+    }
 }
 
 __global__ void __launch_bounds__(512, 3) // todo - any warnings on Turing with only 1024 threads?
@@ -1366,11 +1370,10 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
         const int OC_per_warp = warp_size * x128::size; // 256 at BF16
         const int block_size_x = 32;
         const int block_size_y = block_size / block_size_x; // 16
-        const int grid_size_x = OC / OC_per_warp; // e.g. 3 horizontal blocks for 768 OCs at BF16
+        const int grid_size_x = CEIL_DIV(OC, OC_per_warp); // e.g. 3 horizontal blocks for 768 OCs at BF16
         const int grid_size_y = max(1, deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount
                                      / (block_size * grid_size_x)); // full GPU!
 
-        assert((OC % OC_per_warp) == 0); // there is no bounds checking in the kernel to maximise performance
         assert(block_size_y >= x128::size); // part of the kernel assumes this is large enough to avoid loops
 
         cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float), main_stream);
