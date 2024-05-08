@@ -2128,8 +2128,7 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
         model->num_parameters,
         ncclFloatX, ncclAvg,
         multi_gpu_config->nccl_comm,
-        // use 0 for default stream (always implicitly synchronised)
-        /*stream=*/0));
+        main_stream));
 #endif
 }
 
