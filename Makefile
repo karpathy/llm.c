@@ -30,8 +30,8 @@ endef
 
 ifneq ($(CI),true) # if not in CI, then use the GPU query
   ifndef GPU_COMPUTE_CAPABILITY # set to defaults if: make GPU_COMPUTE_CAPABILITY= 
-    ifneq ($(call file_exists_in_path, __nvcc_device_query),)
-      GPU_COMPUTE_CAPABILITY = $(shell __nvcc_device_query) 
+    ifneq ($(call file_exists_in_path, nvidia-smi),)
+      GPU_COMPUTE_CAPABILITY = $(subst .,,$(shell (nvidia-smi --query-gpu=compute_cap --format=csv,noheader))) 
       GPU_COMPUTE_CAPABILITY := $(strip $(GPU_COMPUTE_CAPABILITY))
     endif
   endif
