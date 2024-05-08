@@ -736,7 +736,7 @@ void attention_forward2(float* out,
     cudaCheck(cudaMalloc(&l, B * nh * N * sizeof(float)));
     cudaCheck(cudaMalloc(&m, B * nh * N * sizeof(float)));
     cudaCheck(cudaMemset(l, 0, B * nh * N * sizeof(float)));
-    cudaCheck(cudaMemset(m, -10000.0f, B * nh * N * sizeof(float)));
+    cudaCheck(cudaMemset(m, 0xF0, B * nh * N * sizeof(float)));
 
     // calculate SRAM size needed per block, ensure we have enough shared memory
     int col_tile_size = Bc * d;  // size of Kj, Vj
