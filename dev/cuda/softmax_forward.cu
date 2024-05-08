@@ -515,6 +515,9 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
 }
 
 __global__ void softmax_forward_online_kernel8(float* out, const float* inp, int N, int C) {
+    // online softmax paper: http://arxiv.org/abs/1805.02867
+    // online softmax reduces loops from 3 to 2
+    // which is done by calculating sumval and maxval in one loop
     const int warpsPerBlock = blockDim.x / warpSize;
     int tid = threadIdx.x;
 
@@ -524,6 +527,7 @@ __global__ void softmax_forward_online_kernel8(float* out, const float* inp, int
 
     int warpId = tid / warpSize;
     int laneId = tid % warpSize;
+    // one warp one row
     int row = blockIdx.x * warpsPerBlock + warpId;
 
     if (row >= N) {
@@ -533,7 +537,7 @@ __global__ void softmax_forward_online_kernel8(float* out, const float* inp, int
     const float* x = inp + row * C;
     float* const y = out + row * C;
 
-    // merging calculating maxval and sumval in one loop
+    // merge calculating maxval and sumval in one loop
     // which is an arithmetic improvment from online softmax over normal softmax
     float maxval = -INFINITY, sumval = 0.0f, bigger;
     for (int i = laneId; i < C; i += warpSize) {
@@ -544,7 +548,7 @@ __global__ void softmax_forward_online_kernel8(float* out, const float* inp, int
         maxval = bigger;
     }
 
-    // using warp functions instead of cooperative groups for better readibility
+    // use warp functions instead of cooperative groups for better readibility
     // calculate the warp wised maxval and sumval
     float offsetMaxval, offsetSumval;
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
@@ -560,7 +564,7 @@ __global__ void softmax_forward_online_kernel8(float* out, const float* inp, int
         sumval += offsetSumval;
     }
 
-    // retrive the warp wised maxval and sumval
+    // sync the warp wised maxval and sumval
     // which are also the maxval and sumval of one row in C
     maxval = __shfl_sync(0xFFFFFFFF, maxval, 0);
     sumval = __shfl_sync(0xFFFFFFFF, sumval, 0);
