@@ -428,6 +428,7 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
     return result;
 #else
     printf("Multi-GPU support is disabled. Using a single GPU.\n");
+    cudaCheck(cudaSetDevice(0));
     MultiGpuConfig result;
     result.process_rank = 0;
     result.num_processes = 1;
@@ -2181,12 +2182,10 @@ void gpt2_free(GPT2 *model) {
 // ----------------------------------------------------------------------------
 // common init & free code for train/test/profile
 void common_start(bool override_enable_tf32 = true, bool print_device_info = true) {
-    int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
-    cudaGetDeviceProperties(&deviceProp, deviceIdx);
+    cudaGetDeviceProperties(&deviceProp, multi_gpu_config.local_device_idx);
     if (print_device_info) {
         printf("[System]\n");
-        printf("Device %d: %s\n", deviceIdx, deviceProp.name);
+        printf("Device %d: %s\n", multi_gpu_config.local_device_idx, deviceProp.name);
     }
 
     cudaCheck(cudaStreamCreate(&main_stream));
