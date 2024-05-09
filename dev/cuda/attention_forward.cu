@@ -2,8 +2,8 @@
 Kernels for attention forward pass.
 
 If you do not have CUDNN, you can remove ENABLE_CUDNN to run the other kernels
-You need cuDNN from: https://developer.nvidia.com/cudnn
-And the cuDNN front-end from: https://github.com/NVIDIA/cudnn-frontend/tree/main
+
+See the README for cuDNN install instructions
 
 Compile example with cuDNN:
 nvcc -I/PATH/TO/cudnn-frontend/include -DENABLE_CUDNN -O3 --use_fast_math -lcublas -lcudnn attention_forward.cu -o attention_forward

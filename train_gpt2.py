@@ -395,6 +395,7 @@ if __name__ == "__main__":
     # python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_bin", type=str, default="data/tiny_shakespeare_val.bin", help="input .bin to train on")
+    parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl")
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
@@ -409,6 +410,8 @@ if __name__ == "__main__":
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
     assert args.dtype in {"float32", "float16", "bfloat16"}
+    assert args.model in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
+    model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -469,7 +472,7 @@ if __name__ == "__main__":
         write_tokenizer(enc, "gpt2_tokenizer.bin")
 
     # load the GPT-2 model weights
-    model = GPT.from_pretrained("gpt2")
+    model = GPT.from_pretrained(args.model)
     model.train()
     model.to(device)
     if args.compile:
@@ -519,11 +522,12 @@ if __name__ == "__main__":
         logits, loss = model(x, y)
         loss.backward()
         # save model params, in both float32 and bfloat16
-        write_model(model, "gpt2_124M.bin", dtype="float32")
-        write_model(model, "gpt2_124M_bf16.bin", dtype="bfloat16")
+        model_size_str = model_to_size[args.model] # e.g. "124M"
+        write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
+        write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
         # save x, y, logits, loss, and parameter gradients, for debugging C
         # always store these in fp32 to have an accurate reference (?)
-        write_state(model, x, y, logits, loss, "gpt2_124M_debug_state.bin")
+        write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
 
     # -------------------------------------------------------------------------
     # STAGE 2: training loop to get timings
