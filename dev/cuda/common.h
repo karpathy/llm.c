@@ -71,7 +71,9 @@ int cuda_threads_per_SM = 0;    // needed to calculate how many blocks to launch
 
 template<class ElementType>
 struct alignas(16) Packed128 {
-    __device__ Packed128() = default;
+    // Note: = default implicitly generates a __device__ function, but explicitly
+    // adding __device__ causes a lot of warnings.
+    Packed128() = default;
     __device__ explicit Packed128(int4 bits) {
         static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
         memcpy(&payload, &bits, sizeof(bits));
