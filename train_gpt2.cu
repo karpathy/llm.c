@@ -596,6 +596,87 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __re
     }
 }
 
+__global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                                               const floatX* inp1, const floatX* inp2,
+                                               const floatX* weight, const floatX* bias,
+                                               int N, int C) {
+    constexpr const int WarpSize = 32;
+    assert(blockDim.x == WarpSize);
+
+    // load weights and biases into shared memory
+    // do this before we allow any threads to exit!
+    extern __shared__ char* params[];
+    // load128/store128 sometimes generated multiple instructions when the types here were floatX*, so
+    // let's keep everything as x128
+    x128* s_weight = reinterpret_cast<x128*>(params);
+    x128* s_bias = reinterpret_cast<x128*>(params) + (C / x128::size);
+    x128* s_res = reinterpret_cast<x128*>(params) + ((2 + threadIdx.y) * C / x128::size);
+
+    int sidx = (threadIdx.x + WarpSize * threadIdx.y) * x128::size;
+    for(int i = sidx; i < C; i += blockDim.y * WarpSize * x128::size) {
+        s_weight[i/x128::size] = load128(weight + i);
+        s_bias[i/x128::size] = load128(bias + i);
+    }
+    __syncthreads();
+
+    int idx = blockIdx.x * blockDim.y + threadIdx.y;
+    if(idx > N) return;
+
+    // adjust pointers to current token
+    residual += C * idx;
+    normed += C * idx;
+    inp1 += C * idx;
+    inp2 += C * idx;
+
+    const float eps = 1e-5f;
+    float sum = 0.0f;
+    for(int c = threadIdx.x * x128::size; c < C; c += WarpSize * x128::size) {
+        const x128 in1 = load128cs(inp1 + c);
+        const x128 in2 = load128cs(inp2 + c);
+        x128 out;
+        for(int k = 0; k < x128::size; ++k) {
+            out[k] = (float)in1[k] + (float)in2[k];
+            sum += (float)out[k];
+        }
+        store128cs(residual + c, out);
+        s_res[c / x128::size] = out;
+    }
+
+    sum = warpReduceSum(sum);
+    float m = sum / C;
+    float v = 0.f;
+
+    for(int c = threadIdx.x * x128::size; c < C; c += WarpSize * x128::size) {
+        const x128 res = s_res[c / x128::size];
+        for(int k = 0; k < x128::size; ++k) {
+            v += ((float)res[k] - m) * ((float)res[k] - m);
+        }
+    }
+
+    v = warpReduceSum(v) / C;
+    float s = rsqrtf(v + eps);
+
+    for(int c = threadIdx.x * x128::size; c < C; c += WarpSize * x128::size) {
+        const x128 res = s_res[c / x128::size];
+        const x128 w = s_weight[c / x128::size];
+        const x128 b = s_bias[c / x128::size];
+        x128 out;
+        for(int k = 0; k < x128::size; ++k) {
+            float n = s * ((float)res[k] - m); // normalized output
+            float o = n * (float)w[k] + (float)b[k]; // scale and shift it
+            out[k] = o;
+        }
+
+        store128cs(normed + c, out);
+    }
+    // cache the mean and rstd for the backward pass later
+    if(threadIdx.x == 0) {
+        mean[idx] = m;
+        rstd[idx] = s;
+    }
+}
+
+
 // inputs floatX, outputs FP32 (for current FP32-only activation path for this WIP)
 __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
                                const floatX* inp,
@@ -736,7 +817,7 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     }
 }
 
-__global__ void residual_forward_kernel(floatX* out, floatX* inp1, floatX* inp2, int N) {
+__global__ void residual_forward_kernel(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     if (idx >= N) { return; }
 
@@ -1184,7 +1265,7 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
 }
 
 void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
-                       floatX* inp, floatX* weight, floatX* bias,
+                       floatX* inp, const floatX* weight, const floatX* bias,
                        int B, int T, int C) {
     NVTX_RANGE_FN();
     const int block_size = 512;
@@ -1321,13 +1402,38 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     cudaCheck(cudaGetLastError());
 }
 
-void residual_forward(floatX* out, floatX* inp1, floatX* inp2, int N) {
+void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
     residual_forward_kernel<<<grid_size, block_size, 0, main_stream>>>(out, inp1, inp2, N);
     cudaCheck(cudaGetLastError());
 }
+
+void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                             const floatX* inp1, const floatX* inp2,
+                             const floatX* weight, const floatX* bias,
+                             int N, int C) {
+    const int block_size = 256;
+    int block_y = block_size / 32;
+    const int grid_size = CEIL_DIV(N, block_y);
+    size_t smem = (2 + block_y) * C * sizeof(floatX);
+
+    // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
+    // this may fail, in which case we fall back to the smem free implementation.
+    cudaCheck(cudaGetLastError());
+    auto status = cudaFuncSetAttribute(fused_residual_forward_kernel5, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaGetLastError();
+    if(status == cudaSuccess) {
+        fused_residual_forward_kernel5<<<grid_size, dim3(32, block_y), smem>>>(residual, normed, mean, rstd, inp1, inp2,
+                                                                               weight, bias, N, C);
+    } else {
+        residual_forward(residual, inp1, inp2, N*C);
+        layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C);
+    }
+    cudaCheck(cudaGetLastError());
+}
+
 
 void gelu_forward(floatX* out, const floatX* inp, int N) {
     NVTX_RANGE_FN();
@@ -1855,17 +1961,17 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bo
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    floatX* residual;
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+
+    // first layernorm isn't fused
+    layernorm_forward(acts.ln1, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C);
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
 
-        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
+        floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
-        floatX* l_ln1w = params.ln1w + l * C;
-        floatX* l_ln1b = params.ln1b + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
         floatX* l_qkvb = params.qkvb + l * 3*C;
         floatX* l_attprojw = params.attprojw + l * C * C;
@@ -1879,8 +1985,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bo
 
         // get the pointers of the activations for this layer
         floatX* l_ln1 = acts.ln1 + l * B * T * C;
-        floatX* l_ln1_mean = acts.ln1_mean + l * B * T;
-        floatX* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_attproj = acts.attproj + l * B * T * C;
@@ -1894,8 +1998,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bo
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
 
         // now do the forward pass
-        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
         matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
@@ -1910,16 +2012,27 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bo
         #endif
 
         matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-        residual_forward(l_residual2, residual, l_attproj, B*T*C);
-        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, l_attproj, l_ln2w, l_ln2b, B*T, C);
         matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
         matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
-        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+
+        // OK, fusion across blocks.
+        if(l+1 != L) {
+            floatX* l_ln1 = acts.ln1 + (l + 1) * B * T * C;
+            floatX* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
+            floatX* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
+            const floatX* l_ln1w = params.ln1w + (l + 1) * C;
+            const floatX* l_ln1b = params.ln1b + (l + 1) * C;
+            fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, l_fcproj, l_ln1w, l_ln1b,
+                                    B * T, C);
+        } else {
+            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, l_fcproj,
+                                    params.lnfw, params.lnfb,
+                                    B * T, C);
+        }
     }
 
-    residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
     matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
