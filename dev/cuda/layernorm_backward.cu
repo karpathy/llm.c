@@ -113,13 +113,6 @@ void layernorm_backward_cpu(float* dinp, float* dweight, float* dbias,
 // GPU kernels
 
 // GPU helper functions for atomicAdd on smaller than 32-bit types
-__device__ float warpReduceSum(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    }
-    return val;
-}
-
 #ifdef ENABLE_BF16
 __device__ void atomicAddX(__nv_bfloat16* addr, __nv_bfloat16 val) {
     uintptr_t ptr_val = reinterpret_cast<uintptr_t>(addr);
