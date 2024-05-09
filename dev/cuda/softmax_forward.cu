@@ -182,14 +182,6 @@ __device__ float warpReduceMax(float val) {
     return val;
 }
 
-// warp-level reduction for summing values
-__device__ float warpReduceSum(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-    }
-    return val;
-}
-
 __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int C) {
     // kernel must use block size of 32
     extern __shared__ float shared[];
