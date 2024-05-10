@@ -2,7 +2,7 @@
 Kernels for matmul backward pass bias only.
 
 Compile example:
-nvcc -O3 matmul_backward_bias.cu -lineinfo -o matmul_backward_bias
+nvcc -O3 -lcublas -lcublasLt matmul_backward_bias.cu -lineinfo -o matmul_backward_bias
 
 ./matmul_backward_bias 1
 ./matmul_backward_bias 2

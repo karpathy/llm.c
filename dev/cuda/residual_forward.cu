@@ -2,7 +2,7 @@
 Kernels for residual forward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math residual_forward.cu -o residual_forward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt residual_forward.cu -o residual_forward
 
 version 1 is naive port from CPU code to kernel
 ./residual_forward 1

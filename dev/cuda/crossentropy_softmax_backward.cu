@@ -2,7 +2,7 @@
 Kernels for crossentropy forward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math crossentropy_softmax_backward.cu -o crossentropy_softmax_backward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt crossentropy_softmax_backward.cu -o crossentropy_softmax_backward
 
 version 1 is a straight-forward port from CPU code to kernel, parallel over B,T
 ./crossentropy_softmax_backward 1
