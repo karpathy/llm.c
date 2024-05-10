@@ -2,7 +2,11 @@ name: Build and test
 
 on:
   push:
-  workflow_dispatch:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
 
 jobs:
   build-and-test-cpu:
@@ -15,9 +19,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-    
+
       - name: Install OpenMP
-        shell: bash
+        if: matrix.os != 'windows-latest'    
         run: |
           if [ "${{ runner.os }}" == "Linux" ]; then
             sudo apt-get update && sudo apt-get install -y libomp-dev
@@ -37,7 +41,14 @@ jobs:
       - name: Download Win32 Make.exe
         if: matrix.os == 'windows-latest'
         run: |
-          curl -O "https://github.com/maweil/MakeForWindows/releases/download/v4.4.1/make-bin-win64.zip"
+            $wc = New-Object System.Net.WebClient
+            $url = 'https://github.com/maweil/MakeForWindows/releases/download/v4.4.1/make-bin-win64.zip'
+            $output = './make-bin-win64.zip'
+            $wc.DownloadFile($url, $output)
+  
+      - name: Unzip Win32 Makefile
+        if: matrix.os == 'windows-latest'      
+        run: |
           unzip make-bin-win64.zip
 
       - name: Compile training and testing program
@@ -78,7 +89,13 @@ jobs:
 
     - name: Download Win32 Make.exe
       run: |
-        curl -O "https://github.com/maweil/MakeForWindows/releases/download/v4.4.1/make-bin-win64.zip"
+          $wc = New-Object System.Net.WebClient
+          $url = 'https://github.com/maweil/MakeForWindows/releases/download/v4.4.1/make-bin-win64.zip'
+          $output = './make-bin-win64.zip'
+          $wc.DownloadFile($url, $output)
+  
+    - name: Unzip Win32 Makefile
+      run: |
         unzip make-bin-win64.zip
       
     - name: Install Cuda Toolkit 12.4 on Windows
