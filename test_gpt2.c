@@ -66,7 +66,7 @@ int main(int argc, char *argv[]) {
     printf("seq_len: %d\n", T);
 
     ParameterTensors expected_grads;
-    float* expected_grads_memory = malloc_and_point_parameters(&expected_grads, model.param_sizes);
+    float* expected_grads_memory = malloc_and_point_parameters(&expected_grads, model.param_sizes, model.num_parameters);
 
     // inputs and expected outputs, only used for error checking
     int* x = (int*) malloc(B * T * sizeof(int));

@@ -91,14 +91,14 @@ void layernorm_forward(float* out, float* mean, float* rstd,
             for (int i = 0; i < C; i++) {
                 m += x[i];
             }
-            m = m/C;
+            m /= C;
             // calculate the variance (without any bias correction)
             float v = 0.0f;
             for (int i = 0; i < C; i++) {
                 float xshift = x[i] - m;
                 v += xshift * xshift;
             }
-            v = v/C;
+            v /= C;
             // calculate the rstd (reciprocal standard deviation)
             float s = 1.0f / sqrtf(v + eps);
             // seek to the output position in out[b,t,:]
@@ -531,11 +531,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
-float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes) {
-    size_t num_parameters = 0;
-    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        num_parameters += param_sizes[i];
-    }
+float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes, size_t num_parameters) {
     // malloc all parameters all at once
     float* params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
     // assign all the tensors
@@ -670,7 +666,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->num_parameters = num_parameters;
 
     // read in all the parameters from file
-    model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, num_parameters);
     freadCheck(model->params_memory, sizeof(float), num_parameters, model_file);
     fcloseCheck(model_file);
 
@@ -825,10 +821,10 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
-        crossentropy_forward(model->acts.losses, model->acts.probs, targets, B, T, Vp);
+        crossentropy_forward(acts.losses, acts.probs, targets, B, T, Vp);
         // for convenience also evaluate the mean loss
         float mean_loss = 0.0f;
-        for (int i=0; i<B*T; i++) { mean_loss += model->acts.losses[i]; }
+        for (int i=0; i<B*T; i++) { mean_loss += acts.losses[i]; }
         mean_loss /= B*T;
         model->mean_loss = mean_loss;
     } else {
@@ -852,7 +848,7 @@ void gpt2_backward(GPT2 *model) {
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
-        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes);
+        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes, model->num_parameters);
         model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, model->act_sizes);
         gpt2_zero_grad(model);
     }
