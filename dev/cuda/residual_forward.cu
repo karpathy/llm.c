@@ -13,23 +13,10 @@ version 2 packs input into 128 bit memory reads
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
+
+#define ENABLE_BF16
 #include "common.h"
 
-// turn on bf16 as default, done up here for now
-#define ENABLE_BF16
-
-#if defined(ENABLE_BF16)
-typedef __nv_bfloat16 floatX;
-typedef __nv_bfloat16 floatN;
-#elif defined(ENABLE_FP16)
-typedef half floatX;
-typedef half floatN;
-#else
-typedef float floatX;
-typedef float floatN;
-#endif
-
-typedef Packed128<floatX> x128;
 // ----------------------------------------------------------------------------
 // CPU code reference lol
 

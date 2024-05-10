@@ -53,14 +53,9 @@ version 11 is kernel 10 skipping FP16/FP32 conversions (full FP16/BF16 network)
 #include <cuda_bf16.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include "common.h"
 
-// ----------------------------------------------------------------------------
-// Floating point precision setup
-typedef __nv_bfloat16 floatX; // half or __nv_bfloat16 (or float)
-#define CUBLAS_LOWP CUDA_R_16BF // CUDA_R_16F or CUDA_R_16BF (or CUDA_R_32F)
-// CUBLAS_COMPUTE_32F or CUBLAS_COMPUTE_16F (for CUDA_R_16F only, potentially slower?!)
-#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+#define ENABLE_BF16
+#include "common.h"
 
 // ----------------------------------------------------------------------------
 // CUDA & cuDNN setup
@@ -241,14 +236,6 @@ __global__ void attention_softmax_kernel1(float* att, const float* preatt,
 __device__ float warpReduceMax(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
         val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
-    }
-    return val;
-}
-
-// warp-level reduction for summing values
-__device__ float warpReduceSum(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
     }
     return val;
 }
