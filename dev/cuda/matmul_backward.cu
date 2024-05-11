@@ -2,7 +2,7 @@
 Kernels for matmul backward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math -Xcompiler -fopenmp matmul_backward.cu -o matmul_backward -lcublas
+nvcc -O3 --use_fast_math -lcublas -lcublasLt -Xcompiler -fopenmp matmul_backward.cu -o matmul_backward
 
 OMP_NUM_THREADS=32 ./matmul_backward 1
 */

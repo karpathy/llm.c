@@ -2,7 +2,7 @@
 Kernels for gelu backward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math gelu_backward.cu -o gelu_backward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt gelu_backward.cu -o gelu_backward
 
 If encountering "error: identifier "M_PI" is undefined", add the following lines to the top of the file:
 

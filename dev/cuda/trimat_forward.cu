@@ -3,7 +3,7 @@ Triangular matrix multiplication as in autoregressive attention. A short story.
 by @ngc92
 
 Compile:
-nvcc -O3 --use_fast_math trimat_forward.cu -o trimat_forward -lcublas
+nvcc -O3 --use_fast_math -lcublas -lcublasLt trimat_forward.cu -o trimat_forward -lcublas
 
 Run:
 

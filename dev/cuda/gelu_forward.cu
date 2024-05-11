@@ -2,7 +2,7 @@
 Kernels for gelu forward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math gelu_forward.cu -o gelu_forward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt gelu_forward.cu -o gelu_forward
 
 If encountering "error: identifier "M_PI" is undefined", add the following lines to the top of the file:
 

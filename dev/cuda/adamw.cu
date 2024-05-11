@@ -6,8 +6,8 @@ References:
   * https://github.com/nvidia/apex/blob/master/csrc/multi_tensor_adam.cu
 
 Compile example:
-nvcc adamw.cu -o adamw
-nvcc -O3 --use_fast_math adamw.cu -o adamw
+nvcc -lcublas -lcublasLt adamw.cu -o adamw
+nvcc -O3 --use_fast_math -lcublas -lcublasLt adamw.cu -o adamw
 
 ./adamw
 

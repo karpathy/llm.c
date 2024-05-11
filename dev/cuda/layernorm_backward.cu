@@ -2,7 +2,7 @@
 Kernels for layernorm backward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math layernorm_backward.cu -o layernorm_backward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt layernorm_backward.cu -o layernorm_backward
 
 version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
 ./layernorm_backward 1

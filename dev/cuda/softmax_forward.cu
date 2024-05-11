@@ -2,7 +2,7 @@
 Kernels for softmax forward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math softmax_forward.cu -o softmax_forward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt softmax_forward.cu -o softmax_forward
 
 version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
 ./softmax_forward 1

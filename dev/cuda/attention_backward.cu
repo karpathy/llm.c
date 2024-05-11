@@ -2,7 +2,7 @@
 Kernels for attention backward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math attention_backward.cu -o attention_backward -lcublas
+nvcc -O3 --use_fast_math -lcublas -lcublasLt attention_backward.cu -o attention_backward
 
 version 1 is a naive first version
 OMP_NUM_THREADS=32 ./attention_backward 1
