@@ -2,7 +2,7 @@
 Kernels for crossentropy forward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math crossentropy_forward.cu -o crossentropy_forward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt crossentropy_forward.cu -o crossentropy_forward
 
 version 1 is a straight-forward port from CPU code to kernel, parallel over B,T
 ./crossentropy_forward 1

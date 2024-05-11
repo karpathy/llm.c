@@ -2,7 +2,7 @@
 Kernels for residual forward pass fused with layernorm
 
 Compile example:
-nvcc -O3 --use_fast_math fused_residual_forward.cu -o fused_residual_forward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt fused_residual_forward.cu -o fused_residual_forward
 
 version 1 is naive port from CPU code to kernel
 ./fused_residual_forward 1
