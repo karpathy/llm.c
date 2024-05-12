@@ -24,7 +24,7 @@ USE_CUDNN ?= 0
 
 # Function to check if a file exists in the PATH
 define file_exists_in_path
-  $(shell where $(1) 2>nul || which $(1) 2>/dev/null)
+  $(shell where $(1) 2>/dev/null || which $(1) 2>/dev/null)
 endef
 
 ifneq ($(CI),true) # if not in CI, then use the GPU query
@@ -61,7 +61,7 @@ else
   CFLAGS :=
   REMOVE_FILES = del *.exe,*.obj,*.lib,*.exp,*.pdb && del
   SHELL_UNAME := Windows
-  ifneq ($(shell where nvcc 2> nul),"")
+  ifneq ($(shell where nvcc 2>/dev/null),"")
     NVCC := nvcc
   else
     NVCC :=
