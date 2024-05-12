@@ -2,7 +2,7 @@
 Kernels for gelu forward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math gelu_forward.cu -o gelu_forward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt gelu_forward.cu -o gelu_forward
 
 If encountering "error: identifier "M_PI" is undefined", add the following lines to the top of the file:
 
@@ -19,23 +19,9 @@ version 2 is bfloat16 with the Packed128 data structure
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
-#include "common.h"
 
-// turn on bf16 as default, done up here for now
 #define ENABLE_BF16
-
-#if defined(ENABLE_BF16)
-typedef __nv_bfloat16 floatX;
-typedef __nv_bfloat16 floatN;
-#elif defined(ENABLE_FP16)
-typedef half floatX;
-typedef half floatN;
-#else
-typedef float floatX;
-typedef float floatN;
-#endif
-
-typedef Packed128<floatX> x128;
+#include "common.h"
 
 // ----------------------------------------------------------------------------
 // CPU code reference

@@ -69,7 +69,6 @@ enum PrecisionMode {
 typedef float floatX;
 #define CUBLAS_LOWP CUDA_R_32F
 #define PRECISION_MODE PRECISION_FP32
-const char* load_filename = "gpt2_124M.bin";
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclFloat;
 #endif
@@ -79,7 +78,6 @@ const ncclDataType_t ncclFloatX = ncclFloat;
 typedef half floatX;
 #define CUBLAS_LOWP CUDA_R_16F
 #define PRECISION_MODE PRECISION_FP16
-const char* load_filename = "gpt2_124M.bin";
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclHalf;
 #endif
@@ -88,7 +86,6 @@ const ncclDataType_t ncclFloatX = ncclHalf;
 typedef __nv_bfloat16 floatX;
 #define CUBLAS_LOWP CUDA_R_16BF
 #define PRECISION_MODE PRECISION_BF16
-const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights specific filename
 #ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclBfloat16;
 #endif
@@ -428,6 +425,7 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
     return result;
 #else
     printf("Multi-GPU support is disabled. Using a single GPU.\n");
+    cudaCheck(cudaSetDevice(0));
     MultiGpuConfig result;
     result.process_rank = 0;
     result.num_processes = 1;
@@ -596,6 +594,87 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __re
     }
 }
 
+__global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                                               const floatX* inp1, const floatX* inp2,
+                                               const floatX* weight, const floatX* bias,
+                                               int N, int C) {
+    constexpr const int WarpSize = 32;
+    assert(blockDim.x == WarpSize);
+
+    // load weights and biases into shared memory
+    // do this before we allow any threads to exit!
+    extern __shared__ char* params[];
+    // load128/store128 sometimes generated multiple instructions when the types here were floatX*, so
+    // let's keep everything as x128
+    x128* s_weight = reinterpret_cast<x128*>(params);
+    x128* s_bias = reinterpret_cast<x128*>(params) + (C / x128::size);
+    x128* s_res = reinterpret_cast<x128*>(params) + ((2 + threadIdx.y) * C / x128::size);
+
+    int sidx = (threadIdx.x + WarpSize * threadIdx.y) * x128::size;
+    for(int i = sidx; i < C; i += blockDim.y * WarpSize * x128::size) {
+        s_weight[i/x128::size] = load128(weight + i);
+        s_bias[i/x128::size] = load128(bias + i);
+    }
+    __syncthreads();
+
+    int idx = blockIdx.x * blockDim.y + threadIdx.y;
+    if(idx > N) return;
+
+    // adjust pointers to current token
+    residual += C * idx;
+    normed += C * idx;
+    inp1 += C * idx;
+    inp2 += C * idx;
+
+    const float eps = 1e-5f;
+    float sum = 0.0f;
+    for(int c = threadIdx.x * x128::size; c < C; c += WarpSize * x128::size) {
+        const x128 in1 = load128cs(inp1 + c);
+        const x128 in2 = load128cs(inp2 + c);
+        x128 out;
+        for(int k = 0; k < x128::size; ++k) {
+            out[k] = (float)in1[k] + (float)in2[k];
+            sum += (float)out[k];
+        }
+        store128cs(residual + c, out);
+        s_res[c / x128::size] = out;
+    }
+
+    sum = warpReduceSum(sum);
+    float m = sum / C;
+    float v = 0.f;
+
+    for(int c = threadIdx.x * x128::size; c < C; c += WarpSize * x128::size) {
+        const x128 res = s_res[c / x128::size];
+        for(int k = 0; k < x128::size; ++k) {
+            v += ((float)res[k] - m) * ((float)res[k] - m);
+        }
+    }
+
+    v = warpReduceSum(v) / C;
+    float s = rsqrtf(v + eps);
+
+    for(int c = threadIdx.x * x128::size; c < C; c += WarpSize * x128::size) {
+        const x128 res = s_res[c / x128::size];
+        const x128 w = s_weight[c / x128::size];
+        const x128 b = s_bias[c / x128::size];
+        x128 out;
+        for(int k = 0; k < x128::size; ++k) {
+            float n = s * ((float)res[k] - m); // normalized output
+            float o = n * (float)w[k] + (float)b[k]; // scale and shift it
+            out[k] = o;
+        }
+
+        store128cs(normed + c, out);
+    }
+    // cache the mean and rstd for the backward pass later
+    if(threadIdx.x == 0) {
+        mean[idx] = m;
+        rstd[idx] = s;
+    }
+}
+
+
 // inputs floatX, outputs FP32 (for current FP32-only activation path for this WIP)
 __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
                                const floatX* inp,
@@ -736,7 +815,7 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     }
 }
 
-__global__ void residual_forward_kernel(floatX* out, floatX* inp1, floatX* inp2, int N) {
+__global__ void residual_forward_kernel(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     if (idx >= N) { return; }
 
@@ -811,16 +890,18 @@ __global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, i
         shared[idx] = 0.0f;
     }
     __syncthreads();
-    for (int idx = blockIdx.y*block_size_y + threadIdx.y; idx < B * T; idx += gridDim.y*block_size_y) {
-        x128 packed_dout = load128(dout + global_oc + idx*OC);
-        for (int k = 0; k < x128::size; k++) {
-            accumulators[k] += (float)packed_dout[k];
-        }
-    }
-    // we need to avoid shared memory bank conflicts for the atomicAdd to maximise performance
-    // so we accumulate in a conflict-free order, then reorder to match the global memory order
-    for (int k = 0; k < x128::size; k++) {
-        atomicAdd(shared + threadIdx.x + (k * block_size_x), accumulators[k]);
+    if(global_oc < OC) {
+        for (int idx = blockIdx.y*block_size_y + threadIdx.y; idx < B * T; idx += gridDim.y*block_size_y) {
+            x128 packed_dout = load128(dout + global_oc + idx*OC);
+            for (int k = 0; k < x128::size; k++) {
+                accumulators[k] += (float)packed_dout[k];
+            }
+	}
+	// we need to avoid shared memory bank conflicts for the atomicAdd to maximise performance
+	// so we accumulate in a conflict-free order, then reorder to match the global memory order
+	for (int k = 0; k < x128::size; k++) {
+            atomicAdd(shared + threadIdx.x + (k * block_size_x), accumulators[k]);
+	}
     }
     if (threadIdx.y >= x128::size) { return; } // only need this many warps to reorder the data
     __syncthreads();
@@ -833,7 +914,9 @@ __global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, i
     shared[local_oc + threadIdx.y] = tmp;
     __syncthreads();
     // now we do a perfectly coalesced atomic add to global memory (1x 128-byte cacheline per warp)
-    atomicAdd(dbias + i + blockIdx.x*OC_per_warp, shared[i]);
+    if (i + blockIdx.x*OC_per_warp < OC) {
+        atomicAdd(dbias + i + blockIdx.x*OC_per_warp, shared[i]);
+    }
 }
 
 __global__ void __launch_bounds__(512, 3) // todo - any warnings on Turing with only 1024 threads?
@@ -1184,7 +1267,7 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
 }
 
 void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
-                       floatX* inp, floatX* weight, floatX* bias,
+                       floatX* inp, const floatX* weight, const floatX* bias,
                        int B, int T, int C) {
     NVTX_RANGE_FN();
     const int block_size = 512;
@@ -1321,13 +1404,38 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     cudaCheck(cudaGetLastError());
 }
 
-void residual_forward(floatX* out, floatX* inp1, floatX* inp2, int N) {
+void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
     residual_forward_kernel<<<grid_size, block_size, 0, main_stream>>>(out, inp1, inp2, N);
     cudaCheck(cudaGetLastError());
 }
+
+void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
+                             const floatX* inp1, const floatX* inp2,
+                             const floatX* weight, const floatX* bias,
+                             int N, int C) {
+    const int block_size = 256;
+    int block_y = block_size / 32;
+    const int grid_size = CEIL_DIV(N, block_y);
+    size_t smem = (2 + block_y) * C * sizeof(floatX);
+
+    // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
+    // this may fail, in which case we fall back to the smem free implementation.
+    cudaCheck(cudaGetLastError());
+    auto status = cudaFuncSetAttribute(fused_residual_forward_kernel5, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaGetLastError();
+    if(status == cudaSuccess) {
+        fused_residual_forward_kernel5<<<grid_size, dim3(32, block_y), smem>>>(residual, normed, mean, rstd, inp1, inp2,
+                                                                               weight, bias, N, C);
+    } else {
+        residual_forward(residual, inp1, inp2, N*C);
+        layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C);
+    }
+    cudaCheck(cudaGetLastError());
+}
+
 
 void gelu_forward(floatX* out, const floatX* inp, int N) {
     NVTX_RANGE_FN();
@@ -1365,11 +1473,10 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
         const int OC_per_warp = warp_size * x128::size; // 256 at BF16
         const int block_size_x = 32;
         const int block_size_y = block_size / block_size_x; // 16
-        const int grid_size_x = OC / OC_per_warp; // e.g. 3 horizontal blocks for 768 OCs at BF16
+        const int grid_size_x = CEIL_DIV(OC, OC_per_warp); // e.g. 3 horizontal blocks for 768 OCs at BF16
         const int grid_size_y = max(1, deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount
                                      / (block_size * grid_size_x)); // full GPU!
 
-        assert((OC % OC_per_warp) == 0); // there is no bounds checking in the kernel to maximise performance
         assert(block_size_y >= x128::size); // part of the kernel assumes this is large enough to avoid loops
 
         cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float), main_stream);
@@ -1743,6 +1850,17 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
         fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
         exit(EXIT_FAILURE);
     }
+    if (PRECISION_MODE == PRECISION_BF16 && version != 5) {
+        fprintf(stderr, "Precision is configured as BF16 but model at %s is not.\n", checkpoint_path);
+        fprintf(stderr, "---> HINT: are you sure you're loading a _bf16.bin file?\n");
+        exit(EXIT_FAILURE);
+    }
+    if (PRECISION_MODE == PRECISION_FP32 && version != 3) {
+        fprintf(stderr, "Precision is configured as FP32 but model at %s is not.\n", checkpoint_path);
+        fprintf(stderr, "---> HINT: to turn on FP32 you have to compile like: `make train_gpt2cu PRECISION=FP32`\n");
+        fprintf(stderr, "---> HINT: are you sure you're loading a .bin file without any _bf16 in the name?\n");
+        exit(EXIT_FAILURE);
+    }
 
     // read in hyperparameters
     model->config.max_seq_len = model_header[2];
@@ -1855,17 +1973,17 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bo
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    floatX* residual;
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+
+    // first layernorm isn't fused
+    layernorm_forward(acts.ln1, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C);
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
 
-        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
+        floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
-        floatX* l_ln1w = params.ln1w + l * C;
-        floatX* l_ln1b = params.ln1b + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
         floatX* l_qkvb = params.qkvb + l * 3*C;
         floatX* l_attprojw = params.attprojw + l * C * C;
@@ -1879,8 +1997,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bo
 
         // get the pointers of the activations for this layer
         floatX* l_ln1 = acts.ln1 + l * B * T * C;
-        floatX* l_ln1_mean = acts.ln1_mean + l * B * T;
-        floatX* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_attproj = acts.attproj + l * B * T * C;
@@ -1894,8 +2010,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bo
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
 
         // now do the forward pass
-        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
         matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
@@ -1910,16 +2024,27 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bo
         #endif
 
         matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-        residual_forward(l_residual2, residual, l_attproj, B*T*C);
-        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, l_attproj, l_ln2w, l_ln2b, B*T, C);
         matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
         matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
-        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+
+        // OK, fusion across blocks.
+        if(l+1 != L) {
+            floatX* l_ln1 = acts.ln1 + (l + 1) * B * T * C;
+            floatX* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
+            floatX* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
+            const floatX* l_ln1w = params.ln1w + (l + 1) * C;
+            const floatX* l_ln1b = params.ln1b + (l + 1) * C;
+            fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, l_fcproj, l_ln1w, l_ln1b,
+                                    B * T, C);
+        } else {
+            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, l_fcproj,
+                                    params.lnfw, params.lnfb,
+                                    B * T, C);
+        }
     }
 
-    residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
     matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
@@ -2127,8 +2252,7 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
         model->num_parameters,
         ncclFloatX, ncclAvg,
         multi_gpu_config->nccl_comm,
-        // use 0 for default stream (always implicitly synchronised)
-        /*stream=*/0));
+        main_stream));
 #endif
 }
 
@@ -2181,12 +2305,10 @@ void gpt2_free(GPT2 *model) {
 // ----------------------------------------------------------------------------
 // common init & free code for train/test/profile
 void common_start(bool override_enable_tf32 = true, bool print_device_info = true) {
-    int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
-    cudaGetDeviceProperties(&deviceProp, deviceIdx);
+    cudaGetDeviceProperties(&deviceProp, multi_gpu_config.local_device_idx);
     if (print_device_info) {
         printf("[System]\n");
-        printf("Device %d: %s\n", deviceIdx, deviceProp.name);
+        printf("Device %d: %s\n", multi_gpu_config.local_device_idx, deviceProp.name);
     }
 
     cudaCheck(cudaStreamCreate(&main_stream));
@@ -2372,6 +2494,7 @@ void error_usage() {
     fprintf(stderr, "Example: ./train_gpt2cu -i data/TinyStories -v 100 -s 100 -g 144 -o stories.log\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -i <string> input dataset prefix (default = data/tiny_shakespeare)\n");
+    fprintf(stderr, "  -e <string> input model filename (default = gpt2_124M_bf16.bin)\n");
     fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
     fprintf(stderr, "  -b <int>    batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
@@ -2394,6 +2517,7 @@ int main(int argc, char *argv[]) {
 
     // read in the (optional) command line arguments
     const char* input_dataset_prefix = "data/tiny_shakespeare"; // or e.g. data/TinyStories
+    const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* output_log_file = NULL;
     int B = 4; // batch size
     int T = 1024; // sequence length max
@@ -2412,6 +2536,7 @@ int main(int argc, char *argv[]) {
         if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
         // read in the args
         if (argv[i][1] == 'i') { input_dataset_prefix = argv[i+1]; }
+        else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
         else if (argv[i][1] == 'o') { output_log_file = argv[i+1]; }
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
