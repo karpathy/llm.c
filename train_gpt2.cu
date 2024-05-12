@@ -869,7 +869,7 @@ __global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, i
     // note: this kernel reads in floatX, but it writes to float!
     // this is because we're using atomics, which are super slow in < fp32 precision on < H100 GPUs
     // so the trick is do fp32 atomics to a buffer, and then copy_and_cast the result to floatX
-    // (this also results in higher accuracy than doing doing accumulation directly in floatX)
+    // (this also results in higher accuracy than doing accumulation directly in floatX)
 
     // see comments in matmul_backward() for an explanation of block/grid dimensions etc.
     const int block_size = 512;
@@ -897,7 +897,7 @@ __global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, i
                 accumulators[k] += (float)packed_dout[k];
             }
 	}
-	// we need to avoid shared memory bank conflicts for the atomicAdd to maximise performance
+	// we need to avoid shared memory bank conflicts for the atomicAdd to maximise performance,
 	// so we accumulate in a conflict-free order, then reorder to match the global memory order
 	for (int k = 0; k < x128::size; k++) {
             atomicAdd(shared + threadIdx.x + (k * block_size_x), accumulators[k]);

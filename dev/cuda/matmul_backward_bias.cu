@@ -22,6 +22,8 @@ sudo ncu --set full --import-source yes -o bias -f ./matmul_backward_bias 1
 #include <omp.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+
+//#define ENABLE_BF16
 #include "common.h"
 
 // ----------------------------------------------------------------------------
@@ -44,6 +46,8 @@ void matmul_backward_bias_cpu(float* dinp, float* dweight, float* dbias,
 
 // ----------------------------------------------------------------------------
 // GPU kernels
+
+float* dbias_buffer;
 
 __global__ void matmul_backward_bias_kernel1(float* dbias, const float* dout, int B, int T, int OC) {
     extern __shared__ float shared[];
@@ -180,6 +184,66 @@ __global__ void matmul_backward_bias_kernel5(float* dbias, const float* dout, in
 }
 
 
+__global__ void cast_and_add_kernel(floatX* dst, const float* src, size_t n) {
+    // used only for matmul_backward_bias kernel, a little bit embarassing TODO delete later
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) { dst[idx] = (floatX)((float)dst[idx] + src[idx]); } // have to += because dbias is a paramater
+}
+
+__global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, int B, int T, int OC, const int block_size) {
+    // note: this kernel reads in floatX, but it writes to float!
+    // this is because we're using atomics, which are super slow in < fp32 precision on < H100 GPUs
+    // so the trick is do fp32 atomics to a buffer, and then copy_and_cast the result to floatX
+    // (this also results in higher accuracy than doing accumulation directly in floatX)
+
+    // see comments in matmul_backward() for an explanation of block/grid dimensions etc.
+    const int block_size_x = 32;
+    const int block_size_y = block_size / block_size_x; // 16
+    const int OC_per_warp = block_size_x * x128::size;  // 256 at BF16
+
+    int local_oc = threadIdx.x * x128::size;
+    int global_oc = blockIdx.x * OC_per_warp + local_oc;
+    float accumulators[x128::size];
+    extern __shared__ float shared[];
+
+    for (int k = 0; k < x128::size; k++) {
+        accumulators[k] = 0.0f;
+    }
+    int thread_id = threadIdx.y * block_size_x + threadIdx.x;
+    for (int idx = thread_id; idx < OC_per_warp; idx += block_size) {
+        shared[idx] = 0.0f;
+    }
+    __syncthreads();
+    if(global_oc < OC) {
+        for (int idx = blockIdx.y*block_size_y + threadIdx.y; idx < B * T; idx += gridDim.y*block_size_y) {
+            x128 packed_dout = load128(dout + global_oc + idx*OC);
+            for (int k = 0; k < x128::size; k++) {
+                accumulators[k] += (float)packed_dout[k];
+            }
+        }
+        // we need to avoid shared memory bank conflicts for the atomicAdd to maximise performance,
+        // so we accumulate in a conflict-free order, then reorder to match the global memory order
+        for (int k = 0; k < x128::size; k++) {
+            atomicAdd(shared + threadIdx.x + (k * block_size_x), accumulators[k]);
+        }
+    }
+    if (threadIdx.y >= x128::size) { return; } // only need this many warps to reorder the data
+    __syncthreads();
+    // read the accumulated values in the conflict-free order
+    int i = threadIdx.x + (threadIdx.y * block_size_x);
+    float tmp = shared[i];
+    __syncthreads();
+    // write them back to shared memory in the global memory order
+    // 8-way bank conflict for BF16 x128, but only 8x per threadblock (rather than 8x per warp)
+    shared[local_oc + threadIdx.y] = tmp;
+    __syncthreads();
+    // now we do a perfectly coalesced atomic add to global memory (1x 128-byte cacheline per warp)
+    if (i + blockIdx.x*OC_per_warp < OC) {
+        atomicAdd(dbias + i + blockIdx.x*OC_per_warp, shared[i]);
+    }
+}
+
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -224,6 +288,33 @@ void matmul_backward_bias5(float* dinp, float* dweight, float* dbias,
     matmul_backward_bias_kernel5<<<dim3(grid_size_x, grid_size_y), dim3(block_size)>>>(dbias, dout, B, T, OC);
 }
 
+void matmul_backward_bias7(float* dinp, float* dweight, float* dbias,
+                      float* dout, float* inp, float* weight, float* ones,
+                      int B, int T, int C, int OC, int block_size) {
+    if(block_size < 128) {
+        block_size = 128;
+    }
+    // Each warp is responsible for 32 * "x128::size" = 256 OCs at BF16 (OC must be a multiple of 256!)
+    // Block size is 512 threads (16 warps) and we reduce those 16 values into 1 at the end
+    // blockDim.x is 32 --> single warp being responsible for those 256 OCs
+    // blockDim.y is 16 --> 16 parallel independent warps processing the same OCs for different BTs
+    // gridDim.x is OC / 256 --> each block processes 256 OCs
+    // grimDim.y is max(1, (cuda_num_SMs * threads_per_SM) / (512 * gridDim.x)); --> fill up the entire GPU!
+    const int warp_size = 32;
+    const int OC_per_warp = warp_size * x128::size; // 256 at BF16
+    const int block_size_x = 32;
+    const int block_size_y = block_size / block_size_x; // 16
+    const int grid_size_x = ceil_div(OC, OC_per_warp); // e.g. 3 horizontal blocks for 768 OCs at BF16
+    const int grid_size_y = max(1, cuda_threads_per_SM * cuda_num_SMs / (block_size * grid_size_x)); // full GPU!
+
+    assert(block_size_y >= x128::size); // part of the kernel assumes this is large enough to avoid loops
+
+    cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float));
+    matmul_backward_bias_kernel7<<<dim3(grid_size_x, grid_size_y),
+    dim3(block_size_x, block_size_y), OC_per_warp * sizeof(float)>>>(dbias_buffer, dout, B, T, OC, block_size);
+    cast_and_add_kernel<<<ceil_div(OC, 256), 256, 0>>>(dbias, dbias_buffer, OC);
+}
+
 void matmul_backward_bias(int kernel_num,
                      float* dinp, float* dweight, float* dbias,
                      float* dout, float* inp, float* weight, float* ones,
@@ -243,6 +334,9 @@ void matmul_backward_bias(int kernel_num,
             break;
         case 5:
             matmul_backward_bias5(dinp, dweight, dbias, dout, inp, weight, ones, B, T, C, OC, block_size);
+            break;
+        case 7:
+            matmul_backward_bias7(dinp, dweight, dbias, dout, inp, weight, ones, B, T, C, OC, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -276,6 +370,7 @@ int main(int argc, char **argv) {
     float* d_dout;
     cudaCheck(cudaMalloc(&d_dbias, OC * sizeof(float)));
     cudaCheck(cudaMalloc(&d_dout, B * T * OC * sizeof(float)));
+    cudaCheck(cudaMalloc(&dbias_buffer, OC * sizeof(float)));
     cudaCheck(cudaMemcpy(d_dbias, dbias, OC * sizeof(float), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(d_dout, dout, B * T * OC * sizeof(float), cudaMemcpyHostToDevice));
 
