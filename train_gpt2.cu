@@ -360,6 +360,8 @@ typedef struct {
     int local_device_idx;  // This process GPU index on current machine. 0 if no multi-GPU.
 #ifdef MULTI_GPU
     ncclComm_t nccl_comm;  // NCCL communication primitive, used for collective multi-GPU work.
+    cudaStream_t nccl_stream; // CUDA Stream to perform NCCL operations.
+    cudaEvent_t compute_stream_event; // Event used to synchronize NCCL with the compute stream.
 #endif
 } MultiGpuConfig;
 
@@ -422,6 +424,9 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
     }
     mpiCheck(MPI_Bcast((void *)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD));
     ncclCheck(ncclCommInitRank(&result.nccl_comm, result.num_processes, nccl_id, result.process_rank));
+
+    cudaCheck(cudaStreamCreate(&result.nccl_stream));
+    cudaCheck(cudaEventCreate(&result.compute_stream_event));
     return result;
 #else
     printf("Multi-GPU support is disabled. Using a single GPU.\n");
@@ -436,6 +441,8 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
 
 void multi_gpu_config_free(const MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
+    cudaCheck(cudaEventDestroy(multi_gpu_config->compute_stream_event));
+    cudaCheck(cudaStreamDestroy(multi_gpu_config->nccl_stream));
     ncclCheck(ncclCommDestroy(multi_gpu_config->nccl_comm));
     mpiCheck(MPI_Finalize());
 #endif
@@ -455,7 +462,7 @@ void printf0(const char *format, ...) {
 // cuDNN path
 #ifdef ENABLE_CUDNN
 // functions defined in cudnn_att.cu
-void create_cudnn();
+void create_cudnn(cudaStream_t stream);
 void destroy_cudnn();
 void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
                              float* stats, // output for backward pass: (B, NH, T)
@@ -466,7 +473,7 @@ void attention_backward_cudnn(floatX* dqkvr,                                    
                               floatX* dout, floatX* qkvr, floatX* o, float* stats, // inputs
                               int B, int T, int NH, int C);
 #else
-void create_cudnn() {}
+void create_cudnn(cudaStream_t stream) {}
 void destroy_cudnn() {}
 #endif // ENABLE_CUDNN
 
@@ -1821,7 +1828,6 @@ typedef struct {
     int* inputs; // the input tokens for the current forward pass
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
-    float accumulated_mean_loss; // Mean loss after aggregating it on all GPUs
     floatX* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
     int use_master_weights;
@@ -2085,7 +2091,44 @@ void gpt2_zero_grad(GPT2 *model) {
     cudaStreamWaitEvent(main_stream, parallel_events[0], 0);
 }
 
-void gpt2_backward(GPT2 *model) {
+// Block NCCL stream until computations on compute_stream are done, then aggregate multiple pointers in an NCCL group.
+void multi_gpu_async_all_reduce_pointers_group(
+    size_t n_pointers, floatX** pointers, size_t* pointers_sizes, 
+    MultiGpuConfig* multi_gpu_config, cudaStream_t compute_stream) {
+#ifdef MULTI_GPU
+    NVTX_RANGE_FN();
+    if (multi_gpu_config->num_processes == 1) {
+        return; // no multi-GPU, just exit.
+    }
+    cudaCheck(cudaEventRecord(multi_gpu_config->compute_stream_event, compute_stream));
+    cudaCheck(cudaStreamWaitEvent(multi_gpu_config->nccl_stream, multi_gpu_config->compute_stream_event));
+
+    ncclCheck(ncclGroupStart()); // NCCL group: aggregate all pointers in a single NCCL GPU kernel.
+    for (int i = 0; i != n_pointers; ++i) {
+        ncclCheck(ncclAllReduce(
+            pointers[i], pointers[i], 
+            pointers_sizes[i], 
+            ncclFloatX, ncclAvg,
+            multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream
+        ));
+    }
+    ncclCheck(ncclGroupEnd());
+#endif
+}
+
+void multi_gpu_block_compute_stream_until_all_reduce_ready(MultiGpuConfig* multi_gpu_config, cudaStream_t compute_stream) {
+#ifdef MULTI_GPU
+    NVTX_RANGE_FN();
+    if (multi_gpu_config->num_processes == 1) {
+        return; // no multi-GPU, just exit.
+    }
+
+    cudaCheck(cudaEventRecord(multi_gpu_config->compute_stream_event, multi_gpu_config->nccl_stream));
+    cudaCheck(cudaStreamWaitEvent(compute_stream, multi_gpu_config->compute_stream_event));
+#endif
+}
+
+void gpt2_backward(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
@@ -2146,6 +2189,11 @@ void gpt2_backward(GPT2 *model) {
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     floatX* dresidual = (floatX*)grads_acts.residual3; // the main buffer holding the gradient in the backward pass
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+
+    // Aggregate grads.lnfw and grads.lnfb in a background stream
+    floatX* layernorm_backward_pointers[] = {grads.lnfw, grads.lnfb};
+    size_t layernorm_backward_sizes[] = {C, C};
+    multi_gpu_async_all_reduce_pointers_group(2, layernorm_backward_pointers, layernorm_backward_sizes, multi_gpu_config, main_stream);
 
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
@@ -2219,8 +2267,35 @@ void gpt2_backward(GPT2 *model) {
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+
+        // Accumulate gradients from this layer in a background stream.
+        floatX* all_reduce_pointers[] = { 
+            dl_ln1w, dl_ln1b,
+            dl_qkvw, dl_qkvb, 
+            dl_attprojw, dl_attprojb, 
+            dl_ln2w, dl_ln2b,
+            dl_fcw, dl_fcb,
+            dl_fcprojw, dl_fcprojb 
+        };
+        size_t all_reduce_sizes[] = {
+            C, C,
+            3*C * C, 3*C,
+            C * C, C,
+            C, C,
+            4*C * C, 4*C,
+            C * 4*C, C
+        };
+        const int n_all_reduce_pointers = sizeof(all_reduce_sizes) / sizeof(all_reduce_sizes[0]);
+        multi_gpu_async_all_reduce_pointers_group(n_all_reduce_pointers, all_reduce_pointers, all_reduce_sizes, multi_gpu_config, main_stream);
     }
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C, random_u32(&model->rng_state));
+
+    // Aggregate grads.wte and grads.wpe in a background stream
+    floatX* encoder_backward_pointers[] = {grads.wte, grads.wpe};
+    size_t encoder_backward_sizes[] = {Vp * C, T * C};
+    multi_gpu_async_all_reduce_pointers_group(2, encoder_backward_pointers, encoder_backward_sizes, multi_gpu_config, main_stream);
+    // Do not proceed with gradient update until all gradients are accumulated.
+    multi_gpu_block_compute_stream_until_all_reduce_ready(multi_gpu_config, main_stream);
 
     // accumulate the loss, this was calculated at the end of gpt2_forward()
     cudaCheck(cudaEventSynchronize(loss_event)); // hopefully finished long ago
@@ -2231,28 +2306,15 @@ void gpt2_backward(GPT2 *model) {
 // Compute a mean of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
 float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
+    if (multi_gpu_config->num_processes == 1) {
+        return value;
+    }
     // MPI doesn't support all reduce with mean, so we sum up, then divide.
     float result;
     mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
     return result / multi_gpu_config->num_processes;
 #else
     return value;
-#endif
-}
-
-// Averages out the loss and gradients across all GPUs. No-op when multi-GPU is disabled.
-// todo - this version only works if all the parameters are the same size (floatX)
-void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
-    NVTX_RANGE_FN();
-    // Average all losses.
-    model->accumulated_mean_loss = multi_gpu_cpu_float_mean(model->mean_loss, multi_gpu_config);
-#ifdef MULTI_GPU
-    // Average all gradients.
-    ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
-        model->num_parameters,
-        ncclFloatX, ncclAvg,
-        multi_gpu_config->nccl_comm,
-        main_stream));
 #endif
 }
 
@@ -2332,7 +2394,7 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
     // setup the (global) cuBLASLt workspace
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
-    create_cudnn();
+    create_cudnn(main_stream);
 }
 
 void common_free(GPT2 &model) {
@@ -2348,7 +2410,7 @@ void common_free(GPT2 &model) {
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
-    create_cudnn();
+    destroy_cudnn();
 }
 
 #ifndef TESTING
@@ -2716,10 +2778,7 @@ int main(int argc, char *argv[]) {
         }
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, false);
         gpt2_zero_grad(&model);
-        gpt2_backward(&model);
-        if (multi_gpu_config.num_processes > 1) {
-            gpt2_multi_gpu_accumulate(&model, &multi_gpu_config);
-        }
+        gpt2_backward(&model, &multi_gpu_config);
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
 
         // todo - move or double-buffer all of this timing logic to avoid idling the GPU at this point!
@@ -2736,14 +2795,14 @@ int main(int argc, char *argv[]) {
             ema_tokens_per_second = 0.95f * ema_tokens_per_second + 0.05f * tokens_per_second;
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
-        float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
+        float accumulated_loss = multi_gpu_cpu_float_mean(model.mean_loss, &multi_gpu_config);
         printf0("step %4d/%d: train loss %f (acc %f) (%f ms, %0f tok/s)\n",
                 step + 1, train_num_batches, model.mean_loss, accumulated_loss,
                 time_elapsed_ms, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
 
         // disable the profiler after 3 steps of optimization
-        if (step == 3) { cudaProfilerStop(); }
+        if (step == 3) { cudaCheck(cudaProfilerStop()); }
     }
     // add a total average, for optimizations that are only mild improvements (excluding 1st batch as warmup)
     printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);
