@@ -243,6 +243,73 @@ __global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, i
     }
 }
 
+// We want to decrease the amount of channels handled by each block, so that we need fewer across-block reductions.
+// We do this by realizing the following: For scalar memory access, we need to read one element per thread in a warp
+// to read an entire cacheline, but for vectorized memory access, with 128 bit of data per thread, we only need eight
+// threads to fetch a cacheline, which means that we can already operate on a "depth" of four within a single warp.
+// => blockDim.x == 4, blockDim.y == 32/4 = 8
+//
+__global__ void matmul_backward_bias_kernel8(float* dbias, const floatX* dout, int B, int T, int OC) {
+    constexpr const int bdx = 4;
+    constexpr const int bdy = 32  / bdx;
+    assert(blockDim.x == bdx);
+    assert(blockDim.y == bdy);
+
+    int warp_d = (int)threadIdx.x;
+    int warp_c = (int)threadIdx.y;
+    int block_d = (int)threadIdx.z;
+
+    const int OC_per_warp = bdy * x128::size;  // 256 at BF16
+
+    int local_oc = warp_c * x128::size;
+    int global_oc = blockIdx.x * OC_per_warp + local_oc;
+
+    int local_bt = warp_d + bdx * block_d;
+    int bt_per_block = bdx * blockDim.z;
+
+    float accumulators[x128::size];
+    for (int k = 0; k < x128::size; k++) {
+        accumulators[k] = 0.0f;
+    }
+
+    if(global_oc < OC) {
+        // sum up over all bt within registers
+        for (int idx = blockIdx.y * bt_per_block + local_bt; idx < B * T; idx += gridDim.y * bt_per_block) {
+            x128 packed_dout = load128(dout + global_oc + idx*OC);
+            for (int k = 0; k < x128::size; k++) {
+                accumulators[k] += (float)packed_dout[k];
+            }
+        }
+    }
+
+    __shared__ float sub_results[x128::size][32][bdy];
+
+    // reduce within-warp results
+    for (int k = 0; k < x128::size; k++) {
+        float v = accumulators[k];
+        v += __shfl_down_sync(0xffffffff, v, 1, 4);
+        v += __shfl_down_sync(0xffffffff, v, 2, 4);
+        if(warp_d == 0) {
+            sub_results[k][block_d][warp_c] = v;
+        }
+    }
+    __syncthreads();
+
+    // block-wide reductions
+    for (int k = block_d; k < x128::size; k += blockDim.z) {
+        float a = 0.f;
+        for (int r = warp_d; r < blockDim.z; r += bdx) {
+            float v = sub_results[k][r][warp_c];
+            v += __shfl_down_sync(0xffffffff, v, 1, 4);
+            v += __shfl_down_sync(0xffffffff, v, 2, 4);
+            a += v;
+        }
+        if(warp_d == 0 && global_oc < OC) {
+            // coalesced, but not cacheline-sized
+            atomicAdd(dbias + global_oc + k, a);
+        }
+    }
+}
 
 // ----------------------------------------------------------------------------
 // kernel launcher
@@ -309,6 +376,18 @@ void matmul_backward_bias7(floatX* dbias, floatX* dout,
     cast_and_add_kernel<<<ceil_div(OC, 256), 256, 0>>>(dbias, dbias_buffer, OC);
 }
 
+void matmul_backward_bias8(floatX* dbias, floatX* dout,
+                      int B, int T, int C, int OC, int block_size) {
+    dim3 block_dim = {4, 8, (unsigned)block_size/32};
+    const int OC_per_warp = block_dim.y * x128::size; // 64 at BF16
+    const int grid_size_x = ceil_div(OC, OC_per_warp); // e.g. 12 horizontal blocks for 768 OCs at BF16
+    const int grid_size_y = max(1, cuda_threads_per_SM * cuda_num_SMs / (block_size * grid_size_x)); // full GPU!
+
+    cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float));
+    matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC);
+    cast_and_add_kernel<<<ceil_div(OC, 256), 256, 0>>>(dbias, dbias_buffer, OC);
+}
+
 void matmul_backward_bias(int kernel_num, floatX* dbias, floatX* dout,
                      int B, int T, int C, int OC, int block_size) {
     switch (kernel_num) {
@@ -329,6 +408,9 @@ void matmul_backward_bias(int kernel_num, floatX* dbias, floatX* dout,
             break;
         case 7:
             matmul_backward_bias7(dbias, dout, B, T, C, OC, block_size);
+            break;
+        case 8:
+            matmul_backward_bias8(dbias, dout, B, T, C, OC, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
