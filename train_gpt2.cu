@@ -865,8 +865,13 @@ __global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floa
     store128(dinp + idx, packed_dinp);
 }
 
-template<typename OutFloat>
-__global__ void matmul_backward_bias_kernel8(OutFloat* dbias, const floatX* dout, int B, int T, int OC) {
+// templated because if we have enough channels, we can write directly to the bf16 dbias buffer, and otherwise
+// we need to write to a fp32 temp buffer. The `Atomic` argument indicates whether we add atomically. We cannot
+// (easily) use a regular runtime `if(blockDim.y == 1)` runtime condition, because that doesn't compile for older
+// GPUs.
+template<typename OutFloat, bool Atomic>
+__global__ void matmul_backward_bias_kernel8(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
+                                             std::bool_constant<Atomic>) {
     constexpr const int bdx = 4;
     constexpr const int bdy = 32  / bdx;
     assert(blockDim.x == bdx);
@@ -921,10 +926,12 @@ __global__ void matmul_backward_bias_kernel8(OutFloat* dbias, const floatX* dout
             v += __shfl_down_sync(0xffffffff, v, 2, 4);
             a += v;
         }
+
+        // coalesced, but not cacheline-sized writes
         if(warp_d == 0 && global_oc < OC) {
-            // coalesced, but not cacheline-sized
-            if constexpr (std::is_same_v<OutFloat, floatX>) {
-                dbias[global_oc + k] = a;
+            // if we have only one block per result, no need for atomics
+            if constexpr (!Atomic) {
+                dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
             } else {
                 atomicAdd(dbias + global_oc + k, a);
             }
@@ -1488,10 +1495,10 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
         // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
         // and write results directly to the output.
         if(grid_size_y == 1) {
-            matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim, 0, main_stream>>>(dbias, dout, B, T, OC);
+            matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim, 0, main_stream>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
         } else {
             cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float), main_stream);
-            matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim, 0, main_stream>>>(dbias_buffer, dout, B, T, OC);
+            matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim, 0, main_stream>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
             cast_and_add_kernel<<<CEIL_DIV(OC, 256), 256, 0, main_stream>>>(dbias, dbias_buffer, OC);
         }
     }
