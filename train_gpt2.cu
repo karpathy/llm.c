@@ -2353,32 +2353,32 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 
 void gpt2_multi_gpu_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
-    if (model->m_memory == NULL) {
-        cudaCheck(cudaMalloc((void**)&model->m_memory, multi_gpu_config->shard_num_parameters * sizeof(float)));
-        cudaCheck(cudaMalloc((void**)&model->v_memory, multi_gpu_config->shard_num_parameters* sizeof(float)));
-        cudaCheck(cudaMemset(model->m_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
-        printf0("allocated %zu MiB for AdamW optimizer state m\n", (multi_gpu_config->shard_num_parameters * sizeof(float)) >> 20);
-        printf0("allocated %zu MiB for AdamW optimizer state v\n", (multi_gpu_config->shard_num_parameters * sizeof(float)) >> 20);
-        if (model->use_master_weights == 1) {
-            cudaCheck(cudaMalloc((void**)&model->master_weights, multi_gpu_config->shard_num_parameters * sizeof(float)));
-            copy_and_cast_kernel<<<CEIL_DIV(multi_gpu_config->shard_num_parameters, 512), 512, 0, main_stream>>>(
-                                                            model->master_weights, (floatX*)model->params_memory, multi_gpu_config->shard_num_parameters);
-            cudaCheck(cudaGetLastError());
-            printf0("allocated %zu MiB for master copy of params\n", (multi_gpu_config->shard_num_parameters * sizeof(float)) >> 20);
-        }
-    }
-
+    size_t num_parameters = multi_gpu_config->shard_num_parameters;
     floatX* params_memory = (floatX*)model->params_memory + multi_gpu_config->shard_offset;
     floatX* grads_memory = (floatX*)model->grads_memory + multi_gpu_config->shard_offset;
 
+    if (model->m_memory == NULL) {
+        cudaCheck(cudaMalloc((void**)&model->m_memory, num_parameters * sizeof(float)));
+        cudaCheck(cudaMalloc((void**)&model->v_memory, num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->m_memory, 0, num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->v_memory, 0, num_parameters * sizeof(float)));
+        printf0("allocated %zu MiB for AdamW optimizer state m\n", (num_parameters * sizeof(float)) >> 20);
+        printf0("allocated %zu MiB for AdamW optimizer state v\n", (num_parameters * sizeof(float)) >> 20);
+        if (model->use_master_weights == 1) {
+            cudaCheck(cudaMalloc((void**)&model->master_weights, num_parameters * sizeof(float)));
+            copy_and_cast_kernel<<<CEIL_DIV(num_parameters, 512), 512, 0, main_stream>>>(model->master_weights, params_memory, num_parameters);
+            cudaCheck(cudaGetLastError());
+            printf0("allocated %zu MiB for master copy of params\n", (num_parameters * sizeof(float)) >> 20);
+        }
+    }
+
     int block_size = 512;
-    int num_blocks = CEIL_DIV(multi_gpu_config->shard_num_parameters, block_size);
+    int num_blocks = CEIL_DIV(num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
     adamw_kernel3<<<num_blocks, block_size, 0, main_stream>>>(params_memory, model->master_weights, grads_memory,
-                                                              model->m_memory, model->v_memory, multi_gpu_config->shard_num_parameters,
+                                                              model->m_memory, model->v_memory, num_parameters,
                                                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
     cudaCheck(cudaGetLastError());
 }
