@@ -1283,16 +1283,6 @@ __device__ float cast_value<float, half>(half val) {
 }
 
 template<>
-__device__ half cast_value<half, float>(float val) {
-    return __float2half(val);
-}
-
-template<>
-__device__ __nv_bfloat16 cast_value<__nv_bfloat16, float>(float val) {
-    return __float2bfloat16(val);
-}
-
-template<>
 __device__ float cast_value<float, __nv_bfloat16>(__nv_bfloat16 val) {
     return __bfloat162float(val);
 } 
@@ -2302,7 +2292,6 @@ void gpt2_backward(GPT2 *model) {
 // Compute a mean of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
 float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
-    if (multi_gpu_config->num_processes == 1) return value;
     // MPI doesn't support all reduce with mean, so we sum up, then divide.
     float result;
     mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
@@ -2315,11 +2304,11 @@ float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_conf
 // Averages out the loss and gradients across all GPUs. No-op when multi-GPU is disabled.
 // todo - this version only works if all the parameters are the same size (floatX)
 void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
+#ifdef MULTI_GPU
     NVTX_RANGE_FN();
+    if (multi_gpu_config->num_processes == 1) return;
     // Average all losses.
     model->accumulated_mean_loss = multi_gpu_cpu_float_mean(model->mean_loss, multi_gpu_config);
-#ifdef MULTI_GPU
-    if (multi_gpu_config->num_processes == 1) return;
     // Average all gradients.
     ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
         model->num_parameters,
