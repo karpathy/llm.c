@@ -249,7 +249,8 @@ __global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, i
 // threads to fetch a cacheline, which means that we can already operate on a "depth" of four within a single warp.
 // => blockDim.x == 4, blockDim.y == 32/4 = 8
 //
-__global__ void matmul_backward_bias_kernel8(float* dbias, const floatX* dout, int B, int T, int OC) {
+template<typename OutFloat>
+__global__ void matmul_backward_bias_kernel8(OutFloat* dbias, const floatX* dout, int B, int T, int OC) {
     constexpr const int bdx = 4;
     constexpr const int bdy = 32  / bdx;
     assert(blockDim.x == bdx);
@@ -306,7 +307,11 @@ __global__ void matmul_backward_bias_kernel8(float* dbias, const floatX* dout, i
         }
         if(warp_d == 0 && global_oc < OC) {
             // coalesced, but not cacheline-sized
-            atomicAdd(dbias + global_oc + k, a);
+            if constexpr (std::is_same_v<OutFloat, floatX>) {
+                dbias[global_oc + k] = a;
+            } else {
+                atomicAdd(dbias + global_oc + k, a);
+            }
         }
     }
 }
@@ -383,9 +388,15 @@ void matmul_backward_bias8(floatX* dbias, floatX* dout,
     const int grid_size_x = ceil_div(OC, OC_per_warp); // e.g. 12 horizontal blocks for 768 OCs at BF16
     const int grid_size_y = max(1, cuda_threads_per_SM * cuda_num_SMs / (block_size * grid_size_x)); // full GPU!
 
-    cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float));
-    matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC);
-    cast_and_add_kernel<<<ceil_div(OC, 256), 256, 0>>>(dbias, dbias_buffer, OC);
+    // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
+    // and write results directly to the output.
+    if(grid_size_y == 1) {
+        matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC);
+    } else {
+        cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float));
+        matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC);
+        cast_and_add_kernel<<<ceil_div(OC, 256), 256, 0>>>(dbias, dbias_buffer, OC);
+    }
 }
 
 void matmul_backward_bias(int kernel_num, floatX* dbias, floatX* dout,
@@ -457,7 +468,7 @@ int main(int argc, char **argv) {
     // matmul_backward_bias(kernel_num, NULL, NULL, d_dbias, d_dout, NULL, NULL, NULL, B, T, C, OC, block_size_debug);
     // exit(EXIT_SUCCESS);
 
-    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+    int block_sizes[] = {32, 64, 128, 256, 512, 768, 1024};
 
     // calculate the CPU reference
     matmul_backward_bias_cpu(NULL, NULL, dbias, dout, NULL, NULL, B, T, C, OC);
