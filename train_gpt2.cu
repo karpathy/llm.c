@@ -2372,26 +2372,23 @@ void gpt2_multi_gpu_update(GPT2 *model, float learning_rate, float beta1, float 
         printf0("allocated %zu MiB for AdamW optimizer state m\n", (multi_gpu_config->shard_num_parameters * sizeof(float)) >> 20);
         printf0("allocated %zu MiB for AdamW optimizer state v\n", (multi_gpu_config->shard_num_parameters * sizeof(float)) >> 20);
         if (model->use_master_weights == 1) {
-            cudaCheck(cudaMalloc((void**)&model->master_weights, model->num_parameters * sizeof(float)));
-            copy_and_cast_kernel<<<CEIL_DIV(model->num_parameters, 512), 512, 0, main_stream>>>(model->master_weights, (floatX*)model->params_memory, model->num_parameters);
+            cudaCheck(cudaMalloc((void**)&model->master_weights, multi_gpu_config->shard_num_parameters * sizeof(float)));
+            copy_and_cast_kernel<<<CEIL_DIV(multi_gpu_config->shard_num_parameters, 512), 512, 0, main_stream>>>(
+                                                            model->master_weights, (floatX*)model->params_memory, multi_gpu_config->shard_num_parameters);
             cudaCheck(cudaGetLastError());
-            printf0("allocated %zu MiB for master copy of params\n", (model->num_parameters * sizeof(float)) >> 20);
+            printf0("allocated %zu MiB for master copy of params\n", (multi_gpu_config->shard_num_parameters * sizeof(float)) >> 20);
         }
     }
 
     floatX* params_memory = (floatX*)model->params_memory + multi_gpu_config->shard_offset;
     floatX* grads_memory = (floatX*)model->grads_memory + multi_gpu_config->shard_offset;
-    float* master_weights = NULL;
-    if (model->use_master_weights == 1) {
-        master_weights = model->master_weights + multi_gpu_config->shard_offset;
-    }
 
     int block_size = 512;
     int num_blocks = CEIL_DIV(multi_gpu_config->shard_num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
-    adamw_kernel3<<<num_blocks, block_size, 0, main_stream>>>(params_memory, master_weights, grads_memory,
+    adamw_kernel3<<<num_blocks, block_size, 0, main_stream>>>(params_memory, model->master_weights, grads_memory,
                                                               model->m_memory, model->v_memory, multi_gpu_config->shard_num_parameters,
                                                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
     cudaCheck(cudaGetLastError());
@@ -2403,20 +2400,11 @@ void gpt2_multi_gpu_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
     if (multi_gpu_config->num_processes == 1) return;
 
     if (multi_gpu_config->zero_stage == 1) {
-        // gather all parameter updates from each process
-        if (model->use_master_weights == 1) {
-            ncclCheck(ncclAllGather(model->master_weights + multi_gpu_config->shard_offset, model->master_weights,
-                                    multi_gpu_config->shard_num_parameters, ncclFloat,
-                                    multi_gpu_config->nccl_comm, 0));
-            // Copy and cast master weights to params 
-            copy_and_cast_kernel<<<CEIL_DIV(model->num_parameters, 512), 512>>>((floatX*)model->params_memory, model->master_weights, model->num_parameters);
-        }
-        else {
-            ncclCheck(ncclAllGather((floatX*)model->params_memory + multi_gpu_config->shard_offset, (floatX*)model->params_memory,
-                                    multi_gpu_config->shard_num_parameters, ncclFloatX,
-                                    multi_gpu_config->nccl_comm, 0));
-        }
-    }  
+        // gather updated shards of model->params_memory from each process
+        ncclCheck(ncclAllGather((floatX*)model->params_memory + multi_gpu_config->shard_offset, (floatX*)model->params_memory,
+                                multi_gpu_config->shard_num_parameters, ncclFloatX,
+                                multi_gpu_config->nccl_comm, 0));
+    }
     cudaCheck(cudaGetLastError());
 #endif
 }
