@@ -2,7 +2,7 @@
 Kernels for the positional encoder forward pass in GPT-2.
 
 Compile example:
-nvcc -O3 --use_fast_math encoder_forward.cu -o encoder_forward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt encoder_forward.cu -o encoder_forward
 
 version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
 ./encoder_forward 1
@@ -17,24 +17,10 @@ version 3 is like version 2 but uses float4 reads/writes
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
-#include "common.h"
 #include <cassert>
 
-// turn on bf16 as default, done up here for now
 #define ENABLE_BF16
-
-#if defined(ENABLE_BF16)
-typedef __nv_bfloat16 floatX;
-typedef __nv_bfloat16 floatN;
-#elif defined(ENABLE_FP16)
-typedef half floatX;
-typedef half floatN;
-#else
-typedef float floatX;
-typedef float floatN;
-#endif
-
-typedef Packed128<floatX> x128;
+#include "common.h"
 
 // ----------------------------------------------------------------------------
 // CPU code reference

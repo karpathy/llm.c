@@ -19,9 +19,27 @@ NVCC_INCLUDES =
 NVCC_LDLIBS =
 NCLL_INCUDES =
 NVCC_CUDNN =
-# overridable flag for multi-GPU training. by default we won't build with cudnn
-# because it bloats up the compile time from a few seconds to ~minute
+# By default we don't build with cudnn because it blows up compile time from a few seconds to ~minute
 USE_CUDNN ?= 0
+
+# Function to check if a file exists in the PATH
+define file_exists_in_path
+  $(shell where $(1) 2>nul || which $(1) 2>/dev/null)
+endef
+
+ifneq ($(CI),true) # if not in CI, then use the GPU query
+  ifndef GPU_COMPUTE_CAPABILITY # set to defaults if: make GPU_COMPUTE_CAPABILITY= 
+    ifneq ($(call file_exists_in_path, __nvcc_device_query),)
+      GPU_COMPUTE_CAPABILITY = $(shell __nvcc_device_query) 
+      GPU_COMPUTE_CAPABILITY := $(strip $(GPU_COMPUTE_CAPABILITY))
+    endif
+  endif
+endif
+
+# set to defaults if - make GPU_COMPUTE_CAPABILITY= otherwise use the compute capability detected above
+ifneq ($(GPU_COMPUTE_CAPABILITY),) 
+  NVCC_FLAGS += --generate-code arch=compute_$(GPU_COMPUTE_CAPABILITY),code=[compute_$(GPU_COMPUTE_CAPABILITY),sm_$(GPU_COMPUTE_CAPABILITY)]
+endif
 
 # autodect a lot of various supports on current platform
 $(info ---------------------------------------------)
@@ -67,27 +85,44 @@ else
 endif
 
 # Check and include cudnn if available
-# Currently hard-coding a bunch of stuff here for Linux, todo make this better/nicer
-# You need cuDNN from: https://developer.nvidia.com/cudnn
-# Follow the apt-get instructions
-# And the cuDNN front-end from: https://github.com/NVIDIA/cudnn-frontend/tree/main
-# For this there is no installation, just download the repo to your home directory
-# and then we include it below (see currently hard-coded path assumed in home directory)
+# You can override the path to cudnn frontend by setting CUDNN_FRONTEND_PATH on the make command line
+# By default, we look for it in HOME/cudnn-frontend/include and ./cudnn-frontend/include
+# Refer to the README for cuDNN install instructions
 ifeq ($(USE_CUDNN), 1)
   ifeq ($(SHELL_UNAME), Linux)
-    # hard-coded path for now
-    CUDNN_FRONTEND_PATH := $(HOME)/cudnn-frontend/include
-    ifeq ($(shell [ -d $(CUDNN_FRONTEND_PATH) ] && echo "exists"), exists)
+    ifeq ($(shell [ -d $(HOME)/cudnn-frontend/include ] && echo "exists"), exists)
       $(info ✓ cuDNN found, will run with flash-attention)
-      NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
-      NVCC_LDFLAGS += -lcudnn
-      NVCC_FLAGS += -DENABLE_CUDNN
-      NVCC_CUDNN = cudnn_att.o
+      CUDNN_FRONTEND_PATH ?= $(HOME)/cudnn-frontend/include
+    else ifeq ($(shell [ -d cudnn-frontend/include ] && echo "exists"), exists)
+      $(info ✓ cuDNN found, will run with flash-attention)
+      CUDNN_FRONTEND_PATH ?= cudnn-frontend/include
     else
-      $(error ✗ cuDNN not found. See the Makefile for our currently hard-coded paths / install instructions)
+      $(error ✗ cuDNN not found. See the README for install instructions and the Makefile for hard-coded paths)
     endif
-  else
-    $(info → cuDNN is not supported right now outside of Linux)
+    NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
+    NVCC_LDFLAGS += -lcudnn
+    NVCC_FLAGS += -DENABLE_CUDNN
+    NVCC_CUDNN = cudnn_att.o
+  else 
+    ifneq ($(OS), Windows_NT)
+      $(info → cuDNN is not supported on MAC OS right now)
+    else
+      $(info ✓ Windows cuDNN found, will run with flash-attention)
+      ifeq ($(shell if exist "$(HOMEDRIVE)$(HOMEPATH)\cudnn-frontend\include" (echo exists)),exists)
+        CUDNN_FRONTEND_PATH ?= $(HOMEDRIVE)$(HOMEPATH)\cudnn-frontend\include #override on command line if different location
+      else ifeq ($(shell if exist "cudnn-frontend\include" (echo exists)),exists)
+        CUDNN_FRONTEND_PATH ?= cudnn-frontend\include #override on command line if different location
+      else
+        $(error ✗ cuDNN not found. See the README for install instructions and the Makefile for hard-coded paths) 
+      endif
+      CUDNN_INCLUDE_PATH ?= -I"C:\Program Files\NVIDIA\CUDNN\v9.1\include\12.4"
+      CUDNN_FRONTEND_PATH += $(CUDNN_INCLUDE_PATH)
+      NVCC_FLAGS += --std c++20 -Xcompiler "/std:c++20" -Xcompiler "/EHsc /W0 /nologo /Ox /FS" -maxrregcount=0 --machine 64
+      NVCC_CUDNN = cudnn_att.obj
+      NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
+      NVCC_LDFLAGS += -L"C:\Program Files\NVIDIA\CUDNN\v9.1\lib\12.4\x64" -lcudnn 
+      NVCC_FLAGS += -DENABLE_CUDNN
+    endif
   endif
 else
   $(info → cuDNN is manually disabled by default, run make with `USE_CUDNN=1` to try to enable)
@@ -183,7 +218,7 @@ ifeq ($(NVCC),)
     $(info ✗ nvcc not found, skipping GPU/CUDA builds)
 else
     $(info ✓ nvcc found, including GPU/CUDA support)
-    TARGETS += train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu
+    TARGETS += train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu $(NVCC_CUDNN)
 endif
 
 $(info ---------------------------------------------)
@@ -191,28 +226,28 @@ $(info ---------------------------------------------)
 all: $(TARGETS)
 
 train_gpt2: train_gpt2.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) $(OUTPUT_FILE)
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
 test_gpt2: test_gpt2.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) $(OUTPUT_FILE)
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
-cudnn_att.o: cudnn_att.cu
-	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)
+$(NVCC_CUDNN): cudnn_att.cpp
+	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_INCLUDES) 
 
 train_gpt2cu: train_gpt2.cu $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE) $(NVCC_CUDNN)
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE) 
 
 train_gpt2fp32cu: train_gpt2_fp32.cu
-	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+	$(NVCC) $(NVCC_FLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 test_gpt2cu: test_gpt2.cu $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE) $(NVCC_CUDNN)
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE) 
 
 test_gpt2fp32cu: test_gpt2_fp32.cu
-	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+	$(NVCC) $(NVCC_FLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE) $(NVCC_CUDNN)
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE) 
 
 clean:
-	$(REMOVE_FILES) $(TARGETS)
+	$(REMOVE_FILES) $(TARGETS) $(NVCC_CUDNN)

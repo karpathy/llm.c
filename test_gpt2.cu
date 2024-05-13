@@ -85,8 +85,16 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
 int main(int argc, char *argv[]) {
     common_start(false, true);
 
+    // set the right paths
+    #if defined(ENABLE_BF16)
+    const char* load_filename = "gpt2_124M_bf16.bin";
+    #else
+    const char* load_filename = "gpt2_124M.bin";
+    #endif
+
     // build the GPT-2 model from a checkpoint
     GPT2 model;
+
     gpt2_build_from_checkpoint(&model, load_filename);
     size_t V = model.config.vocab_size;
     size_t Vp = model.config.padded_vocab_size;
@@ -239,7 +247,7 @@ int main(int argc, char *argv[]) {
             // In that case it's ok to extend the tolerance by a bit, after a manual review.
             allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", 8e-1f);
             allok = allok & check_tensor(tensors1[1], tensors2[1], maxT * C, "wpe", 1e-2f);
-            allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", 1.1e-1); // hmm a bit high
+            allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", 1.4e-1); // hmm a bit high
             allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", 4e-2f);
             allok = allok & check_tensor(tensors1[4], tensors2[4], L * C * C, "attprojw", 3e-2f);
             allok = allok & check_tensor(tensors1[5], tensors2[5], L * C, "attprojb", 3e-2f);

@@ -10,6 +10,13 @@ __host__ __device__ T ceil_div(T dividend, T divisor) {
     return (dividend + divisor-1) / divisor;
 }
 
+__device__ float warpReduceSum(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
 // ----------------------------------------------------------------------------
 // checking utils
 
@@ -49,6 +56,14 @@ int cuda_num_SMs = 0; // for persistent threads where we want 1 threadblock per 
 int cuda_threads_per_SM = 0;    // needed to calculate how many blocks to launch to fill up the GPU
 
 // ----------------------------------------------------------------------------
+// to make sure that 2 blocks fit on A100/H100 to maximise latency tolerance
+#if __CUDA_ARCH__ == 800 || __CUDA_ARCH__ >= 900
+#define MAX_1024_THREADS_BLOCKS 2
+#else
+#define MAX_1024_THREADS_BLOCKS 1
+#endif
+
+// ----------------------------------------------------------------------------
 // Packed128 data structure, which forces the compiler to use 128-bit loads/stores
 // in GPUs that support (the LDG.128 and STS.128 instructions)
 // This is a bit similar to the use of float4 in the case of 32-bit floats, but
@@ -56,7 +71,9 @@ int cuda_threads_per_SM = 0;    // needed to calculate how many blocks to launch
 
 template<class ElementType>
 struct alignas(16) Packed128 {
-    __device__ Packed128() = default;
+    // Note: = default implicitly generates a __device__ function, but explicitly
+    // adding __device__ causes a lot of warnings.
+    Packed128() = default;
     __device__ explicit Packed128(int4 bits) {
         static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
         memcpy(&payload, &bits, sizeof(bits));
@@ -88,24 +105,67 @@ template<class ElementType>
 __device__ Packed128<ElementType> load128(const ElementType* address) {
     return Packed128<ElementType>{*reinterpret_cast<const int4*>(address)};
 }
-
 // load a Packed128 from an aligned memory address with streaming cache hint
 template<class ElementType>
 __device__ Packed128<ElementType> load128cs(const ElementType* address) {
     return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
 }
-
 // store a Packed128 to an aligned memory address
 template<class ElementType>
 __device__ void store128(ElementType* target, Packed128<ElementType> value) {
     *reinterpret_cast<int4*>(target) = value.get_bits();
 }
-
 // store a Packed128 to an aligned memory address with streaming cache hint
 template<class ElementType>
 __device__ void store128cs(ElementType* target, Packed128<ElementType> value) {
     __stcs(reinterpret_cast<int4*>(target), value.get_bits());
 }
+// store a Packed128 to an aligned memory address while caching in L2 but bypassing L1
+template<class ElementType>
+__device__ void store128cg(ElementType* target, Packed128<ElementType> value) {
+    __stcg(reinterpret_cast<int4*>(target), value.get_bits());
+}
+
+// ----------------------------------------------------------------------------
+// reduced/mixed precision utilities
+
+#if defined(ENABLE_BF16)
+
+typedef __nv_bfloat16 floatX;
+typedef __nv_bfloat16 floatN;
+#define CUBLAS_LOWP CUDA_R_16BF // CUDA_R_16F or CUDA_R_16BF (or CUDA_R_32F)
+// CUBLAS_COMPUTE_32F or CUBLAS_COMPUTE_16F (for CUDA_R_16F only, potentially slower?!)
+#define CUBLAS_LOWP_COMPUTE CUBLAS_COMPUTE_32F
+
+#elif defined(ENABLE_FP16)
+
+typedef half floatX;
+typedef half floatN;
+
+#else
+
+typedef float floatX;
+typedef float floatN;
+#endif
+
+typedef Packed128<floatX> x128;
+
+
+// older nvcc does not provide __ldcs and __stcs for bfloat16, despite these actually just being unsigned shorts.
+// we need to be careful here to only define our own versions if none already exist, otherwise the compiler will
+// complain.
+// If not, you easily get "no viable overload" (for sm52) and "function already exists" (sm_80)
+#if defined(ENABLE_BF16) && (__CUDACC_VER_MAJOR__ < 12) && !((__CUDA_ARCH__ >= 800) || !defined(__CUDA_ARCH__))
+__device__ floatX __ldcs(const floatX* address) {
+    unsigned short bf = __ldcs(reinterpret_cast<const unsigned short*>(address));
+    return __nv_bfloat16_raw{bf};
+}
+
+__device__ void __stcs(floatX* address, floatX value) {
+    __stcs(reinterpret_cast<unsigned short*>(address), ((__nv_bfloat16_raw)value).x);
+}
+#endif
+
 
 // ----------------------------------------------------------------------------
 // random utils

@@ -32,7 +32,7 @@ make train_gpt2cu
 ./train_gpt2cu
 ```
 
-If you additionally install cuDNN (see `Makefile` for instructions), you can also go faster with flash attention
+If you additionally install cuDNN (see the CUDA section below), you can also go faster with flash attention
 
 ```bash
 make train_gpt2cu USE_CUDNN=1
@@ -256,7 +256,16 @@ If you have the latest CUDA you should expect this to compile OK, and you should
 make train_gpt2cu USE_CUDNN=1
 ```
 
-This will try to compile with cudnn and run it. You have to have cuDNN installed on your system. Follow the [cuDNN installation instructions](https://developer.nvidia.com/cudnn) to install cuDNN with apt-get. On top of this you need the [cuDNN frontend](https://github.com/NVIDIA/cudnn-frontend/tree/main), but this is just header files. So simply download the repo to your disk, currently assumed to be in your home directory (i.e. the Makefile looks for `~/cudnn-frontend/include`).
+This will try to compile with cudnn and run it. You have to have cuDNN installed on your system. The [cuDNN installation instructions](https://developer.nvidia.com/cudnn) with apt-get will grab the default set of cuDNN packages. For a minimal setup, the cuDNN dev package is sufficient, e.g. on Ubuntu 22.04 for CUDA 12.x:
+
+```bash
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+sudo apt-get -y install libcudnn9-dev-cuda-12
+```
+
+On top of this you need the [cuDNN frontend](https://github.com/NVIDIA/cudnn-frontend/tree/main), but this is just header files. Simply clone the repo to your disk. The Makefile currently looks for it in either your home directory or the current directory. If you have put it elsewhere, add `CUDNN_FRONTEND_PATH=/path/to/your/cudnn-frontend/include` to the `make` command-line.
 
 **Multi-GPU training**. As of April 26, 2024 there is now also support for multi-GPU training using MPI and NCCL. Make sure you install MPI, e.g. on Linux:
 
@@ -335,6 +344,7 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 
 - C#
   - [llm.cs](https://github.com/azret/llm.cs) by @[azret](https://github.com/azret): a C# port of this project
+  - [Llm.cs](https://github.com/nietras/Llm.cs) by @[nietras](https://github.com/nietras): a C# port of this project with focus on easy to get started on any platform. Clone and run ✅
 
 - CUDA C++
   - [llm.cpp](https://github.com/gevtushenko/llm.c) by @[gevtushenko](https://github.com/gevtushenko): a port of this project using the [CUDA C++ Core Libraries](https://github.com/NVIDIA/cccl)
@@ -353,6 +363,7 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
   - [llm.🔥](https://github.com/dorjeduck/llm.mojo) by @[dorjeduck](https://github.com/dorjeduck): a Mojo port of this project
 
 - Rust
+  -  [llm.rs](https://github.com/yijunyu/llm.rs) by @[Yijun Yu](https://github.com/yijunyu): a Rust rewrite with the aim to have same performance
   -  [llm.rs](https://github.com/ToJen/llm.rs) by @[ToJen](https://github.com/ToJen): a Rust port of this project
 
 - Zig
