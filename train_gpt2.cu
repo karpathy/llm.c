@@ -873,7 +873,7 @@ template<typename OutFloat, bool Atomic>
 __global__ void matmul_backward_bias_kernel8(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
                                              std::bool_constant<Atomic>) {
     constexpr const int bdx = 4;
-    constexpr const int bdy = 32  / bdx;
+    constexpr const int bdy = 32 / bdx;
     assert(blockDim.x == bdx);
     assert(blockDim.y == bdy);
 
@@ -881,7 +881,7 @@ __global__ void matmul_backward_bias_kernel8(OutFloat* dbias, const floatX* dout
     int warp_c = (int)threadIdx.y;
     int block_d = (int)threadIdx.z;
 
-    const int OC_per_warp = bdy * x128::size;  // 256 at BF16
+    const int OC_per_warp = bdy * x128::size;  // 64 at BF16
 
     int local_oc = warp_c * x128::size;
     int global_oc = blockIdx.x * OC_per_warp + local_oc;
