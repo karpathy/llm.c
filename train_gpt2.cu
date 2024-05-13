@@ -904,57 +904,77 @@ __global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floa
     store128(dinp + idx, packed_dinp);
 }
 
-__global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, int B, int T, int OC) {
-    // note: this kernel reads in floatX, but it writes to float!
-    // this is because we're using atomics, which are super slow in < fp32 precision on < H100 GPUs
-    // so the trick is do fp32 atomics to a buffer, and then copy_and_cast the result to floatX
-    // (this also results in higher accuracy than doing doing accumulation directly in floatX)
+// templated because if we have enough channels, we can write directly to the bf16 dbias buffer, and otherwise
+// we need to write to a fp32 temp buffer. The `Atomic` argument indicates whether we add atomically. We cannot
+// (easily) use a regular runtime `if(blockDim.y == 1)` runtime condition, because that doesn't compile for older
+// GPUs.
+template<typename OutFloat, bool Atomic>
+__global__ void matmul_backward_bias_kernel8(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
+                                             std::bool_constant<Atomic>) {
+    constexpr const int bdx = 4;
+    constexpr const int bdy = 32 / bdx;
+    assert(blockDim.x == bdx);
+    assert(blockDim.y == bdy);
 
-    // see comments in matmul_backward() for an explanation of block/grid dimensions etc.
-    const int block_size = 512;
-    const int block_size_x = 32;
-    const int block_size_y = block_size / block_size_x; // 16
-    const int OC_per_warp = block_size_x * x128::size;  // 256 at BF16
+    int warp_d = (int)threadIdx.x;
+    int warp_c = (int)threadIdx.y;
+    int block_d = (int)threadIdx.z;
 
-    int local_oc = threadIdx.x * x128::size;
+    const int OC_per_warp = bdy * x128::size;  // 64 at BF16
+
+    int local_oc = warp_c * x128::size;
     int global_oc = blockIdx.x * OC_per_warp + local_oc;
-    float accumulators[x128::size];
-    __shared__ float shared[OC_per_warp];
 
+    int local_bt = warp_d + bdx * block_d;
+    int bt_per_block = bdx * blockDim.z;
+
+    float accumulators[x128::size];
     for (int k = 0; k < x128::size; k++) {
         accumulators[k] = 0.0f;
     }
-    int thread_id = threadIdx.y * block_size_x + threadIdx.x;
-    for (int idx = thread_id; idx < OC_per_warp; idx += block_size) {
-        shared[idx] = 0.0f;
-    }
-    __syncthreads();
+
     if(global_oc < OC) {
-        for (int idx = blockIdx.y*block_size_y + threadIdx.y; idx < B * T; idx += gridDim.y*block_size_y) {
+        // sum up over all bt within registers
+        for (int idx = blockIdx.y * bt_per_block + local_bt; idx < B * T; idx += gridDim.y * bt_per_block) {
             x128 packed_dout = load128(dout + global_oc + idx*OC);
             for (int k = 0; k < x128::size; k++) {
                 accumulators[k] += (float)packed_dout[k];
             }
-	}
-	// we need to avoid shared memory bank conflicts for the atomicAdd to maximise performance
-	// so we accumulate in a conflict-free order, then reorder to match the global memory order
-	for (int k = 0; k < x128::size; k++) {
-            atomicAdd(shared + threadIdx.x + (k * block_size_x), accumulators[k]);
-	}
+        }
     }
-    if (threadIdx.y >= x128::size) { return; } // only need this many warps to reorder the data
+
+    __shared__ float sub_results[x128::size][32][bdy];
+
+    // reduce within-warp results
+    for (int k = 0; k < x128::size; k++) {
+        float v = accumulators[k];
+        v += __shfl_down_sync(0xffffffff, v, 1, 4);
+        v += __shfl_down_sync(0xffffffff, v, 2, 4);
+        if(warp_d == 0) {
+            sub_results[k][block_d][warp_c] = v;
+        }
+    }
     __syncthreads();
-    // read the accumulated values in the conflict-free order
-    int i = threadIdx.x + (threadIdx.y * block_size_x);
-    float tmp = shared[i];
-    __syncthreads();
-    // write them back to shared memory in the global memory order
-    // 8-way bank conflict for BF16 x128, but only 8x per threadblock (rather than 8x per warp)
-    shared[local_oc + threadIdx.y] = tmp;
-    __syncthreads();
-    // now we do a perfectly coalesced atomic add to global memory (1x 128-byte cacheline per warp)
-    if (i + blockIdx.x*OC_per_warp < OC) {
-        atomicAdd(dbias + i + blockIdx.x*OC_per_warp, shared[i]);
+
+    // block-wide reductions
+    for (int k = block_d; k < x128::size; k += blockDim.z) {
+        float a = 0.f;
+        for (int r = warp_d; r < blockDim.z; r += bdx) {
+            float v = sub_results[k][r][warp_c];
+            v += __shfl_down_sync(0xffffffff, v, 1, 4);
+            v += __shfl_down_sync(0xffffffff, v, 2, 4);
+            a += v;
+        }
+
+        // coalesced, but not cacheline-sized writes
+        if(warp_d == 0 && global_oc < OC) {
+            // if we have only one block per result, no need for atomics
+            if constexpr (!Atomic) {
+                dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
+            } else {
+                atomicAdd(dbias + global_oc + k, a);
+            }
+        }
     }
 }
 
@@ -1523,28 +1543,25 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
 
     // backward to bias, if given, does a +=
     if (dbias != NULL) {
-        // Each warp is responsible for 32 * "x128::size" = 256 OCs at BF16 (OC must be a multiple of 256!)
-        // Block size is 512 threads (16 warps) and we reduce those 16 values into 1 at the end
-        // blockDim.x is 32 --> single warp being responsible for those 256 OCs
-        // blockDim.y is 16 --> 16 parallel independent warps processing the same OCs for different BTs
-        // gridDim.x is OC / 256 --> each block processes 256 OCs
-        // grimDim.y is max(1, (cuda_num_SMs * threads_per_SM) / (512 * gridDim.x)); --> fill up the entire GPU!
-        const int warp_size = 32;
-        const int block_size = 512;
-        const int OC_per_warp = warp_size * x128::size; // 256 at BF16
-        const int block_size_x = 32;
-        const int block_size_y = block_size / block_size_x; // 16
-        const int grid_size_x = CEIL_DIV(OC, OC_per_warp); // e.g. 3 horizontal blocks for 768 OCs at BF16
-        const int grid_size_y = max(1, deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount
-                                     / (block_size * grid_size_x)); // full GPU!
+        // Each warp is responsible for 8 * "x128::size" = 64 OCs at BF16 (OC must be a multiple of 64!)
+        // Block size is 1024 | 768 threads (32|24 warps) and we reduce those values into 1 at the end
 
-        assert(block_size_y >= x128::size); // part of the kernel assumes this is large enough to avoid loops
+        const int block_size = deviceProp.maxThreadsPerMultiProcessor == 1536 ? 768 : 1024;
 
-        cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float), main_stream);
-        matmul_backward_bias_kernel7<<<dim3(grid_size_x, grid_size_y),
-                                       dim3(block_size_x, block_size_y),
-                                       OC_per_warp * sizeof(float), main_stream>>>(dbias_buffer, dout, B, T, OC);
-        cast_and_add_kernel<<<CEIL_DIV(OC, 256), 256, 0, main_stream>>>(dbias, dbias_buffer, OC);
+        dim3 block_dim = {4, 8, (unsigned)block_size/32};
+        const int OC_per_warp = block_dim.y * x128::size; // 64 at BF16
+        const int grid_size_x = CEIL_DIV(OC, OC_per_warp); // e.g. 12 horizontal blocks for 768 OCs at BF16
+        const int grid_size_y = max(1, deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / (block_size * grid_size_x)); // full GPU!
+
+        // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
+        // and write results directly to the output.
+        if(grid_size_y == 1) {
+            matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim, 0, main_stream>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
+        } else {
+            cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float), main_stream);
+            matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim, 0, main_stream>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
+            cast_and_add_kernel<<<CEIL_DIV(OC, 256), 256, 0, main_stream>>>(dbias, dbias_buffer, OC);
+        }
     }
 
     // backward to input, uses = in the backward pass (set the gradient)
