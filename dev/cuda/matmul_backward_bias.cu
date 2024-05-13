@@ -172,6 +172,7 @@ __global__ void matmul_backward_bias_kernel4(floatX* dbias, const floatX* dout, 
     }
 }
 
+#ifndef ENABLE_BF16
 __global__ void matmul_backward_bias_kernel5(floatX* dbias, const floatX* dout, int B, int T, int OC) {
     int oc = blockIdx.x * blockDim.x + threadIdx.x;
     if(oc >= OC) return;
@@ -183,6 +184,7 @@ __global__ void matmul_backward_bias_kernel5(floatX* dbias, const floatX* dout, 
     // and atomically add everything together. atomics within one block are conflict-free!
     atomicAdd(dbias + oc, sum);
 }
+#endif
 
 
 __global__ void cast_and_add_kernel(floatX* dst, const float* src, size_t n) {
@@ -350,12 +352,14 @@ void matmul_backward_bias4(floatX* dbias, floatX* dout,
     matmul_backward_bias_kernel4<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
 }
 
+#ifndef ENABLE_BF16
 void matmul_backward_bias5(floatX* dbias, floatX* dout,
                       int B, int T, int C, int OC, int block_size) {
     const int grid_size_x = ceil_div(OC, block_size);
     const int grid_size_y = max(1, cuda_threads_per_SM * cuda_num_SMs / block_size);
     matmul_backward_bias_kernel5<<<dim3(grid_size_x, grid_size_y), dim3(block_size)>>>(dbias, dout, B, T, OC);
 }
+#endif
 
 void matmul_backward_bias7(floatX* dbias, floatX* dout,
                       int B, int T, int C, int OC, int block_size) {
@@ -417,7 +421,12 @@ void matmul_backward_bias(int kernel_num, floatX* dbias, floatX* dout,
             matmul_backward_bias4(dbias, dout, B, T, C, OC, block_size);
             break;
         case 5:
+#ifndef ENABLE_BF16
             matmul_backward_bias5(dbias, dout, B, T, C, OC, block_size);
+#else
+            fprintf(stderr, "Kernel 5 is only supported for fp32");
+            exit(1);
+#endif
             break;
         case 7:
             matmul_backward_bias7(dbias, dout, B, T, C, OC, block_size);
