@@ -158,32 +158,76 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
     }
 }
 
+void matmul_forward_slow(float* out,
+                         const float* inp, const float* weight, const float* bias,
+                         int B, int T, int C, int OC) {
+    // basic implementation of matrix multiplication. This serves as a fallback
+    // for bad input shapes, and as an illustration for the most basic version
+    // of the algorithm.
+#pragma omp parallel for collapse(2)
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            int bt = b * T + t;
+            for (int o = 0; o < OC; o++) {
+                float val = (bias != NULL) ? bias[o] : 0.0f;
+                for (int i = 0; i < C; i++) {
+                    val += inp[bt * C + i] * weight[o*C + i];
+                }
+                out[bt * OC + o] = val;
+            }
+        }
+    }
+}
+
 void matmul_forward(float* out,
-                    float* inp, float* weight, float* bias,
+                    const float* inp, const float* weight, const float* bias,
                     int B, int T, int C, int OC) {
     // most of the running time is spent here and in matmul_backward
     // OC is short for "output channels"
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
     // out will be (B,T,OC)
-    #pragma omp parallel for collapse(2)
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            float* out_bt = out + b * T * OC + t * OC;
-            float* inp_bt = inp + b * T * C + t * C;
-            for (int o = 0; o < OC; o++) {
-                float val = (bias != NULL) ? bias[o] : 0.0f;
-                float* wrow = weight + o*C;
-                for (int i = 0; i < C; i++) {
-                    val += inp_bt[i] * wrow[i];
+
+    // make sure the tiled loop will be correct, otherwise, fallback to slow version
+    const int LOOP_UNROLL = 8;
+    if (B*T % LOOP_UNROLL != 0) {
+        matmul_forward_slow(out, inp, weight, bias, B, T, C, OC);
+        return;
+    }
+
+    // collapse the B and T loops into one and turn it into a strided loop.
+    // then we can tile the inner loop, and reuse the loaded weight LOOP_UNROLL many times
+    // for significant speed-ups.
+    #pragma omp parallel for
+    for (int obt = 0; obt < B * T; obt += LOOP_UNROLL) {
+        for (int o = 0; o < OC; o++) {
+            // keep LOOP_UNROLL many results in register, initialized by the bias term.
+            float result[LOOP_UNROLL];
+            for (int ibt = 0; ibt < LOOP_UNROLL; ++ibt) {
+                result[ibt] = (bias != NULL) ? bias[o] : 0.0f;
+            }
+
+            // inner loops. Because we do LOOP_UNROLL steps of inner bt, we can cache
+            // the value of weight[i + o * C] and reuse it.
+            // we compile with -Ofast, so the compiler will turn the inner loop into a bunch of FMAs
+            for (int i = 0; i < C; i++) {
+                float w = weight[i + o * C];
+                for (int ibt = 0; ibt < LOOP_UNROLL; ++ibt) {
+                    int bt = obt + ibt;
+                    result[ibt] += inp[bt * C + i] * w;
                 }
-                out_bt[o] = val;
+            }
+
+            // write back results to main memory
+            for (int ibt = 0; ibt < LOOP_UNROLL; ++ibt) {
+                int bt = obt + ibt;
+                out[bt * OC + o] = result[ibt];
             }
         }
     }
 }
 
 void matmul_backward(float* dinp, float* dweight, float* dbias,
-                     float* dout, float* inp, float* weight,
+                     const float* dout, const float* inp, const float* weight,
                      int B, int T, int C, int OC) {
     // most of the running time is spent here and in matmul_forward
     // this backward could be done in a single "round" of loops
