@@ -41,6 +41,20 @@ ifneq ($(GPU_COMPUTE_CAPABILITY),)
   NVCC_FLAGS += --generate-code arch=compute_$(GPU_COMPUTE_CAPABILITY),code=[compute_$(GPU_COMPUTE_CAPABILITY),sm_$(GPU_COMPUTE_CAPABILITY)]
 endif
 
+# AMD flags
+ROCM_PATH ?= /opt/rocm
+HIPCC := $(shell which hipcc 2>/dev/null)
+HIPIFY := $(shell which hipify-perl 2>/dev/null)
+HIPCC_FLAGS = -O3 -march=native --offload-arch=native -mcumode
+HIPCC_LDFLAGS = -lhipblas -lhipblaslt -lamdhip64 -ldevice_gemm_operations -lutility -ldevice_other_operations
+REMOVE_FILES += *.hip
+ifneq ($(NO_MULTI_GPU), 1)
+  ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && [ -d /usr/lib/x86_64-linux-gnu/openmpi/include/ ] && echo "exists"), exists)
+    HIPCC_FLAGS += -I/usr/lib/x86_64-linux-gnu/openmpi/include -DMULTI_GPU
+    HIPCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/ -lmpi -lrccl
+  endif
+endif
+
 # autodect a lot of various supports on current platform
 $(info ---------------------------------------------)
 
@@ -221,6 +235,15 @@ else
     TARGETS += train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu $(NVCC_CUDNN)
 endif
 
+# Conditional inclusion of AMD targets
+ifeq ($(HIPCC),)
+    $(info ✗ hipcc not found, skipping GPU/AMD builds)
+else
+    $(info ✓ hipcc found, including GPU/AMD builds)
+    TARGETS += train_gpt2amd
+    HIPCC_FLAGS += -DBUILD_AMD
+endif
+
 $(info ---------------------------------------------)
 
 all: $(TARGETS)
@@ -248,6 +271,12 @@ test_gpt2fp32cu: test_gpt2_fp32.cu
 
 profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE) 
+
+%.hip: %.cu
+	$(HIPIFY) -quiet-warnings $< -o $@
+
+%amd: %.hip amd_support.h
+	$(HIPCC) $(HIPCC_FLAGS) $(PFLAGS) $< $(HIPCC_LDFLAGS) -o $@
 
 clean:
 	$(REMOVE_FILES) $(TARGETS) $(NVCC_CUDNN)
