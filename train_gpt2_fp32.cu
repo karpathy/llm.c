@@ -20,12 +20,16 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <string.h>
 #include <unistd.h>
 
+#ifdef BUILD_AMD
+#include "amd_support.h"
+#else
 // GPU / CUDA related
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#endif
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 #include "utils.h"
@@ -643,12 +647,33 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
+__global__ void add_bias(float* out, const float* bias, int B, int T, int OC) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = idx; i < B * T * OC; i += stride) {
+        int col = i % OC;
+        out[i] += bias[col];
+    }
+}
+
 // uses cuBLASLt to fuse the bias and gelu. does not work with OC = 50257 (last layer)
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
 // https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtSgemm/sample_cublasLt_LtSgemm.cu
 void matmul_forward_cublaslt(float* out,
                      float* inp, float* weight, float* bias,
                      int B, int T, int C, int OC) {
+#ifdef BUILD_AMD
+    // work around for hipblaslt not supporting gfx11 fully:
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC));
+    if (bias != NULL) {
+        int block_size = 512;
+        int grid_size = CEIL_DIV(OC * B * T, block_size);
+        add_bias<<<grid_size, block_size>>>(out, bias, B, T, OC);
+        cudaCheck(cudaGetLastError());
+    }
+#else
     int has_bias = (bias != NULL);
 
     // check bias alignment
@@ -714,6 +739,7 @@ void matmul_forward_cublaslt(float* out,
     cublasCheck(cublasLtMatrixLayoutDestroy(inputLayout));
     cublasCheck(cublasLtMatrixLayoutDestroy(outputLayout));
     cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
+#endif
 }
 
 void attention_forward(float* out, float* qkvr, float* att,
@@ -1038,6 +1064,11 @@ float* malloc_and_point(float** targets[], const size_t* act_sizes, int n) {
     }
     float* acts_memory;
     cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
+#ifdef BUILD_AMD
+    // due to differences in cross lane warp operations on AMD, easiest way to make it work
+    // without bigger changes to kernels is to simply to zero the memory on init
+    cudaCheck(cudaMemset(acts_memory, 0, num_activations * sizeof(float)));
+#endif
     float* acts_memory_iterator = acts_memory;
     for (size_t i = 0; i < n; i++) {
         *(targets[i]) = acts_memory_iterator;

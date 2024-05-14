@@ -323,3 +323,53 @@ static __device__ __forceinline__ int4 patched_ldcs(const int4 *addr) {
 static __device__ __forceinline__ hip_bfloat16 patched_ldcs(const hip_bfloat16 *addr) {
     return *addr;
 }
+
+// emulate CG for old train_gpt2_fp32:
+static __device__ __forceinline__ float warp_reduce_sum(float x) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        x += __shfl_xor_sync(0xffffffff, x, mask, 32);
+    }
+    return x;
+}
+
+static __device__ __forceinline__ float warp_reduce_max(float x) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, mask, 32));
+    }
+    return x;
+}
+namespace cooperative_groups {
+template <typename T>
+struct reduce_operator {
+    static __device__ __forceinline__ T reduce(const T a, const T b) { return a+b; };
+};
+
+template <typename T>
+struct plus : public reduce_operator<T> {
+    static __device__ __forceinline__ T reduce(const T a, const T b) {
+        return a + b;
+    }
+};
+
+template <typename T>
+struct greater : public reduce_operator<T> {
+    static __device__ __forceinline__ T reduce(const T a, const T b) {
+        return fmaxf(a, b);
+    }
+};
+
+template <typename T>
+static __device__ __forceinline__ float reduce(const thread_block_tile<32>& warp, float x, const plus<T>& op) {
+    return warp_reduce_sum(x);
+}
+
+template <typename T>
+static __device__ __forceinline__ float reduce(const thread_block_tile<32>& warp, float x, const greater<T>& op) {
+    return warp_reduce_max(x);
+}
+
+template struct plus<float>;
+template struct greater<float>;
+}
