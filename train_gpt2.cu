@@ -123,12 +123,7 @@ cublasHandle_t cublas_handle;
 cudaDeviceProp deviceProp;
 
 // CUDA streams & events (note: non-timing events, use separate events for timing/profiling!)
-constexpr int num_parallel_streams = 2; // + 1 primary "main_stream" (+ default stream)
-cudaStream_t parallel_streams[num_parallel_streams];
-cudaEvent_t parallel_events[num_parallel_streams];
 cudaStream_t main_stream;
-cudaEvent_t main_event;
-cudaEvent_t loss_event; // to make sure fused_classifier has written the losses to the CPU buffer
 
 // convenience macro for calculating grid/block dimensions for kernels
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
@@ -1558,7 +1553,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
         if(grid_size_y == 1) {
             matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim, 0, main_stream>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
         } else {
-            cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float), main_stream);
+            cudaMemset(dbias_buffer, 0, OC * sizeof(float));
             matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim, 0, main_stream>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
             cast_and_add_kernel<<<CEIL_DIV(OC, 256), 256, 0, main_stream>>>(dbias, dbias_buffer, OC);
         }
@@ -1586,7 +1581,7 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     const int grid_size = blocks_per_sm * deviceProp.multiProcessorCount;
     size_t shared_mem_size = (2 * C + 1) * sizeof(float);
 
-    cudaMemsetAsync(scratch, 0, (2 * C + 1) * sizeof(float), main_stream);
+    cudaMemset(scratch, 0, (2 * C + 1) * sizeof(float));
     layernorm_backward_kernel8<<<grid_size, block_size, shared_mem_size, main_stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
@@ -2041,11 +2036,10 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bo
 
     // copy inputs/targets to the model
     // todo - inputs is copied on default stream so this synchronises CPU/GPU for now
-    cudaCheck(cudaMemcpyAsync(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice, 0));
+    cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
     if (targets != NULL) {
         // memcpy targets in parallel then wait for them before fused_classifier
-        cudaCheck(cudaMemcpyAsync(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice, parallel_streams[0]));
-        cudaEventRecord(parallel_events[0], parallel_streams[0]);
+        cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     }
 
     // forward pass
@@ -2128,16 +2122,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bo
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         NvtxRange classifier_and_loss_range("classifier_and_loss");
-        // wait on memcpy of targets (definitely finished by now, but better safe than sorry)
-        cudaStreamWaitEvent(main_stream, parallel_events[0], 0);
         // fused classifier: does the forward pass and first part of the backward pass
         const float dloss = 1.0f / (B * T * grad_accum_steps); // results in the uniform average loss over all elements
         fused_classifier(acts.output, model->cpu_losses, dloss, model->targets, B, T, V, Vp);
-
-        // the GPU now writes the losses directly to the CPU buffer allocated with cudaMallocHost()
-        // we accumulate cpu_losses at the end of gpt2_backward() waiting on this event
-        cudaEventRecord(loss_event, main_stream);
-
         // reset mean_loss here so gpt2_backward() knows we have targets
         model->mean_loss = 0.0f;
     } else {
@@ -2148,7 +2135,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bo
     // accumulate the loss immediately if we are not going to run gpt2_backward(), e.g. inference
     if (get_loss) {
         assert(targets != NULL); // makes no sense to request loss if we don't have targets
-        cudaCheck(cudaEventSynchronize(loss_event)); // hopefully finished long ago
         for (int i=0; i<B*T; i++) { model->mean_loss += (float)(model->cpu_losses[i]); }
         model->mean_loss /= B*T*grad_accum_steps;
     }
@@ -2157,11 +2143,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bo
 void gpt2_zero_grad(GPT2 *model) {
     NVTX_RANGE_FN();
     if (model->grads_memory != NULL) {
-        cudaCheck(cudaMemsetAsync(model->grads_memory, 0, model->num_parameters * sizeof(floatX), parallel_streams[0]));
+        cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(floatX)));
     }
-    // Allow this to run in parallel with forward pass, but create a dependency with everything after (backwards pass)
-    cudaEventRecord(parallel_events[0], parallel_streams[0]);
-    cudaStreamWaitEvent(main_stream, parallel_events[0], 0);
 }
 
 void gpt2_backward(GPT2 *model) {
@@ -2207,10 +2190,7 @@ void gpt2_backward(GPT2 *model) {
     GradActTensors grads_acts = model->grads_acts;
 
     // reset residual stream gradients (put here to work with gradient accumulation)
-    cudaCheck(cudaMemsetAsync(model->grads_acts.residual3, 0, B * T * C * sizeof(floatX), parallel_streams[0]));
-    // allow the memset to run in parallel with the forward pass, but create a dependency with everything after
-    cudaEventRecord(parallel_events[0], parallel_streams[0]);
-    cudaStreamWaitEvent(main_stream, parallel_events[0], 0);
+    cudaCheck(cudaMemset(model->grads_acts.residual3, 0, B * T * C * sizeof(floatX)));
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
     float* scratchF = (float*)acts.output;
@@ -2302,7 +2282,6 @@ void gpt2_backward(GPT2 *model) {
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C, random_u32(&model->rng_state));
 
     // accumulate the loss, this was calculated at the end of gpt2_forward()
-    cudaCheck(cudaEventSynchronize(loss_event)); // hopefully finished long ago
     for (int i=0; i<B*T; i++) { model->mean_loss += (float)(model->cpu_losses[i]); }
     model->mean_loss /= B*T;
 }
@@ -2439,12 +2418,6 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
     }
 
     cudaCheck(cudaStreamCreate(&main_stream));
-    cudaEventCreateWithFlags(&main_event, cudaEventDisableTiming);
-    cudaEventCreateWithFlags(&loss_event, cudaEventDisableTiming);
-    for (int i = 0; i < num_parallel_streams; i++) {
-        cudaCheck(cudaStreamCreate(&parallel_streams[i]));
-        cudaEventCreateWithFlags(&parallel_events[i], cudaEventDisableTiming);
-    }
 
     // set up cuBLAS and cuBLASLt (and cuDNN if enabled)
     cublasCheck(cublasCreate(&cublas_handle));
@@ -2463,14 +2436,7 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
 }
 
 void common_free(GPT2 &model) {
-    cudaCheck(cudaEventDestroy(main_event));
-    cudaCheck(cudaEventDestroy(loss_event));
-    for (int i = 0; i < num_parallel_streams; i++) {
-        cudaCheck(cudaStreamDestroy(parallel_streams[i]));
-        cudaCheck(cudaEventDestroy(parallel_events[i]));
-    }
     cudaCheck(cudaStreamDestroy(main_stream));
-
     gpt2_free(&model);
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
@@ -2819,7 +2785,7 @@ int main(int argc, char *argv[]) {
                 // we re-calculate the forward pass for all of (B,T) positions from scratch
                 // but the inference here is just for sanity checking anyway
                 // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
+                gpt2_forward(&model, gen_tokens, NULL, B, T, false);
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
