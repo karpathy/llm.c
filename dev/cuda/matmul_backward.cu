@@ -60,7 +60,7 @@ void matmul_backward_cpu(float* dinp, float* dweight, float* dbias,
 }
 
 // ----------------------------------------------------------------------------
-// GPU kernels
+// GPU kernels, more matmul_backward_bias_kernels are in the matmul_backward_bias.cu file
 
 // naive kernel to backpropagate only the bias, it's just a sum :'(
 __global__ void matmul_backward_bias_kernel_naive(float* dbias, const float* dout, int B, int T, int OC) {
@@ -99,7 +99,7 @@ __global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* do
     }
     // write the final result (at thread 0) to global memory
     if (tid == 0) {
-        dbias[o] = shared[0];
+        dbias[o] = (float)dbias[o] + shared[0];
     }
 }
 
