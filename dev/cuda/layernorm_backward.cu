@@ -2,7 +2,7 @@
 Kernels for layernorm backward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math layernorm_backward.cu -o layernorm_backward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt layernorm_backward.cu -o layernorm_backward
 
 version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
 ./layernorm_backward 1
@@ -17,22 +17,9 @@ version 2 moves a lot of reduction to shared memory over global memory
 #include <assert.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include "common.h"
 
-// turn on bf16 as default, done up here for now
 #define ENABLE_BF16
-
-#if defined(ENABLE_BF16)
-typedef __nv_bfloat16 floatX;
-typedef __nv_bfloat16 floatN;
-#elif defined(ENABLE_FP16)
-typedef half floatX;
-typedef half floatN;
-#else
-typedef float floatX;
-typedef float floatN;
-#endif
-typedef Packed128<floatX> x128;
+#include "common.h"
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -126,13 +113,6 @@ void layernorm_backward_cpu(float* dinp, float* dweight, float* dbias,
 // GPU kernels
 
 // GPU helper functions for atomicAdd on smaller than 32-bit types
-__device__ float warpReduceSum(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    }
-    return val;
-}
-
 #ifdef ENABLE_BF16
 __device__ void atomicAddX(__nv_bfloat16* addr, __nv_bfloat16 val) {
     uintptr_t ptr_val = reinterpret_cast<uintptr_t>(addr);
