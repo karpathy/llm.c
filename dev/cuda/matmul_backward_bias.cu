@@ -72,7 +72,7 @@ __global__ void matmul_backward_bias_kernel1(floatX* dbias, const floatX* dout, 
     }
     // write the final result (at thread 0) to global memory
     if (tid == 0) {
-        dbias[o] = (float)dbias[o] + shared[0];
+        dbias[o] = shared[0];
     }
 }
 
