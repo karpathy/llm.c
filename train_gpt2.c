@@ -237,10 +237,10 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            float* dout_bt = dout + b * T * OC + t * OC;
+            const float* dout_bt = dout + b * T * OC + t * OC;
             float* dinp_bt = dinp + b * T * C + t * C;
             for (int o = 0; o < OC; o++) {
-                float* wrow = weight + o*C;
+                const float* wrow = weight + o*C;
                 float d = dout_bt[o];
                 for (int i = 0; i < C; i++) {
                     dinp_bt[i] += wrow[i] * d;
@@ -253,8 +253,8 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     for (int o = 0; o < OC; o++) {
         for (int b = 0; b < B; b++) {
             for (int t = 0; t < T; t++) {
-                float* dout_bt = dout + b * T * OC + t * OC;
-                float* inp_bt = inp + b * T * C + t * C;
+                const float* dout_bt = dout + b * T * OC + t * OC;
+                const float* inp_bt = inp + b * T * C + t * C;
                 float* dwrow = dweight + o*C;
                 float d = dout_bt[o];
                 if (dbias != NULL) { dbias[o] += d; }
