@@ -842,11 +842,13 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
             int global_index = (warpThreadIdx * x128::size) + (i * C_per_iteration);
             int shared_index = warpThreadIdx + (i * C_per_iteration);
 
-            x128 dbias128;
-            x128 dweight128;
+            x128 dbias128 = load128(dbias + global_index);
+            x128 dweight128 = load128(dweight + global_index);
             for (int x = 0; x < x128::size; x++) {
-                dbias128[x] = (floatX)scratch_dbias[shared_index + x*warpSize];
-                dweight128[x] = (floatX)scratch_dweight[shared_index + x*warpSize];
+                float s_db = scratch_dbias[shared_index + x*warpSize];
+                float s_dw = scratch_dweight[shared_index + x*warpSize];
+                dbias128[x] = (floatX)(s_db + (float)dbias128[x]);
+                dweight128[x] = (floatX)(s_dw + (float)dweight128[x]);
             }
             store128(dbias + global_index, dbias128);
             store128(dweight + global_index, dweight128);
