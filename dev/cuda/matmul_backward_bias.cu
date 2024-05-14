@@ -324,45 +324,50 @@ __global__ void matmul_backward_bias_kernel8(OutFloat* dbias, const floatX* dout
 // kernel launcher
 
 // version1: simple cuBLAS calls
-void matmul_backward_bias1(floatX* dbias, floatX* dout,
-                      int B, int T, int C, int OC, int block_size) {
+void matmul_backward_bias1(floatX* dbias, const floatX* dout,
+                      int B, int T, int OC, int block_size) {
     dim3 block_dim(block_size);
     dim3 grid_dim(OC);
     size_t shared_mem_size = block_size * sizeof(float);
     matmul_backward_bias_kernel1<<<grid_dim, block_dim, shared_mem_size>>>(dbias, dout, B, T, OC);
+    cudaCheck(cudaGetLastError());
 }
 
-void matmul_backward_bias2(floatX* dbias, floatX* dout,
-                      int B, int T, int C, int OC, int block_size) {
+void matmul_backward_bias2(floatX* dbias, const floatX* dout,
+                      int B, int T, int OC, int block_size) {
     // block_size 512 seems best
     const int grid_size = ceil_div(OC * 32, block_size);
     matmul_backward_bias_kernel2<<<grid_size, block_size>>>(dbias, dout, B, T, OC);
+    cudaCheck(cudaGetLastError());
 }
 
-void matmul_backward_bias3(floatX* dbias, floatX* dout,
-                      int B, int T, int C, int OC, int block_size) {
+void matmul_backward_bias3(floatX* dbias, const floatX* dout,
+                      int B, int T, int OC, int block_size) {
     // block_size 256 seems best
     matmul_backward_bias_kernel3<<<OC, block_size>>>(dbias, dout, B, T, OC);
+    cudaCheck(cudaGetLastError());
 }
 
-void matmul_backward_bias4(floatX* dbias, floatX* dout,
-                      int B, int T, int C, int OC, int block_size) {
+void matmul_backward_bias4(floatX* dbias, const floatX* dout,
+                      int B, int T, int OC, int block_size) {
     assert(OC % 32 == 0); // OC must be divisible by 32 for this kernel
     const int grid_size = OC / 32;
     matmul_backward_bias_kernel4<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
+    cudaCheck(cudaGetLastError());
 }
 
 #ifndef ENABLE_BF16
-void matmul_backward_bias5(floatX* dbias, floatX* dout,
-                      int B, int T, int C, int OC, int block_size) {
+void matmul_backward_bias5(floatX* dbias, const floatX* dout,
+                      int B, int T, int OC, int block_size) {
     const int grid_size_x = ceil_div(OC, block_size);
     const int grid_size_y = max(1, cuda_threads_per_SM * cuda_num_SMs / block_size);
     matmul_backward_bias_kernel5<<<dim3(grid_size_x, grid_size_y), dim3(block_size)>>>(dbias, dout, B, T, OC);
+    cudaCheck(cudaGetLastError());
 }
 #endif
 
-void matmul_backward_bias7(floatX* dbias, floatX* dout,
-                      int B, int T, int C, int OC, int block_size) {
+void matmul_backward_bias7(floatX* dbias, const floatX* dout,
+                      int B, int T, int OC, int block_size) {
     if(block_size < 256) {
         block_size = 256;
     }
@@ -381,14 +386,16 @@ void matmul_backward_bias7(floatX* dbias, floatX* dout,
 
     assert(block_size_y >= x128::size); // part of the kernel assumes this is large enough to avoid loops
 
-    cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float));
+    cudaCheck(cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float)));
     matmul_backward_bias_kernel7<<<dim3(grid_size_x, grid_size_y),
-    dim3(block_size_x, block_size_y), OC_per_warp * sizeof(float)>>>(dbias_buffer, dout, B, T, OC, block_size);
+        dim3(block_size_x, block_size_y), OC_per_warp * sizeof(float)>>>(dbias_buffer, dout, B, T, OC, block_size);
+    cudaCheck(cudaGetLastError());
     cast_and_add_kernel<<<ceil_div(OC, 256), 256, 0>>>(dbias, dbias_buffer, OC);
+    cudaCheck(cudaGetLastError());
 }
 
-void matmul_backward_bias8(floatX* dbias, floatX* dout,
-                      int B, int T, int C, int OC, int block_size) {
+void matmul_backward_bias8(floatX* dbias, const floatX* dout,
+                      int B, int T, int OC, int block_size) {
     dim3 block_dim = {4, 8, (unsigned)block_size/32};
     const int OC_per_warp = block_dim.y * x128::size; // 64 at BF16
     const int grid_size_x = ceil_div(OC, OC_per_warp); // e.g. 12 horizontal blocks for 768 OCs at BF16
@@ -398,41 +405,44 @@ void matmul_backward_bias8(floatX* dbias, floatX* dout,
     // and write results directly to the output.
     if(grid_size_y == 1) {
         matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
+        cudaCheck(cudaGetLastError());
     } else {
-        cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float));
+        cudaCheck(cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float)));
         matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
+        cudaCheck(cudaGetLastError());
         cast_and_add_kernel<<<ceil_div(OC, 256), 256, 0>>>(dbias, dbias_buffer, OC);
+        cudaCheck(cudaGetLastError());
     }
 }
 
 void matmul_backward_bias(int kernel_num, floatX* dbias, floatX* dout,
-                     int B, int T, int C, int OC, int block_size) {
+                     int B, int T, int OC, int block_size) {
     switch (kernel_num) {
         case 1:
-            matmul_backward_bias1(dbias, dout, B, T, C, OC, block_size);
+            matmul_backward_bias1(dbias, dout, B, T, OC, block_size);
             break;
         case 2:
-            matmul_backward_bias2(dbias, dout, B, T, C, OC, block_size);
+            matmul_backward_bias2(dbias, dout, B, T, OC, block_size);
             break;
         case 3:
-            matmul_backward_bias3(dbias, dout,  B, T, C, OC, block_size);
+            matmul_backward_bias3(dbias, dout,  B, T, OC, block_size);
             break;
         case 4:
-            matmul_backward_bias4(dbias, dout, B, T, C, OC, block_size);
+            matmul_backward_bias4(dbias, dout, B, T, OC, block_size);
             break;
         case 5:
 #ifndef ENABLE_BF16
-            matmul_backward_bias5(dbias, dout, B, T, C, OC, block_size);
+            matmul_backward_bias5(dbias, dout, B, T, OC, block_size);
 #else
             fprintf(stderr, "Kernel 5 is only supported for fp32");
             exit(1);
 #endif
             break;
         case 7:
-            matmul_backward_bias7(dbias, dout, B, T, C, OC, block_size);
+            matmul_backward_bias7(dbias, dout, B, T, OC, block_size);
             break;
         case 8:
-            matmul_backward_bias8(dbias, dout, B, T, C, OC, block_size);
+            matmul_backward_bias8(dbias, dout, B, T, OC, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -466,7 +476,7 @@ int main(int argc, char **argv) {
     floatX* d_dout;
     cudaCheck(cudaMalloc(&d_dbias, OC * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_dout, B * T * OC * sizeof(floatX)));
-    cudaCheck(cudaMalloc(&dbias_buffer, OC * sizeof(float)));
+    cudaCheck(cudaMalloc(&dbias_buffer, OC * sizeof(float) * 32));
     cudaCheck(memcpy_convert(d_dbias, dbias, OC));
     cudaCheck(memcpy_convert(d_dout, dout, B * T * OC));
 
@@ -489,7 +499,7 @@ int main(int argc, char **argv) {
         // memset the bias to zero
         cudaCheck(cudaMemset(d_dbias, 0, OC * sizeof(floatX)));
         // calculate the GPU version
-        matmul_backward_bias(kernel_num, d_dbias, d_dout, B, T, C, OC, block_size);
+        matmul_backward_bias(kernel_num, d_dbias, d_dout, B, T, OC, block_size);
         // compare
         printf("Checking correctness...\n");
         float tol = std::is_same_v<floatX, float> ? 5e-3f : 1.0f;
@@ -502,7 +512,7 @@ int main(int argc, char **argv) {
         int block_size = block_sizes[j];
         int repeat_times = 2000;
         float elapsed_time = benchmark_kernel(repeat_times, matmul_backward_bias, kernel_num,
-                                            d_dbias, d_dout, B, T, C, OC, block_size);
+                                            d_dbias, d_dout, B, T, OC, block_size);
         printf("block_size %d time %.4f ms\n", block_size, elapsed_time);
     }
 
