@@ -151,9 +151,9 @@ static inline void matmul_forward_gfx11(hip_bfloat16* out,
             1>{};
         auto invoker = device_op.MakeInvoker();
         auto argument = device_op.MakeArgument(
-            static_cast<ck::bhalf_t*>(static_cast<void *>(const_cast<hip_bfloat16 *>(inp))),
-            static_cast<ck::bhalf_t*>(static_cast<void *>(const_cast<hip_bfloat16 *>(weight))),
-            static_cast<ck::bhalf_t*>(static_cast<void *>(out)),
+            reinterpret_cast<ck::bhalf_t*>(const_cast<hip_bfloat16 *>(inp)),
+            reinterpret_cast<ck::bhalf_t*>(const_cast<hip_bfloat16 *>(weight)),
+            reinterpret_cast<ck::bhalf_t*>(out),
             B*T,
             OC,
             C,
@@ -209,10 +209,10 @@ static inline void matmul_forward_gfx11(hip_bfloat16* out,
             8>{};
         auto invoker = device_op.MakeInvoker();
         auto argument = device_op.MakeArgument(
-            static_cast<ck::bhalf_t*>(static_cast<void *>(const_cast<hip_bfloat16 *>(inp))),
-            static_cast<ck::bhalf_t*>(static_cast<void *>(const_cast<hip_bfloat16 *>(weight))),
-            std::array<const void*, 1>{static_cast<ck::bhalf_t*>(static_cast<void *>(const_cast<hip_bfloat16 *>(bias)))},
-            static_cast<ck::bhalf_t*>(static_cast<void *>(out)),
+            reinterpret_cast<ck::bhalf_t*>(const_cast<hip_bfloat16 *>(inp)),
+            reinterpret_cast<ck::bhalf_t*>(const_cast<hip_bfloat16 *>(weight)),
+            std::array<const void*, 1>{reinterpret_cast<ck::bhalf_t*>(const_cast<hip_bfloat16 *>(bias))},
+            reinterpret_cast<ck::bhalf_t*>(out),
             B*T,
             OC,
             C,
