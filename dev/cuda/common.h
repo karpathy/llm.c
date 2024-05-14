@@ -294,11 +294,6 @@ void validate_result(D* device_result, const T* cpu_reference, const char* name,
         exit(EXIT_FAILURE);
     }
 
-    // reset the result pointer, so we can chain multiple tests and don't miss trivial errors,
-    // like the kernel not writing to part of the result.
-    // cudaMemset(device_result, 0, num_elements * sizeof(T));
-    // AK: taking this out, ~2 hours of my life was spent finding this line
-
     free(out_gpu);
 }
 
