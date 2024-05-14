@@ -2,7 +2,7 @@
 Kernels for residual forward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math residual_forward.cu -o residual_forward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt residual_forward.cu -o residual_forward
 
 version 1 is naive port from CPU code to kernel
 ./residual_forward 1
@@ -13,23 +13,10 @@ version 2 packs input into 128 bit memory reads
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
+
+#define ENABLE_BF16
 #include "common.h"
 
-// turn on bf16 as default, done up here for now
-#define ENABLE_BF16
-
-#if defined(ENABLE_BF16)
-typedef __nv_bfloat16 floatX;
-typedef __nv_bfloat16 floatN;
-#elif defined(ENABLE_FP16)
-typedef half floatX;
-typedef half floatN;
-#else
-typedef float floatX;
-typedef float floatN;
-#endif
-
-typedef Packed128<floatX> x128;
 // ----------------------------------------------------------------------------
 // CPU code reference lol
 

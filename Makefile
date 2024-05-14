@@ -19,8 +19,7 @@ NVCC_INCLUDES =
 NVCC_LDLIBS =
 NCLL_INCUDES =
 NVCC_CUDNN =
-# overridable flag for multi-GPU training. by default we won't build with cudnn
-# because it bloats up the compile time from a few seconds to ~minute
+# By default we don't build with cudnn because it blows up compile time from a few seconds to ~minute
 USE_CUDNN ?= 0
 
 # Function to check if a file exists in the PATH
@@ -86,16 +85,15 @@ else
 endif
 
 # Check and include cudnn if available
-# You can override the path to cudnn frontend by setting CUDNN_FRONTEND_PATH=your_path on the make command line
+# You can override the path to cudnn frontend by setting CUDNN_FRONTEND_PATH on the make command line
+# By default, we look for it in HOME/cudnn-frontend/include and ./cudnn-frontend/include
 # Refer to the README for cuDNN install instructions
 ifeq ($(USE_CUDNN), 1)
   ifeq ($(SHELL_UNAME), Linux)
-    # hard-coded path for now in either . or ($HOME) directory 
-    # this can be overridden by setting CUDNN_FRONTEND_PATH on the command line
     ifeq ($(shell [ -d $(HOME)/cudnn-frontend/include ] && echo "exists"), exists)
       $(info ✓ cuDNN found, will run with flash-attention)
       CUDNN_FRONTEND_PATH ?= $(HOME)/cudnn-frontend/include
-    else ifeq ($(shell [ -d cudnn-frontend/include ] && echo "exists"),)
+    else ifeq ($(shell [ -d cudnn-frontend/include ] && echo "exists"), exists)
       $(info ✓ cuDNN found, will run with flash-attention)
       CUDNN_FRONTEND_PATH ?= cudnn-frontend/include
     else
