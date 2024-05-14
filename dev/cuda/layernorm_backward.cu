@@ -842,11 +842,13 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
             int global_index = (warpThreadIdx * x128::size) + (i * C_per_iteration);
             int shared_index = warpThreadIdx + (i * C_per_iteration);
 
-            x128 dbias128;
-            x128 dweight128;
+            x128 dbias128 = load128(dbias + global_index);
+            x128 dweight128 = load128(dweight + global_index);
             for (int x = 0; x < x128::size; x++) {
-                dbias128[x] = (floatX)scratch_dbias[shared_index + x*warpSize];
-                dweight128[x] = (floatX)scratch_dweight[shared_index + x*warpSize];
+                float s_db = scratch_dbias[shared_index + x*warpSize];
+                float s_dw = scratch_dweight[shared_index + x*warpSize];
+                dbias128[x] = (floatX)(s_db + (float)dbias128[x]);
+                dweight128[x] = (floatX)(s_dw + (float)dweight128[x]);
             }
             store128(dbias + global_index, dbias128);
             store128(dweight + global_index, dweight128);
@@ -1012,25 +1014,6 @@ int main(int argc, char **argv) {
     float *dbias = make_zeros_float(C);
     layernorm_backward_cpu(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
 
-    // convert all the necessary cpu data to floatX (e.g. bfloat16)
-    floatX* meanX = (floatX*)malloc(B * T * sizeof(floatX));
-    floatX* rstdX = (floatX*)malloc(B * T * sizeof(floatX));
-    floatX* doutX = (floatX*)malloc(B * T * C * sizeof(floatX));
-    floatX* inpX = (floatX*)malloc(B * T * C * sizeof(floatX));
-    floatX* weightX = (floatX*)malloc(C * sizeof(floatX));
-
-    for (int i = 0; i < B * T; i++) {
-        meanX[i] = (floatX)mean[i];
-        rstdX[i] = (floatX)rstd[i];
-    }
-    for (int i = 0; i < B * T * C; i++) {
-        doutX[i] = (floatX)dout[i];
-        inpX[i] = (floatX)inp[i];
-    }
-    for (int i = 0; i < C; i++) {
-        weightX[i] = (floatX)weight[i];
-    }
-
     // the above calculations act as the reference
     // now let's do the same on the GPU
 
@@ -1061,33 +1044,39 @@ int main(int argc, char **argv) {
     cudaCheck(cudaMalloc(&d_rstd, B * T * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_scratch, cuda_num_SMs * (2 * C + 1) * sizeof(float)));
     // copy over the "inputs" to the backward call
-    cudaCheck(cudaMemcpy(d_dout, doutX, B * T * C * sizeof(floatX), cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(d_inp, inpX, B * T * C * sizeof(floatX), cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(d_weight, weightX, C * sizeof(floatX), cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(d_mean, meanX, B * T * sizeof(floatX), cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(d_rstd, rstdX, B * T * sizeof(floatX), cudaMemcpyHostToDevice));
-    // init the "outputs" of the backward call to zeros
-    cudaCheck(cudaMemset(d_dinp, 0, B * T * C * sizeof(floatX)));
-    cudaCheck(cudaMemset(d_dweight, 0, C * sizeof(floatX)));
-    cudaCheck(cudaMemset(d_dbias, 0, C * sizeof(floatX)));
+    cudaCheck(memcpy_convert(d_dout, dout, B * T * C));
+    cudaCheck(memcpy_convert(d_inp, inp, B * T * C));
+    cudaCheck(memcpy_convert(d_weight, weight, C));
+    cudaCheck(memcpy_convert(d_mean, mean, B * T));
+    cudaCheck(memcpy_convert(d_rstd, rstd, B * T));
 
     // launch the kernel
-    const int block_size = 256;
-    layernorm_backward(kernel_num, d_dinp, d_dweight, d_dbias, d_scratch, d_dout, d_inp, d_weight, d_mean, d_rstd, B, T, C, block_size);
+    int block_sizes[] = {32, 64, 128, 256, 512, 768, 1024};
+    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+        int block_size = block_sizes[j];
+        // init the "outputs" of the backward call to zeros
+        cudaCheck(cudaMemset(d_dinp, 0, B * T * C * sizeof(floatX)));
+        cudaCheck(cudaMemset(d_dweight, 0, C * sizeof(floatX)));
+        cudaCheck(cudaMemset(d_dbias, 0, C * sizeof(floatX)));
 
-    // check the correctness of the kernel
-    float error_threshold_dinp = sizeof(floatX) == 4 ? 1e-3f : 1e-1f; // allow larger errors for BF16/FP16
-    float error_threshold_dparams = sizeof(floatX) == 4 ? 1e-3f : 20.0f; // much, much larger...
-    printf("Checking correctness...\n");
-    printf("dinp:\n");
-    validate_result(d_dinp, dinp, "dinp", B * T * C, error_threshold_dinp);
-    printf("dweight:\n");
-    validate_result(d_dweight, dweight, "dweight", C, error_threshold_dparams);
-    printf("dbias:\n");
-    validate_result(d_dbias, dbias, "dbias", C, error_threshold_dparams);
+        layernorm_backward(kernel_num, d_dinp, d_dweight, d_dbias, d_scratch, d_dout, d_inp, d_weight, d_mean, d_rstd,
+                           B, T, C, block_size);
+
+        // check the correctness of the kernel
+        float error_threshold_dinp = sizeof(floatX) == 4 ? 1e-3f : 1e-1f; // allow larger errors for BF16/FP16
+        float error_threshold_dparams = sizeof(floatX) == 4 ? 1e-3f : 5e-1f; // much, much larger...
+        printf("Checking correctness...\n");
+        printf("dinp:\n");
+        validate_result(d_dinp, dinp, "dinp", B * T * C, error_threshold_dinp);
+        printf("dweight:\n");
+        validate_result(d_dweight, dweight, "dweight", C, error_threshold_dparams);
+        printf("dbias:\n");
+        validate_result(d_dbias, dbias, "dbias", C, error_threshold_dparams);
+
+        printf("All results match for block_size=%d.\n\n", block_size);
+    }
 
     // now time the kernel
-    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         int repeat_times = 100;
@@ -1108,11 +1097,6 @@ int main(int argc, char **argv) {
     free(dinp);
     free(dweight);
     free(dbias);
-    free(meanX);
-    free(rstdX);
-    free(doutX);
-    free(inpX);
-    free(weightX);
     cudaCheck(cudaFree(d_dinp));
     cudaCheck(cudaFree(d_dweight));
     cudaCheck(cudaFree(d_dbias));
