@@ -1067,9 +1067,6 @@ void dataloader_free(DataLoader *loader) {
 // ----------------------------------------------------------------------------
 // sampler
 
-// the GPT-2 end-of-text token id
-#define GPT2_EOT 50256
-
 unsigned int random_u32(unsigned long long *state) {
     // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
     *state ^= *state >> 12;
@@ -1149,7 +1146,7 @@ int main() {
         if (step > 0 && step % 20 == 0) {
             // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
             for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = GPT2_EOT;
+                gen_tokens[i] = tokenizer.eot;
             }
             // now sample from the model autoregressively
             printf("generating:\n---\n");
