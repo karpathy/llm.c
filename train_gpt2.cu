@@ -2045,8 +2045,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, bo
 
     // todo - the 1st optional memcpy is async relative to CPU, but fully serialised on GPU (default legacy stream 0)
     // the 2nd memcpy is fully synchronous, so this creates a full "CPU waits until GPU is idle" dependency here!
-    // if both were cudaMemcpyAsync, need to guarantee GPU has read CPU inputs/targets buffers before overwriting them
-    // so this is 100% safe, and better than 2 separate non-sync memcpy serialising CPU/GPU twice, but far from optimal
+    // if both were cudaMemcpyAsync we'd need to guarantee GPU read CPU inputs/targets buffers before overwriting them!
+    // but this is 100% safe, better than 2 separate non-sync memcpy serialising CPU/GPU twice, though far from optimal
     // memcpy non-async with cudaMemcpyHostToDevice is blocking on CPU because of read-after-write hazards on the input
     // but memset non-async is NOT blocking on CPU, so memsetAsync with legacy stream 0 is the same as regular memset
 
