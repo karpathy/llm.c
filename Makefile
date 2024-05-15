@@ -240,7 +240,7 @@ ifeq ($(HIPCC),)
     $(info ✗ hipcc not found, skipping GPU/AMD builds)
 else
     $(info ✓ hipcc found, including GPU/AMD builds)
-    TARGETS += train_gpt2amd
+    TARGETS += train_gpt2amd test_gpt2amd train_gpt2_fp32amd test_gpt2_fp32amd profile_gpt2amd
     HIPCC_FLAGS += -DBUILD_AMD
 endif
 
@@ -276,6 +276,15 @@ profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
 	$(HIPIFY) -quiet-warnings $< -o $@
 
 %amd: %.hip amd_support.h
+	$(HIPCC) $(HIPCC_FLAGS) $(PFLAGS) $< $(HIPCC_LDFLAGS) -o $@
+
+profile_gpt2amd: profile_gpt2.hip train_gpt2.hip amd_support.h
+	$(HIPCC) $(HIPCC_FLAGS) $(PFLAGS) $< $(HIPCC_LDFLAGS) -o $@
+
+test_gpt2amd: test_gpt2.hip train_gpt2.hip amd_support.h
+	$(HIPCC) $(HIPCC_FLAGS) $(PFLAGS) $< $(HIPCC_LDFLAGS) -o $@
+
+test_gpt2_fp32amd: test_gpt2_fp32.hip train_gpt2_fp32.hip amd_support.h
 	$(HIPCC) $(HIPCC_FLAGS) $(PFLAGS) $< $(HIPCC_LDFLAGS) -o $@
 
 clean:

@@ -1,5 +1,9 @@
 #define TESTING
+#ifdef BUILD_AMD
+#include "train_gpt2.hip"
+#else
 #include "train_gpt2.cu"
+#endif
 
 // poor man's tensor checker
 int check_tensor(float *a, float *b, int n, const char* label, float threshold=1e-0) {

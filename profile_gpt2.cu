@@ -25,7 +25,11 @@ the profile.ncu-rep from a cloud box to local to pretty view.
 */
 
 #define TESTING
+#ifdef BUILD_AMD
+#include "train_gpt2.hip"
+#else
 #include "train_gpt2.cu"
+#endif
 
 int main() {
     common_start(true, true);
