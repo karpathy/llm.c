@@ -1146,7 +1146,7 @@ int main() {
         if (step > 0 && step % 20 == 0) {
             // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
             for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = tokenizer.eot;
+                gen_tokens[i] = tokenizer.eot_token;
             }
             // now sample from the model autoregressively
             printf("generating:\n---\n");
