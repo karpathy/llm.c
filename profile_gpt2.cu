@@ -27,7 +27,8 @@ the profile.ncu-rep from a cloud box to local to pretty view.
 #define TESTING
 #include "train_gpt2.cu"
 
-int main() {
+int main(int argc, char *argv[]) {
+    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
     common_start(true, true);
 
     // build the GPT-2 model from a checkpoint
@@ -53,7 +54,7 @@ int main() {
     gpt2_forward(&model, x, y, B, T);
     gpt2_zero_grad(&model);
     gpt2_backward(&model);
-    gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, 1);
+    gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, 1, &multi_gpu_config);
     cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
 
     // free

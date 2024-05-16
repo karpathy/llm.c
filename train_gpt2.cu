@@ -458,28 +458,26 @@ void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t t
     multi_gpu_config->shard_num_parameters = total_parameters;
     multi_gpu_config->shard_offset = 0;
 
-#ifdef MULTI_GPU
-        // Check the Zero Stage and define sharding parameters
-        if (zero_stage == 0) {
-            printf0("| Zero Optimization is disabled                                              |\n");
-        }
-        else if (zero_stage == 1) {
-            if (total_parameters % multi_gpu_config->num_processes != 0) {
-                printf0("| Zero Optimization is disabled, Can't equally partition parameters          |\n");
-                multi_gpu_config->zero_stage = 0;
-            }
-            else {
-                printf0("| Zero Stage1 is enabled                                                     |\n");
-                multi_gpu_config->zero_stage = 1;
-                multi_gpu_config->shard_num_parameters = total_parameters / multi_gpu_config->num_processes;
-                multi_gpu_config->shard_offset = multi_gpu_config->process_rank * (total_parameters / multi_gpu_config->num_processes);
-            }
-        }
-        else{
-            printf0("| Disabling Zero Optimization, Zero Stage2 and Stage3 are not yet supported  |\n");
+    // Check the Zero Stage and define sharding parameters
+    if (zero_stage == 0) {
+        printf0("| Zero Optimization is disabled                                              |\n");
+    }
+    else if (zero_stage == 1) {
+        if (total_parameters % multi_gpu_config->num_processes != 0) {
+            printf0("| Zero Optimization is disabled, Can't equally partition parameters          |\n");
             multi_gpu_config->zero_stage = 0;
         }
-#endif
+        else {
+            printf0("| Zero Stage1 is enabled                                                     |\n");
+            multi_gpu_config->zero_stage = 1;
+            multi_gpu_config->shard_num_parameters = total_parameters / multi_gpu_config->num_processes;
+            multi_gpu_config->shard_offset = multi_gpu_config->process_rank * multi_gpu_config->shard_num_parameters;
+        }
+    }
+    else{
+        printf0("| Disabling Zero Optimization, Zero Stage2 and Stage3 are not yet supported  |\n");
+        multi_gpu_config->zero_stage = 0;
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -2307,49 +2305,24 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
     if (multi_gpu_config->num_processes == 1) { return; }
     // Average all losses.
     model->accumulated_mean_loss = multi_gpu_cpu_float_mean(model->mean_loss, multi_gpu_config);
-    // Average all gradients.
-    ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
-        model->num_parameters,
-        ncclFloatX, ncclAvg,
-        multi_gpu_config->nccl_comm,
-        0));
+    if(multi_gpu_config->zero_stage == 0) {
+        //  no ZERO == standard DDP: Average all gradients.
+        ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
+                                model->num_parameters,
+                                ncclFloatX, ncclAvg,
+                                multi_gpu_config->nccl_comm, 0));
+    } else if (multi_gpu_config->zero_stage == 1) {
+        // ZERO-1: Get average gradient for local shard
+        floatX* local_grads_memory = (floatX*) model->grads_memory + multi_gpu_config->shard_offset;
+        ncclCheck(ncclReduceScatter(model->grads_memory, local_grads_memory,
+                                    multi_gpu_config->shard_num_parameters,
+                                    ncclFloatX, ncclAvg,
+                                    multi_gpu_config->nccl_comm, 0));
+    }
 #endif
 }
 
-void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
-    NVTX_RANGE_FN();
-    // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
-
-    // lazily allocate the memory for m_memory and v_memory
-    if (model->m_memory == NULL) {
-        cudaCheck(cudaMalloc((void**)&model->m_memory, model->num_parameters * sizeof(float)));
-        cudaCheck(cudaMalloc((void**)&model->v_memory, model->num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->m_memory, 0, model->num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, model->num_parameters * sizeof(float)));
-        printf0("allocated %zu MiB for AdamW optimizer state m\n", (model->num_parameters * sizeof(float)) >> 20);
-        printf0("allocated %zu MiB for AdamW optimizer state v\n", (model->num_parameters * sizeof(float)) >> 20);
-        if (model->use_master_weights == 1) {
-            // allocate one more buffer to keep the master copy of weights as float, and copy the weights over
-            cudaCheck(cudaMalloc((void**)&model->master_weights, model->num_parameters * sizeof(float)));
-            copy_and_cast_kernel<<<CEIL_DIV(model->num_parameters, 512), 512>>>(model->master_weights, (floatX*)model->params_memory, model->num_parameters);
-            cudaCheck(cudaGetLastError());
-            printf0("allocated %zu MiB for master copy of params\n", (model->num_parameters * sizeof(float)) >> 20);
-        }
-    }
-
-    int block_size = 512;
-    int num_blocks = CEIL_DIV(model->num_parameters, block_size);
-    float beta1_correction = 1.0f - powf(beta1, t);
-    float beta2_correction = 1.0f - powf(beta2, t);
-    unsigned int seed = random_u32(&model->rng_state);
-    adamw_kernel3<<<num_blocks, block_size>>>((floatX*)model->params_memory, model->master_weights,
-                                              (floatX*)model->grads_memory, model->m_memory, model->v_memory,
-                                              model->num_parameters,
-                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
-    cudaCheck(cudaGetLastError());
-}
-
-void gpt2_multi_gpu_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t, MultiGpuConfig* multi_gpu_config) {
+void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
     size_t num_parameters = multi_gpu_config->shard_num_parameters;
     floatX* params_memory = (floatX*)model->params_memory + multi_gpu_config->shard_offset;
@@ -2843,13 +2816,9 @@ int main(int argc, char *argv[]) {
         // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
         model.mean_loss = lossf;
         // update the parameters
-#ifndef MULTI_GPU
-        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
-#else
         gpt2_multi_gpu_accumulate(&model, &multi_gpu_config);
-        gpt2_multi_gpu_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1, &multi_gpu_config);
+        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1, &multi_gpu_config);
         gpt2_multi_gpu_gather(&model, &multi_gpu_config);
-#endif
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
         cudaEventRecord(end);
