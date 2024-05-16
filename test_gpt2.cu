@@ -83,6 +83,7 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
 }
 
 int main(int argc, char *argv[]) {
+    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
     common_start(false, true);
 
     // set the right paths
@@ -118,6 +119,8 @@ int main(int argc, char *argv[]) {
     printf("[State]\n");
     printf("batch_size: %d\n", B);
     printf("seq_len: %d\n", T);
+
+    set_zero_configs(&multi_gpu_config, 0, model.num_parameters);
 
     // read reference information from the file saved from Python/PyTorch side
     // 1) input x and y
@@ -263,7 +266,7 @@ int main(int argc, char *argv[]) {
             allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", 3e-2f);
         }
 
-        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1);
+        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1, &multi_gpu_config);
 
         // print the timing information at the end
         printf("step %d: loss %f (took %f ms)\n", step+1, model.mean_loss, time_elapsed_s * 1000);
