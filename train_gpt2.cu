@@ -894,13 +894,9 @@ __global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floa
     store128(dinp + idx, packed_dinp);
 }
 
-// templated because if we have enough channels, we can write directly to the bf16 dbias buffer, and otherwise
-// we need to write to a fp32 temp buffer. The `Atomic` argument indicates whether we add atomically. We cannot
-// (easily) use a regular runtime `if(blockDim.y == 1)` runtime condition, because that doesn't compile for older
-// GPUs.
-template<typename OutFloat, bool Atomic>
-__global__ void matmul_backward_bias_kernel8(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
-                                             std::bool_constant<Atomic>) {
+template<typename OutFloat, bool UseAuxBuffer>
+__global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
+                                             std::bool_constant<UseAuxBuffer>) {
     constexpr const int bdx = 4;
     constexpr const int bdy = 32 / bdx;
     assert(blockDim.x == bdx);
@@ -955,15 +951,33 @@ __global__ void matmul_backward_bias_kernel8(OutFloat* dbias, const floatX* dout
             v += __shfl_down_sync(0xffffffff, v, 2, 4);
             a += v;
         }
-
-        // coalesced, but not cacheline-sized writes
         if(warp_d == 0 && global_oc < OC) {
-            // if we have only one block per result, no need for atomics
-            if constexpr (!Atomic) {
+            if constexpr (!UseAuxBuffer) {
                 dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
             } else {
-                atomicAdd(dbias + global_oc + k, a);
+                dbias[global_oc + k + blockIdx.y * OC] = a;
             }
+        }
+    }
+}
+
+__global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, size_t m) {
+    const size_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * f128::size;
+    assert(n % x128::size == 0);
+    if (idx < n) {
+        f128 acc;
+        for(int k = 0; k < f128::size; ++k) {
+            acc[k] = 0.f;
+        }
+
+        for(int l = 0; l < m; ++l) {
+            f128 s = load128(src + idx + n * l);
+            for(int k = 0; k < f128::size; ++k) {
+                acc[k] += s[k];
+            }
+        }
+        for(int k = 0; k < f128::size; ++k) {
+            dst[idx + k] = (floatX) ((float)dst[idx + k] + acc[k]);
         }
     }
 }
@@ -1306,12 +1320,6 @@ __global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n) {
     }
 }
 
-__global__ void cast_and_add_kernel(floatX* dst, const float* src, size_t n) {
-    // used only for matmul_backward_bias kernel, a little bit embarassing TODO delete later
-    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) { dst[idx] = (floatX)((float)dst[idx] + src[idx]); } // have to += because dbias is a paramater
-}
-
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -1546,11 +1554,14 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
         // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
         // and write results directly to the output.
         if(grid_size_y == 1) {
-            matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
+            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
+            cudaCheck(cudaGetLastError());
         } else {
-            cudaMemset(dbias_buffer, 0, OC * sizeof(float));
-            matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
-            cast_and_add_kernel<<<CEIL_DIV(OC, 256), 256>>>(dbias, dbias_buffer, OC);
+            // kernel 9 overwrites temp buffer, so no need to memset
+            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
+            cudaCheck(cudaGetLastError());
+            reduce_add_sum_kernel<<<CEIL_DIV(OC, 256 * f128::size), 256>>>(dbias, dbias_buffer, OC, grid_size_y);
+            cudaCheck(cudaGetLastError());
         }
     }
 
