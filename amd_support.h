@@ -326,20 +326,33 @@ static __device__ __forceinline__ hip_bfloat16 patched_ldcs(const hip_bfloat16 *
 
 // emulate CG for old train_gpt2_fp32:
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
-#pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1) {
-        x += __shfl_xor_sync(0xffffffff, x, mask, 32);
-    }
+    asm volatile ("ds_swizzle_b32 v1, %0 offset:swizzle(SWAP,16) \n"\
+                  "s_waitcnt lgkmcnt(0) \n"\
+                  "v_add_f32_e32 %0, %0, v1 \n"
+                  "s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1) \n"\
+                  "v_add_f32_dpp %0, %0, %0 row_ror:8 row_mask:0xf bank_mask:0xf bound_ctrl:1 \n"\
+                  "v_add_f32_dpp %0, %0, %0 row_ror:4 row_mask:0xf bank_mask:0xf bound_ctrl:1 \n"\
+                  "s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1) \n"\
+                  "v_add_f32_dpp %0, %0, %0 row_ror:2 row_mask:0xf bank_mask:0xf bound_ctrl:1 \n"\
+                  "v_add_f32_dpp %0, %0, %0 row_ror:1 row_mask:0xf bank_mask:0xf bound_ctrl:1 \n"
+                  : "+v"(x) : : "v1");
     return x;
 }
 
 static __device__ __forceinline__ float warp_reduce_max(float x) {
-#pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1) {
-        x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, mask, 32));
-    }
+    asm volatile ("s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1) \n"\
+                  "v_max_f32_dpp %0, %0, %0 row_ror:8 row_mask:0xf bank_mask:0xf bound_ctrl:1 \n"\
+                  "v_max_f32_dpp %0, %0, %0 row_ror:4 row_mask:0xf bank_mask:0xf bound_ctrl:1 \n"\
+                  "s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1) \n"\
+                  "v_max_f32_dpp %0, %0, %0 row_ror:2 row_mask:0xf bank_mask:0xf bound_ctrl:1 \n"\
+                  "v_max_f32_dpp %0, %0, %0 row_ror:1 row_mask:0xf bank_mask:0xf bound_ctrl:1 \n"\
+                  "ds_swizzle_b32 v1, %0 offset:swizzle(SWAP,16) \n"\
+                  "s_waitcnt lgkmcnt(0) \n"\
+                  "v_max_f32_e32 %0, %0, v1 \n"
+                  : "+v"(x) : : "v1");
     return x;
 }
+
 namespace cooperative_groups {
 template <typename T>
 struct reduce_operator {

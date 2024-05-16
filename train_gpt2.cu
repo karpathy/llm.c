@@ -186,17 +186,25 @@ __device__ void __stcs(floatX* address, floatX value) {
 
 // warp-level reduction for summing values
 __device__ float warpReduceSum(float val) {
+#ifdef BUILD_AMD
+    return warp_reduce_sum(val);
+#else
     for (int offset = 16; offset > 0; offset /= 2) {
         val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
     }
     return val;
+#endif
 }
 // warp-level reduction for finding the maximum value
 __device__ float warpReduceMax(float val) {
+#ifdef BUILD_AMD
+    return warp_reduce_max(val);
+#else
     for (int offset = 16; offset > 0; offset /= 2) {
         val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
     }
     return val;
+#endif
 }
 // requires all 32 threads in the warp to be active, but should work for any block size
 // uses non-dynamic shared memory so every call increases shared memory requirements by 128 bytes
