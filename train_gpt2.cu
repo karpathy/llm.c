@@ -1766,7 +1766,7 @@ typedef struct {
     floatX* output;
 } ActivationTensors;
 
-void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config) {
+void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config, int recompute) {
     size_t Vp = config.padded_vocab_size;
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
@@ -1788,7 +1788,8 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     act_sizes[9] = L * B * T; // ln2_mean
     act_sizes[10] = L * B * T; // ln2_rstd
     act_sizes[11] = L * B * T * 4*C; // fch
-    act_sizes[12] = L * B * T * 4*C; // fch_gelu
+    // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
+    act_sizes[12] = (recompute == 0) ? L * B * T * 4*C : B * T * 4*C;
     act_sizes[13] = L * B * T * C; // fcproj
     act_sizes[14] = L * B * T * C; // residual3
     act_sizes[15] = B * T * C; // lnf
@@ -1897,6 +1898,7 @@ typedef struct {
     floatX* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
     int use_master_weights;
+    int recompute;
 } GPT2;
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -1977,6 +1979,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
     model->rng_state = 13371337;
     model->use_master_weights = 1; // keep master weights copy in float for optim update?
+    model->recompute = 1; // default to recompute gelu during backward
 }
 
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, int grad_accum_steps=1) {
@@ -2012,7 +2015,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         model->batch_size = B;
         model->seq_len = T;
         // allocate the space
-        fill_in_activation_sizes(model->act_sizes, B, T, model->config);
+        fill_in_activation_sizes(model->act_sizes, B, T, model->config, model->recompute);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
@@ -2075,7 +2078,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
-        floatX* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
+        // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
+        // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
+        floatX* l_fch_gelu = (model->recompute == 0) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         floatX* l_fcproj = acts.fcproj + l * B * T * C;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
 
@@ -2238,7 +2243,7 @@ void gpt2_backward(GPT2 *model) {
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
-        floatX* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
+        floatX* l_fch_gelu = (model->recompute == 0) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
@@ -2248,7 +2253,12 @@ void gpt2_backward(GPT2 *model) {
         floatX* dl_btc = (floatX*)acts.lnf;
         floatX* dl_bt4c = (floatX*)grads_acts.bt4c;
 
-        // backprop this layer
+        // start the backward pass for this layer
+        if(model->recompute >= 1) {
+            // recompute >= 1 means we recompute gelu. in this case,
+            // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
+            gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+        }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C);
         gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C);
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C);
@@ -2588,6 +2598,7 @@ void error_usage() {
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
+    fprintf(stderr, "  -r <int>    recompute: saves memory at cost of speed. (default = 1), 0 = none. 1 = recompute gelu\n");
     exit(EXIT_FAILURE);
 }
 
@@ -2612,6 +2623,7 @@ int main(int argc, char *argv[]) {
     int max_steps = -1;
     int override_enable_tf32 = 1;
     int use_master_weights = 1;
+    int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
@@ -2634,6 +2646,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else { error_usage(); }
     }
     // calculate a sensible default for total batch size by assuming no gradient accumulation
@@ -2654,6 +2667,7 @@ int main(int argc, char *argv[]) {
     printf0("| genT                  | %-50d |\n", genT);
     printf0("| overfit_single_batch  | %-50d |\n", overfit_single_batch);
     printf0("| use_master_weights    | %-50s |\n", use_master_weights ? "enabled" : "disabled");
+    printf0("| recompute             | %-50d |\n", recompute);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     common_start(override_enable_tf32, false); // common init code for train/test/profile
@@ -2670,6 +2684,7 @@ int main(int argc, char *argv[]) {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, load_filename);
     model.use_master_weights = use_master_weights;
+    model.recompute = recompute;
     printf0("| load_filename         | %-50s |\n", load_filename);
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
