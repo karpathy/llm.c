@@ -2409,8 +2409,6 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
     bool enable_tf32 = PRECISION_MODE == PRECISION_FP32 && deviceProp.major >= 8 && override_enable_tf32;
     cublasCheck(cublasSetMathMode(cublas_handle, enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
     cublas_compute = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
-    // setup the (global) cuBLASLt workspace
-    cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     create_cudnn();
 }
