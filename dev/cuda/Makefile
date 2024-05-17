@@ -11,7 +11,6 @@ endif
 # Compiler flags
 CFLAGS = -O3 --use_fast_math
 NVCCFLAGS = -lcublas -lcublasLt -std=c++17
-MPI_PATHS = -I/usr/lib/x86_64-linux-gnu/openmpi/include -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
 
 # Default rule for our CUDA files
 %: %.cu
@@ -52,7 +51,7 @@ global_norm: global_norm.cu
 
 # NCCL communication kernels
 nccl_all_reduce: nccl_all_reduce.cu
-	$(NVCC) -lmpi -lnccl $(NVCCFLAGS) $(MPI_PATHS) nccl_all_reduce.cu -o nccl_all_reduce
+	$(NVCC) -lnccl $(NVCCFLAGS) nccl_all_reduce.cu -o nccl_all_reduce
 
 # Run all targets
 run_all: all

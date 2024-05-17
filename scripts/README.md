@@ -21,7 +21,7 @@ Long story short, try `-r 1` (recompute GeLU, trading off speed and memory) to c
 It might be that you only have one GPU and not a whole box of them. Every script is fairly easy to change for just a single GPU. For llm.c, simply change line 1 to line 2 and leave everything else the same:
 
 ```bash
-mpirun -np 8 ./train_gpt2cu \
+mpirun -np 8 bach -c './train_gpt2cu -pn 8 -pr $OMPI_COMM_WORLD_RANK'
 ./train_gpt2cu \
 ```
 

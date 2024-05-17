@@ -89,7 +89,7 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
 }
 
 int main(int argc, char *argv[]) {
-    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
+    multi_gpu_config = multi_gpu_config_init(1, 0, 8, ".");
     common_start(false, true);
 
     // set the right paths

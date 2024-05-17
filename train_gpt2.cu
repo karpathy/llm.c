@@ -325,6 +325,7 @@ typedef struct {
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float accumulated_mean_loss; // Mean loss after aggregating it on all GPUs
+    float* unified_buffer; // GPU buffer to avg loss across process
     floatX* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
     float* cpu_losses_fp32; // same but fp32
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
@@ -346,6 +347,7 @@ void gpt2_init_common(GPT2 *model) {
     model->targets = NULL;
     model->cpu_losses = NULL;
     model->cpu_losses_fp32 = NULL;
+    model->unified_buffer = NULL;
     // the B,T params are determined and set, fixed on first batch in forward()
     model->batch_size = 0;
     model->seq_len = 0;
@@ -894,12 +896,17 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
 }
 
 // Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
-float multi_gpu_cpu_float_sum(float value) {
+float multi_gpu_float_sum(float value, float *unified_buffer, const MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
-    // note MPI doesn't support all reduce with mean, only sum
-    float result;
-    mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
-    return result;
+    if (multi_gpu_config->num_processes == 1) return value;
+
+    if (unified_buffer == NULL) cudaCheck(cudaMallocManaged(&unified_buffer, sizeof(float)));
+    *unified_buffer = value;
+    cudaCheck(cudaMemPrefetchAsync(unified_buffer, sizeof(float), multi_gpu_config->device_idx, 0));
+    ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, 0));
+    cudaCheck(cudaMemPrefetchAsync(unified_buffer, sizeof(float), cudaCpuDeviceId, 0));
+    cudaCheck(cudaDeviceSynchronize());
+    return *unified_buffer;
 #else
     return value;
 #endif
@@ -913,7 +920,7 @@ void gpt2_multi_gpu_loss_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
     // If there's only one process, there is nothing to do
     if (multi_gpu_config->num_processes == 1) { return; }
     // Average all losses.
-    model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss) / multi_gpu_config->num_processes;
+    model->accumulated_mean_loss = multi_gpu_float_sum(model->mean_loss, model->unified_buffer, multi_gpu_config) / multi_gpu_config->num_processes;
 #endif
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -992,7 +999,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
         cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
         // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
-        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
+        grad_norm_squared_cpu = multi_gpu_float_sum(grad_norm_squared_cpu, model->unified_buffer, multi_gpu_config);
     } else {
         // in regular DDP, backward has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
@@ -1124,10 +1131,10 @@ void gpt2_free(GPT2 *model) {
 void common_start(bool override_enable_tf32 = true, bool print_device_info = true) {
 
     // get CUDA device infos
-    cudaGetDeviceProperties(&deviceProp, multi_gpu_config.local_device_idx);
+    cudaGetDeviceProperties(&deviceProp, multi_gpu_config.device_idx);
     if (print_device_info) {
         printf("[System]\n");
-        printf("Device %d: %s\n", multi_gpu_config.local_device_idx, deviceProp.name);
+        printf("Device %d: %s\n", multi_gpu_config.device_idx, deviceProp.name);
     }
 
     // set up the cuda streams. atm everything is on the single main stream
@@ -1326,7 +1333,6 @@ void error_usage() {
 // ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
-    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
 
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
@@ -1353,10 +1359,14 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    int num_processes = 1;
+    int process_rank = 0;
+    int gpus_per_node = 8;
+    char dfs_path[256] = ".";
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
-        if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
+        if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x (one dash, one letter)
         // read in the args
         if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
@@ -1382,8 +1392,15 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'n') { num_processes = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'r') { process_rank = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'g') { gpus_per_node = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'd') { strcpy(dfs_path, argv[i+1]); }
         else { error_usage(); }
     }
+
+    multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, dfs_path);
+
     // should do a bit more error checking here
     assert(warmup_iterations >= 0);
     if (output_log_dir != NULL) {
@@ -1582,7 +1599,7 @@ int main(int argc, char *argv[]) {
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
-            val_loss = multi_gpu_cpu_float_sum(val_loss) / multi_gpu_config.num_processes;
+            val_loss = multi_gpu_float_sum(val_loss, model.unified_buffer, &multi_gpu_config) / multi_gpu_config.num_processes;
             printf0("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
         }
@@ -1601,7 +1618,7 @@ int main(int argc, char *argv[]) {
                 eval_acc_norm += (float)correct;
             }
             // careful because not all ranks may have the exact same allocation of number of examples
-            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm);
+            eval_acc_norm = multi_gpu_float_sum(eval_acc_norm, model.unified_buffer, &multi_gpu_config);
             printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
             logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
         }
@@ -1666,13 +1683,13 @@ int main(int argc, char *argv[]) {
             snprintf(filename_buffer, 512, "%s/state_%08d_%05d.bin", output_log_dir, step, multi_gpu_config.process_rank);
             save_state(filename_buffer, step, &model, &train_loader);
             // DONE file is a signal that this checkpoint as a whole is complete
-            multi_gpu_barrier(&multi_gpu_config);
+            multi_gpu_barrier(&multi_gpu_config, model.unified_buffer);
             if (multi_gpu_config.process_rank == 0) {
                 snprintf(filename_buffer, 512, "%s/DONE_%08d", output_log_dir, step);
                 FILE* done_file = fopenCheck(filename_buffer, "w");
                 fclose(done_file);
             }
-            multi_gpu_barrier(&multi_gpu_config);
+            multi_gpu_barrier(&multi_gpu_config, model.unified_buffer);
         }
         resuming = 0;
 
