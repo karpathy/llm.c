@@ -2,7 +2,7 @@
 Kernels for the positional encoder forward pass in GPT-2.
 
 Compile example:
-nvcc -O3 --use_fast_math encoder_forward.cu -o encoder_forward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt encoder_forward.cu -o encoder_forward
 
 version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
 ./encoder_forward 1
@@ -17,8 +17,10 @@ version 3 is like version 2 but uses float4 reads/writes
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
-#include "common.h"
 #include <cassert>
+
+#define ENABLE_BF16
+#include "common.h"
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -44,8 +46,8 @@ void encoder_forward_cpu(float* out,
 // GPU kernels
 
 // naive implementation into kernel, parallelize over B,T, loop over C
-__global__ void encoder_forward_kernel1(float* out,
-                               const int* inp, const float* wte, const float* wpe,
+__global__ void encoder_forward_kernel1(floatX* out,
+                               const int* inp, const floatX* wte, const floatX* wpe,
                                int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * T;
@@ -53,19 +55,19 @@ __global__ void encoder_forward_kernel1(float* out,
     if (idx < N) {
         int b = idx / T;
         int t = idx % T;
-        float* out_bt = out + b * T * C + t * C;
+        floatX* out_bt = out + b * T * C + t * C;
         int ix = inp[b * T + t];
-        const float* wte_ix = wte + ix * C;
-        const float* wpe_t = wpe + t * C;
+        const floatX* wte_ix = wte + ix * C;
+        const floatX* wpe_t = wpe + t * C;
         for (int i = 0; i < C; i++) {
-            out_bt[i] = wte_ix[i] + wpe_t[i];
+            out_bt[i] = (floatX)((float)wte_ix[i] + (float)wpe_t[i]);
         }
     }
 }
 
 // optimized implementation: parallelize over all of B,T,C
-__global__ void encoder_forward_kernel2(float* out,
-                               const int* inp, const float* wte, const float* wpe,
+__global__ void encoder_forward_kernel2(floatX* out,
+                               const int* inp, const floatX* wte, const floatX* wpe,
                                int B, int T, int C) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * T * C;
@@ -78,40 +80,46 @@ __global__ void encoder_forward_kernel2(float* out,
 
         int ix = inp[b * T + t];
 
-        float* out_btc = out + b * T * C + t * C + c;
-        const float* wte_ix = wte + ix * C + c;
-        const float* wpe_tc = wpe + t * C + c;
-        *out_btc = *wte_ix + *wpe_tc;
+        floatX* out_btc = out + b * T * C + t * C + c;
+        const floatX* wte_ix = wte + ix * C + c;
+        const floatX* wpe_tc = wpe + t * C + c;
+        *out_btc = (floatX)((float)*wte_ix + (float)*wpe_tc);
     }
 }
 
-__device__ inline float4 add_float4(const float4& a, const float4& b) {
-    return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
-}
-
-// use of float4 leads to using 128-bit LDG / STG instructions in SASS,
-// very helpful in memory-bound kernels like encoder_forward
-__global__ void encoder_forward_kernel3(float4* out,
-                               const int* inp, const float4* wte, const float4* wpe,
+__global__ void encoder_forward_kernel3(floatX* out,
+                               const int* inp, const floatX* wte, const floatX* wpe,
                                int B, int T, int C) {
-    int C4 = C / 4;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int N = B * T * C4;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    int N = B * T * C;
     if (idx < N) {
-        int bt = idx / C4;
+        int bt = idx / C;
         int b = bt / T;
         int t = bt % T;
-        int c4 = idx % C4;
+        int c = idx % C;
+
         int ix = inp[b * T + t];
-        out[b * T * C4 + t * C4 + c4] = add_float4(wte[ix * C4 + c4], wpe[t * C4 + c4]);
+
+        floatX* out_btc = out + b * T * C + t * C + c;
+        const floatX* wte_ix = wte + ix * C + c;
+        const floatX* wpe_tc = wpe + t * C + c;
+
+        x128 packed_out;
+        x128 wte = load128cs(wte_ix);
+        x128 wpe = load128cs(wpe_tc);
+        #pragma unroll
+        for (int k = 0; k < wte.size; k++) {
+            packed_out[k] = (floatX)((float)wte[k] + (float)wpe[k]);
+        }
+        store128(out_btc, packed_out);
     }
 }
 
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-void encoder_forward1(float* out,
-                     const int* inp, const float* wte, const float* wpe,
+void encoder_forward1(floatX* out,
+                     const int* inp, const floatX* wte, const floatX* wpe,
                      int B, int T, int C,
                      const int block_size) {
     const int N = B * T;
@@ -120,8 +128,8 @@ void encoder_forward1(float* out,
     cudaCheck(cudaGetLastError());
 }
 
-void encoder_forward2(float* out,
-                     const int* inp, const float* wte, const float* wpe,
+void encoder_forward2(floatX* out,
+                     const int* inp, const floatX* wte, const floatX* wpe,
                      int B, int T, int C,
                      const int block_size) {
     const int N = B * T * C;
@@ -130,21 +138,20 @@ void encoder_forward2(float* out,
     cudaCheck(cudaGetLastError());
 }
 
-void encoder_forward3(float* out,
-                     const int* inp, const float* wte, const float* wpe,
+void encoder_forward3(floatX* out,
+                     const int* inp, const floatX* wte, const floatX* wpe,
                      int B, int T, int C,
                      const int block_size) {
-    assert(C % 4 == 0);
     const int N = B * T * C;
-    const int grid_size = ceil_div(N / 4, block_size);
-    encoder_forward_kernel3<<<grid_size, block_size>>>((float4*) out, inp, (float4*) wte, (float4*) wpe, B, T, C);
+    const int grid_size = ceil_div(N, (int)(block_size * x128::size));
+    encoder_forward_kernel3<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
 // kernel version dispatch
 void encoder_forward(int kernel_num,
-                     float* out,
-                     const int* inp, const float* wte, const float* wpe,
+                     floatX* out,
+                     const int* inp, const floatX* wte, const floatX* wpe,
                      int B, int T, int C,
                      const int block_size) {
     switch (kernel_num) {
@@ -166,7 +173,7 @@ void encoder_forward(int kernel_num,
 // ----------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
-    srand(0);
+    setup_main();
 
     int B = 8;
     int T = 1024;
@@ -183,17 +190,17 @@ int main(int argc, char **argv) {
     float* wpe = make_random_float(T * C);
 
     // move to GPU
-    float* d_out;
+    floatX* d_out;
     int* d_inp;
-    float* d_wte;
-    float* d_wpe;
-    cudaCheck(cudaMalloc(&d_out, B * T * C * sizeof(float)));
+    floatX* d_wte;
+    floatX* d_wpe;
+    cudaCheck(cudaMalloc(&d_out, B * T * C * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_inp, B * T * sizeof(int)));
-    cudaCheck(cudaMalloc(&d_wte, V * C * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_wpe, T * C * sizeof(float)));
+    cudaCheck(cudaMalloc(&d_wte, V * C * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&d_wpe, T * C * sizeof(floatX)));
     cudaCheck(cudaMemcpy(d_inp, inp, B * T * sizeof(int), cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(d_wte, wte, V * C * sizeof(float), cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(d_wpe, wpe, T * C * sizeof(float), cudaMemcpyHostToDevice));
+    cudaCheck(memcpy_convert(d_wte, wte, V * C));
+    cudaCheck(memcpy_convert(d_wpe, wpe, T * C));
 
     // read kernel_num from command line
     int kernel_num = 2;
@@ -205,7 +212,6 @@ int main(int argc, char **argv) {
     // first check the correctness of the kernel
     encoder_forward_cpu(out, inp, wte, wpe, B, T, C);
 
-
     // time the kernel at different block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
 
@@ -213,7 +219,12 @@ int main(int argc, char **argv) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
         encoder_forward(kernel_num, d_out, d_inp, d_wte, d_wpe, B, T, C, block_size);
-        validate_result(d_out, out, "out", B * T * C, 1e-5f);
+#if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
+        float tol = 1e-5;
+#else
+        float tol = 1e-2f;
+#endif
+        validate_result(d_out, out, "out", B * T * C, tol);
     }
 
     printf("All results match. Starting benchmarks.\n\n");

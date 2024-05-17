@@ -5,7 +5,7 @@ Fills a vector with 1s on the first GPU, 2s on the second, etc.
 Then aggregates the values in the resulting vectors.
 
 Compile example:
-nvcc -lmpi -lnccl -I/usr/lib/x86_64-linux-gnu/openmpi/include -L/usr/lib/x86_64-linux-gnu/openmpi/lib/ nccl_all_reduce.cu -o nccl_all_reduce
+nvcc -lmpi -lnccl -I/usr/lib/x86_64-linux-gnu/openmpi/include -L/usr/lib/x86_64-linux-gnu/openmpi/lib/ -lcublas -lcublasLt nccl_all_reduce.cu -o nccl_all_reduce
 
 Run on 2 local GPUs (set -np to a different value to change GPU count):
 mpirun -np 2 ./nccl_all_reduce

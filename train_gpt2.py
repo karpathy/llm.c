@@ -11,6 +11,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 Example launches to only benchmark the speed of bfloat16 compiled GPU training:
 1 GPU:
 python train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
+you can also turn on flash-attention by appending --flash=1
 4 GPU:
 torchrun --standalone --nproc_per_node=4 train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
 """
@@ -33,6 +34,9 @@ class NewGELU(nn.Module):
     """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
     def forward(self, input):
         return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
+
+# using a global to toggle flash-attention
+FLASH = 0
 
 class CausalSelfAttention(nn.Module):
 
@@ -58,11 +62,16 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # manual implementation of attention
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        if FLASH:
+            # flashattention
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # manual implementation of attention
+            # this materializes the large (T,T) matrix for all the queries and keys
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -119,7 +128,7 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, return_logits=True):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -142,6 +151,10 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+
+        # there are performance reasons why not returning logits is prudent, if not needed
+        if not return_logits:
+            logits = None
 
         return logits, loss
 
@@ -234,67 +247,37 @@ def write_bf16(tensor, file):
     b = t.numpy().tobytes()
     file.write(b)
 
-def write_tensors_fp32(model_tensors, L, file):
-    write_fp32(model_tensors["transformer.wte.weight"], file) # (V, C)
-    write_fp32(model_tensors["transformer.wpe.weight"], file) # (T, C)
+def write_tensors(model_tensors, L, file, dtype):
+    assert dtype in {"float32", "bfloat16"}
+    write_fun = write_fp32 if dtype == "float32" else write_bf16
+    write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
+    write_fun(model_tensors["transformer.wpe.weight"], file) # (T, C)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
     for i in range(L): # (L, 3C, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
     for i in range(L): # (L, 3C)
-        write_fp32(model_tensors[f"transformer.h.{i}.attn.c_attn.bias"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.bias"], file)
     for i in range(L): # (L, C, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
     for i in range(L): # (L, 4C, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
     for i in range(L): # (L, 4C)
-        write_fp32(model_tensors[f"transformer.h.{i}.mlp.c_fc.bias"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.bias"], file)
     for i in range(L): # (L, C, 4C)
-        write_fp32(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
     for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
-    write_fp32(model_tensors["transformer.ln_f.weight"], file) # (C, )
-    write_fp32(model_tensors["transformer.ln_f.bias"], file) # (C, )
-
-def write_tensors_bf16(model_tensors, L, file):
-    # same but we keep the layernorm in fp32
-    # these two functions are so similar we can join them later most likely
-    write_bf16(model_tensors["transformer.wte.weight"], file) # (V, C)
-    write_bf16(model_tensors["transformer.wpe.weight"], file) # (T, C)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
-    for i in range(L): # (L, 3C, C)
-        write_bf16(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
-    for i in range(L): # (L, 3C)
-        write_bf16(model_tensors[f"transformer.h.{i}.attn.c_attn.bias"], file)
-    for i in range(L): # (L, C, C)
-        write_bf16(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
-    for i in range(L): # (L, C)
-        write_bf16(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
-    for i in range(L): # (L, C)
-        write_fp32(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
-    for i in range(L): # (L, 4C, C)
-        write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
-    for i in range(L): # (L, 4C)
-        write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_fc.bias"], file)
-    for i in range(L): # (L, C, 4C)
-        write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
-    for i in range(L): # (L, C)
-        write_bf16(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
-    write_fp32(model_tensors["transformer.ln_f.weight"], file) # (C, )
-    write_fp32(model_tensors["transformer.ln_f.bias"], file) # (C, )
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
+    write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
+    write_fun(model_tensors["transformer.ln_f.bias"], file) # (C, )
 
 @torch.no_grad()
 def pad_vocab(tensor, multiple=128, value=0):
@@ -322,8 +305,8 @@ def write_model(model, filename, dtype):
     # 1) header is: version int, GPTConfig ints, padding to 1024 bytes
     assert dtype in {"float32", "bfloat16"} # float16 todo maybe later
     version = {
-        "float32": 3,
-        "bfloat16": 4,
+        "float32": 3, # 3: all tensors are fp32, padded vocab
+        "bfloat16": 5, # 5: all tensors are bf16, padded vocab
     }[dtype]
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240326 # magic
@@ -343,11 +326,8 @@ def write_model(model, filename, dtype):
     header[7] = wte_padded.size(0) # padded vocab size store in header
     # now write to file
     with open(filename, "wb") as file:
-        # write header
-        file.write(header.numpy().tobytes())
-        # write params
-        write_fun = write_tensors_fp32 if dtype == "float32" else write_tensors_bf16
-        write_fun(params, model.config.n_layer, file)
+        file.write(header.numpy().tobytes()) # header
+        write_tensors(params, model.config.n_layer, file, dtype) # params
     print(f"wrote {filename}")
 
 def write_state(model, x, y, logits, loss, filename):
@@ -377,15 +357,16 @@ def write_state(model, x, y, logits, loss, filename):
         # loss (single float, result of the cross entropy loss)
         write_fp32(loss.cpu(), file)
         # gradients
-        write_tensors_fp32(grads, model.config.n_layer, file)
+        write_tensors(grads, model.config.n_layer, file, "float32")
     print(f"wrote {filename}")
 
 def write_tokenizer(enc, filename):
     n = enc.max_token_value + 1
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240328 # magic
-    header[1] = 1 # tokenizer version = 1
+    header[1] = 2 # tokenizer version = 2 (1 -> 2: includes EOT token)
     header[2] = n # number of tokens
+    header[3] = enc.eot_token # EOT token
     with open(filename, "wb") as file:
         file.write(header.numpy().tobytes())
         for i in range(n):
@@ -413,19 +394,25 @@ if __name__ == "__main__":
     # if you'd like to e.g. time the forward pass only, call this script as:
     # python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024
     parser = argparse.ArgumentParser()
+    parser.add_argument("--input_bin", type=str, default="data/tiny_shakespeare_val.bin", help="input .bin to train on")
+    parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl")
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
     parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
     parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
+    parser.add_argument("--flash", type=int, default=0, help="use flash attention")
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
-    parser.add_argument("--batch_size", type=int, default=4, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
+    parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
     args = parser.parse_args()
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
     assert args.dtype in {"float32", "float16", "bfloat16"}
+    assert args.model in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
+    model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -457,6 +444,13 @@ if __name__ == "__main__":
                 device = "mps"
     print(f"using device: {device}")
 
+    # calculate gradient accumulation from the desired total batch size and the current run configuration
+    tokens_per_fwdbwd = B * T * ddp_world_size
+    assert args.total_batch_size % tokens_per_fwdbwd == 0
+    grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
+    print(f"total desired batch size: {args.total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
     # set up a context manager following the desired dtype and device
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
     ctx = torch.amp.autocast(device_type="cuda", dtype=ptdtype) if device == "cuda" else nullcontext()
@@ -474,6 +468,10 @@ if __name__ == "__main__":
     if args.tensorcores:
         torch.set_float32_matmul_precision('high')
 
+    # turn on/off flash attention
+    assert args.flash in {0, 1}
+    FLASH = args.flash
+
     # init (and write) the tokenizer
     enc = tiktoken.get_encoding("gpt2")
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
@@ -482,7 +480,7 @@ if __name__ == "__main__":
         write_tokenizer(enc, "gpt2_tokenizer.bin")
 
     # load the GPT-2 model weights
-    model = GPT.from_pretrained("gpt2")
+    model = GPT.from_pretrained(args.model)
     model.train()
     model.to(device)
     if args.compile:
@@ -495,21 +493,15 @@ if __name__ == "__main__":
     # data loading related: long but it's just to get a single batch of data
 
     # load the tokens
-    # prefer to use tiny_shakespeare if it's available, otherwise use tiny_stories
-    # we're using val instead of train split just because it is smaller/faster
-    shake_tokens_bin = "data/tiny_shakespeare_val.bin"
-    story_tokens_bin = "data/TinyStories_val.bin"
-    assert os.path.isfile(shake_tokens_bin) or os.path.isfile(story_tokens_bin), "you must run prepro on some dataset"
-    tokens_bin = shake_tokens_bin if os.path.isfile(shake_tokens_bin) else story_tokens_bin
-    assert os.path.isfile(tokens_bin)
-    print0(f"loading cached tokens in {tokens_bin}")
-    with open(tokens_bin, "rb") as f:
+    # note we're using val by default instead of train split just because it is smaller/faster
+    assert os.path.isfile(args.input_bin)
+    print0(f"loading cached tokens in {args.input_bin}")
+    with open(args.input_bin, "rb") as f:
         tokens = np.frombuffer(f.read(), dtype=np.int32)
 
     # np -> tensor, long, on device
     tokens = torch.tensor(tokens)
     tokens = tokens.to(torch.long)
-    tokens = tokens.to(device)
 
     # lightweight dataloader
     def get_batch():
@@ -527,6 +519,8 @@ if __name__ == "__main__":
     # fetch one batch of data, which we will overfit to
     data_iter = iter(get_batch())
     x, y = next(data_iter) # we'll overfit this batch below
+    x = x.to(device)
+    y = y.to(device)
 
     # -------------------------------------------------------------------------
     # STAGE 1: weights / state logging for C to load later
@@ -536,11 +530,12 @@ if __name__ == "__main__":
         logits, loss = model(x, y)
         loss.backward()
         # save model params, in both float32 and bfloat16
-        write_model(model, "gpt2_124M.bin", dtype="float32")
-        write_model(model, "gpt2_124M_bf16.bin", dtype="bfloat16")
+        model_size_str = model_to_size[args.model] # e.g. "124M"
+        write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
+        write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
         # save x, y, logits, loss, and parameter gradients, for debugging C
         # always store these in fp32 to have an accurate reference (?)
-        write_state(model, x, y, logits, loss, "gpt2_124M_debug_state.bin")
+        write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
 
     # -------------------------------------------------------------------------
     # STAGE 2: training loop to get timings
@@ -557,15 +552,33 @@ if __name__ == "__main__":
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     timings = []
-    for i in range(args.num_iterations):
+    for step in range(args.num_iterations):
         t0 = time.time()
-        with ctx:
-            logits, loss = model(x, y)
-            del logits
+
+        # micro-batch loop where we do gradient accumulation to reach desired total batch size
+        lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
+        for micro_step in range(grad_accum_steps):
+            # forward pass
+            with ctx:
+                _, loss = model(x, y, return_logits=False)
+                # we have to scale the loss to account for gradient accumulation,
+                # because the gradients just add on each successive backward().
+                # addition of gradients corresponds to a SUM in the objective, but
+                # instead of a SUM we want MEAN, so we scale the loss here
+                loss = loss / grad_accum_steps
+                lossf += loss.item() # keep track of the mean loss
+            if ddp:
+                # we want only the last micro-step to sync grads in a DDP model
+                # the official way to do this is with model.no_sync(), but that is a
+                # context manager that bloats the code, so we just toggle this variable
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+            # backward pass
             if not args.inference_only:
-                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                optimizer.step()
+        # todo: grad clip here
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
         # wait on the CPU for all device work to end so we get accurate per-iteration timings below
         if device == "mps":
             torch.mps.synchronize()
@@ -574,9 +587,10 @@ if __name__ == "__main__":
         # time and print
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
-        if i > 0 and i > args.num_iterations - 20:
+        tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
+        print0(f"iteration {step+1}, loss: {lossf:.4f}, time: {(t1-t0)*1000:.3f}ms, tok/s: {tokens_per_second:.2f}")
+        if step > 0 and step > args.num_iterations - 20:
             timings.append(t1-t0)
-            print0(f"iteration {i}, loss: {loss.item()}, time: {(t1-t0)*1000:.3f}ms")
 
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
