@@ -435,6 +435,40 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 }
 
 
+__device__ __inline__ float calculateValue(const floatX* dout, int idx, int T, int OC, int o) {
+    int b = idx / T;
+    int t = idx % T;
+    return (float)dout[b * T * OC + t * OC + o];
+}
+
+// Modification of PMPP CoarsenedSumReduction kernel in 10.15
+// By including a dimy to handle the OC dimension
+__global__ void matmul_backward_bias_kernel10(float* dbias, const floatX* dout, int B, int T, int OC, int coarse_factor) {
+    extern __shared__ float input_s[];              
+    int o = blockDim.y * blockIdx.y + threadIdx.y; // range [0, OC)
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int segment = coarse_factor*2*blockDim.x*blockIdx.x;
+    int i = segment + threadIdx.x;
+
+    float sum = 0.f;
+    for(int tile = 0; tile < coarse_factor*2; ++tile) {
+        sum += (i + tile*blockDim.x < B * T) ? calculateValue(dout, i + tile*blockDim.x, T, OC, o) : 0.0f;
+    }
+    input_s[ty * blockDim.x + tx] = sum;
+    for (int stride = blockDim.x/2; stride >= 1; stride /= 2) {
+        __syncthreads();
+        if (tx < stride) {
+            input_s[ty * blockDim.x + tx] += input_s[ty * blockDim.x + tx + stride];
+        }
+    }
+    if (tx == 0) {
+        atomicAdd(dbias+o, input_s[ty * blockDim.x]);
+    }
+}
+
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -554,6 +588,24 @@ void matmul_backward_bias9(floatX* dbias, const floatX* dout,
     }
 }
 
+void matmul_backward_bias10(floatX* dbias, floatX* dout,
+                      int B, int T, int OC, int block_size) {
+    if (block_size == 768) { block_size = 1024; } // block_size_y assumes power of 2, block_size_x for none power of 2 values are not supported, due to the reduction
+    if (block_size < 256) { block_size = 256; }   // block size should be larger than block_size_y
+    const int coarse_factor = 8;
+    const int block_size_y = 128; 
+    const int block_size_x = block_size / block_size_y;
+    const dim3 block_dim(block_size_x, block_size_y);
+    const int grid_size_x = ceil_div(B * T, block_size_x * 2 * coarse_factor); 
+    const int grid_size_y = ceil_div(OC, block_size_y); 
+    const dim3 grid_dim(grid_size_x, grid_size_y);
+    size_t shared_mem_size = block_size_x * block_size_y * sizeof(float);
+
+    cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float));
+    matmul_backward_bias_kernel10<<<grid_dim, block_dim, shared_mem_size>>>(dbias_buffer, dout, B, T, OC, coarse_factor);
+    cast_and_add_kernel<<<ceil_div(OC, 256), 256, 0>>>(dbias, dbias_buffer, OC);
+}
+
 void matmul_backward_bias(int kernel_num, floatX* dbias, floatX* dout,
                      int B, int T, int OC, int block_size) {
     switch (kernel_num) {
@@ -585,6 +637,9 @@ void matmul_backward_bias(int kernel_num, floatX* dbias, floatX* dout,
             break;
         case 9:
             matmul_backward_bias9(dbias, dout, B, T, OC, block_size);
+            break;
+        case 10:
+            matmul_backward_bias10(dbias, dout, B, T, OC, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
