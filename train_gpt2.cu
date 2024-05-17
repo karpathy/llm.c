@@ -2340,11 +2340,12 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     floatX* grads_memory = (floatX*)model->grads_memory + multi_gpu_config->shard_offset;
 
     if (model->m_memory == NULL) {
-        size_t alloc_bytes = 2 * num_parameters * sizeof(float);
-        printf0("allocating %zu MiB for AdamW optimizer state\n", alloc_bytes >> 20);
-        cudaCheck(cudaMalloc((void**)&model->m_memory, alloc_bytes));
-        model->v_memory = model->m_memory + num_parameters;
-        cudaCheck(cudaMemset(model->m_memory, 0, alloc_bytes));
+        printf0("allocating %zu MiB for AdamW optimizer state m\n", (num_parameters * sizeof(float)) >> 20);
+        printf0("allocating %zu MiB for AdamW optimizer state v\n", (num_parameters * sizeof(float)) >> 20);
+        cudaCheck(cudaMalloc((void**)&model->m_memory, num_parameters * sizeof(float)));
+        cudaCheck(cudaMalloc((void**)&model->v_memory, num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->m_memory, 0, num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->v_memory, 0, num_parameters * sizeof(float)));
         if (model->use_master_weights == 1) {
             printf0("allocating %zu MiB for master copy of params\n", (num_parameters * sizeof(float)) >> 20);
             cudaCheck(cudaMalloc((void**)&model->master_weights, num_parameters * sizeof(float)));
