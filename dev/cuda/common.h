@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
+#include <float.h>
 
 
 template<class T>
@@ -260,13 +261,25 @@ void validate_result(D* device_result, const T* cpu_reference, const char* name,
     D* out_gpu = (D*)malloc(num_elements * sizeof(D));
     cudaCheck(cudaMemcpy(out_gpu, device_result, num_elements * sizeof(D), cudaMemcpyDeviceToHost));
     int nfaults = 0;
+#ifndef ENABLE_BF16
+    float epsilon = FLT_EPSILON;
+#else
+    float epsilon = 0.079;
+#endif
     for (int i = 0; i < num_elements; i++) {
+        // Skip masked elements
+        if(!isfinite(cpu_reference[i]))
+            continue;
+
         // print the first few comparisons
         if (i < 5) {
             printf("%f %f\n", cpu_reference[i], (T)out_gpu[i]);
         }
-        // ensure correctness for all elements. We can set an "ignore" mask by writing NaN
-        if (fabs(cpu_reference[i] - (T)out_gpu[i]) > tolerance && isfinite(cpu_reference[i])) {
+        // effective tolerance is based on expected rounding error (epsilon),
+        // plus any specified additional tolerance
+        float t_eff = tolerance + fabs(cpu_reference[i]) * epsilon;
+        // ensure correctness for all elements.
+        if (fabs(cpu_reference[i] - (T)out_gpu[i]) > t_eff) {
             printf("Mismatch of %s at %d: CPU_ref: %f vs GPU: %f\n", name, i, cpu_reference[i], (T)out_gpu[i]);
             nfaults ++;
             if (nfaults >= 10) {
@@ -276,10 +289,10 @@ void validate_result(D* device_result, const T* cpu_reference, const char* name,
         }
     }
 
-    // reset the result pointer, so we can chain multiple tests and don't miss trivial errors,
-    // like the kernel not writing to part of the result.
-    // cudaMemset(device_result, 0, num_elements * sizeof(T));
-    // AK: taking this out, ~2 hours of my life was spent finding this line
+    if (nfaults > 0) {
+        free(out_gpu);
+        exit(EXIT_FAILURE);
+    }
 
     free(out_gpu);
 }

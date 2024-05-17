@@ -506,6 +506,66 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
     }
 }
 
+__global__ void softmax_forward_online_kernel8(float* out, const float* inp, int N, int C) {
+    // online softmax paper: http://arxiv.org/abs/1805.02867
+    // online softmax reduces loops from 3 to 2
+    // which is done by calculating sumval and maxval in one loop
+    const int warpsPerBlock = blockDim.x / warpSize;
+    int tid = threadIdx.x;
+
+    if (tid >= C) {
+        return;
+    }
+
+    int warpId = tid / warpSize;
+    int laneId = tid % warpSize;
+    // one warp one row
+    int row = blockIdx.x * warpsPerBlock + warpId;
+
+    if (row >= N) {
+        return;
+    }
+
+    const float* x = inp + row * C;
+    float* const y = out + row * C;
+
+    // merge calculating maxval and sumval in one loop
+    // which is an arithmetic improvment from online softmax over normal softmax
+    float maxval = -INFINITY, sumval = 0.0f, bigger;
+    for (int i = laneId; i < C; i += warpSize) {
+        // when updating the maxval, dynamically updates the previous sumval by
+        // multiplying e^{previous_maxval - current_maxval}
+        bigger = fmaxf(maxval, x[i]);
+        sumval = sumval * expf(maxval - bigger) + expf(x[i] - bigger);
+        maxval = bigger;
+    }
+
+    // use warp functions instead of cooperative groups for better readibility
+    // calculate the warp wised maxval and sumval
+    float offsetMaxval, offsetSumval;
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        __syncwarp();
+        offsetMaxval = __shfl_down_sync(0xFFFFFFFF, maxval, offset);
+        offsetSumval = __shfl_down_sync(0xFFFFFFFF, sumval, offset);
+        if (offsetMaxval > maxval) {
+            sumval *= expf(maxval - offsetMaxval);
+            maxval = offsetMaxval;
+        } else {
+            offsetSumval *= expf(offsetMaxval - maxval);
+        }
+        sumval += offsetSumval;
+    }
+
+    // sync the warp wised maxval and sumval
+    // which are also the maxval and sumval of one row in C
+    maxval = __shfl_sync(0xFFFFFFFF, maxval, 0);
+    sumval = __shfl_sync(0xFFFFFFFF, sumval, 0);
+
+    for (int i = laneId; i < C; i += warpSize) {
+        y[i] = expf(x[i] - maxval) / sumval;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -552,6 +612,12 @@ void softmax_forward7(float* out, const float* inp, int N, int C, int block_size
     softmax_forward_kernel7<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
 }
 
+void softmax_forward_online8(float* out, const float* inp, int N, int C, int block_size) {
+    const int grid_size = ceil_div(N * 32, block_size);
+    softmax_forward_online_kernel8<<<grid_size, block_size>>>(out, inp, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void softmax_forward(int kernel_num, float* out, const float* inp, int N, int C, const int block_size) {
     switch (kernel_num) {
@@ -575,6 +641,9 @@ void softmax_forward(int kernel_num, float* out, const float* inp, int N, int C,
             break;
         case 7:
             softmax_forward7(out, inp, N, C, block_size);
+            break;
+        case 8:
+            softmax_forward_online8(out, inp, N, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
