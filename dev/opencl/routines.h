@@ -30,7 +30,7 @@ void cl_matmul_forward(GPT2_CL *gcl, float* out,
         exit(1);
     }
 
-    size_t tile_size = MATMUL_TILE_SIZE;
+    size_t tile_size = gcl->matmul_tile_size;
     size_t bt_round = (((B * T) + tile_size - 1) / tile_size) * tile_size;
     size_t oc_round = ((OC + tile_size - 1) / tile_size) * tile_size;
     size_t size_global[2] = {bt_round, oc_round};
@@ -79,7 +79,7 @@ void cl_matmul_backward(GPT2_CL *gcl, float* dinp, float* dweight, float* dbias,
         exit(1);
     }
 
-    size_t tile_size = MATMUL_TILE_SIZE;
+    size_t tile_size = gcl->matmul_tile_size;
     size_t bt_round = (((B * T) + tile_size - 1) / tile_size) * tile_size;
     size_t c_round = ((C + tile_size - 1) / tile_size) * tile_size;
     size_t size_global1[2] = {bt_round, c_round};

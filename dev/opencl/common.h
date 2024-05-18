@@ -36,6 +36,7 @@ typedef struct {
     cl_mem matmul_bias;
     cl_mem matmul_out;
     size_t max_wg_size;
+    size_t matmul_tile_size;
 } GPT2_CL;
 
 // set env CL_PLATFORM_IDX to select a platform
@@ -53,6 +54,11 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     int size;
     char *env;
     cl_int err;
+    int matmul_tile_size = MATMUL_TILE_SIZE;
+    int matmul_local_mem_padding_size = MATMUL_LOCAL_MEM_PADDING_SIZE;
+    int matmul_vload_size = MATMUL_VLOAD_SIZE;
+    int matmul_do_preload = MATMUL_DO_PRELOAD;
+    int matmul_use_dot_product = MATMUL_USE_DOT_PRODUCT;
 
     err = clGetPlatformIDs(0, NULL, &num_platforms);
     err |= clGetPlatformIDs(num_platforms, platforms, NULL);
@@ -124,13 +130,37 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
         exit(1);
     }
 
-    // build program
-    if(MATMUL_VLOAD_SIZE && (MATMUL_TILE_SIZE % MATMUL_VLOAD_SIZE) != 0) {
-        printf("error: MATMUL_TILE_SIZE must be multiple of MATMUL_VLOAD_SIZE\n");
+    // load tune parameters from env
+    env = getenv("MATMUL_TILE_SIZE");
+    if (env != NULL) {
+        matmul_tile_size = atoi(env);
+    }
+    env = getenv("MATMUL_LOCAL_MEM_PADDING_SIZE");
+    if (env != NULL) {
+        matmul_local_mem_padding_size = atoi(env);
+    }
+    env = getenv("MATMUL_VLOAD_SIZE");
+    if (env != NULL) {
+        matmul_vload_size = atoi(env);
+    }
+    env = getenv("MATMUL_DO_PRELOAD");
+    if (env != NULL) {
+        matmul_do_preload = atoi(env);
+    }
+    env = getenv("MATMUL_USE_DOT_PRODUCT");
+    if (env != NULL) {
+        matmul_use_dot_product = atoi(env);
+    }
+    if(matmul_vload_size && (matmul_tile_size % matmul_vload_size) != 0) {
+        printf("error: matmul_tile_size(%d) must be multiple of matmul_vload_size(%d)\n",
+                    matmul_tile_size, matmul_vload_size);
         exit(1);
     }
+    gcl->matmul_tile_size = matmul_tile_size;
+
+    // build program
     sprintf(build_options_str, "%s -D TILE_SIZE=%d -D LOCAL_MEM_PADDING_SIZE=%d -D VLOAD_SIZE=%d -D DO_PRELOAD=%d -D USE_DOT_PRODUCT=%d",
-        build_options, MATMUL_TILE_SIZE, MATMUL_LOCAL_MEM_PADDING_SIZE, MATMUL_VLOAD_SIZE, MATMUL_DO_PRELOAD, MATMUL_USE_DOT_PRODUCT);
+        build_options, matmul_tile_size, matmul_local_mem_padding_size, matmul_vload_size, matmul_do_preload, matmul_use_dot_product);
     err = clBuildProgram(gcl->program, 1, &gcl->device, build_options_str, NULL, NULL);
     if (err != CL_SUCCESS) {
         size_t buf_len = 0;
