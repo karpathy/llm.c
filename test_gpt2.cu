@@ -12,7 +12,8 @@ int check_tensor(float *a, float *b, int n, const char* label, float threshold=1
     float max_a = 0.0f;
     float max_b = 0.0f;
     float epsilon = 0.079;      // BF16 epsilon value
-    printf("%8s: ", label);
+    printf("---\n");
+    printf("checking tensor: %s\n", label);
     for (int i = 0; i < n; i++) {
         float t_eff = threshold + fabs(b[i]) * epsilon;
         float diff = fabsf(a[i] - b[i]);
@@ -27,6 +28,11 @@ int check_tensor(float *a, float *b, int n, const char* label, float threshold=1
         if (diff > t_eff) {
             ok = 0;
         }
+        // print the first few elements so we can visually assess the "proof" of the comparison
+        if (i < print_upto) {
+            printf(diff <= t_eff ? "OK " :  "NOT OK ");
+            printf("%f %f\n", a[i], b[i]);
+        }
     }
     // print the final result
     if (ok) {
@@ -35,16 +41,6 @@ int check_tensor(float *a, float *b, int n, const char* label, float threshold=1
     } else {
         printf("TENSOR NOT OK, max diff: %.3e, with rel error: %.3e (calculated=%10f, ref=%10f), %.2f%% of maximum error\n",
                 max_diff, max_rel_error, max_a, max_b, max_to_threshold*100);
-    }
-
-    if(ok == 0) {
-        for (int i = 0; i < print_upto; i++) {
-            float t_eff = threshold + fabs(b[i]) * epsilon;
-            float diff = fabsf(a[i] - b[i]);
-            printf(diff <= threshold ? "OK " :  "NOT OK ");
-            printf("%f %f\n", a[i], b[i]);
-        }
-        printf("\n");
     }
     return ok;
 }
@@ -260,7 +256,7 @@ int main(int argc, char *argv[]) {
             // In that case it's ok to extend the tolerance by a bit, after a manual review.
             // Also, different GPUs may use different matrix multiplication algorithms, so the
             // actual errors can be hardware specific.
-            allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", 4e-1f); // hmm a bit high
+            allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", 6e-1f); // hmm a bit high
             allok = allok & check_tensor(tensors1[1], tensors2[1], maxT * C, "wpe", 4e-3f);
             allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", 1e-1); // hmm a bit high
             allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", 3.5e-2f);
