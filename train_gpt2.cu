@@ -2030,8 +2030,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
             num_activations += model->act_sizes[i];
         }
         model->num_activations = num_activations;
+        printf0("allocating %d MiB for activations\n", (int)round(num_activations * sizeof(floatX) / (1024 * 1024)));
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
-        printf0("allocated %d MiB for activations\n", (int)round(num_activations * sizeof(floatX) / (1024 * 1024)));
         // also create memory for caching inputs and targets
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
@@ -2167,19 +2167,19 @@ void gpt2_backward(GPT2 *model) {
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
         // allocate buffers for weight gradients
+        printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
-        printf0("allocated %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
         // we're going to be clever for the activations backward pass. we don't need to exactly
         // mirror the forward pass activations and we will save memory.
         size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
         fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, model->config);
         // count up and allocate the space
-        model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
         model->num_grad_acts = 0;
         for (size_t i = 0; i < NUM_BACKWARD_TENSORS; i++) {
             model->num_grad_acts += bw_act_sizes[i];
         }
-        printf0("allocated %d MiB for activation gradients\n", (int)round(model->num_grad_acts * sizeof(floatX) / (1024 * 1024)));
+        printf0("allocating %d MiB for activation gradients\n", (int)round(model->num_grad_acts * sizeof(floatX) / (1024 * 1024)));
+        model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
         // init gradients of parameters and activations to zero
         gpt2_zero_grad(model);
     }
@@ -2340,17 +2340,17 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     floatX* grads_memory = (floatX*)model->grads_memory + multi_gpu_config->shard_offset;
 
     if (model->m_memory == NULL) {
+        printf0("allocating %zu MiB for AdamW optimizer state m\n", (num_parameters * sizeof(float)) >> 20);
+        printf0("allocating %zu MiB for AdamW optimizer state v\n", (num_parameters * sizeof(float)) >> 20);
         cudaCheck(cudaMalloc((void**)&model->m_memory, num_parameters * sizeof(float)));
         cudaCheck(cudaMalloc((void**)&model->v_memory, num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->m_memory, 0, num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->v_memory, 0, num_parameters * sizeof(float)));
-        printf0("allocated %zu MiB for AdamW optimizer state m\n", (num_parameters * sizeof(float)) >> 20);
-        printf0("allocated %zu MiB for AdamW optimizer state v\n", (num_parameters * sizeof(float)) >> 20);
         if (model->use_master_weights == 1) {
+            printf0("allocating %zu MiB for master copy of params\n", (num_parameters * sizeof(float)) >> 20);
             cudaCheck(cudaMalloc((void**)&model->master_weights, num_parameters * sizeof(float)));
             copy_and_cast_kernel<<<CEIL_DIV(num_parameters, 512), 512>>>(model->master_weights, params_memory, num_parameters);
             cudaCheck(cudaGetLastError());
-            printf0("allocated %zu MiB for master copy of params\n", (num_parameters * sizeof(float)) >> 20);
         }
     }
 
@@ -2410,8 +2410,6 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
     bool enable_tf32 = PRECISION_MODE == PRECISION_FP32 && deviceProp.major >= 8 && override_enable_tf32;
     cublasCheck(cublasSetMathMode(cublas_handle, enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
     cublas_compute = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
-    // setup the (global) cuBLASLt workspace
-    cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     create_cudnn();
 }
