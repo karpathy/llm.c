@@ -5,35 +5,17 @@ Global norm in this context means that we want to calculate a single norm cooper
 
 Compile example:
 nvcc -O3 --use_fast_math global_norm.cu -o global_norm
-
-version 1 uses as few blocks as possible to still fill the GPU, and only does atomic adds in the end
-./gelu_forward 1
-
-version 2 is the same but with only warp-wide reduction inside the kernel, and more global atomics
-./gelu_forward 2
 */
 
-#include "common.h"
+
 #include <assert.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
-// TODO move this into common.h
 // turn on bf16 as default, done up here for now
 #define ENABLE_BF16
+#include "common.h"
 
-#if defined(ENABLE_BF16)
-typedef __nv_bfloat16 floatX;
-typedef __nv_bfloat16 floatN;
-#elif defined(ENABLE_FP16)
-typedef half floatX;
-typedef half floatN;
-#else
-typedef float floatX;
-typedef float floatN;
-#endif
-
-typedef Packed128<floatX> x128;
 
 float global_norm_cpu(const float* data, size_t count) {
     // accumulate in double so we have an accurate numerical reference
@@ -167,7 +149,7 @@ int main(int argc, const char **argv) {
     cudaCheck(cudaMalloc(&d_inp, num_params * sizeof(floatX)));
     cudaCheck(memcpy_convert(d_inp, inp, num_params));
 
-    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+    int block_sizes[] = {32, 64, 128, 256, 512, 768, 1024};
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
