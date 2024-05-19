@@ -1147,11 +1147,10 @@ __device__ float lerp(float start, float end, float weight) {
 }
 
 template <typename Tp, typename Tg>
-__global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
-                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
+__global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory,
+                              float beta1, float beta2, float learning_rate_inv_beta1_correction, float inv_beta2_correction, float eps, float learning_rate_weight_decay,
                               float grad_scale, unsigned int seed) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_parameters) { return; }  // guard
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     // get the gradient, m, and v for this parameter
     float grad = grad_scale * (float)grads_memory[idx];
@@ -1163,12 +1162,12 @@ __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg
     // update the second moment (RMSprop)
     v = lerp(grad * grad, v, beta2);
     v_memory[idx] = v;
-    m /= beta1_correction;  // m_hat
-    v /= beta2_correction;  // v_hat
+    m *= learning_rate_inv_beta1_correction;
+    v *= inv_beta2_correction;
     // fetch the old value of this parameter as a float, from either source
     float old_param = (master_params_memory != NULL) ? master_params_memory[idx] : (float)params_memory[idx];
     // update this parameter
-    float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * old_param));
+    float param = old_param - (m / (sqrtf(v) + eps)) + (learning_rate_weight_decay * old_param);
     // update our low precision version of the parameters using stochastic rounding
     // this will be used in the next forward pass
     // TODO: simply doing `params_memory[i] = (floatX)param;` breaks everything (why?)
@@ -2412,13 +2411,14 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     // AdamW update
     int block_size = 512;
     int num_blocks = CEIL_DIV(num_parameters, block_size);
-    float beta1_correction = 1.0f - powf(beta1, t);
-    float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
+    float learning_rate_inv_beta1_correction = learning_rate*(1.0f/1.0f - powf(beta1, t));
+    float inv_beta2_correction = 1.0f/(1.0f - powf(beta2, t));
+    float learning_rate_weight_decay = learning_rate * weight_decay;
+    assert(num_parameters % block_size == 0); //bounds check
     adamw_kernel3<<<num_blocks, block_size>>>(params_memory, model->master_weights, grads_memory,
-                                              model->m_memory, model->v_memory, num_parameters,
-                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
-                                              grad_scale, seed);
+                                              model->m_memory, model->v_memory, beta1, beta2, learning_rate_inv_beta1_correction,
+                                              inv_beta2_correction, eps, learning_rate_weight_decay, grad_scale, seed);
     cudaCheck(cudaGetLastError());
     return grad_norm_cpu;
 }

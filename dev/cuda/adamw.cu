@@ -22,6 +22,7 @@ thread coarsening/ILP
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <assert.h>
 #include <cuda_runtime.h>
 #include "common.h"
 
@@ -97,6 +98,28 @@ __global__ void adamw_kernel2(float* params_memory, const float* grads_memory, f
    params_memory[i] -= learning_rate * (m / (sqrtf(v) + eps) + weight_decay * params_memory[i]);
 }
 
+// Slightly more optimized AdamW kernel by:
+// * precalculating inverse values instead of doing division
+// Precalculating some of the constants multiplication through moving around
+__global__ void adamw_kernel3(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory,
+                              float beta1, float beta2, float learning_rate_inv_beta1_correction, float inv_beta2_correction,
+                              float eps, float learning_rate_weight_decay) {
+   size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+   float grad = grads_memory[i];
+   float m = m_memory[i];
+   float v = v_memory[i];
+   // update the first moment (momentum)
+   m = lerp(grad, m, beta1);
+   m_memory[i] = m;
+   // update the second moment (RMSprop)
+   v = lerp(grad * grad, v, beta2);
+   v_memory[i] = v;
+   m *= learning_rate_inv_beta1_correction;
+   v *= inv_beta2_correction;
+   params_memory[i] -= (m / (sqrtf(v) + eps) + learning_rate_weight_decay * params_memory[i]);
+}
+
+
 
 // ----------------------------------------------------------------------------
 // kernel launcher
@@ -121,6 +144,21 @@ void adamw_dispatch2(float* params_memory, const float* grads_memory, float* m_m
     cudaCheck(cudaGetLastError());
 }
 
+// version 3: precalculating adamw constants
+void adamw_dispatch3(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+                     float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+    unsigned int block_size = 512;
+    float learning_rate_inv_beta1_correction = learning_rate*(1.0f/beta1_correction);
+    float inv_beta2_correction = 1.0f/beta2_correction;
+    float learning_rate_weight_decay = learning_rate * weight_decay;
+    assert(num_parameters % block_size == 0); //bounds check
+    unsigned int num_blocks = ceil_div(num_parameters, (long) block_size);
+    adamw_kernel3<<<num_blocks, block_size>>>(params_memory, grads_memory, m_memory, v_memory, beta1, beta2, 
+                                              learning_rate_inv_beta1_correction, inv_beta2_correction, eps, learning_rate_weight_decay);
+    cudaCheck(cudaGetLastError());
+}
+
+
 void adamw(int kernel_num,
            float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, int t, long num_parameters,
            float learning_rate=1e-3, float beta1=0.9, float beta2=0.999, float eps=1e-8, float weight_decay=0.0) {
@@ -134,6 +172,10 @@ void adamw(int kernel_num,
             break;
         case 2:
             adamw_dispatch2(params_memory, grads_memory, m_memory, v_memory, num_parameters,
+                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+            break;
+        case 3:
+            adamw_dispatch3(params_memory, grads_memory, m_memory, v_memory, num_parameters,
                             learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
             break;
         default:
