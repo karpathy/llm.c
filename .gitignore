@@ -24,6 +24,7 @@ dev/cuda/matmul_backward_bias
 dev/cuda/nccl_all_reduce
 *.obj
 *.exe
+*.o
 
 # log files
 *.log
