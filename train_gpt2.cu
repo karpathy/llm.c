@@ -1151,11 +1151,31 @@ __device__ float lerp(float start, float end, float weight) {
 template <typename Tp, typename Tg>
 __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
+                              float* grad_norm, float max_grad_norm,
                               unsigned int seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_parameters) { return; }  // guard
+
+    float scale = 1.f;
+    if(!isfinite(*grad_norm)) {
+        // if we had a numerical problem (e.g, overflow)
+        // in our gradient calculation, don't mess up the
+        // existing weights.
+        // TODO increase a global counter somewhere so we actually know if/how often this happens
+        if(threadIdx.x == 0 &&  blockIdx.x == 0) {
+            printf("[WARNING] weight update skipped due to non-finite gradients!\n");
+        }
+        return;
+    }
+    if(*grad_norm > max_grad_norm) {
+        scale = max_grad_norm / sqrtf(*grad_norm);
+        // TODO just for debugging, remove this
+        if(threadIdx.x == 0 &&  blockIdx.x == 0) {
+            printf("[norm %f]\n", sqrtf(*grad_norm));
+        }
+    }
     // get the gradient, m, and v for this parameter
-    float grad = (float)grads_memory[idx];
+    float grad = scale * (float)grads_memory[idx];
     float m = m_memory[idx];
     float v = v_memory[idx];
     // update the first moment (momentum)
@@ -1178,6 +1198,27 @@ __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg
     // write the full, float version of the param into our master copy, if we maintain one
     // this will be used in the next update
     if (master_params_memory != NULL) { master_params_memory[idx] = param; }
+}
+
+template<class T>
+__global__ void global_norm_kernel(float* out, const T* data, size_t count) {
+    // we want as few atomics as possible, so each block tries to do
+    // the maximum amount of work (so no fixed chunk, but instead iterating
+    // until we run out of data), and then we reduce inside the block
+    // and finally have just one atomic per block.
+    // out will be updated atomically from all thread blocks. It is a float, so the
+    // atomic op is unproblematic
+    size_t index = threadIdx.x + blockDim.x * blockIdx.x;
+    size_t grid_width = blockDim.x * gridDim.x;
+    float accumulator = 0.f;
+    for(size_t i = index; i < count; i += grid_width) {
+        accumulator += (float)data[i] * (float)data[i];
+    }
+    // warp-level reduce
+    float block_sum = blockReduce<warpReduceSum>(accumulator);
+    if(threadIdx.x == 0) {
+        atomicAdd(out, block_sum);
+    }
 }
 
 struct SoftmaxParams {
@@ -1653,6 +1694,20 @@ void fused_classifier(Type* logits, Type* losses,
     const int N = B * T;
     const int grid_size = N;
     fused_classifier_kernel5<<<grid_size, block_size, 512>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
+    cudaCheck(cudaGetLastError());
+}
+
+template<typename T>
+void global_norm(float* out, const T* values, size_t count) {
+    const int block_size = 512;
+    // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
+    // having one block less than possible is a tiny performance hit, having
+    // one block too many is catastrophic, since it only can start once all the other
+    // blocks finish. anyway, I think cuda_threads_per_SM should be a multiple of 512
+    // on all gpus, so the division really is going to be exact.
+    const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
+    assert(grid_size > 0);      // gives a better error than letting the call below fail
+    global_norm_kernel<<<grid_size, block_size>>>(out, values, count);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2333,7 +2388,7 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 #endif
 }
 
-void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t, MultiGpuConfig* multi_gpu_config) {
+void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_clipping, int t, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
     size_t num_parameters = multi_gpu_config->shard_num_parameters;
     floatX* params_memory = (floatX*)model->params_memory + multi_gpu_config->shard_offset;
@@ -2354,6 +2409,14 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         }
     }
 
+    // repurposing this buffer. We calculate the gradient norm on the GPU, and need it in the next kernel,
+    // so we _really_ don't want to transfer it here as an actual float. So we just pass around a pointer
+    // to this memory that is not otherwise needed during the update phase.
+    float* grad_norm = (float*)model->acts.output;
+
+    // global gradient norm
+    global_norm(grad_norm, (floatX*)model->grads_memory, model->num_parameters);
+
     int block_size = 512;
     int num_blocks = CEIL_DIV(num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
@@ -2361,7 +2424,9 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     unsigned int seed = random_u32(&model->rng_state);
     adamw_kernel3<<<num_blocks, block_size>>>(params_memory, model->master_weights, grads_memory,
                                                               model->m_memory, model->v_memory, num_parameters,
-                                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
+                                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
+                                              grad_norm, grad_clipping,
+                                              seed);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2607,6 +2672,7 @@ int main(int argc, char *argv[]) {
     int use_master_weights = 1;
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
+    float grad_clipping  = 1.f;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -2627,6 +2693,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'c') { grad_clipping = atof(argv[i+1]); }
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else { error_usage(); }
@@ -2642,6 +2709,7 @@ int main(int argc, char *argv[]) {
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
     printf0("| learning rate         | %-50e |\n", learning_rate);
+    printf0("| grad_clipping         | %-50e |\n", grad_clipping);
     printf0("| max_steps             | %-50d |\n", max_steps);
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
     printf0("| val_max_batches       | %-50d |\n", val_max_batches);
@@ -2826,7 +2894,7 @@ int main(int argc, char *argv[]) {
         model.mean_loss = lossf;
         // update the parameters
         gpt2_multi_gpu_accumulate(&model, &multi_gpu_config);
-        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1, &multi_gpu_config);
+        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, grad_clipping, step+1, &multi_gpu_config);
         gpt2_multi_gpu_gather(&model, &multi_gpu_config);
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
