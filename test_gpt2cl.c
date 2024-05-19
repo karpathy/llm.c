@@ -83,7 +83,11 @@ int main(int argc, char *argv[]) {
     fread(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
     fclose(state_file);
 
-    cl_init(&gcl, B, T, C, Vp);
+    int clret = cl_init(&gcl, B, T, C, Vp);
+    if (clret != 0) {
+        printf("error initializing opencl\n");
+        return clret;
+    }
 
     // overall OK signal for the test
     int allok = 1;

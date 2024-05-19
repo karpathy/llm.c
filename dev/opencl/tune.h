@@ -2,6 +2,7 @@
 
 /*
   sets the tile size for matmul kernels
+  possible values: 4, 8, 16
   best value varies from device to device
 */
 #define MATMUL_TILE_SIZE 16

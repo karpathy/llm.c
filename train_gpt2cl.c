@@ -1122,7 +1122,11 @@ int main() {
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     const int genT = 64; // number of steps of inference we will do
 
-    cl_init(&gcl, B, T, model.config.channels, model.config.padded_vocab_size);
+    int clret = cl_init(&gcl, B, T, model.config.channels, model.config.padded_vocab_size);
+    if (clret != 0) {
+        printf("error initializing opencl\n");
+        return clret;
+    }
 
     // train
     struct timespec start, end;

@@ -41,7 +41,8 @@ typedef struct {
 
 // set env CL_PLATFORM_IDX to select a platform
 // set env CL_DEVICE_IDX to select a device
-void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
+// returns non-zero number on error
+int cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     cl_platform_id platforms[5];
     char platform_name[1024];
     cl_uint num_platforms;
@@ -64,7 +65,7 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     err |= clGetPlatformIDs(num_platforms, platforms, NULL);
     if (err != CL_SUCCESS) {
         printf("error getting opencl platform: %d\n", err);
-        exit(1);
+        return -1;
     }
 
     // choose cl platfrom from environment
@@ -74,13 +75,13 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     }
     if(selected_platform >= num_platforms) {
         printf("invalid platform index %d\n", selected_platform);
-        exit(1);
+        return -2;
     }
 
     err = clGetPlatformInfo(platforms[selected_platform], CL_PLATFORM_NAME, sizeof(platform_name), platform_name, NULL);
     if (err != CL_SUCCESS) {
         printf("error getting opencl platform name: %d\n", err);
-        exit(1);
+        return -3;
     }
     printf("using opencl platform: %s\n", platform_name);
 
@@ -88,7 +89,7 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     err |= clGetDeviceIDs(platforms[selected_platform], CL_DEVICE_TYPE_ALL, num_devices, devices, NULL);
     if (err != CL_SUCCESS) {
         printf("error getting opencl device: %d\n", err);
-        exit(1);
+        return -4;
     }
 
     // choose cl device from environment
@@ -98,14 +99,14 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     }
     if(selected_device >= num_devices) {
         printf("invalid device index %d\n", selected_device);
-        exit(1);
+        return -5;
     }
 
     gcl->device = devices[selected_device];
     err = clGetDeviceInfo(gcl->device, CL_DEVICE_NAME, sizeof(device_name), device_name, NULL);
     if (err != CL_SUCCESS) {
         printf("error getting opencl device name: %d\n", err);
-        exit(1);
+        return -6;
     }
     printf("using opencl device: %s\n", device_name);
 
@@ -113,21 +114,21 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     gcl->context = clCreateContext(0, 1, &gcl->device, NULL, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl context: %d\n", err);
-        exit(1);
+        return -7;
     }
 
     // create command queue
     gcl->queue = clCreateCommandQueue(gcl->context, gcl->device, 0, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl command queue: %d\n", err);
-        exit(1);
+        return -8;
     }
 
     // create program
     gcl->program = clCreateProgramWithSource(gcl->context, 1, (const char**)&KernelSource, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl program: %d\n", err);
-        exit(1);
+        return -9;
     }
 
     // load tune parameters from env
@@ -154,7 +155,7 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     if(matmul_vload_size && (matmul_tile_size % matmul_vload_size) != 0) {
         printf("error: matmul_tile_size(%d) must be multiple of matmul_vload_size(%d)\n",
                     matmul_tile_size, matmul_vload_size);
-        exit(1);
+        return -10;
     }
     gcl->matmul_tile_size = matmul_tile_size;
 
@@ -175,46 +176,51 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
             printf("%s\n", buffer);
             free(buffer);
         }
-        exit(1);
+        return -11;
     }
 
     // create kernel
     gcl->matmul_forward = clCreateKernel(gcl->program, "matmul_forward", &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl kernel: %d\n", err);
-        exit(1);
+        return -12;
     }
 
     gcl->matmul_backward1 = clCreateKernel(gcl->program, "matmul_backward1", &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl kernel: %d\n", err);
-        exit(1);
+        return -12;
     }
 
     gcl->matmul_backward2 = clCreateKernel(gcl->program, "matmul_backward2", &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl kernel: %d\n", err);
-        exit(1);
+        return -12;
     }
 
     gcl->matmul_backward3 = clCreateKernel(gcl->program, "matmul_backward3", &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl kernel: %d\n", err);
-        exit(1);
+        return -12;
     }
 
     err = clGetKernelWorkGroupInfo(gcl->matmul_forward, gcl->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(gcl->max_wg_size), &gcl->max_wg_size, NULL);
     if (err != CL_SUCCESS)
     {
         printf("error: Failed to retrieve kernel work group info! %d\n", err);
-        exit(1);
+        return -13;
+    }
+    if((matmul_tile_size * matmul_tile_size) > gcl->max_wg_size) {
+        printf("error: matmul_tile_size(%d) * matmul_tile_size(%d) > max_wg_size(%lu)\n",
+                matmul_tile_size, matmul_tile_size, gcl->max_wg_size);
+        return -10;
     }
 
     size = MAX(B * T * 4 * C, B * T * V);
     gcl->matmul_A = clCreateBuffer(gcl->context,  CL_MEM_READ_ONLY,  sizeof(float) * size, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl buffer: %d\n", err);
-        exit(1);
+        return -14;
     }
 
     size = MAX(4 * C * C, V * C);
@@ -222,14 +228,14 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     gcl->matmul_B = clCreateBuffer(gcl->context, CL_MEM_READ_ONLY, sizeof(float) * size, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl buffer: %d\n", err);
-        exit(1);
+        return -14;
     }
 
     size = MAX(4 * C, V);
     gcl->matmul_bias = clCreateBuffer(gcl->context, CL_MEM_READ_WRITE, sizeof(float) * size, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl buffer: %d\n", err);
-        exit(1);
+        return -14;
     }
 
     size = MAX(B * T * 4 * C, B * T * V);
@@ -238,7 +244,7 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     gcl->matmul_out = clCreateBuffer(gcl->context, CL_MEM_READ_WRITE, sizeof(float) * size, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl buffer: %d\n", err);
-        exit(1);
+        return -14;
     }
 
     err = 0;
@@ -257,8 +263,10 @@ void cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     if (err != CL_SUCCESS)
     {
         printf("error: Failed to set kernel arguments! %d\n", err);
-        exit(1);
+        return -15;
     }
+
+    return 0;
 }
 
 void cl_deinit(GPT2_CL *gcl) {
