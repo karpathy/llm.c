@@ -167,15 +167,16 @@ void matmul_forward(float* out,
     // OC is short for "output channels"
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
     // out will be (B,T,OC)
+    int b, t, o, i;
     #pragma omp parallel for collapse(2)
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
+    for (b = 0; b < B; b++) {
+        for (t = 0; t < T; t++) {
             float* out_bt = out + b * T * OC + t * OC;
             float* inp_bt = inp + b * T * C + t * C;
-            for (int o = 0; o < OC; o++) {
+            for (o = 0; o < OC; o++) {
                 float val = (bias != NULL) ? bias[o] : 0.0f;
                 float* wrow = weight + o*C;
-                for (int i = 0; i < C; i++) {
+                for (i = 0; i < C; i++) {
                     val += inp_bt[i] * wrow[i];
                 }
                 out_bt[o] = val;
@@ -192,15 +193,16 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     // but that doesn't afford an efficient parallelization strategy
 
     // backward into inp first, parallelize over B,T
+    int b, t, o, i;
     #pragma omp parallel for collapse(2)
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
+    for (b = 0; b < B; b++) {
+        for (t = 0; t < T; t++) {
             float* dout_bt = dout + b * T * OC + t * OC;
             float* dinp_bt = dinp + b * T * C + t * C;
-            for (int o = 0; o < OC; o++) {
+            for (o = 0; o < OC; o++) {
                 float* wrow = weight + o*C;
                 float d = dout_bt[o];
-                for (int i = 0; i < C; i++) {
+                for (i = 0; i < C; i++) {
                     dinp_bt[i] += wrow[i] * d;
                 }
             }
@@ -208,15 +210,15 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     }
     // backward into weight/bias, parallelize over output channels OC
     #pragma omp parallel for
-    for (int o = 0; o < OC; o++) {
-        for (int b = 0; b < B; b++) {
-            for (int t = 0; t < T; t++) {
+    for (o = 0; o < OC; o++) {
+        for (b = 0; b < B; b++) {
+            for (t = 0; t < T; t++) {
                 float* dout_bt = dout + b * T * OC + t * OC;
                 float* inp_bt = inp + b * T * C + t * C;
                 float* dwrow = dweight + o*C;
                 float d = dout_bt[o];
                 if (dbias != NULL) { dbias[o] += d; }
-                for (int i = 0; i < C; i++) {
+                for (i = 0; i < C; i++) {
                     dwrow[i] += inp_bt[i] * d;
                 }
             }
@@ -237,23 +239,24 @@ void attention_forward(float* out, float* preatt, float* att,
     int C3 = C*3;
     int hs = C / NH; // head size
     float scale = 1.0 / sqrtf(hs);
+    int b, t, h, t2, i;
 
     #pragma omp parallel for collapse(3)
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            for (int h = 0; h < NH; h++) {
+    for (b = 0; b < B; b++) {
+        for (t = 0; t < T; t++) {
+            for (h = 0; h < NH; h++) {
                 float* query_t = inp + b * T * C3 + t * C3 + h * hs;
                 float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
                 float* att_bth = att + b*NH*T*T + h*T*T + t*T;
 
                 // pass 1: calculate query dot key and maxval
                 float maxval = -10000.0f; // TODO something better
-                for (int t2 = 0; t2 <= t; t2++) {
+                for (t2 = 0; t2 <= t; t2++) {
                     float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
 
                     // (query_t) dot (key_t2)
                     float val = 0.0f;
-                    for (int i = 0; i < hs; i++) {
+                    for (i = 0; i < hs; i++) {
                         val += query_t[i] * key_t2[i];
                     }
                     val *= scale;
@@ -267,7 +270,7 @@ void attention_forward(float* out, float* preatt, float* att,
                 // pass 2: calculate the exp and keep track of sum
                 // maxval is being calculated and subtracted only for numerical stability
                 float expsum = 0.0f;
-                for (int t2 = 0; t2 <= t; t2++) {
+                for (t2 = 0; t2 <= t; t2++) {
                     float expv = expf(preatt_bth[t2] - maxval);
                     expsum += expv;
                     att_bth[t2] = expv;
@@ -275,7 +278,7 @@ void attention_forward(float* out, float* preatt, float* att,
                 float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
                 // pass 3: normalize to get the softmax
-                for (int t2 = 0; t2 < T; t2++) {
+                for (t2 = 0; t2 < T; t2++) {
                     if (t2 <= t) {
                         att_bth[t2] *= expsum_inv;
                     } else {
@@ -287,11 +290,11 @@ void attention_forward(float* out, float* preatt, float* att,
 
                 // pass 4: accumulate weighted values into the output of attention
                 float* out_bth = out + b * T * C + t * C + h * hs;
-                for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
-                for (int t2 = 0; t2 <= t; t2++) {
+                for (i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
+                for (t2 = 0; t2 <= t; t2++) {
                     float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
                     float att_btht2 = att_bth[t2];
-                    for (int i = 0; i < hs; i++) {
+                    for (i = 0; i < hs; i++) {
                         out_bth[i] += att_btht2 * value_t2[i];
                     }
                 }
@@ -407,32 +410,33 @@ void softmax_forward(float* probs, float* logits, int B, int T, int V, int Vp) {
     // input: logits is (B,T,Vp) of the unnormalized log probabilities
     // Vp is the padded vocab size (for efficiency), V is the "real" vocab size
     // example: Vp is 50304 and V is 50257
+    int b, t, i;
     #pragma omp parallel for collapse(2)
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
+    for (b = 0; b < B; b++) {
+        for (t = 0; t < T; t++) {
             // probs <- softmax(logits)
             float* logits_bt = logits + b * T * Vp + t * Vp;
             float* probs_bt = probs + b * T * Vp + t * Vp;
 
             // maxval is only calculated and subtracted for numerical stability
             float maxval = -10000.0f; // TODO something better
-            for (int i = 0; i < V; i++) {
+            for (i = 0; i < V; i++) {
                 if (logits_bt[i] > maxval) {
                     maxval = logits_bt[i];
                 }
             }
             float sum = 0.0f;
-            for (int i = 0; i < V; i++) {
+            for (i = 0; i < V; i++) {
                 probs_bt[i] = expf(logits_bt[i] - maxval);
                 sum += probs_bt[i];
             }
             // note we only loop to V, leaving the padded dimensions
-            for (int i = 0; i < V; i++) {
+            for (i = 0; i < V; i++) {
                 probs_bt[i] /= sum;
             }
             // for extra super safety we may wish to include this too,
             // forcing the probabilities here to be zero, but it shouldn't matter
-            for (int i = V; i < Vp; i++) {
+            for (i = V; i < Vp; i++) {
                 probs_bt[i] = 0.0f;
             }
         }
