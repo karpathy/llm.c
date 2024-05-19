@@ -15,8 +15,13 @@ split: train, val, or test.
 split_type: indomain if the activity label is seen during training, else zeroshot
 source_id: Which video or WikiHow article this example came from
 
-gpt2 (124M) = 28.2%
-gpt2-xl (1558M) = 39.22%
+gpt2 (124M)
+- eleuther harness reports acc 28.92%, acc_norm 31.14% (multiple choice style)
+- this script: 10042 acc: 0.2820 acc_norm: 0.2839
+
+gpt2-xl (1558M)
+- eleuther harness reports acc 40.04%, acc_norm 50.89% (multiple choice style)
+- this script: 10042 acc: 0.3922 acc_norm: 0.4664
 """
 
 import os
@@ -109,9 +114,13 @@ def iterate_examples(split):
 @torch.no_grad()
 def evaluate(model_type, device):
 
+    torch.set_float32_matmul_precision('high') # use tf32
+
     model = GPT2LMHeadModel.from_pretrained(model_type)
     model.to(device)
+    # model = torch.compile(model)
 
+    num_correct_norm = 0
     num_correct = 0
     num_total = 0
     for example in iterate_examples("val"):
@@ -136,15 +145,14 @@ def evaluate(model_type, device):
         avg_loss = sum_loss / shift_mask.sum(dim=1)
         # now we have a loss for each of the 4 completions
         # the one with the lowest loss should be the most likely
-        # to think through more carefully: sum or average? sum is more right probabilistically
-        use_loss = sum_loss
-        # ok predict what the model thinks is the most likely completion
-        pred = use_loss.argmin().item()
+        pred = sum_loss.argmin().item()
+        pred_norm = avg_loss.argmin().item()
 
         # accumulate stats
         num_total += 1
         num_correct += int(pred == label)
-        print(f"accuracy: {num_correct/num_total:.4f} ({num_correct}/{num_total})")
+        num_correct_norm += int(pred_norm == label)
+        print(f"{num_total} acc: {num_correct/num_total:.4f} acc_norm: {num_correct_norm/num_total:.4f}")
 
         # debug: pretty print a few examples, and the losses in each case
         if num_total < 10:
@@ -152,7 +160,7 @@ def evaluate(model_type, device):
             print(f"Context:\n {example['ctx']}")
             print(f"Endings:")
             for i, end in enumerate(example["endings"]):
-                print(f"{i} (loss: {use_loss[i].item():.4f}) {end}")
+                print(f"{i} (loss: {avg_loss[i].item():.4f}) {end}")
             print(f"predicted: {pred}, actual: {label}")
 
 if __name__ == "__main__":
