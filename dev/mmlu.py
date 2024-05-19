@@ -4,10 +4,10 @@ This then acts as the reference file for llm.c
 https://github.com/hendrycks/test
 
 gpt2 (124M)
-- this script: 14042 acc: 0.2534 acc_norm: 0.2734
+- this script: 14042 acc: 0.2557 acc_norm: 0.2721
 
-gpt2-xl (1558M) = 27.00% ...
-- this script: 14042 acc: 0.2700 acc_norm: 0.2938
+gpt2-xl (1558M)
+- this script: 14042 acc: 0.2927 acc_norm: 0.3035
 """
 
 import os
@@ -128,7 +128,7 @@ def evaluate(model_type, device):
         shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
         shift_losses = shift_losses.view(tokens.size(0), -1)
         # now get the average loss just for the completion region (where mask == 1), in each row
-        shift_mask = (mask[..., :-1]).contiguous()
+        shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
         masked_shift_losses = shift_losses * shift_mask
         # sum and divide by the number of 1s in the mask
         sum_loss = masked_shift_losses.sum(dim=1)

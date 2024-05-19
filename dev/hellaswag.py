@@ -17,11 +17,11 @@ source_id: Which video or WikiHow article this example came from
 
 gpt2 (124M)
 - eleuther harness reports acc 28.92%, acc_norm 31.14% (multiple choice style)
-- this script: 10042 acc: 0.2820 acc_norm: 0.2839
+- this script: 10042 acc: 0.2859 acc_norm: 0.2955 (completion style)
 
 gpt2-xl (1558M)
 - eleuther harness reports acc 40.04%, acc_norm 50.89% (multiple choice style)
-- this script: 10042 acc: 0.3922 acc_norm: 0.4664
+- this script: 10042 acc: 0.3842 acc_norm: 0.4893 (completion style)
 """
 
 import os
@@ -138,7 +138,7 @@ def evaluate(model_type, device):
         shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
         shift_losses = shift_losses.view(tokens.size(0), -1)
         # now get the average loss just for the completion region (where mask == 1), in each row
-        shift_mask = (mask[..., :-1]).contiguous()
+        shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
         masked_shift_losses = shift_losses * shift_mask
         # sum and divide by the number of 1s in the mask
         sum_loss = masked_shift_losses.sum(dim=1)
