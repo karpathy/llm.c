@@ -274,7 +274,7 @@ int main(int argc, char *argv[]) {
             allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", 2e-2f);
         }
 
-        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1, &multi_gpu_config);
+        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, 1.f, step+1, &multi_gpu_config);
 
         // print the timing information at the end
         printf("step %d: loss %f (took %f ms)\n", step+1, model.mean_loss, time_elapsed_s * 1000);
@@ -283,16 +283,16 @@ int main(int argc, char *argv[]) {
 
     // expected losses are as follows, from Python
     float expected_losses[10] = {
-        5.270007133483887,
-        4.059706687927246,
-        3.3751230239868164,
-        2.8007826805114746,
-        2.315382242202759,
-        1.8490285873413086,
-        1.3946564197540283,
-        0.9991465210914612,
-        0.6240804195404053,
-        0.37651097774505615
+        5.2700,
+        4.0607,
+        3.3166,
+        2.7115,
+        2.1702,
+        1.6349,
+        1.1419,
+        0.7038,
+        0.3769,
+        0.1743
     };
 
     // compare
