@@ -16,7 +16,6 @@ static inline int clock_gettime(int ignore_variable, struct timespec* tv)
     return timespec_get(tv, TIME_UTC); // TODO: not sure this is the best solution. Need to review.
 }
 
-#define OMP /* turn it on */
 #include <io.h> /* needed for access below */
 #define F_OK 0
 #define access _access
