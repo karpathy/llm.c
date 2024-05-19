@@ -59,10 +59,15 @@ __global__ void norm_kernel1(float* out, const T* data, size_t count) {
     }
 }
 
-
-
 template<class T>
 __global__ void norm_kernel2(float* out, const T* data, size_t count) {
+    // concrete example for an A100 GPU (108 SMs, 2048 max threads each)
+    // so there are 2048 * 108 = 221,184 threads total
+    // say the block_size is 512, then we would launch 432 blocks in total
+    // say num_params is ~100M, each thread will process ~500 elements
+    // warps reduce with warp-level reduce, we have 221,184/32 = 6,912 warps
+    // and then each warp atomicAdd's to global memory, total of 6,912 atomics
+
     // no shared memory; but one atomic per warp instead of per block
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
@@ -83,8 +88,6 @@ __global__ void norm_kernel2(float* out, const T* data, size_t count) {
         atomicAdd(out, warp_result);
     }
 }
-
-
 
 template<typename T>
 void global_norm1(float* out, const T* values, size_t count, int block_size) {

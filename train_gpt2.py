@@ -407,7 +407,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
     parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
-    parser.add_argument("--grad_clipping", type=float, default=1, help="maximum gradient magnitude")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
     args = parser.parse_args()
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
@@ -553,7 +553,7 @@ if __name__ == "__main__":
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     timings = []
-    norm = -1   # dummy value to print in inference-only mode
+    norm = -1.0   # dummy value to print in inference-only mode
     for step in range(args.num_iterations):
         t0 = time.time()
 
@@ -577,7 +577,7 @@ if __name__ == "__main__":
             # backward pass
             if not args.inference_only:
                 loss.backward()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clipping)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
