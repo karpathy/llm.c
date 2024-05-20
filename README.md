@@ -12,7 +12,7 @@ The "I don't care about anything I just want to train and I have a GPU" section.
 
 ```bash
 pip install -r requirements.txt
-python prepro_tinyshakespeare.py
+python dev/data/tinyshakespeare.py
 python train_gpt2.py
 make train_gpt2fp32cu
 ./train_gpt2fp32cu
@@ -22,17 +22,17 @@ The above lines (1) download the [tinyshakespeare](https://raw.githubusercontent
 
 ## quick start (GPU, fast bleeding edge)
 
-I want to see it go fast. In this case switch to our mainline, most optimized `train_gpt2.cu` and also turn on flash attention. Run:
+I want to see it go fast. In this case switch to our mainline, most optimized `train_gpt2.cu`. Run:
 
 ```bash
 pip install -r requirements.txt
-python prepro_tinyshakespeare.py
+python dev/data/tinyshakespeare.py
 python train_gpt2.py
 make train_gpt2cu
 ./train_gpt2cu
 ```
 
-If you additionally install cuDNN (see the CUDA section below), you can also go faster with flash attention
+If you additionally install cuDNN (see the CUDA section below), you can go even faster with flash attention. Adjust the make command as follows to compile with cudnn / flash attention:
 
 ```bash
 make train_gpt2cu USE_CUDNN=1
@@ -48,9 +48,9 @@ Note that the default batch size is very low (4). If you have enough memory on y
 My standard "prod" run with a nice GPU (e.g. A100 40GB) actually trains on TinyStories instead of TinyShakespeare, and looks like this:
 
 ```bash
-python prepro_tinystories.py
+python dev/data/tinystories.py
 make train_gpt2cu USE_CUDNN=1
-./train_gpt2cu -i data/TinyStories -v 250 -s 250 -g 144 -o stories.log -b 32
+./train_gpt2cu -i dev/data/tinystories/TinyStories -v 250 -s 250 -g 144 -o stories.log -b 32
 ```
 
 Where I decrease the frequency of validation loss and sampling to every 250 steps, sample 144 tokens during sampling stage (to fit ~one story), and at batch size 32.
@@ -61,7 +61,7 @@ The "I am so GPU poor that I don't even have one" section. No worries, run:
 
 ```bash
 pip install -r requirements.txt
-python prepro_tinyshakespeare.py
+python dev/data/tinyshakespeare.py
 python train_gpt2.py
 make train_gpt2
 OMP_NUM_THREADS=8 ./train_gpt2
@@ -73,10 +73,10 @@ The above lines (1) download the [tinyshakespeare](https://raw.githubusercontent
 
 You'll be using the (more bleeding edge) mixed precision version of the code:
 
-```
+```bash
 sudo apt install openmpi-bin openmpi-doc libopenmpi-dev
 pip install -r requirements.txt
-python prepro_tinyshakespeare.py
+python dev/data/tinyshakespeare.py
 python train_gpt2.py
 make train_gpt2cu
 mpirun -np <number of GPUs on your machine> ./train_gpt2cu
@@ -89,17 +89,17 @@ Sub in the number of GPUs you'd like to run on in the last command.
 Download and tokenize a dataset. The [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset is the fastest to download and tokenize:
 
 ```bash
-python prepro_tinyshakespeare.py
+python dev/data/tinyshakespeare.py
 ```
 
 This prints:
 
 ```
-Saved 32768 tokens to data/tiny_shakespeare_val.bin
-Saved 305260 tokens to data/tiny_shakespeare_train.bin
+Saved 32768 tokens to (...)/tiny_shakespeare_val.bin
+Saved 305260 tokens to (...)/tiny_shakespeare_train.bin
 ```
 
-The .bin files are raw byte streams of int32 numbers indicating the token ids with the GPT-2 tokenizer. Alternatively you could also tokenize the [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) dataset with `prepro_tinystories.py`.
+The .bin files are raw byte streams of int32 numbers indicating the token ids with the GPT-2 tokenizer. Alternatively you could also tokenize the [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) dataset with `tinystories.py`.
 
 In principle we'd be ready to train the model right here. However the baseline CPU/fp32 reference code is so inefficient that it's not practical to train these models from scratch yet. Instead, we initialize with the GPT-2 weights released by OpenAI and just do finetuning. For that, we have to download the GPT-2 weights and save them as a checkpoint we can load in C:
 

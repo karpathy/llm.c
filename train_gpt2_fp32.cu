@@ -1595,7 +1595,7 @@ void error_usage() {
     // default run = debugging run with TinyShakespeare
     // bigger run = train on TinyStories! e.g. val/sample less often, but sample more tokens, write to logfile
     fprintf(stderr, "Usage:   ./train_gpt2fp32cu [options]\n");
-    fprintf(stderr, "Example: ./train_gpt2fp32cu -i data/TinyStories -v 100 -s 100 -g 144 -o stories.log\n");
+    fprintf(stderr, "Example: ./train_gpt2fp32cu -i dev/data/tinystories/TinyStories -v 100 -s 100 -g 144 -o stories.log\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -i <string> input dataset prefix (default = data/tiny_shakespeare)\n");
     fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
@@ -1614,7 +1614,7 @@ void error_usage() {
 int main(int argc, char *argv[]) {
 
     // read in the (optional) command line arguments
-    const char* input_dataset_prefix = "data/tiny_shakespeare"; // or e.g. data/TinyStories
+    const char* input_dataset_prefix = "dev/data/tinyshakespeare/tiny_shakespeare"; // or e.g. data/TinyStories
     const char* output_log_file = NULL;
     int B = 4; // batch size
     int T = 1024; // sequence length max

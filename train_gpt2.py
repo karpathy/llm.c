@@ -394,7 +394,7 @@ if __name__ == "__main__":
     # if you'd like to e.g. time the forward pass only, call this script as:
     # python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_bin", type=str, default="data/tiny_shakespeare_val.bin", help="input .bin to train on")
+    parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl")
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")

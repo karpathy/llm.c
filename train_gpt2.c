@@ -1100,10 +1100,10 @@ int main() {
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
-    const char* tiny_stories_train = "data/TinyStories_train.bin";
-    const char* tiny_stories_val = "data/TinyStories_val.bin";
-    const char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
-    const char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
+    const char* tiny_stories_train = "dev/data/tinystories/TinyStories_train.bin";
+    const char* tiny_stories_val = "dev/data/tinystories/TinyStories_val.bin";
+    const char* tiny_shakespeare_train = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+    const char* tiny_shakespeare_val = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
     int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
