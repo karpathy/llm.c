@@ -259,5 +259,8 @@ train_gpt2cl: train_gpt2cl.c
 test_gpt2cl: test_gpt2cl.c
 	$(CC) $(CFLAGS) $(CLCFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) $(CLLDFLAGS) $(OUTPUT_FILE)
 
+tune_gpt2cl: tune_gpt2cl.c
+	$(CC) $(CFLAGS) $(CLCFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) $(CLLDFLAGS) $(OUTPUT_FILE)
+
 clean:
-	$(REMOVE_FILES) $(TARGETS) $(NVCC_CUDNN) train_gpt2cl test_gpt2cl
+	$(REMOVE_FILES) $(TARGETS) $(NVCC_CUDNN) train_gpt2cl test_gpt2cl tune_gpt2cl
