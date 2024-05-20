@@ -8,11 +8,16 @@ int check_tensor(float *a, float *b, int n, const char* label, float threshold=1
     int ok = 1;
     float max_diff = 0.0f;
     float max_rel_error = 0.0f;
+    float max_to_threshold = 0.f;
     float max_a = 0.0f;
     float max_b = 0.0f;
-    printf("%s\n", label);
+    float epsilon = 0.079;      // BF16 epsilon value
+    printf("---\n");
+    printf("checking tensor: %s\n", label);
     for (int i = 0; i < n; i++) {
+        float t_eff = threshold + fabs(b[i]) * epsilon;
         float diff = fabsf(a[i] - b[i]);
+        max_to_threshold = max(max_to_threshold, diff / t_eff);
         if (diff > max_diff) {
             max_diff = diff;
             float denom = fabsf(b[i]);
@@ -20,21 +25,22 @@ int check_tensor(float *a, float *b, int n, const char* label, float threshold=1
             max_a = a[i];
             max_b = b[i];
         }
-        if (diff <= threshold) {
-            if (i < print_upto) { printf("OK "); }
-        } else {
-            if (i < print_upto) { printf("NOT OK "); }
+        if (diff > t_eff) {
             ok = 0;
         }
-        if (i < print_upto) { printf("%f %f\n", a[i], b[i]); }
+        // print the first few elements so we can visually assess the "proof" of the comparison
+        if (i < print_upto) {
+            printf(diff <= t_eff ? "OK " :  "NOT OK ");
+            printf("%f %f\n", a[i], b[i]);
+        }
     }
     // print the final result
     if (ok) {
-        printf("TENSOR OK, max diff: %e, with rel error: %e (calculated=%f, ref=%f)\n",
-                max_diff, max_rel_error, max_a, max_b);
+        printf("TENSOR OK, max diff: %.3e, with rel error: %.3e (calculated=%10f, ref=%10f), %.2f%% of maximum error\n",
+                max_diff, max_rel_error, max_a, max_b, max_to_threshold*100);
     } else {
-        printf("TENSOR NOT OK, max diff: %e, with rel error: %e (calculated=%f, ref=%f)\n",
-                max_diff, max_rel_error, max_a, max_b);
+        printf("TENSOR NOT OK, max diff: %.3e, with rel error: %.3e (calculated=%10f, ref=%10f), %.2f%% of maximum error\n",
+                max_diff, max_rel_error, max_a, max_b, max_to_threshold*100);
     }
     return ok;
 }
@@ -248,25 +254,27 @@ int main(int argc, char *argv[]) {
             // Also, if code changes and some of these get tripped, it could be ok if it's not by too much,
             // because our use of stochastic rounding is adding some non-determinism "pepper noise".
             // In that case it's ok to extend the tolerance by a bit, after a manual review.
-            allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", 8e-1f);
-            allok = allok & check_tensor(tensors1[1], tensors2[1], maxT * C, "wpe", 1e-2f);
-            allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", 1.4e-1); // hmm a bit high
-            allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", 4e-2f);
-            allok = allok & check_tensor(tensors1[4], tensors2[4], L * C * C, "attprojw", 3e-2f);
+            // Also, different GPUs may use different matrix multiplication algorithms, so the
+            // actual errors can be hardware specific.
+            allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", 6e-1f); // hmm a bit high
+            allok = allok & check_tensor(tensors1[1], tensors2[1], maxT * C, "wpe", 4e-3f);
+            allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", 1e-1); // hmm a bit high
+            allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", 3.5e-2f);
+            allok = allok & check_tensor(tensors1[4], tensors2[4], L * C * C, "attprojw", 2e-2f);
             allok = allok & check_tensor(tensors1[5], tensors2[5], L * C, "attprojb", 3e-2f);
-            allok = allok & check_tensor(tensors1[6], tensors2[6], L * 4*C * C, "fcw", 9e-2f); // hmm a bit high
-            allok = allok & check_tensor(tensors1[7], tensors2[7], L * 4*C, "fcb", 9e-2f); // hmm a bit high
-            allok = allok & check_tensor(tensors1[8], tensors2[8], L * C * 4*C, "fcprojw", 9e-2f); // hmm a bit high
-            allok = allok & check_tensor(tensors1[9], tensors2[9], L * C, "fcprojb", 3e-2f);
-            allok = allok & check_tensor(tensors1[10], tensors2[10], L * C, "ln1w", 0.1f); // hmm bit higher
-            allok = allok & check_tensor(tensors1[11], tensors2[11], L * C, "ln1b", 3e-2f);
-            allok = allok & check_tensor(tensors1[12], tensors2[12], L * C, "ln2w", 0.1f); // hmm bit higher
-            allok = allok & check_tensor(tensors1[13], tensors2[13], L * C, "ln2b", 3e-2f);
+            allok = allok & check_tensor(tensors1[6], tensors2[6], L * 4*C * C, "fcw", 5e-2f); // hmm a bit high
+            allok = allok & check_tensor(tensors1[7], tensors2[7], L * 4*C, "fcb", 5e-2f); // hmm a bit high
+            allok = allok & check_tensor(tensors1[8], tensors2[8], L * C * 4*C, "fcprojw", 5e-2f); // hmm a bit high
+            allok = allok & check_tensor(tensors1[9], tensors2[9], L * C, "fcprojb", 1.5e-2f);
+            allok = allok & check_tensor(tensors1[10], tensors2[10], L * C, "ln1w", 6e-4f);
+            allok = allok & check_tensor(tensors1[11], tensors2[11], L * C, "ln1b", 9e-3f);
+            allok = allok & check_tensor(tensors1[12], tensors2[12], L * C, "ln2w", 2e-3f);
+            allok = allok & check_tensor(tensors1[13], tensors2[13], L * C, "ln2b", 2.5e-3f);
             allok = allok & check_tensor(tensors1[14], tensors2[14], C, "lnfw", 0.12f); // hmm bit higher
-            allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", 3e-2f);
+            allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", 2e-2f);
         }
 
-        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1, &multi_gpu_config);
+        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, 1.f, step+1, &multi_gpu_config);
 
         // print the timing information at the end
         printf("step %d: loss %f (took %f ms)\n", step+1, model.mean_loss, time_elapsed_s * 1000);
@@ -275,16 +283,16 @@ int main(int argc, char *argv[]) {
 
     // expected losses are as follows, from Python
     float expected_losses[10] = {
-        5.270007133483887,
-        4.059706687927246,
-        3.3751230239868164,
-        2.8007826805114746,
-        2.315382242202759,
-        1.8490285873413086,
-        1.3946564197540283,
-        0.9991465210914612,
-        0.6240804195404053,
-        0.37651097774505615
+        5.2700,
+        4.0607,
+        3.3166,
+        2.7115,
+        2.1702,
+        1.6349,
+        1.1419,
+        0.7038,
+        0.3769,
+        0.1743
     };
 
     // compare
