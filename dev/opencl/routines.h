@@ -42,7 +42,7 @@ void cl_matmul_forward(GPT2_CL *gcl, float* out,
         exit(1);
     }
 
-    err = clEnqueueReadBuffer(gcl->queue, gcl->matmul_out, CL_TRUE, 0, sizeof(float) * B * T * OC, out, 0, NULL, NULL );
+    err = clEnqueueReadBuffer(gcl->queue, gcl->matmul_out, CL_FALSE, 0, sizeof(float) * B * T * OC, out, 0, NULL, NULL );
     if (err != CL_SUCCESS)
     {
         printf("error: failed to read output array! %d\n", err);
@@ -91,13 +91,12 @@ void cl_matmul_backward(GPT2_CL *gcl, float* dinp, float* dweight, float* dbias,
         exit(1);
     }
 
-    err = clEnqueueReadBuffer(gcl->queue, gcl->matmul_out, CL_TRUE, 0, sizeof(float) * B * T * C, dinp, 0, NULL, NULL );
+    err = clEnqueueReadBuffer(gcl->queue, gcl->matmul_out, CL_FALSE, 0, sizeof(float) * B * T * C, dinp, 0, NULL, NULL );
     if (err != CL_SUCCESS)
     {
         printf("error: failed to read output array! %d\n", err);
         exit(1);
     }
-    clFinish(gcl->queue);
 
     // dout is (B,T,OC), inp is (B,T,C)
     // dweight will be (OC,C)
@@ -135,13 +134,12 @@ void cl_matmul_backward(GPT2_CL *gcl, float* dinp, float* dweight, float* dbias,
         exit(1);
     }
 
-    err = clEnqueueReadBuffer(gcl->queue, gcl->matmul_out, CL_TRUE, 0, sizeof(float) * OC * C, dweight, 0, NULL, NULL );
+    err = clEnqueueReadBuffer(gcl->queue, gcl->matmul_out, CL_FALSE, 0, sizeof(float) * OC * C, dweight, 0, NULL, NULL );
     if (err != CL_SUCCESS)
     {
         printf("error: failed to read output array! %d\n", err);
         exit(1);
     }
-    clFinish(gcl->queue);
 
     // dbias will be (OC)
     if(dbias != NULL) {
@@ -176,12 +174,13 @@ void cl_matmul_backward(GPT2_CL *gcl, float* dinp, float* dweight, float* dbias,
             exit(1);
         }
 
-        err = clEnqueueReadBuffer(gcl->queue, gcl->matmul_bias, CL_TRUE, 0, sizeof(float) * OC, dbias, 0, NULL, NULL );
+        err = clEnqueueReadBuffer(gcl->queue, gcl->matmul_bias, CL_FALSE, 0, sizeof(float) * OC, dbias, 0, NULL, NULL );
         if (err != CL_SUCCESS)
         {
             printf("error: failed to read output array! %d\n", err);
             exit(1);
         }
-        clFinish(gcl->queue);
     }
+
+    clFinish(gcl->queue);
 }
