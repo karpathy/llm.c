@@ -42,8 +42,8 @@ __kernel void matmul_backward1(__global float* out, __global float* AMat, __glob
             int row = t + local_id0;
             int col = t + local_id1;
 
-            A_tile[local_id0][local_id1] = (col < C && is_valid_g0) ? AMat[global_id0 * OC + col] : 0.0f;
-            B_tile[local_id1][local_id0] = (row < C && is_valid_g1) ? BMat[row * C + global_id1] : 0.0f;
+            A_tile[local_id0][local_id1] = (col < OC && is_valid_g0) ? AMat[global_id0 * OC + col] : 0.0f;
+            B_tile[local_id1][local_id0] = (row < OC && is_valid_g1) ? BMat[row * C + global_id1] : 0.0f;
 
             val += perform_dot(A_tile, B_tile, local_id0, local_id1);
         }
@@ -77,8 +77,8 @@ __kernel void matmul_backward1(__global float* out, __global float* AMat, __glob
             int row = t + local_id0;
             int col = t + local_id1;
 
-            A_tile[local_id0][local_id1] = (col < C) ? AMat[global_id0 * OC + col] : 0.0f;
-            B_tile[local_id1][local_id0] = (row < C) ? BMat[row * C + global_id1] : 0.0f;
+            A_tile[local_id0][local_id1] = (col < OC) ? AMat[global_id0 * OC + col] : 0.0f;
+            B_tile[local_id1][local_id0] = (row < OC) ? BMat[row * C + global_id1] : 0.0f;
 
             val += perform_dot(A_tile, B_tile, local_id0, local_id1);
         }
@@ -132,8 +132,8 @@ __kernel void matmul_backward2(__global float* out, __global float* AMat, __glob
             int row = t + local_id0;
             int col = t + local_id1;
 
-            A_tile[local_id0][local_id1] = (col < C && is_valid_g0) ? AMat[col * OC + global_id0] : 0.0f;
-            B_tile[local_id1][local_id0] = (row < C && is_valid_g1) ? BMat[row * C + global_id1] : 0.0f;
+            A_tile[local_id0][local_id1] = (col < bt && is_valid_g0) ? AMat[col * OC + global_id0] : 0.0f;
+            B_tile[local_id1][local_id0] = (row < bt && is_valid_g1) ? BMat[row * C + global_id1] : 0.0f;
 
             val += perform_dot(A_tile, B_tile, local_id0, local_id1);
         }
@@ -167,8 +167,8 @@ __kernel void matmul_backward2(__global float* out, __global float* AMat, __glob
             int row = t + local_id0;
             int col = t + local_id1;
 
-            A_tile[local_id0][local_id1] = (col < C) ? AMat[col * OC + global_id0] : 0.0f;
-            B_tile[local_id1][local_id0] = (row < C) ? BMat[row * C + global_id1] : 0.0f;
+            A_tile[local_id0][local_id1] = (col < bt) ? AMat[col * OC + global_id0] : 0.0f;
+            B_tile[local_id1][local_id0] = (row < bt) ? BMat[row * C + global_id1] : 0.0f;
 
             val += perform_dot(A_tile, B_tile, local_id0, local_id1);
         }
