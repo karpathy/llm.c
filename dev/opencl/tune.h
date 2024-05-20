@@ -2,7 +2,6 @@
 
 /*
   sets the tile size for matmul kernels
-  possible values: 4, 8, 16
   best value varies from device to device
 */
 #define MATMUL_TILE_SIZE 16
@@ -22,13 +21,13 @@
 #define MATMUL_VLOAD_SIZE 4
 
 /*
-  set it to 1 to enable dot product
-  set it to 0 to use mad
-*/
-#define MATMUL_USE_DOT_PRODUCT 0
-
-/*
   set it to 1 to enable preload
   set it to 0 to disable
 */
 #define MATMUL_DO_PRELOAD 1
+
+/*
+  set it to 1 to enable dot product
+  set it to 0 to use mad
+*/
+#define MATMUL_USE_DOT_PRODUCT 0
