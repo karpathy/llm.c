@@ -1021,6 +1021,9 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     loader->tokens_file = fopen(filename, "rb");
     if (loader->tokens_file == NULL) {
         printf("Error opening tokens file\n");
+        printf("--> HINT: the data directory may have moved recently from data/ to dev/data/(dataset)/");
+        printf("--> HINT: refer again to the README file and possibly re-run the dataset prepro script.");
+        printf("--> HINT: example: re-run `python dev/data/tinyshakespeare.py`");
         exit(1);
     }
 

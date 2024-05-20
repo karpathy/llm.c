@@ -2622,7 +2622,7 @@ void error_usage() {
     fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
     fprintf(stderr, "Example: ./train_gpt2cu -i dev/data/tinystories/TinyStories -v 100 -s 100 -g 144 -o stories.log\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -i <string> input dataset prefix (default = data/tiny_shakespeare)\n");
+    fprintf(stderr, "  -i <string> input dataset prefix (default = dev/data/tinyshakespeare/tiny_shakespeare)\n");
     fprintf(stderr, "  -e <string> input model filename (default = gpt2_124M_bf16.bin)\n");
     fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
     fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");

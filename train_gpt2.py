@@ -495,7 +495,11 @@ if __name__ == "__main__":
 
     # load the tokens
     # note we're using val by default instead of train split just because it is smaller/faster
-    assert os.path.isfile(args.input_bin)
+    if not os.path.isfile(args.input_bin):
+        print0(f"ERROR: input .bin file not found: {args.input_bin}")
+        print0("---> HINT: try to re-run the data prepro script. these recently moved to dev/data")
+        print0("---> HINT: for example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        exit(1)
     print0(f"loading cached tokens in {args.input_bin}")
     with open(args.input_bin, "rb") as f:
         tokens = np.frombuffer(f.read(), dtype=np.int32)
