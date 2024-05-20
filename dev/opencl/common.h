@@ -61,6 +61,19 @@ int cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     int matmul_do_preload = MATMUL_DO_PRELOAD;
     int matmul_use_dot_product = MATMUL_USE_DOT_PRODUCT;
 
+    // initialize all variables to NULL
+    gcl->context = NULL;
+    gcl->queue = NULL;
+    gcl->program = NULL;
+    gcl->matmul_forward = NULL;
+    gcl->matmul_backward1 = NULL;
+    gcl->matmul_backward2 = NULL;
+    gcl->matmul_backward3 = NULL;
+    gcl->matmul_A = NULL;
+    gcl->matmul_B = NULL;
+    gcl->matmul_bias = NULL;
+    gcl->matmul_out = NULL;
+
     err = clGetPlatformIDs(0, NULL, &num_platforms);
     err |= clGetPlatformIDs(num_platforms, platforms, NULL);
     if (err != CL_SUCCESS) {
@@ -104,8 +117,9 @@ int cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
 
     gcl->device = devices[selected_device];
     err = clGetDeviceInfo(gcl->device, CL_DEVICE_NAME, sizeof(device_name), device_name, NULL);
+    err |= clGetDeviceInfo(gcl->device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(gcl->max_wg_size), &gcl->max_wg_size, NULL);
     if (err != CL_SUCCESS) {
-        printf("error getting opencl device name: %d\n", err);
+        printf("error getting opencl device info: %d\n", err);
         return -6;
     }
     printf("using opencl device: %s\n", device_name);
@@ -157,6 +171,11 @@ int cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
                     matmul_tile_size, matmul_vload_size);
         return -10;
     }
+    if((matmul_tile_size * matmul_tile_size) > gcl->max_wg_size) {
+        printf("error: matmul_tile_size(%d) * matmul_tile_size(%d) > max_wg_size(%lu)\n",
+                matmul_tile_size, matmul_tile_size, gcl->max_wg_size);
+        return -10;
+    }
     gcl->matmul_tile_size = matmul_tile_size;
 
     // build program
@@ -204,23 +223,11 @@ int cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
         return -12;
     }
 
-    err = clGetKernelWorkGroupInfo(gcl->matmul_forward, gcl->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(gcl->max_wg_size), &gcl->max_wg_size, NULL);
-    if (err != CL_SUCCESS)
-    {
-        printf("error: Failed to retrieve kernel work group info! %d\n", err);
-        return -13;
-    }
-    if((matmul_tile_size * matmul_tile_size) > gcl->max_wg_size) {
-        printf("error: matmul_tile_size(%d) * matmul_tile_size(%d) > max_wg_size(%lu)\n",
-                matmul_tile_size, matmul_tile_size, gcl->max_wg_size);
-        return -10;
-    }
-
     size = MAX(B * T * 4 * C, B * T * V);
     gcl->matmul_A = clCreateBuffer(gcl->context,  CL_MEM_READ_ONLY,  sizeof(float) * size, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl buffer: %d\n", err);
-        return -14;
+        return -13;
     }
 
     size = MAX(4 * C * C, V * C);
@@ -228,14 +235,14 @@ int cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     gcl->matmul_B = clCreateBuffer(gcl->context, CL_MEM_READ_ONLY, sizeof(float) * size, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl buffer: %d\n", err);
-        return -14;
+        return -13;
     }
 
     size = MAX(4 * C, V);
     gcl->matmul_bias = clCreateBuffer(gcl->context, CL_MEM_READ_WRITE, sizeof(float) * size, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl buffer: %d\n", err);
-        return -14;
+        return -13;
     }
 
     size = MAX(B * T * 4 * C, B * T * V);
@@ -244,7 +251,7 @@ int cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     gcl->matmul_out = clCreateBuffer(gcl->context, CL_MEM_READ_WRITE, sizeof(float) * size, NULL, &err);
     if (err != CL_SUCCESS) {
         printf("error creating opencl buffer: %d\n", err);
-        return -14;
+        return -13;
     }
 
     err = 0;
@@ -263,22 +270,22 @@ int cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     if (err != CL_SUCCESS)
     {
         printf("error: Failed to set kernel arguments! %d\n", err);
-        return -15;
+        return -14;
     }
 
     return 0;
 }
 
 void cl_deinit(GPT2_CL *gcl) {
-    clReleaseMemObject(gcl->matmul_A);
-    clReleaseMemObject(gcl->matmul_B);
-    clReleaseMemObject(gcl->matmul_bias);
-    clReleaseMemObject(gcl->matmul_out);
-    clReleaseKernel(gcl->matmul_forward);
-    clReleaseKernel(gcl->matmul_backward1);
-    clReleaseKernel(gcl->matmul_backward2);
-    clReleaseKernel(gcl->matmul_backward3);
-    clReleaseProgram(gcl->program);
-    clReleaseCommandQueue(gcl->queue);
-    clReleaseContext(gcl->context);
+    if(gcl->matmul_A) clReleaseMemObject(gcl->matmul_A);
+    if(gcl->matmul_B) clReleaseMemObject(gcl->matmul_B);
+    if(gcl->matmul_bias) clReleaseMemObject(gcl->matmul_bias);
+    if(gcl->matmul_out) clReleaseMemObject(gcl->matmul_out);
+    if(gcl->matmul_forward) clReleaseKernel(gcl->matmul_forward);
+    if(gcl->matmul_backward1) clReleaseKernel(gcl->matmul_backward1);
+    if(gcl->matmul_backward2) clReleaseKernel(gcl->matmul_backward2);
+    if(gcl->matmul_backward3) clReleaseKernel(gcl->matmul_backward3);
+    if(gcl->program) clReleaseProgram(gcl->program);
+    if(gcl->queue) clReleaseCommandQueue(gcl->queue);
+    if(gcl->context) clReleaseContext(gcl->context);
 }
