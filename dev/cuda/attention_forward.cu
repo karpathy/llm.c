@@ -61,6 +61,9 @@ version 11 is kernel 10 skipping FP16/FP32 conversions (full FP16/BF16 network)
 // CUDA & cuDNN setup
 static bool first_run_validation = true; // always run e.g. permute on 1st run
 
+// WarpSize set as the compile time constant, this allows the compiler to optimize
+constexpr int WARP_SIZE = 32;
+
 #ifdef ENABLE_CUDNN
 #include <cudnn_frontend.h>
 namespace fe = cudnn_frontend;
@@ -251,11 +254,11 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     extern __shared__ float shared[];
     int idx = blockIdx.x;
     int tid = threadIdx.x;
-    int warpId = threadIdx.x / 32; // warp index within a block
-    int laneId = threadIdx.x % 32; // thread index within a warp
+    int warpId = threadIdx.x / WARP_SIZE; // warp index within a block
+    int laneId = threadIdx.x % WARP_SIZE; // thread index within a warp
 
     // the number of warps per block. recall that blockDim.x is block_size
-    int warpsPerBlock = blockDim.x / 32;
+    int warpsPerBlock = blockDim.x / WARP_SIZE;
 
     // shared[] must be allocated to have 2 * warpsPerBlock elements
     // first half for max values, the second half for sum values
