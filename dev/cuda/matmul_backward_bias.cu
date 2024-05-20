@@ -421,6 +421,9 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 // version1: simple cuBLAS calls
 void matmul_backward_bias1(floatX* dbias, const floatX* dout,
                       int B, int T, int OC, int block_size) {
+    if (block_size == 768) {
+        block_size = 1024;      // block_size needs to be power of 2 due to the reduction
+    }
     dim3 block_dim(block_size);
     dim3 grid_dim(OC);
     size_t shared_mem_size = block_size * sizeof(float);
