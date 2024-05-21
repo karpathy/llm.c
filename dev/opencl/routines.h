@@ -163,7 +163,7 @@ void cl_matmul_backward(GPT2_CL *gcl, float* dinp, float* dweight, float* dbias,
             exit(1);
         }
 
-        size_t wg_size = gcl->max_wg_size;
+        size_t wg_size = gcl->kb3_preferred_wg_size;
         size_t oc_round = ((OC + wg_size - 1) / wg_size) * wg_size;
         size_t size_global3 = oc_round;
         size_t size_local3 = wg_size;
