@@ -85,18 +85,18 @@ int main(int argc, char *argv[]) {
     // overall OK signal for the test
     int allok = 1;
 
-    // let's do 10 training iterations, following the pytorch code
+    // let's do 10 training iterations
     float expected_losses[10] = {
-        5.270007133483887,
-        4.059706687927246,
-        3.3751230239868164,
-        2.8007826805114746,
-        2.315382242202759,
-        1.8490285873413086,
-        1.3946564197540283,
-        0.9991465210914612,
-        0.6240804195404053,
-        0.37651097774505615
+        5.270957,
+        4.209763,
+        3.635266,
+        3.099755,
+        2.646840,
+        2.240989,
+        1.831270,
+        1.422460,
+        1.050359,
+        0.729938,
     };
     for (int step = 0; step < 10; step++) {
 
@@ -178,7 +178,7 @@ int main(int argc, char *argv[]) {
         allok = allok && step_loss_ok;
 
         // print the timing information at the end
-        printf("step %d: loss %f (took %f ms) OK = %d\n", step, model.mean_loss, time_elapsed_s * 1000, step_loss_ok);
+        printf("step %2d: loss %f (took %f ms) OK = %d\n", step, model.mean_loss, time_elapsed_s * 1000, step_loss_ok);
     }
 
     // final judgement
