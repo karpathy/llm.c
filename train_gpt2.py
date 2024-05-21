@@ -404,8 +404,10 @@ if __name__ == "__main__":
     parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
     parser.add_argument("--flash", type=int, default=0, help="use flash attention")
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
-    parser.add_argument("--batch_size", type=int, default=4, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
+    parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
     args = parser.parse_args()
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
@@ -442,6 +444,13 @@ if __name__ == "__main__":
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 device = "mps"
     print(f"using device: {device}")
+
+    # calculate gradient accumulation from the desired total batch size and the current run configuration
+    tokens_per_fwdbwd = B * T * ddp_world_size
+    assert args.total_batch_size % tokens_per_fwdbwd == 0
+    grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
+    print(f"total desired batch size: {args.total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
     # set up a context manager following the desired dtype and device
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
@@ -544,14 +553,34 @@ if __name__ == "__main__":
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     timings = []
-    for i in range(args.num_iterations):
+    norm = -1.0   # dummy value to print in inference-only mode
+    for step in range(args.num_iterations):
         t0 = time.time()
-        with ctx:
-            _, loss = model(x, y, return_logits=False)
-        if not args.inference_only:
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+
+        # micro-batch loop where we do gradient accumulation to reach desired total batch size
+        lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
+        for micro_step in range(grad_accum_steps):
+            # forward pass
+            with ctx:
+                _, loss = model(x, y, return_logits=False)
+                # we have to scale the loss to account for gradient accumulation,
+                # because the gradients just add on each successive backward().
+                # addition of gradients corresponds to a SUM in the objective, but
+                # instead of a SUM we want MEAN, so we scale the loss here
+                loss = loss / grad_accum_steps
+                lossf += loss.item() # keep track of the mean loss
+            if ddp:
+                # we want only the last micro-step to sync grads in a DDP model
+                # the official way to do this is with model.no_sync(), but that is a
+                # context manager that bloats the code, so we just toggle this variable
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+            # backward pass
+            if not args.inference_only:
+                loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
         # wait on the CPU for all device work to end so we get accurate per-iteration timings below
         if device == "mps":
             torch.mps.synchronize()
@@ -560,9 +589,9 @@ if __name__ == "__main__":
         # time and print
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
-        tokens_per_second = ddp_world_size * B * T / (t1-t0)
-        print0(f"iteration {i+1}, loss: {loss.item():.4f}, time: {(t1-t0)*1000:.3f}ms, tok/s: {tokens_per_second:.2f}")
-        if i > 0 and i > args.num_iterations - 20:
+        tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
+        print0(f"iteration {step+1}, loss: {lossf:.4f}, time: {(t1-t0)*1000:.3f}ms, tok/s: {tokens_per_second:.2f}, norm: {norm:.3f}")
+        if step > 0 and step > args.num_iterations - 20:
             timings.append(t1-t0)
 
     # print the average of the last 20 timings, to get something smooth-ish
