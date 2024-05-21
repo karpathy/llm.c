@@ -12,6 +12,7 @@ Implements a medium simple DataLoader for a distributed training setup.
 
 // ----------------------------------------------------------------------------
 // Distributed Data Loader
+#define HEADER_SIZE 256
 
 typedef struct {
     // Distributed data parallel specifics.
@@ -26,12 +27,19 @@ typedef struct {
     long file_size;
     long current_position;
     // outputs
-    int* batch;
-    int* inputs;
-    int* targets;
+    uint16_t* buffer; // used to fread data from file into
+    int* inputs;  // input tokens into transformer
+    int* targets; // target tokens for the transformer
     // convenience variables
     size_t num_batches;
 } DataLoader;
+
+void dataloader_reset(DataLoader *loader) {
+    // each process starts at a different offset in the file
+    long header_bytes = HEADER_SIZE * sizeof(int);
+    long token_bytes_offset = loader->process_rank * loader->B * loader->T * sizeof(uint16_t);
+    loader->current_position = header_bytes + token_bytes_offset;
+}
 
 void dataloader_init(DataLoader *loader,
                      const char* filename,
@@ -46,46 +54,64 @@ void dataloader_init(DataLoader *loader,
 
     // open the input file for reading
     loader->tokens_file = fopenCheck(filename, "rb");
+    // validate the header
+    int header[HEADER_SIZE];
+    freadCheck(header, sizeof(int), HEADER_SIZE, loader->tokens_file);
+    if (header[0] != 20240520) { printf("Bad magic in data file\n"); exit(EXIT_FAILURE); }
+    if (header[1] != 1) { printf("Bad version in data file\n"); exit(EXIT_FAILURE); }
+    long ntok = header[2]; // number of tokens in the file
 
-    // determine the file size
-    fseekCheck(loader->tokens_file, 0, SEEK_END);
-    loader->file_size = ftell(loader->tokens_file);
-    fseekCheck(loader->tokens_file, 0, SEEK_SET);
-    if (loader->file_size < (B * T + 1) * sizeof(int)) {
-        printf("Error: file size is too small for the batch size and sequence length\n");
+    // determine the file size and make sure it is consistent with the number of tokens
+    fseekCheck(loader->tokens_file, 0, SEEK_END); // seek to end of file
+    loader->file_size = ftell(loader->tokens_file); // read the offset, i.e. file size
+    fseekCheck(loader->tokens_file, 0, SEEK_SET); // seek back to the beginning
+    // we expect ntok in the file to be consistent with filesize, assert that is the case
+    long expected_file_size = HEADER_SIZE * sizeof(int) + ntok * sizeof(uint16_t);
+    if (loader->file_size != expected_file_size) {
+        printf("Error: file size is not as expected\n");
         exit(EXIT_FAILURE);
     }
-    loader->current_position = loader->process_rank * B * T * sizeof(int); // start at the beginning
+    if (ntok < num_processes * B * T + 1) {
+        // being too defensive/lazy, we could tolerate as low as T+1 tokens in principle
+        printf("Error: there are too few tokens\n");
+        exit(EXIT_FAILURE);
+    }
 
     // allocate space for B*T + 1 integers to store the inputs and targets
-    loader->batch = (int*)malloc((B * T + 1) * sizeof(int));
-    loader->inputs = loader->batch;
-    loader->targets = loader->batch + 1; // targets are shifted by one
+    loader->buffer = (uint16_t*)malloc((B * T + 1) * sizeof(uint16_t));
+    loader->inputs = (int*)malloc(B * T * sizeof(int));
+    loader->targets = (int*)malloc(B * T * sizeof(int));
     // note: we definitely want to advance by B * T; That is the "stride" by which we move
     // the window of tokens. We only load B * T + 1 tokens because our targets are offset by 1
-    loader->num_batches = loader->file_size / (loader->num_processes * B * T * sizeof(int));
-}
+    loader->num_batches = ntok / (num_processes * B * T);
 
-void dataloader_reset(DataLoader *loader) {
-    loader->current_position = 0;
+    // reset the loader to the beginning of the file
+    dataloader_reset(loader);
 }
 
 void dataloader_next_batch(DataLoader *loader) {
     size_t B = loader->B;
     size_t T = loader->T;
     // if we are at the end of the file, loop back to the beginning
-    if (loader->current_position + (loader->num_processes * B * T + 1) * sizeof(int) > loader->file_size) {
-        loader->current_position = loader->process_rank * B * T * sizeof(int);
+    if (loader->current_position + (loader->num_processes * B * T + 1) * sizeof(uint16_t) > loader->file_size) {
+        dataloader_reset(loader);
     }
-    // read the B*T+1 integers from the file into batch
+    // read B*T+1 uint16_t tokens from the file into buffer
     fseekCheck(loader->tokens_file, loader->current_position, SEEK_SET);
-    freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
+    freadCheck(loader->buffer, sizeof(uint16_t), B*T+1, loader->tokens_file);
+    // decode the buffer into inputs and targets (cast to int)
+    for (int i = 0; i < B*T; i++) {
+        loader->inputs[i] = (int)loader->buffer[i];
+        loader->targets[i] = (int)loader->buffer[i+1];
+    }
     // advance the current position by B*T*num_processes integers
     // note: the "stride" of tokens by which we move each time is definitely B * T
-    loader->current_position += loader->num_processes * B * T * sizeof(int);
+    loader->current_position += loader->num_processes * B * T * sizeof(uint16_t);
 }
 
 void dataloader_free(DataLoader *loader) {
-    free(loader->batch);
+    free(loader->buffer);
+    free(loader->inputs);
+    free(loader->targets);
     fcloseCheck(loader->tokens_file);
 }

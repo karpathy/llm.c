@@ -17,7 +17,7 @@ streams of int32 numbers indicating the token ids.
 import os
 import tiktoken
 import numpy as np
-from data_common import download_file
+from data_common import download_file, write_datafile
 
 # -----------------------------------------------------------------------------
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "tinyshakespeare")
@@ -52,13 +52,8 @@ def tokenize():
     # save to file
     val_filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare_val.bin")
     train_filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare_train.bin")
-    with open(val_filename, "wb") as f:
-        f.write(val_tokens_np.tobytes())
-    with open(train_filename, "wb") as f:
-        f.write(train_tokens_np.tobytes())
-    # prints
-    print(f"Saved {len(val_tokens_np)} tokens to {val_filename}")
-    print(f"Saved {len(train_tokens_np)} tokens to {train_filename}")
+    write_datafile(val_filename, val_tokens_np)
+    write_datafile(train_filename, train_tokens_np)
 
 if __name__ == "__main__":
     download()

@@ -23,8 +23,12 @@ def download_file(url: str, fname: str, chunk_size=1024):
             bar.update(size)
 
 
-def write_shard(filename, toks):
-    """Saves token data as a .bin file, for reading in C"""
+def write_datafile(filename, toks):
+    """
+    Saves token data as a .bin file, for reading in C.
+    - First comes a header with 256 int32s
+    - The tokens follow, each as a uint16
+    """
     assert len(toks) < 2**31, "token count too large" # ~2.1B tokens
     # construct the header
     header = np.zeros(256, dtype=np.int32)
@@ -37,7 +41,7 @@ def write_shard(filename, toks):
     # construct the tokens
     toks_np = np.array(toks, dtype=np.uint16)
     # write to file
-    print(f"writing {filename}")
+    print(f"writing {len(toks):,} tokens to {filename}")
     with open(filename, "wb") as f:
         f.write(header.tobytes())
         f.write(toks_np.tobytes())

@@ -25,7 +25,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 import argparse
 
-from data_common import write_shard
+from data_common import write_datafile
 # ------------------------------------------
 
 parser = argparse.ArgumentParser(description="FineWeb dataset preprocessing")
@@ -75,7 +75,7 @@ for tokens in pool.imap(tokenize, fw):
         filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{shard_index:06d}.bin")
         write_tokens = all_tokens[:args.shard_size]
         rest_tokens = all_tokens[args.shard_size:]
-        write_shard(filename, write_tokens)
+        write_datafile(filename, write_tokens)
         shard_index += 1
         progress_bar = None
         # note: create a copy so Python can free the all_tokens memory above

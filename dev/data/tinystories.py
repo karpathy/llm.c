@@ -25,7 +25,7 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import tiktoken
 import numpy as np
-from data_common import download_file
+from data_common import download_file, write_datafile
 
 # -----------------------------------------------------------------------------
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "tinystories")
@@ -96,9 +96,7 @@ def tokenize():
 
         all_tokens_np = np.array(all_tokens, dtype=np.int32)
         split_filename = os.path.join(DATA_CACHE_DIR, f"TinyStories_{split_name}.bin")
-        with open(split_filename, "wb") as f:
-            f.write(all_tokens_np.tobytes())
-        print(f"Saved {len(all_tokens_np)} tokens to {split_filename}")
+        write_datafile(split_filename, all_tokens_np)
 
 if __name__ == "__main__":
     download()
