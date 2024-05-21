@@ -980,30 +980,34 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
     }
 }
 
-__global__ void __launch_bounds__(512, 3) // todo - any warnings on Turing with only 1024 threads?
-                layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+__global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with only 1024 threads?
+                layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                                             const floatX* dout, const floatX* inp, const floatX* weight,
                                             const floatX* mean, const floatX* rstd,
                                             int B, int T, int C) {
+    constexpr int BLOCK_SIZE = 512;
+    constexpr int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
     extern __shared__ float shared[]; // size = 2 * C + 1
+
     int warpId = threadIdx.x / WARP_SIZE; // warp index within a block
-    int warpsInBlock = blockDim.x / WARP_SIZE; //number of warps in block
     int baseIdx = blockIdx.x * warpsInBlock + warpId;
     int warpThreadIdx = threadIdx.x % WARP_SIZE; // Thread index within the warp
     int warpsInGrid = gridDim.x * warpsInBlock;
     int C_per_iteration = WARP_SIZE * x128::size;
-    int iterations_C = C / C_per_iteration;
+    int iterations_C = CEIL_DIV(C, C_per_iteration);
 
     // the first half of shared memory is bias, second is weight
     float* dbias_shared = shared;
     float* dweight_shared = shared + C;
+    float* dbias_tmp_shared = shared + 2 * C;
+    float* dweight_tmp_shared = shared + 2 * C + BLOCK_SIZE;
 
     // init shared memory to zero
-    for(int i = threadIdx.x; i < C; i+= blockDim.x){
+    for(int i = threadIdx.x; i < C; i+= BLOCK_SIZE){
        dbias_shared[i] = 0.0f;
        dweight_shared[i] = 0.0f;
     }
-    unsigned int *tmp_flag = (unsigned int*)(shared + C*2);
+    unsigned int *tmp_flag = (unsigned int*)(shared + 2*C + 2*BLOCK_SIZE);
     __syncthreads();
 
     for (int idx = baseIdx; idx < B * T; idx += warpsInGrid) {
@@ -1041,6 +1045,10 @@ __global__ void __launch_bounds__(512, 3) // todo - any warnings on Turing with 
         for (int i = 0; i < iterations_C; i++) {
             int global_index = (warpThreadIdx * x128::size) + (i * C_per_iteration);
             int shared_index = warpThreadIdx + (i * C_per_iteration);
+            if (global_index >= C) {
+                break;
+            }
+
             x128 dout128   = load128cs(dout_bt + global_index);
             x128 inp128    = load128cs(inp_bt  + global_index);
             x128 dinp128   = load128(dinp_bt   + global_index);
@@ -1050,10 +1058,29 @@ __global__ void __launch_bounds__(512, 3) // todo - any warnings on Turing with 
                 float dout_i = (float)dout128[x];
                 float norm_bti = ((float)inp128[x] - mean_bt) * rstd_bt;
                 float dnorm_i = (float)weight128[x] * dout_i;
-                // gradient contribution to bias (using shared memory friendly index)
-                atomicAdd(&dbias_shared[shared_index + x*WARP_SIZE], dout_i);
-                // gradient contribution to weight (using shared memory friendly index)
-                atomicAdd(&dweight_shared[shared_index + x*WARP_SIZE], norm_bti * dout_i);
+
+                // sum up the gradients for bias and weight across the entire block
+                // this is basically a reduction (but only inter-warp, not intra-warp)
+                // doing it this way allows us to avoid using atomics while using many warps
+                if (warpId != 0) {
+                    dbias_tmp_shared[threadIdx.x] = dout_i;
+                    dweight_tmp_shared[threadIdx.x] = norm_bti * dout_i;
+                }
+                __syncthreads();
+                if (warpId == 0) {
+                    float dbias_tmp = dout_i;
+                    float dweight_tmp = norm_bti * dout_i;
+                    for (int j = 1; j < warpsInBlock; j++) {
+                        dbias_tmp += dbias_tmp_shared[threadIdx.x + j * WARP_SIZE];
+                        dweight_tmp += dweight_tmp_shared[threadIdx.x + j * WARP_SIZE];
+                    }
+                    // gradient contribution to bias (using shared memory friendly index)
+                    dbias_shared[shared_index + x*WARP_SIZE] += dbias_tmp;
+                    // gradient contribution to weight (using shared memory friendly index)
+                    dweight_shared[shared_index + x*WARP_SIZE] += dweight_tmp;
+                }
+                __syncthreads();
+
                 // gradient contribution to input
                 float dval = 0.0f;
                 dval += dnorm_i; // term 1
@@ -1066,35 +1093,64 @@ __global__ void __launch_bounds__(512, 3) // todo - any warnings on Turing with 
             store128cg(dinp_bt + global_index, dinp128);
         }
     }
-    // Accumulate into a FP32 scratchpad
-    // BF16 atomics are potentially much slower... and this is more precise!
-    // todo - could potentially avoid the extra copy if floatX is FP32, fairly negligible though
     __syncthreads();
+    // Each block writes its partial sum to global memory
+    // The last block to finish becomes responsible for summing up all the partial sums
+    // This is done by atomically incrementing a flag (cleared to 0 before launching the kernel)
+    unsigned int* scratchFlag = (unsigned int*)(scratch);
+    // Increment scratch pointer by a full cacheline so that everything remains cacheline aligned
+    scratch += 32;
     float* scratch_dbias = scratch;
     float* scratch_dweight = scratch + C;
-    unsigned int* scratchFlag = (unsigned int*)(scratch + (2 * C));
-    for(int i = threadIdx.x; i < C; i+= blockDim.x) {
-        // global atomics in the same "shared memory banking friendly" order
-        atomicAdd(&scratch_dbias[i], dbias_shared[i]);
-        atomicAdd(&scratch_dweight[i], dweight_shared[i]);
+    for(int i = threadIdx.x; i < C; i+= BLOCK_SIZE) {
+        // Write to global memory in the same "shared memory banking friendly" order
+        scratch_dbias[i + 2*C*blockIdx.x] = dbias_shared[i];
+        scratch_dweight[i + 2*C*blockIdx.x] = dweight_shared[i];
     }
+
     __syncthreads();
     if (threadIdx.x == 0) {
         *tmp_flag = atomicInc(scratchFlag, gridDim.x);
     }
     __syncthreads();
     if (*tmp_flag == gridDim.x-1) {
+        // Reduction of the partial sums by the final block
+        // todo - there isn't enough parallelism even inside that single SM...
+        // ==> so could maybe split into another kernel with YET ANOTHER level of reduction?!
+        for(int i = threadIdx.x * f128::size; i < C; i+= BLOCK_SIZE * f128::size) {
+            f128 dbias_accum(make_int4(0, 0, 0, 0));
+            f128 dweight_accum(make_int4(0, 0, 0, 0));
+
+            for (int read_block_idx = 0; read_block_idx < gridDim.x; read_block_idx++) {
+                int offset = i + 2*C*read_block_idx;
+                f128 dbias128 = load128(scratch_dbias + offset);
+                f128 dweight128 = load128(scratch_dweight + offset);
+                for(int k = 0; k < f128::size; k++) {
+                    dbias_accum[k] += dbias128[k];
+                    dweight_accum[k] += dweight128[k];
+                }
+            }
+            store128(dbias_shared + i, dbias_accum);
+            store128(dweight_shared + i, dweight_accum);
+        }
+        __syncthreads();
+
+        // reorder from atomic/shared memory-friendly index to real global memory index
+        // and convert from float/FP32 to floatX/BF16 for the final write
+        // this is separate also because it cannot use as many warps as the above (f128 vs x128)
+        // todo - if we split this code into another kernel, we could maybe do it at the same time?
         for (int i = warpId; i < iterations_C; i += warpsInBlock) {
-            // reorder from atomic/shared memory-friendly index to real global memory index
-            // and convert from float/FP32 to floatX/BF16 for the final write
             int global_index = (warpThreadIdx * x128::size) + (i * C_per_iteration);
             int shared_index = warpThreadIdx + (i * C_per_iteration);
+            if (global_index >= C) {
+                break;
+            }
 
             x128 dbias128 = load128(dbias + global_index);
             x128 dweight128 = load128(dweight + global_index);
             for (int x = 0; x < x128::size; x++) {
-                float s_db = scratch_dbias[shared_index + x*WARP_SIZE];
-                float s_dw = scratch_dweight[shared_index + x*WARP_SIZE];
+                float s_db = dbias_shared[shared_index + x*WARP_SIZE];
+                float s_dw = dweight_shared[shared_index + x*WARP_SIZE];
                 dbias128[x] = (floatX)(s_db + (float)dbias128[x]);
                 dweight128[x] = (floatX)(s_dw + (float)dweight128[x]);
             }
@@ -1603,15 +1659,13 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
                         const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
                         int B, int T, int C) {
     NVTX_RANGE_FN();
-    // todo - forcing 3 x 512 threads per SM maximum is a bit hacky, but more than that results in
-    // cache thrashing and lower performance on A100... is there a better way?
     const int block_size = 512;
-    const int blocks_per_sm = min(3, (deviceProp.maxThreadsPerMultiProcessor / 1024));
+    const int blocks_per_sm = 2; // supported on every architecture and less cache thrashing than 3
     const int grid_size = blocks_per_sm * deviceProp.multiProcessorCount;
-    size_t shared_mem_size = (2 * C + 1) * sizeof(float);
+    size_t shared_mem_size = (2*C + 2*block_size + 1) * sizeof(float);  // see kernel
 
-    cudaMemset(scratch, 0, (2 * C + 1) * sizeof(float));
-    layernorm_backward_kernel8<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+    cudaMemset(scratch, 0, 1 * sizeof(float)); // only need to reset the flag to 0
+    layernorm_backward_kernel9<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
