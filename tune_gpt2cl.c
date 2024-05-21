@@ -2,7 +2,7 @@
 #include "train_gpt2cl.c"
 
 #define NUM_STEPS 6
-#define SKIP_STEPS 2
+#define SKIP_STEPS 3
 
 int do_run(double *time_taken) {
     // build the GPT-2 model from a checkpoint
