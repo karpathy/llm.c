@@ -94,9 +94,8 @@ def tokenize():
             for future in as_completed(futures):
                 all_tokens.extend(future.result())
 
-        all_tokens_np = np.array(all_tokens, dtype=np.int32)
         split_filename = os.path.join(DATA_CACHE_DIR, f"TinyStories_{split_name}.bin")
-        write_datafile(split_filename, all_tokens_np)
+        write_datafile(split_filename, all_tokens)
 
 if __name__ == "__main__":
     download()

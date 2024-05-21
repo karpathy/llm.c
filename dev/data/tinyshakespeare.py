@@ -45,15 +45,14 @@ def tokenize():
     text = text.replace('\n\n', '\n\n<|endoftext|>')
     # encode the text
     tokens = encode(text)
-    tokens_np = np.array(tokens, dtype=np.int32)
     # let's take the first 32,768 tokens as the validation split (~10%)
-    val_tokens_np = tokens_np[:32768]
-    train_tokens_np = tokens_np[32768:]
+    val_tokens = tokens[:32768]
+    train_tokens = tokens[32768:]
     # save to file
     val_filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare_val.bin")
     train_filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare_train.bin")
-    write_datafile(val_filename, val_tokens_np)
-    write_datafile(train_filename, train_tokens_np)
+    write_datafile(val_filename, val_tokens)
+    write_datafile(train_filename, train_tokens)
 
 if __name__ == "__main__":
     download()

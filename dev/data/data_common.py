@@ -38,7 +38,7 @@ def write_datafile(filename, toks):
     # validate that no token exceeds a uint16
     maxtok = 2**16
     assert all(0 <= t < maxtok for t in toks), "token dictionary too large for uint16"
-    # construct the tokens
+    # construct the tokens numpy array
     toks_np = np.array(toks, dtype=np.uint16)
     # write to file
     print(f"writing {len(toks):,} tokens to {filename}")
