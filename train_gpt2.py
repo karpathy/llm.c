@@ -514,6 +514,8 @@ if __name__ == "__main__":
         ntok = header[2] # number of tokens (claimed)
         # the rest of it are tokens, stored as uint16
         tokens = np.frombuffer(f.read(), dtype=np.uint16)
+        # convert tokens to int32 because torch can't handle uint16 sad
+        tokens = tokens.astype(np.int32)
         assert len(tokens) == ntok, "number of tokens read does not match header?"
 
     # np -> tensor, long, on device
