@@ -39,6 +39,7 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #include <stdarg.h>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <functional>
 #include <unordered_map>
 // GPU / CUDA related
