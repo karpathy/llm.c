@@ -55,7 +55,6 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
 #include "tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
-// defines: evalloader_init, evalloader_reset, evalloader_next_batch, evalloader_free
 #include "dataloader.h"
 // defines: manual_seed, normal_
 // numerically identical to PyTorch's torch.manual_seed and torch.normal
@@ -497,11 +496,11 @@ void destroy_cudnn();
 void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
                              float* stats, // output for backward pass: (B, NH, T)
                              floatX* inp,  // input: (B, T, 3, NH, HS) QKV
-                             int B, int T, int NH, int C);
+                             int B, int T, int NH, int C, cudaStream_t stream);
 
 void attention_backward_cudnn(floatX* dqkvr,                                       // output
                               floatX* dout, floatX* qkvr, floatX* o, float* stats, // inputs
-                              int B, int T, int NH, int C);
+                              int B, int T, int NH, int C, cudaStream_t stream);
 #else
 void create_cudnn() {}
 void destroy_cudnn() {}
@@ -1353,41 +1352,41 @@ __global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n) {
 
 void encoder_forward(floatX* out,
                      const int* inp, const floatX* wte, const floatX* wpe,
-                     int B, int T, int C) {
+                     int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int N = B * T * C;
     const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
-    encoder_forward_kernel3<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
+    encoder_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, inp, wte, wpe, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
 void encoder_backward(floatX* dwte, floatX* dwpe,
                     const floatX* dout, const int* inp,
-                    int B, int T, int C, unsigned int seed) {
+                    int B, int T, int C, unsigned int seed, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int N = B * T * C;
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size * 2); // each thread handles 2 elements
-    encoder_backward_kernel<<<grid_size, block_size>>>(dwte, dwpe, dout, inp, B, T, C, seed);
+    encoder_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwte, dwpe, dout, inp, B, T, C, seed);
     cudaCheck(cudaGetLastError());
 }
 
 void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
                        floatX* inp, const floatX* weight, const floatX* bias,
-                       int B, int T, int C) {
+                       int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 512;
     const int N = B * T;
     const int grid_size = CEIL_DIV(N * WARP_SIZE, block_size);
-    layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
+    layernorm_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
 
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
 void matmul_forward_cublaslt(floatX* out,
                      floatX* inp, floatX* weight, floatX* bias,
-                     int B, int T, int C, int OC) {
+                     int B, int T, int C, int OC, cudaStream_t stream) {
     NVTX_RANGE_FN();
     int has_bias = (bias != NULL);
 
@@ -1444,7 +1443,7 @@ void matmul_forward_cublaslt(floatX* out,
     cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
         &alpha, weight, weightLayout, inp, inputLayout, &beta,
         out, outputLayout, out, outputLayout, &heuristic.algo,
-        cublaslt_workspace, cublaslt_workspace_size, 0));
+        cublaslt_workspace, cublaslt_workspace_size, stream));
 
     // cleanups
     cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
@@ -1457,7 +1456,7 @@ void matmul_forward_cublaslt(floatX* out,
 
 void attention_forward(floatX* out, floatX* qkvr, floatX* att,
                        floatX* inp,
-                       int B, int T, int C, int NH) {
+                       int B, int T, int C, int NH, cudaStream_t stream) {
     NVTX_RANGE_FN();
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
     // Its contents will be overwritten by this function.
@@ -1476,10 +1475,11 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     v = qkvr + 2 * B * T * C;
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
-    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+    permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, B, T, NH, HS);
 
 
     floatX* preatt = inp;
+    cublasCheck(cublasSetStream(cublas_handle, stream));
     cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
                                      CUBLAS_OP_T, CUBLAS_OP_N,
                                      T, T, HS, &alpha,
@@ -1491,7 +1491,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
     int grid_size = CEIL_DIV(B * NH * T * 32, block_size);
-    softmax_forward_kernel5<<<grid_size, block_size>>>(att, scale, preatt, B * NH, T);
+    softmax_forward_kernel5<<<grid_size, block_size, 0, stream>>>(att, scale, preatt, B * NH, T);
 
     // new approach: first cuBLAS another batched matmul
     floatX* vaccum = inp;
@@ -1507,23 +1507,23 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+    unpermute_kernel<<<num_blocks, block_size, 0, stream>>>(vaccum, out, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
 
-void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
+void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     assert(N % block_size == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    residual_forward_kernel<<<grid_size, block_size>>>(out, inp1, inp2);
+    residual_forward_kernel<<<grid_size, block_size, 0, stream>>>(out, inp1, inp2);
     cudaCheck(cudaGetLastError());
 }
 
 void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
                              const floatX* inp1, const floatX* inp2,
                              const floatX* weight, const floatX* bias,
-                             int N, int C) {
+                             int N, int C, cudaStream_t stream) {
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
     const int grid_size = CEIL_DIV(N, block_y);
@@ -1535,38 +1535,38 @@ void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, flo
     auto status = cudaFuncSetAttribute(fused_residual_forward_kernel5, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaGetLastError();
     if(status == cudaSuccess) {
-        fused_residual_forward_kernel5<<<grid_size, dim3(WARP_SIZE, block_y), smem>>>(residual, normed, mean, rstd, inp1, inp2,
+        fused_residual_forward_kernel5<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(residual, normed, mean, rstd, inp1, inp2,
                                                                                weight, bias, N, C);
     } else {
-        residual_forward(residual, inp1, inp2, N*C);
-        layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C);
+        residual_forward(residual, inp1, inp2, N*C, stream);
+        layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C, stream);
     }
     cudaCheck(cudaGetLastError());
 }
 
 
-void gelu_forward(floatX* out, const floatX* inp, int N) {
+void gelu_forward(floatX* out, const floatX* inp, int N, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 512;
     assert(N % block_size == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_forward_kernel2<<<grid_size, block_size>>>(out, inp);
+    gelu_forward_kernel2<<<grid_size, block_size, 0, stream>>>(out, inp);
     cudaCheck(cudaGetLastError());
 }
 
-void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
+void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const int N, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 128;
     assert(N % block_size == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout);
+    gelu_backward_kernel<<<grid_size, block_size, 0, stream>>>(dinp, inp, dout);
     cudaCheck(cudaGetLastError());
 }
 
 void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
                      floatX* dout, floatX* inp, floatX* weight,
                      float* dbias_buffer,
-                     int B, int T, int C, int OC) {
+                     int B, int T, int C, int OC, cudaStream_t stream) {
     NVTX_RANGE_FN();
     float one = 1.0f, zero = 0.0f;
 
@@ -1585,17 +1585,18 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
         // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
         // and write results directly to the output.
         if(grid_size_y == 1) {
-            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
+            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim, 0, stream>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
             cudaCheck(cudaGetLastError());
         } else {
             // kernel 9 overwrites temp buffer, so no need to memset
-            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
+            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim, 0, stream>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
             cudaCheck(cudaGetLastError());
-            reduce_add_sum_kernel<<<CEIL_DIV(OC, 256 * f128::size), 256>>>(dbias, dbias_buffer, OC, grid_size_y);
+            reduce_add_sum_kernel<<<CEIL_DIV(OC, 256 * f128::size), 256, 0, stream>>>(dbias, dbias_buffer, OC, grid_size_y);
             cudaCheck(cudaGetLastError());
         }
     }
 
+    cublasCheck(cublasSetStream(cublas_handle, stream));
     // backward to input, uses = in the backward pass (set the gradient)
     cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &one,
                              weight, CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &zero,
@@ -1609,7 +1610,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
 
 void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                         const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
-                        int B, int T, int C) {
+                        int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     // todo - forcing 3 x 512 threads per SM maximum is a bit hacky, but more than that results in
     // cache thrashing and lower performance on A100... is there a better way?
@@ -1619,7 +1620,7 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     size_t shared_mem_size = (2 * C + 1) * sizeof(float);
 
     cudaMemset(scratch, 0, (2 * C + 1) * sizeof(float));
-    layernorm_backward_kernel8<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+    layernorm_backward_kernel8<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1629,7 +1630,7 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
 void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* datt, floatX* scratch,
                         const floatX* dout,
                         const floatX* qkvr, const floatX* att,
-                        int B, int T, int C, int NH) {
+                        int B, int T, int C, int NH, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     int HS = C / NH; // head size
@@ -1647,8 +1648,9 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* da
 
     // backward through the unpermute operation
     int num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel_backward<<<num_blocks, block_size>>>(scratch, dout, B, T, NH, HS);
+    unpermute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(scratch, dout, B, T, NH, HS);
     // backward into datt
+    cublasCheck(cublasSetStream(cublas_handle, stream));
     cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha,
                                            v, CUBLAS_LOWP, HS, T * HS, scratch, CUBLAS_LOWP, HS, T * HS, &beta,
                                            datt, CUBLAS_LOWP, T, T * T, B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
@@ -1659,7 +1661,7 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* da
     // backward into preatt
     int hs = C / NH; // head size
     float scale = 1.0f / sqrtf(hs);
-    softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256, 256>>>(dpreatt, datt, att, B, T, C, scale);
+    softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256, 256, stream>>>(dpreatt, datt, att, B, T, C, scale);
     // backward into q
     cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha,
                                            k, CUBLAS_LOWP, HS, T * HS, dpreatt, CUBLAS_LOWP, T, T * T, &beta,
@@ -1670,7 +1672,7 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* da
                                            dk, CUBLAS_LOWP, HS, T * HS, B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
     // backward into inp
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
-    permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
+    permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dinp, dq, dk, dv, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1678,17 +1680,17 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* da
 template <typename Type>
 void fused_classifier(Type* logits, Type* losses,
                       const float dloss, const int* targets,
-                      int B, int T, int V, int P) {
+                      int B, int T, int V, int P, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = N;
-    fused_classifier_kernel5<<<grid_size, block_size, 512>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
+    fused_classifier_kernel5<<<grid_size, block_size, 512, stream>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
     cudaCheck(cudaGetLastError());
 }
 
 template<typename T>
-void global_norm_squared(float* out, const T* values, size_t count) {
+void global_norm_squared(float* out, const T* values, size_t count, cudaStream_t stream) {
     const int block_size = 512;
     // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
     // having one block less than possible is a tiny performance hit, having
@@ -1699,7 +1701,23 @@ void global_norm_squared(float* out, const T* values, size_t count) {
     assert(grid_size > 0);      // gives a better error than letting the call below fail
     // initialize out with zero
     cudaCheck(cudaMemset(out, 0, sizeof(float)));
-    global_norm_squared_kernel<<<grid_size, block_size>>>(out, values, count);
+    global_norm_squared_kernel<<<grid_size, block_size, 0, stream>>>(out, values, count);
+    cudaCheck(cudaGetLastError());
+}
+
+template <typename Tp, typename Tg>
+void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+                  float learning_rate, float beta1, float beta2, int t, float eps, float weight_decay,
+                  float grad_scale, unsigned int seed, cudaStream_t stream) {
+    // AdamW update
+    int block_size = 512;
+    int num_blocks = CEIL_DIV(num_parameters, block_size);
+    float beta1_correction = 1.0f - powf(beta1, t);
+    float beta2_correction = 1.0f - powf(beta2, t);
+    adamw_kernel3<<<num_blocks, block_size, 0, stream>>>(params_memory, master_params_memory, grads_memory,
+                                              m_memory, v_memory, num_parameters,
+                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
+                                              grad_scale, seed);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1956,6 +1974,7 @@ typedef struct {
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
     int use_master_weights;
     int recompute;
+    cudaStream_t main_stream;
 } GPT2;
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -2038,6 +2057,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->rng_state = 13371337;
     model->use_master_weights = 1; // keep master weights copy in float for optim update?
     model->recompute = 1; // default to recompute gelu during backward
+    cudaStreamCreate(&model->main_stream);
 }
 
 void gpt2_build_from_random(GPT2 *model, int depth) {
@@ -2207,13 +2227,15 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     }
 
+    cudaStream_t main_stream = model->main_stream;
+
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
 
     // first layernorm isn't fused
-    layernorm_forward(acts.ln1, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C);
+    layernorm_forward(acts.ln1, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
@@ -2251,22 +2273,22 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         // now do the forward pass
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C);
+        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         floatX* scratch = (floatX*)acts.output;
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
+        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
         #endif
 
-        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, l_attproj, l_ln2w, l_ln2b, B*T, C);
-        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
-        gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, l_attproj, l_ln2w, l_ln2b, B*T, C, main_stream);
+        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream);
+        gelu_forward(l_fch_gelu, l_fch, B*T*4*C, main_stream);
+        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
 
         // OK, fusion across blocks.
         if(l+1 != L) {
@@ -2276,22 +2298,22 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
             const floatX* l_ln1b = params.ln1b + (l + 1) * C;
             fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, l_fcproj, l_ln1w, l_ln1b,
-                                    B * T, C);
+                                    B * T, C, main_stream);
         } else {
             fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, l_fcproj,
                                     params.lnfw, params.lnfb,
-                                    B * T, C);
+                                    B * T, C, main_stream);
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         NvtxRange classifier_and_loss_range("classifier_and_loss");
         // fused classifier: does the forward pass and first part of the backward pass
         const float dloss = 1.0f / (B * T * grad_accum_steps); // results in the uniform average loss over all elements
-        fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp);
+        fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, main_stream);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost));
         float mean_loss = 0.0f;
@@ -2363,16 +2385,18 @@ void gpt2_backward(GPT2 *model) {
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
     float* scratchF = (float*)acts.output;
 
+    cudaStream_t main_stream = model->main_stream;
+
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // this was done in the fused classifier kernel as last step of forward pass
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     floatX* dresidual = (floatX*)grads_acts.residual3; // the main buffer holding the gradient in the backward pass
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
 
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
@@ -2425,18 +2449,18 @@ void gpt2_backward(GPT2 *model) {
         if(model->recompute >= 1) {
             // recompute >= 1 means we recompute gelu. in this case,
             // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
-            gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+            gelu_forward(l_fch_gelu, l_fch, B*T*4*C, main_stream);
         }
-        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C);
-        gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C);
-        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C);
+        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream);
+        gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C, main_stream);
+        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
-        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
-        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C);
+        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
+        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
 
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C);
+        attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
@@ -2444,15 +2468,15 @@ void gpt2_backward(GPT2 *model) {
         floatX* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
         floatX* dl_preatt = (floatX*)grads_acts.preatt; // dedicated scratchpad allocation
         floatX* scratchX =  (floatX*)acts.output;
-        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
+        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         #endif
 
         // QKV parameter gradients
-        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C);
+        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
     }
-    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C, random_u32(&model->rng_state));
+    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C, random_u32(&model->rng_state), main_stream);
 }
 
 // Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
@@ -2516,7 +2540,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     // gradient clipping
     // repurposing this buffer (which isn't needed now) to write grad norm into it
     float* grad_norm_squared = (float*)model->acts.output;
-    global_norm_squared(grad_norm_squared, (floatX*)model->grads_memory, model->num_parameters);
+    global_norm_squared(grad_norm_squared, (floatX*)model->grads_memory, model->num_parameters, model->main_stream);
     // transfer the gradient norm to CPU
     float grad_norm_squared_cpu = 0.0f;
     cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
@@ -2530,16 +2554,11 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     float grad_scale = (grad_norm_cpu > grad_clip) ? grad_clip / grad_norm_cpu : 1.0f;
 
     // AdamW update
-    int block_size = 512;
-    int num_blocks = CEIL_DIV(num_parameters, block_size);
-    float beta1_correction = 1.0f - powf(beta1, t);
-    float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
-    adamw_kernel3<<<num_blocks, block_size>>>(params_memory, model->master_weights, grads_memory,
-                                              model->m_memory, model->v_memory, num_parameters,
-                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
-                                              grad_scale, seed);
-    cudaCheck(cudaGetLastError());
+    adamw_update(params_memory, model->master_weights, grads_memory,
+                 model->m_memory, model->v_memory, num_parameters,
+                 learning_rate, beta1, beta2, t, eps, weight_decay,
+                 grad_scale, seed, model->main_stream);
     return grad_norm_cpu;
 }
 
@@ -2567,8 +2586,9 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->grads_acts_memory));
     cudaCheck(cudaFree(model->inputs));
     cudaCheck(cudaFree(model->targets));
-    cudaFreeHost(model->cpu_losses);
-    cudaFreeHost(model->cpu_losses_fp32);
+    cudaCheck(cudaStreamDestroy(model->main_stream));
+    cudaCheck(cudaFreeHost(model->cpu_losses));
+    cudaCheck(cudaFreeHost(model->cpu_losses_fp32));
 }
 
 // ----------------------------------------------------------------------------
@@ -2598,7 +2618,7 @@ void common_free(GPT2 &model) {
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
-    create_cudnn();
+    destroy_cudnn();
 }
 
 #ifndef TESTING
