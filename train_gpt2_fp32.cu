@@ -31,6 +31,8 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include "utils.h"
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
 #include "tokenizer.h"
+// defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
+#include "dataloader.h"
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -1453,75 +1455,6 @@ void gpt2_free(GPT2 *model) {
 
 #ifndef TESTING
 // if we are TESTING (see test_gpt2.cu), we'll skip the int main below
-
-// ----------------------------------------------------------------------------
-// data loader lite: returns random batches of data from a file of integers
-
-typedef struct {
-    // hyperparameters
-    int B;
-    int T;
-    // input handling and its state
-    FILE* tokens_file;
-    long file_size;
-    long current_position;
-    // output memory
-    int* batch;
-    int* inputs;
-    int* targets;
-    // convenience variables
-    long num_batches;
-} DataLoader;
-
-void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
-    loader->B = B;
-    loader->T = T;
-
-    // open the input file for reading
-    loader->tokens_file = fopenCheck(filename, "rb");
-
-    // determine the file size
-    fseekCheck(loader->tokens_file, 0, SEEK_END);
-    loader->file_size = ftell(loader->tokens_file);
-    fseekCheck(loader->tokens_file, 0, SEEK_SET);
-    if (loader->file_size < (B * T + 1) * sizeof(int)) {
-        printf("Error: file size is too small for the batch size and sequence length\n");
-        exit(EXIT_FAILURE);
-    }
-    loader->current_position = 0; // start at the beginning
-
-    // allocate space for B*T + 1 integers to store the inputs and targets
-    // Using CUDA CPU pinned memory for faster PCI Express transfers to GPU
-    // See: https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/
-    cudaMallocHost((void**)&loader->batch, (B * T + 1) * sizeof(int));
-    loader->inputs = loader->batch;
-    loader->targets = loader->batch + 1; // targets are shifted by one
-    loader->num_batches = loader->file_size / (B * T * sizeof(int));
-}
-
-void dataloader_reset(DataLoader *loader) {
-    loader->current_position = 0;
-}
-
-void dataloader_next_batch(DataLoader *loader) {
-    int B = loader->B;
-    int T = loader->T;
-    // if we are at the end of the file, loop back to the beginning
-    if (loader->current_position + (B*T+1) * sizeof(int) > loader->file_size) {
-        loader->current_position = 0;
-    }
-    // read the B*T+1 integers from the file into batch
-    fseekCheck(loader->tokens_file, loader->current_position, SEEK_SET);
-    freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
-    // advance the current position by B*T integers
-    loader->current_position += B*T * sizeof(int);
-}
-
-void dataloader_free(DataLoader *loader) {
-    fcloseCheck(loader->tokens_file);
-    cudaFreeHost(loader->batch);
-}
-
 // ----------------------------------------------------------------------------
 // sampler: takes probabilities and samples integers from them
 
@@ -1689,10 +1622,9 @@ int main(int argc, char *argv[]) {
     assert(strlen(input_dataset_prefix) < 100); // being bit lazy here, make sure we don't overflow
     sprintf(train_tokens_filename, "%s_train.bin", input_dataset_prefix);
     sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
-    DataLoader train_loader;
-    dataloader_init(&train_loader, train_tokens_filename, B, T);
-    DataLoader val_loader;
-    dataloader_init(&val_loader, val_tokens_filename, B, T);
+    DataLoader train_loader, val_loader;
+    dataloader_init(&train_loader, train_tokens_filename, B, T, 0, 1);
+    dataloader_init(&val_loader, val_tokens_filename, B, T, 0, 1);
     int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default for now
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
     printf("| train_num_batches     | %-50d |\n", train_num_batches);
