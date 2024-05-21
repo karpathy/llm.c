@@ -57,7 +57,12 @@ void dataloader_init(DataLoader *loader,
     // validate the header
     int header[HEADER_SIZE];
     freadCheck(header, sizeof(int), HEADER_SIZE, loader->tokens_file);
-    if (header[0] != 20240520) { printf("Bad magic in data file\n"); exit(EXIT_FAILURE); }
+    if (header[0] != 20240520) {
+        printf("Bad magic in the data file\n");
+        printf("---> HINT: Are you passing in a correct file?\n");
+        printf("---> HINT: The data encoding may have changed, re-run data prepro or refer again to README.\n");
+        exit(EXIT_FAILURE);
+    }
     if (header[1] != 1) { printf("Bad version in data file\n"); exit(EXIT_FAILURE); }
     long ntok = header[2]; // number of tokens in the file
 
