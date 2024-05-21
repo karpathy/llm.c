@@ -985,10 +985,8 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
                                             const floatX* dout, const floatX* inp, const floatX* weight,
                                             const floatX* mean, const floatX* rstd,
                                             int B, int T, int C) {
-    constexpr int BLOCK_SIZE = 512;
-    constexpr int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
-    extern __shared__ float shared[]; // size = 2 * C + 1
-
+    extern __shared__ float shared[]; // size = 2*C + 2*block_size + 1
+    int warpsInBlock = blockDim.x / WARP_SIZE; //number of warps in block
     int warpId = threadIdx.x / WARP_SIZE; // warp index within a block
     int baseIdx = blockIdx.x * warpsInBlock + warpId;
     int warpThreadIdx = threadIdx.x % WARP_SIZE; // Thread index within the warp
@@ -1000,14 +998,14 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
     float* dbias_shared = shared;
     float* dweight_shared = shared + C;
     float* dbias_tmp_shared = shared + 2 * C;
-    float* dweight_tmp_shared = shared + 2 * C + BLOCK_SIZE;
+    float* dweight_tmp_shared = shared + 2 * C + blockDim.x;
 
     // init shared memory to zero
-    for(int i = threadIdx.x; i < C; i+= BLOCK_SIZE){
+    for(int i = threadIdx.x; i < C; i+= blockDim.x){
        dbias_shared[i] = 0.0f;
        dweight_shared[i] = 0.0f;
     }
-    unsigned int *tmp_flag = (unsigned int*)(shared + 2*C + 2*BLOCK_SIZE);
+    unsigned int *tmp_flag = (unsigned int*)(shared + 2*C + 2*blockDim.x);
     __syncthreads();
 
     for (int idx = baseIdx; idx < B * T; idx += warpsInGrid) {
@@ -1102,12 +1100,14 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
     scratch += 32;
     float* scratch_dbias = scratch;
     float* scratch_dweight = scratch + C;
-    for(int i = threadIdx.x; i < C; i+= BLOCK_SIZE) {
+    for(int i = threadIdx.x; i < C; i+= blockDim.x) {
         // Write to global memory in the same "shared memory banking friendly" order
         scratch_dbias[i + 2*C*blockIdx.x] = dbias_shared[i];
         scratch_dweight[i + 2*C*blockIdx.x] = dweight_shared[i];
     }
 
+    // todo - everything below could become a separate kernel for better performance with maybe less code
+    // not enough parallelism even inside that single SM... do we need another level of reduction?!
     __syncthreads();
     if (threadIdx.x == 0) {
         *tmp_flag = atomicInc(scratchFlag, gridDim.x);
@@ -1115,9 +1115,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
     __syncthreads();
     if (*tmp_flag == gridDim.x-1) {
         // Reduction of the partial sums by the final block
-        // todo - there isn't enough parallelism even inside that single SM...
-        // ==> so could maybe split into another kernel with YET ANOTHER level of reduction?!
-        for(int i = threadIdx.x * f128::size; i < C; i+= BLOCK_SIZE * f128::size) {
+        for(int i = threadIdx.x * f128::size; i < C; i+= blockDim.x * f128::size) {
             f128 dbias_accum(make_int4(0, 0, 0, 0));
             f128 dweight_accum(make_int4(0, 0, 0, 0));
 
