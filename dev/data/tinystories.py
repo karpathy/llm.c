@@ -3,13 +3,13 @@ Downloads and tokenizes the TinyStories dataset.
 - The download is from HuggingFace datasets.
 - The tokenization is GPT-2 tokenizer with tiktoken
 
-The output is written to a newly created data/ folder.
+The output is written to a newly created tinystories/ folder.
 The script prints:
 
 Tokenizing val split...
-Saved 19043638 tokens to data/TinyStories_val.bin
+Saved 19043638 tokens to tinystories/TinyStories_val.bin
 Tokenizing train split...
-Saved 925653391 tokens to data/TinyStories_train.bin
+Saved 925653391 tokens to tinystories/TinyStories_train.bin
 
 And runs in 1-2 minutes two depending on your internet
 connection and computer. The .bin files are raw byte
@@ -23,28 +23,15 @@ import random
 import requests
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
-
 import tiktoken
 import numpy as np
+from data_common import download_file, write_datafile
 
-DATA_CACHE_DIR = "data"
+# -----------------------------------------------------------------------------
+DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "tinystories")
+
 enc = tiktoken.get_encoding("gpt2")
 encode = lambda s: enc.encode_ordinary(s)
-
-def download_file(url: str, fname: str, chunk_size=1024):
-    """Helper function to download a file from a given url"""
-    resp = requests.get(url, stream=True)
-    total = int(resp.headers.get("content-length", 0))
-    with open(fname, "wb") as file, tqdm(
-        desc=fname,
-        total=total,
-        unit="iB",
-        unit_scale=True,
-        unit_divisor=1024,
-    ) as bar:
-        for data in resp.iter_content(chunk_size=chunk_size):
-            size = file.write(data)
-            bar.update(size)
 
 def download():
     """Downloads the TinyStories dataset to DATA_CACHE_DIR"""
@@ -70,11 +57,11 @@ def download():
 
     # print a single example just for debugging and such
     shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
-    with open(shard_filenames[0], "r") as f:
-        data = json.load(f)
     print("Download done.")
     print(f"Number of shards: {len(shard_filenames)}")
-    #print(f"Example story:\n{data[0]}")
+    # with open(shard_filenames[0], "r") as f:
+    #     data = json.load(f)
+    # print(f"Example story:\n{data[0]}")
 
 def process_shard(shard_index, shard_filename):
     with open(shard_filename, "r") as f:
@@ -107,11 +94,8 @@ def tokenize():
             for future in as_completed(futures):
                 all_tokens.extend(future.result())
 
-        all_tokens_np = np.array(all_tokens, dtype=np.int32)
         split_filename = os.path.join(DATA_CACHE_DIR, f"TinyStories_{split_name}.bin")
-        with open(split_filename, "wb") as f:
-            f.write(all_tokens_np.tobytes())
-        print(f"Saved {len(all_tokens_np)} tokens to {split_filename}")
+        write_datafile(split_filename, all_tokens)
 
 if __name__ == "__main__":
     download()
