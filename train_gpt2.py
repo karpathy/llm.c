@@ -502,7 +502,14 @@ if __name__ == "__main__":
         exit(1)
     print0(f"loading cached tokens in {args.input_bin}")
     with open(args.input_bin, "rb") as f:
-        tokens = np.frombuffer(f.read(), dtype=np.int32)
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        assert header[0] == 20240520, "magic number mismatch, corrupt file?"
+        assert header[1] == 1, "unsupported version"
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+        assert len(tokens) == ntok, "number of tokens read does not match header?"
 
     # np -> tensor, long, on device
     tokens = torch.tensor(tokens)
