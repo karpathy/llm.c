@@ -497,14 +497,19 @@ if __name__ == "__main__":
     # note we're using val by default instead of train split just because it is smaller/faster
     if not os.path.isfile(args.input_bin):
         print0(f"ERROR: input .bin file not found: {args.input_bin}")
-        print0("---> HINT: try to re-run the data prepro script. these recently moved to dev/data")
-        print0("---> HINT: for example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        print0("---> HINT: Try to re-run the data prepro script. these recently moved to dev/data")
+        print0("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
         exit(1)
     print0(f"loading cached tokens in {args.input_bin}")
     with open(args.input_bin, "rb") as f:
         # first read the header, which is 256 int32 integers (4 bytes each)
         header = np.frombuffer(f.read(256*4), dtype=np.int32)
-        assert header[0] == 20240520, "magic number mismatch, corrupt file?"
+        if header[0] != 20240520:
+            print0("ERROR: magic number mismatch in the data .bin file!")
+            print0("---> HINT: Are you passing in a correct file with --input_bin?")
+            print0("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
+            print0("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+            exit(1)
         assert header[1] == 1, "unsupported version"
         ntok = header[2] # number of tokens (claimed)
         # the rest of it are tokens, stored as uint16
