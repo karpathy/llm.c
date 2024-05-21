@@ -23,9 +23,15 @@ NVCC_CUDNN =
 USE_CUDNN ?= 0
 
 # Function to check if a file exists in the PATH
+ifneq ($(OS), Windows_NT)
 define file_exists_in_path
-  $(shell where $(1) 2>nul || which $(1) 2>/dev/null)
+  $(which $(1) 2>/dev/null)
 endef
+else
+define file_exists_in_path
+  $(shell where $(1) 2>nul)
+endef
+endif
 
 ifneq ($(CI),true) # if not in CI, then use the GPU query
   ifndef GPU_COMPUTE_CAPABILITY # set to defaults if: make GPU_COMPUTE_CAPABILITY= 
