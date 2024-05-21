@@ -54,6 +54,8 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #include "utils.h"
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
 #include "tokenizer.h"
+// defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
+#include "dataloader.h"
 
 // ----------------------------------------------------------------------------
 // CUDA precision settings
@@ -2481,85 +2483,7 @@ void common_free(GPT2 &model) {
 }
 
 #ifndef TESTING
-// if we are TESTING (see test_gpt2.cu), we'll skip the int main below
-// ----------------------------------------------------------------------------
-// data loader lite: returns random batches of data from a file of integers
-
-typedef struct {
-    // Distributed data parallel specifics.
-    // Each worker loads it's own chunk of data.
-    int process_rank;
-    int num_processes;
-    // hyperparameters. use size_t to prevent overflow
-    size_t B;
-    size_t T;
-    // input handling and its state
-    FILE* tokens_file;
-    long file_size;
-    long current_position;
-    // output memory
-    int* batch;
-    int* inputs;
-    int* targets;
-    // convenience variables
-    size_t num_batches;
-} DataLoader;
-
-void dataloader_init(DataLoader *loader, const MultiGpuConfig* multi_gpu_config, const char* filename, size_t B, size_t T) {
-    loader->process_rank = multi_gpu_config->process_rank;
-    loader->num_processes = multi_gpu_config->num_processes;
-    loader->B = B;
-    loader->T = T;
-
-    // open the input file for reading
-    loader->tokens_file = fopenCheck(filename, "rb");
-
-    // determine the file size
-    fseekCheck(loader->tokens_file, 0, SEEK_END);
-    loader->file_size = ftell(loader->tokens_file);
-    fseekCheck(loader->tokens_file, 0, SEEK_SET);
-    if (loader->file_size < (B * T + 1) * sizeof(int)) {
-        printf("Error: file size is too small for the batch size and sequence length\n");
-        exit(EXIT_FAILURE);
-    }
-    loader->current_position = loader->process_rank * B * T * sizeof(int); // start at the beginning
-
-    // allocate space for B*T + 1 integers to store the inputs and targets
-    // Using CUDA CPU pinned memory for faster PCI Express transfers to GPU
-    // See: https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/
-    cudaMallocHost((void**)&loader->batch, (B * T + 1) * sizeof(int));
-    loader->inputs = loader->batch;
-    loader->targets = loader->batch + 1; // targets are shifted by one
-    // note: we definitely want to advance by B * T; That is the "stride" by which we move
-    // the window of tokens. We only load B * T + 1 tokens because our targets are offset by 1
-    loader->num_batches = loader->file_size / (loader->num_processes * B * T * sizeof(int));
-}
-
-void dataloader_reset(DataLoader *loader) {
-    loader->current_position = 0;
-}
-
-void dataloader_next_batch(DataLoader *loader) {
-    NVTX_RANGE_FN();
-    size_t B = loader->B;
-    size_t T = loader->T;
-    // if we are at the end of the file, loop back to the beginning
-    if (loader->current_position + (loader->num_processes * B * T + 1) * sizeof(int) > loader->file_size) {
-        loader->current_position = loader->process_rank * B * T * sizeof(int);
-    }
-    // read the B*T+1 integers from the file into batch
-    fseekCheck(loader->tokens_file, loader->current_position, SEEK_SET);
-    freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
-    // advance the current position by B*T*num_processes integers
-    // note: the "stride" of tokens by which we move each time is definitely B * T
-    loader->current_position += loader->num_processes * B * T * sizeof(int);
-}
-
-void dataloader_free(DataLoader *loader) {
-    fcloseCheck(loader->tokens_file);
-    cudaFreeHost(loader->batch);
-}
-
+// if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
 // ----------------------------------------------------------------------------
 // sampler: takes probabilities and samples integers from them
 
@@ -2747,8 +2671,8 @@ int main(int argc, char *argv[]) {
     sprintf(train_tokens_filename, "%s_%s.bin", input_dataset_prefix, train_split);
     sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, &multi_gpu_config, train_tokens_filename, B, T);
-    dataloader_init(&val_loader, &multi_gpu_config, val_tokens_filename, B, T);
+    dataloader_init(&train_loader, train_tokens_filename, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    dataloader_init(&val_loader, val_tokens_filename, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
     int train_num_batches = (max_steps == -1) ? train_loader.num_batches : max_steps; // default = 1 epoch
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
     printf0("| train_num_batches     | %-50d |\n", train_num_batches);
