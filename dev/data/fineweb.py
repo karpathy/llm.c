@@ -72,7 +72,8 @@ for tokens in pool.imap(tokenize, fw):
 
     # if we reach shard_size tokens, write shard to disk
     if len(all_tokens) >= args.shard_size:
-        filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{shard_index:06d}.bin")
+        split = "val" if shard_index == 0 else "train"
+        filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{split}_{shard_index:06d}.bin")
         write_tokens = all_tokens[:args.shard_size]
         rest_tokens = all_tokens[args.shard_size:]
         write_datafile(filename, write_tokens)
