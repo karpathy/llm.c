@@ -15,7 +15,7 @@ jobs:
         working-directory: ./dev
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v1
@@ -25,14 +25,9 @@ jobs:
       with:
         python-version: '3.12.3'
 
-    - name: Verify Python installation
-      run: python --version
-      shell: cmd
-
     - name: Install Python dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        pip install -r ..\requirements.txt
 
 # Download CUDA Toolkit - note the hardcoded version number. 
     - name: Download Cuda file
