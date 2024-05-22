@@ -203,7 +203,7 @@ int main(int argc, char *argv[]) {
         clock_gettime(CLOCK_MONOTONIC, &start);
         gpt2_forward(&model, x, y, B, T);
         gpt2_zero_grad(&model);
-        gpt2_backward(&model);
+        float mean_loss = gpt2_backward(&model);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
@@ -211,11 +211,11 @@ int main(int argc, char *argv[]) {
             // error checking at step 0 for reference activations
 
             // compare the achieved loss
-            if (fabsf(model.mean_loss - *expected_loss) >= loss_diff_threshold) {
-                printf("LOSS MISMATCH: %f %f\n", model.mean_loss, *expected_loss);
+            if (fabsf(mean_loss - *expected_loss) >= loss_diff_threshold) {
+                printf("LOSS MISMATCH: %f %f\n", mean_loss, *expected_loss);
                 allok = 0;
             } else {
-                printf("LOSS OK: %f %f\n", model.mean_loss, *expected_loss);
+                printf("LOSS OK: %f %f\n", mean_loss, *expected_loss);
             }
 
             // move the (mixed precision) grads from GPU to CPU
@@ -277,8 +277,8 @@ int main(int argc, char *argv[]) {
         gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+1, &multi_gpu_config);
 
         // print the timing information at the end
-        printf("step %d: loss %f (took %f ms)\n", step+1, model.mean_loss, time_elapsed_s * 1000);
-        losses[step] = model.mean_loss;
+        printf("step %d: loss %f (took %f ms)\n", step+1, mean_loss, time_elapsed_s * 1000);
+        losses[step] = mean_loss;
     }
 
     // expected losses are as follows, from Python
