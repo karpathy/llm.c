@@ -1619,7 +1619,7 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     const int grid_size = blocks_per_sm * deviceProp.multiProcessorCount;
     size_t shared_mem_size = (2 * C + 1) * sizeof(float);
 
-    cudaMemset(scratch, 0, (2 * C + 1) * sizeof(float));
+    cudaCheck(cudaMemsetAsync(scratch, 0, (2 * C + 1) * sizeof(float), stream));
     layernorm_backward_kernel8<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
@@ -2058,6 +2058,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->use_master_weights = 1; // keep master weights copy in float for optim update?
     model->recompute = 1; // default to recompute gelu during backward
     cudaStreamCreate(&model->main_stream);
+    // only return from this function once we are certain the params are ready on the GPU
+    cudaCheck(cudaDeviceSynchronize());
 }
 
 void gpt2_build_from_random(GPT2 *model, int depth) {
@@ -2165,7 +2167,8 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     model->recompute = 1; // default to recompute gelu during backward
 }
 
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, int grad_accum_steps=1) {
+void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, size_t T, int grad_accum_steps=1) {
+    // right now, this function is fully synchronous with the host
     NVTX_RANGE_FN();
     // targets are optional and could be NULL
     // in this function we must be careful and use size_t instead of int, otherwise
@@ -2178,11 +2181,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
     }
 
     // convenience parameters
-    size_t V = model->config.vocab_size;
-    size_t Vp = model->config.padded_vocab_size;
-    size_t L = model->config.num_layers;
-    size_t NH = model->config.num_heads;
-    size_t C = model->config.channels;
+    const size_t V = model->config.vocab_size;
+    const size_t Vp = model->config.padded_vocab_size;
+    const size_t L = model->config.num_layers;
+    const size_t NH = model->config.num_heads;
+    const size_t C = model->config.channels;
 
     // validate inputs, all indices must be in the range [0, V)
     for(int i = 0; i < B * T; i++) {
@@ -2221,13 +2224,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
     }
 
     // copy inputs/targets to the model
-    // todo - inputs is copied on default stream so this synchronises CPU/GPU for now
-    cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
-    if (targets != NULL) {
-        cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
-    }
-
     cudaStream_t main_stream = model->main_stream;
+    cudaCheck(cudaMemcpyAsync(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice, main_stream));
+    if (targets != NULL) {
+        cudaCheck(cudaMemcpyAsync(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice, main_stream));
+    }
 
     // forward pass
     ParameterTensors params = model->params; // for brevity
@@ -2328,13 +2329,15 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         // if we don't have targets, we don't have loss
         model->mean_loss = -1.0f;
     }
+    cudaCheck(cudaDeviceSynchronize());
 }
 
 void gpt2_zero_grad(GPT2 *model) {
     NVTX_RANGE_FN();
     if (model->grads_memory != NULL) {
-        cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(floatX)));
+        cudaCheck(cudaMemsetAsync(model->grads_memory, 0, model->num_parameters * sizeof(floatX), model->main_stream));
     }
+    cudaCheck(cudaDeviceSynchronize());
 }
 
 void gpt2_backward(GPT2 *model) {
@@ -2366,12 +2369,12 @@ void gpt2_backward(GPT2 *model) {
     }
 
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
-    size_t B = model->batch_size;
-    size_t T = model->seq_len;
-    size_t Vp = model->config.padded_vocab_size;
-    size_t L = model->config.num_layers;
-    size_t NH = model->config.num_heads;
-    size_t C = model->config.channels;
+    const size_t B = model->batch_size;
+    const size_t T = model->seq_len;
+    const size_t Vp = model->config.padded_vocab_size;
+    const size_t L = model->config.num_layers;
+    const size_t NH = model->config.num_heads;
+    const size_t C = model->config.channels;
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
     ParameterTensors params = model->params; // for brevity
@@ -2379,13 +2382,13 @@ void gpt2_backward(GPT2 *model) {
     ActivationTensors acts = model->acts;
     GradActTensors grads_acts = model->grads_acts;
 
+    cudaStream_t main_stream = model->main_stream;
+
     // reset residual stream gradients (put here to work with gradient accumulation)
-    cudaCheck(cudaMemset(model->grads_acts.residual3, 0, B * T * C * sizeof(floatX)));
+    cudaCheck(cudaMemsetAsync(model->grads_acts.residual3, 0, B * T * C * sizeof(floatX), main_stream));
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
     float* scratchF = (float*)acts.output;
-
-    cudaStream_t main_stream = model->main_stream;
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // this was done in the fused classifier kernel as last step of forward pass
@@ -2477,6 +2480,8 @@ void gpt2_backward(GPT2 *model) {
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
     }
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C, random_u32(&model->rng_state), main_stream);
+
+    cudaCheck(cudaDeviceSynchronize());
 }
 
 // Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
@@ -2504,16 +2509,17 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
         ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
                                 model->num_parameters,
                                 ncclFloatX, ncclAvg,
-                                multi_gpu_config->nccl_comm, 0));
+                                multi_gpu_config->nccl_comm, model->main_stream));
     } else if (multi_gpu_config->zero_stage == 1) {
         // ZERO-1: Get average gradient for local shard
         floatX* local_grads_memory = (floatX*) model->grads_memory + multi_gpu_config->shard_offset;
         ncclCheck(ncclReduceScatter(model->grads_memory, local_grads_memory,
                                     multi_gpu_config->shard_num_parameters,
                                     ncclFloatX, ncclAvg,
-                                    multi_gpu_config->nccl_comm, 0));
+                                    multi_gpu_config->nccl_comm, model->main_stream));
     }
 #endif
+    cudaCheck(cudaDeviceSynchronize());
 }
 
 float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_clip, int t, MultiGpuConfig* multi_gpu_config) {
@@ -2527,12 +2533,12 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         printf0("allocating %zu MiB for AdamW optimizer state v\n", (num_parameters * sizeof(float)) >> 20);
         cudaCheck(cudaMalloc((void**)&model->m_memory, num_parameters * sizeof(float)));
         cudaCheck(cudaMalloc((void**)&model->v_memory, num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->m_memory, 0, num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, num_parameters * sizeof(float)));
+        cudaCheck(cudaMemsetAsync(model->m_memory, 0, num_parameters * sizeof(float), model->main_stream));
+        cudaCheck(cudaMemsetAsync(model->v_memory, 0, num_parameters * sizeof(float), model->main_stream));
         if (model->use_master_weights == 1) {
             printf0("allocating %zu MiB for master copy of params\n", (num_parameters * sizeof(float)) >> 20);
             cudaCheck(cudaMalloc((void**)&model->master_weights, num_parameters * sizeof(float)));
-            copy_and_cast_kernel<<<CEIL_DIV(num_parameters, 512), 512>>>(model->master_weights, params_memory, num_parameters);
+            copy_and_cast_kernel<<<CEIL_DIV(num_parameters, 512), 512, 0, model->main_stream>>>(model->master_weights, params_memory, num_parameters);
             cudaCheck(cudaGetLastError());
         }
     }
@@ -2559,6 +2565,8 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
                  model->m_memory, model->v_memory, num_parameters,
                  learning_rate, beta1, beta2, t, eps, weight_decay,
                  grad_scale, seed, model->main_stream);
+
+    cudaCheck(cudaDeviceSynchronize());
     return grad_norm_cpu;
 }
 
@@ -2570,10 +2578,11 @@ void gpt2_multi_gpu_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
         // gather updated shards of model->params_memory from each process
         ncclCheck(ncclAllGather((floatX*)model->params_memory + multi_gpu_config->shard_offset, (floatX*)model->params_memory,
                                 multi_gpu_config->shard_num_parameters, ncclFloatX,
-                                multi_gpu_config->nccl_comm, 0));
+                                multi_gpu_config->nccl_comm, model->main_stream));
     }
     cudaCheck(cudaGetLastError());
 #endif
+    cudaCheck(cudaDeviceSynchronize());
 }
 
 void gpt2_free(GPT2 *model) {
