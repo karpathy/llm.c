@@ -32,7 +32,7 @@ jobs:
     - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install tqdm numpy torch tiktoken transformers requests
+        pip install -r requirements.txt
 
 # Download CUDA Toolkit - note the hardcoded version number. 
     - name: Download Cuda file

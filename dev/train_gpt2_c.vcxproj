@@ -124,7 +124,7 @@
     </Link>
     <CustomBuildStep>
       <Command>cd ..
-python prepro_tinyshakespeare.py
+python dev/data/tinyshakespeare.py
 python train_gpt2.py</Command>
     </CustomBuildStep>
     <CustomBuildStep>
@@ -156,7 +156,7 @@ python train_gpt2.py</Command>
     </Link>
     <CustomBuildStep>
       <Command>cd ..
-python prepro_tinyshakespeare.py
+python dev/data/tinyshakespeare.py
 python train_gpt2.py</Command>
       <Message>Prepro Tinyshakespeare build step</Message>
       <Outputs>..\data\tiny_shakespeare_val.bin;..\data\tiny_shakespeare_train.bin;..\gpt2_124M.bin;..\gpt2_124M_debug_state.bin;..\gpt2_tokenizer.bin;%(Outputs)</Outputs>
