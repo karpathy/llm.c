@@ -2,14 +2,43 @@
 Implements a medium simple DataLoader for a distributed training setup.
 */
 
-#include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <assert.h>
+#include <string.h>
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck
 // defines: mallocCheck
 #include "utils.h"
+
+// ----------------------------------------------------------------------------
+// we need glob to list files matching a pattern
+// windows does not have glob, so we fall back on a very simple implementation
+// this implementation doesn't actually do a glob, it assumes that the "pattern"
+// is exactly the single file of interest
+#ifndef _WIN32
+#include <glob.h>
+#else
+
+typedef struct glob_t {
+    size_t gl_pathc;
+    char **gl_pathv;
+} glob_t;
+
+int glob(const char *pattern, int flags, void *unused, glob_t *pglob) {
+    assert(strstr(pattern, "*") == NULL); // we don't support * here
+    pglob->gl_pathc = 1;
+    pglob->gl_pathv = (char **)malloc(sizeof(char *));
+    if (pglob->gl_pathv == NULL) { exit(EXIT_FAILURE); } // ??? oom?
+    pglob->gl_pathv[0] = (char *)pattern;
+    return 0;
+}
+
+void globfree(glob_t* pglob) {
+    free(pglob->gl_pathv);
+}
+#endif
 
 // ----------------------------------------------------------------------------
 // Distributed Data Loader
