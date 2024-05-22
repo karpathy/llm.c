@@ -9,75 +9,66 @@ float perform_dot(__local float A_tile[TILE_SIZE][TILE_SIZE+LOCAL_MEM_PADDING_SI
     barrier(CLK_LOCAL_MEM_FENCE);
 
     \n#if VLOAD_SIZE == 4\n
+
+        float4 t4 = (float4)(0.0);
         for (int i = 0; i < TILE_SIZE/4; i++) {
             float4 A_vec = vload4(i, A_tile[local_id0]);
             float4 B_vec = vload4(i, B_tile[local_id1]);
 
-            \n#if USE_DOT_PRODUCT == 1\n
-                val += dot(A_vec, B_vec);
+            \n#if USE_MAD == 1\n
+                t4 = mad(A_vec, B_vec, t4);
             \n#else\n
-                val = mad(A_vec.x, B_vec.x, val);
-                val = mad(A_vec.y, B_vec.y, val);
-                val = mad(A_vec.z, B_vec.z, val);
-                val = mad(A_vec.w, B_vec.w, val);
+                t4 = (A_vec * B_vec) + t4;
             \n#endif\n
         }
+        float2 t2 = t4.hi + t4.lo;
+        val = t2.hi + t2.lo;
+
     \n#elif VLOAD_SIZE == 8\n
+
+        float8 t8 = (float8)(0.0);
         for (int i = 0; i < TILE_SIZE/8; i++) {
             float8 A_vec = vload8(i, A_tile[local_id0]);
             float8 B_vec = vload8(i, B_tile[local_id1]);
 
-            \n#if USE_DOT_PRODUCT == 1\n
-                val += dot(A_vec.lo, B_vec.lo);
-                val += dot(A_vec.hi, B_vec.hi);
+            \n#if USE_MAD == 1\n
+                t8 = mad(A_vec, B_vec, t8);
             \n#else\n
-                val = mad(A_vec.S0, B_vec.S0, val);
-                val = mad(A_vec.S1, B_vec.S1, val);
-                val = mad(A_vec.S2, B_vec.S2, val);
-                val = mad(A_vec.S3, B_vec.S3, val);
-                val = mad(A_vec.S4, B_vec.S4, val);
-                val = mad(A_vec.S5, B_vec.S5, val);
-                val = mad(A_vec.S6, B_vec.S6, val);
-                val = mad(A_vec.S7, B_vec.S7, val);
+                t8 = (A_vec * B_vec) + t8;
             \n#endif\n
         }
+        float4 t4 = t8.hi + t8.lo;
+        float2 t2 = t4.hi + t4.lo;
+        val = t2.hi + t2.lo;
+
     \n#elif VLOAD_SIZE == 16\n
+
+        float16 t16 = (float16)(0.0);
         for (int i = 0; i < TILE_SIZE/16; i++) {
             float16 A_vec = vload16(i, A_tile[local_id0]);
             float16 B_vec = vload16(i, B_tile[local_id1]);
 
-            \n#if USE_DOT_PRODUCT == 1\n
-                val += dot(A_vec.lo.lo, B_vec.lo.lo);
-                val += dot(A_vec.lo.hi, B_vec.lo.hi);
-                val += dot(A_vec.hi.lo, B_vec.hi.lo);
-                val += dot(A_vec.hi.hi, B_vec.hi.hi);
+            \n#if USE_MAD == 1\n
+                t16 = mad(A_vec, B_vec, t16);
             \n#else\n
-                val = mad(A_vec.S0, B_vec.S0, val);
-                val = mad(A_vec.S1, B_vec.S1, val);
-                val = mad(A_vec.S2, B_vec.S2, val);
-                val = mad(A_vec.S3, B_vec.S3, val);
-                val = mad(A_vec.S4, B_vec.S4, val);
-                val = mad(A_vec.S5, B_vec.S5, val);
-                val = mad(A_vec.S6, B_vec.S6, val);
-                val = mad(A_vec.S7, B_vec.S7, val);
-                val = mad(A_vec.S8, B_vec.S8, val);
-                val = mad(A_vec.S9, B_vec.S9, val);
-                val = mad(A_vec.SA, B_vec.SA, val);
-                val = mad(A_vec.SB, B_vec.SB, val);
-                val = mad(A_vec.SC, B_vec.SC, val);
-                val = mad(A_vec.SD, B_vec.SD, val);
-                val = mad(A_vec.SE, B_vec.SE, val);
-                val = mad(A_vec.SF, B_vec.SF, val);
+                t16 = (A_vec * B_vec) + t16;
             \n#endif\n
         }
+        float8 t8 = t16.hi + t16.lo;
+        float4 t4 = t8.hi + t8.lo;
+        float2 t2 = t4.hi + t4.lo;
+        val = t2.hi + t2.lo;
+
     \n#else\n
+
         for (int i = 0; i < TILE_SIZE; i++) {
-            \n#if USE_DOT_PRODUCT == 1\n
-                val += dot(A_tile[local_id0][i], B_tile[local_id1][i]);
-            \n#else\n
+            \n#if USE_MAD == 1\n
                 val = mad(A_tile[local_id0][i], B_tile[local_id1][i], val);
+            \n#else\n
+                val = (A_tile[local_id0][i] * B_tile[local_id1][i]) + val;
             \n#endif\n
         }
+
     \n#endif\n
 
     // synchronize before loading next tile

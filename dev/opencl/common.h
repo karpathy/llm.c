@@ -78,7 +78,7 @@ int cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     int matmul_local_mem_padding_size = MATMUL_LOCAL_MEM_PADDING_SIZE;
     int matmul_vload_size = MATMUL_VLOAD_SIZE;
     int matmul_do_preload = MATMUL_DO_PRELOAD;
-    int matmul_use_dot_product = MATMUL_USE_DOT_PRODUCT;
+    int matmul_use_mad = MATMUL_USE_MAD;
 
     // initialize all variables to NULL
     gcl->context = NULL;
@@ -180,9 +180,9 @@ int cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     if (env != NULL) {
         matmul_do_preload = atoi(env);
     }
-    env = getenv("MATMUL_USE_DOT_PRODUCT");
+    env = getenv("MATMUL_USE_MAD");
     if (env != NULL) {
-        matmul_use_dot_product = atoi(env);
+        matmul_use_mad = atoi(env);
     }
     if(matmul_vload_size && (matmul_tile_size % matmul_vload_size) != 0) {
         printf("error: matmul_tile_size(%d) must be multiple of matmul_vload_size(%d)\n",
@@ -192,8 +192,8 @@ int cl_init(GPT2_CL *gcl, int B, int T, int C, int V) {
     gcl->matmul_tile_size = matmul_tile_size;
 
     // build program
-    sprintf(build_options_str, "%s -D TILE_SIZE=%d -D LOCAL_MEM_PADDING_SIZE=%d -D VLOAD_SIZE=%d -D DO_PRELOAD=%d -D USE_DOT_PRODUCT=%d",
-        build_options, matmul_tile_size, matmul_local_mem_padding_size, matmul_vload_size, matmul_do_preload, matmul_use_dot_product);
+    sprintf(build_options_str, "%s -D TILE_SIZE=%d -D LOCAL_MEM_PADDING_SIZE=%d -D VLOAD_SIZE=%d -D DO_PRELOAD=%d -D USE_MAD=%d",
+        build_options, matmul_tile_size, matmul_local_mem_padding_size, matmul_vload_size, matmul_do_preload, matmul_use_mad);
     err = clBuildProgram(gcl->program, 1, &gcl->device, build_options_str, NULL, NULL);
     if (err != CL_SUCCESS) {
         size_t buf_len = 0;

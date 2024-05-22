@@ -87,14 +87,14 @@ int main(int argc, char *argv[]) {
     int lmp_size_lst[] = {0, 1};
     int vload_size_lst[] = {0, 4, 8, 16};
     int do_preload_lst[] = {0, 1};
-    int use_dp_lst[] = {0, 1};
+    int use_mad_lst[] = {0, 1};
 
     double best_time_taken = 1e10;
     int best_tile_size = 0;
     int best_lmp_size = 0;
     int best_vload_size = 0;
     int best_do_preload = 0;
-    int best_use_dp = 0;
+    int best_use_mad = 0;
 
     for(int ti=0; ti<sizeof(tile_size_lst)/sizeof(tile_size_lst[0]); ti++) {
         int tile_size = tile_size_lst[ti];
@@ -116,13 +116,13 @@ int main(int argc, char *argv[]) {
                     snprintf(str, sizeof(str), "%d", do_preload);
                     setenv("MATMUL_DO_PRELOAD", str, 1);
 
-                    for(int udpi=0; udpi<sizeof(use_dp_lst)/sizeof(use_dp_lst[0]); udpi++) {
-                        int use_dp = use_dp_lst[udpi];
-                        snprintf(str, sizeof(str), "%d", use_dp);
-                        setenv("MATMUL_USE_DOT_PRODUCT", str, 1);
+                    for(int umadi=0; umadi<sizeof(use_mad_lst)/sizeof(use_mad_lst[0]); umadi++) {
+                        int use_mad = use_mad_lst[umadi];
+                        snprintf(str, sizeof(str), "%d", use_mad);
+                        setenv("MATMUL_USE_MAD", str, 1);
 
-                        printf("MATMUL_TILE_SIZE=%d MATMUL_LOCAL_MEM_PADDING_SIZE=%d MATMUL_VLOAD_SIZE=%d MATMUL_DO_PRELOAD=%d MATMUL_USE_DOT_PRODUCT=%d\n",
-                                tile_size, lmp_size, vload_size, do_preload, use_dp);
+                        printf("MATMUL_TILE_SIZE=%d MATMUL_LOCAL_MEM_PADDING_SIZE=%d MATMUL_VLOAD_SIZE=%d MATMUL_DO_PRELOAD=%d MATMUL_USE_MAD=%d\n",
+                                tile_size, lmp_size, vload_size, do_preload, use_mad);
                         printf("---------------------------------------------\n");
 
                         int ret = do_run(&time_taken);
@@ -135,7 +135,7 @@ int main(int argc, char *argv[]) {
                                 best_lmp_size = lmp_size;
                                 best_vload_size = vload_size;
                                 best_do_preload = do_preload;
-                                best_use_dp = use_dp;
+                                best_use_mad = use_mad;
                             }
                         } else {
                             printf("skipping\n");
@@ -147,7 +147,7 @@ int main(int argc, char *argv[]) {
         }
     }
     printf("\nbest time taken: %lf ms with combination\n", best_time_taken);
-    printf("MATMUL_TILE_SIZE=%d MATMUL_LOCAL_MEM_PADDING_SIZE=%d MATMUL_VLOAD_SIZE=%d MATMUL_DO_PRELOAD=%d MATMUL_USE_DOT_PRODUCT=%d\n",
-                best_tile_size, best_lmp_size, best_vload_size, best_do_preload, best_use_dp);
+    printf("MATMUL_TILE_SIZE=%d MATMUL_LOCAL_MEM_PADDING_SIZE=%d MATMUL_VLOAD_SIZE=%d MATMUL_DO_PRELOAD=%d MATMUL_USE_MAD=%d\n",
+                best_tile_size, best_lmp_size, best_vload_size, best_do_preload, best_use_mad);
     return 0;
 }

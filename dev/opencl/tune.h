@@ -27,7 +27,7 @@
 #define MATMUL_DO_PRELOAD 1
 
 /*
-  set it to 1 to enable dot product
-  set it to 0 to use mad
+  set it to 1 to use mad
+  set it to 0 to disable
 */
-#define MATMUL_USE_DOT_PRODUCT 0
+#define MATMUL_USE_MAD 0
