@@ -55,6 +55,7 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
 #include "tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
+// defines: evalloader_init, evalloader_reset, evalloader_next_batch, evalloader_free
 #include "dataloader.h"
 
 // ----------------------------------------------------------------------------
@@ -1946,6 +1947,7 @@ typedef struct {
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float accumulated_mean_loss; // Mean loss after aggregating it on all GPUs
     floatX* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
+    float* cpu_losses_fp32; // same but fp32
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
     int use_master_weights;
     int recompute;
@@ -2024,6 +2026,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->inputs = NULL;
     model->targets = NULL;
     model->cpu_losses = NULL;
+    model->cpu_losses_fp32 = NULL;
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
@@ -2077,6 +2080,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(floatX)));
+        cudaCheck(cudaMallocHost((void**)&model->cpu_losses_fp32, B * T * sizeof(float)));
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -2181,7 +2185,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost));
         float mean_loss = 0.0f;
-        for (int i = 0; i < B*T; i++) { mean_loss += (float)(model->cpu_losses[i]); }
+        for (int i = 0; i < B*T; i++) {
+            float loss = (float)(model->cpu_losses[i]);
+            model->cpu_losses_fp32[i] = loss;
+            mean_loss += loss;
+        }
         mean_loss /= B*T*grad_accum_steps;
         model->mean_loss = mean_loss;
     } else {
@@ -2450,6 +2458,7 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->inputs));
     cudaCheck(cudaFree(model->targets));
     cudaFreeHost(model->cpu_losses);
+    cudaFreeHost(model->cpu_losses_fp32);
 }
 
 // ----------------------------------------------------------------------------
@@ -2750,38 +2759,15 @@ int main(int argc, char *argv[]) {
             NvtxRange evaluation_range("evaluation");
             float eval_acc_norm = 0.0f;
             evalloader_reset(&eval_loader);
-            int eval_num_batches = eval_loader.end_example_index - eval_loader.start_example_index;
-            for (int i = 0; i < eval_num_batches; i++) {
+            for (int i = 0; i < eval_loader.num_batches; i++) {
                 evalloader_next_batch(&eval_loader);
                 gpt2_forward(&model, eval_loader.inputs, eval_loader.targets, B, T);
-                // so at this stage we have model->cpu_losses giving the loss at each (b,t) position
-                // now we want to iterate in each row (b=0..3) and average the loss at mask=1 positions
-                float min_loss;
-                int min_loss_index;
-                for (int b = 0; b < eval_loader.num_completions; b++) {
-                    float average_loss = 0.0f;
-                    int count = 0;
-                    for (int t = 0; t < T; t++) {
-                        char mask = eval_loader.mask[b * T + t];
-                        if (mask == 1) {
-                            average_loss += (float)model.cpu_losses[b * T + t];
-                            count++;
-                        }
-                    }
-                    if (count > 0) { average_loss /= count; }
-                    if (b == 0 || average_loss < min_loss) {
-                        min_loss = average_loss;
-                        min_loss_index = b;
-                    }
-                }
-                if (min_loss_index == eval_loader.label) {
-                    eval_acc_norm += 1.0f;
-                }
+                int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses_fp32);
+                eval_acc_norm += (float)correct;
             }
             // careful because not all ranks may have the exact same allocation of number of examples
             eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm);
-            eval_acc_norm /= eval_loader.num_examples;
-            printf0("HellaSwag: %f\n", eval_acc_norm);
+            printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
             logger_log_eval(&logger, step, eval_acc_norm);
         }
 
@@ -2895,6 +2881,7 @@ int main(int argc, char *argv[]) {
     // free and destroy everything
     cudaCheck(cudaEventDestroy(end));
     cudaCheck(cudaEventDestroy(start));
+    evalloader_free(&eval_loader);
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
@@ -2903,7 +2890,6 @@ int main(int argc, char *argv[]) {
     free(gen_tokens);
     logger_free(&logger);
     multi_gpu_config_free(&multi_gpu_config);
-
     common_free(model);
     return 0;
 }

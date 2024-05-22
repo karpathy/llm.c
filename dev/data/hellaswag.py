@@ -108,9 +108,8 @@ def iterate_examples(split):
             example = json.loads(line)
             n += 1
             yield example
-
             # DEBUGGING, TODO REMOVE
-            if n >= 100:
+            if n >= 101:
                 break
 
 @torch.no_grad()
@@ -156,7 +155,7 @@ def evaluate(model_type, device):
         num_total += 1
         num_correct += int(pred == label)
         num_correct_norm += int(pred_norm == label)
-        print(f"{num_total} acc: {num_correct/num_total:.4f} acc_norm: {num_correct_norm/num_total:.4f}")
+        print(f"{num_total} acc: {num_correct/num_total:.4f} acc_norm: {num_correct_norm}/{num_total}={num_correct_norm/num_total:.4f}")
 
         # debug: pretty print a few examples, and the losses in each case
         if num_total < 10:
