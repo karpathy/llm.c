@@ -16,8 +16,8 @@ Implements a medium simple DataLoader for a distributed training setup.
 #define HEADER_SIZE 256
 
 typedef struct {
-    // Distributed data parallel specifics.
-    // Each worker loads it's own chunk of data.
+    // variables related to distributed training
+    // each process/worker has to access different parts of the data
     int process_rank;
     int num_processes;
     // hyperparameters. use size_t to prevent overflow
@@ -29,12 +29,11 @@ typedef struct {
     FILE* tokens_file;
     long file_size;
     long current_position;
-    // outputs
-    uint16_t* buffer; // used to fread data from file into
+    uint16_t* buffer; // we fread data from file into this buffer
+    // public variables that could be accessed from outside
+    size_t num_batches;
     int* inputs;  // input tokens into transformer
     int* targets; // target tokens for the transformer
-    // convenience variables
-    size_t num_batches;
 } DataLoader;
 
 long dataloader_load_shard_(DataLoader *loader, int shard_index) {
@@ -125,8 +124,9 @@ void dataloader_init(DataLoader *loader,
         assert(shard_ntok >= num_processes * B * T + 1);
         ntok_total += shard_ntok;
     }
-    printf("DataLoader: filename_pattern: %s\n", filename_pattern);
-    printf("DataLoader: Found %ld tokens across %zu shards\n", ntok_total, loader->glob_result.gl_pathc);
+    // debugging prints
+    // printf("DataLoader: filename_pattern: %s\n", filename_pattern);
+    // printf("DataLoader: Found %ld tokens across %zu shards\n", ntok_total, loader->glob_result.gl_pathc);
 
     // allocate all the space we'll need
     loader->buffer = (uint16_t*)malloc((B * T + 1) * sizeof(uint16_t));

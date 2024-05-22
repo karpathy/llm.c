@@ -55,30 +55,36 @@ def tokenize(doc):
     return enc.encode_ordinary(doc["text"])
 
 # main loop write files
-pool = mp.Pool()
-shard_index = 0
-all_tokens = []
-progress_bar = None
-for tokens in pool.imap(tokenize, fw):
+with mp.Pool() as pool:
+    shard_index = 0
+    all_tokens = []
+    progress_bar = None
+    for tokens in pool.imap(tokenize, fw):
 
-    # record the tokens and make sure to separate documents
-    all_tokens.append(eot)
-    all_tokens.extend(tokens)
+        # record the tokens and make sure to separate documents
+        all_tokens.append(eot)
+        all_tokens.extend(tokens)
 
-    # update progress bar
-    if progress_bar is None:
-        progress_bar = tqdm(total=args.shard_size, unit="tokens", desc=f"Shard {shard_index}")
-    progress_bar.update(len(tokens))
+        # update progress bar
+        if progress_bar is None:
+            progress_bar = tqdm(total=args.shard_size, unit="tokens", desc=f"Shard {shard_index}")
+        progress_bar.update(len(tokens))
 
-    # if we reach shard_size tokens, write shard to disk
-    if len(all_tokens) >= args.shard_size:
+        # if we reach shard_size tokens, write shard to disk
+        if len(all_tokens) >= args.shard_size:
+            split = "val" if shard_index == 0 else "train"
+            filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{split}_{shard_index:06d}.bin")
+            write_tokens = all_tokens[:args.shard_size]
+            rest_tokens = all_tokens[args.shard_size:]
+            write_datafile(filename, write_tokens)
+            shard_index += 1
+            progress_bar = None
+            # note: create a copy so Python can free the all_tokens memory above
+            # the list rest_tokens is expected to be very small
+            all_tokens = [t for t in rest_tokens]
+
+    # write any remaining tokens as the last shard
+    if len(all_tokens) > 0:
         split = "val" if shard_index == 0 else "train"
         filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{split}_{shard_index:06d}.bin")
-        write_tokens = all_tokens[:args.shard_size]
-        rest_tokens = all_tokens[args.shard_size:]
-        write_datafile(filename, write_tokens)
-        shard_index += 1
-        progress_bar = None
-        # note: create a copy so Python can free the all_tokens memory above
-        # the list rest_tokens is expected to be very small
-        all_tokens = [t for t in rest_tokens]
+        write_datafile(filename, all_tokens)
