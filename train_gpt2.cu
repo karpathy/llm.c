@@ -2337,13 +2337,13 @@ void gpt2_backward(GPT2 *model) {
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C, random_u32(&model->rng_state));
 }
 
-// Compute a mean of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
-float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_config) {
+// Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
+float multi_gpu_cpu_float_sum(float value) {
 #ifdef MULTI_GPU
-    // MPI doesn't support all reduce with mean, so we sum up, then divide.
+    // note MPI doesn't support all reduce with mean, only sum
     float result;
     mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
-    return result / multi_gpu_config->num_processes;
+    return result;
 #else
     return value;
 #endif
@@ -2356,7 +2356,7 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
     if (multi_gpu_config->num_processes == 1) { return; }
     // Average all losses.
-    model->accumulated_mean_loss = multi_gpu_cpu_float_mean(model->mean_loss, multi_gpu_config);
+    model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss) / multi_gpu_config->num_processes;
     if(multi_gpu_config->zero_stage == 0) {
         //  no ZERO == standard DDP: Average all gradients.
         ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
@@ -2520,6 +2520,12 @@ void logger_init(Logger *logger, const char *filename) {
     if (filename != NULL) { logger->logfile = fopenCheck(filename, "w"); }
 }
 
+void logger_log_eval(Logger *logger, int step, float val_loss) {
+    if (logger->logfile != NULL) {
+        fprintf(logger->logfile, "s:%d eval:%.4f\n", step, val_loss);
+    }
+}
+
 void logger_log_val(Logger *logger, int step, float val_loss) {
     if (logger->logfile != NULL) {
         fprintf(logger->logfile, "s:%d tel:%.4f\n", step, val_loss);
@@ -2676,6 +2682,11 @@ int main(int argc, char *argv[]) {
     printf0("| val_num_batches       | %-50d |\n", val_num_batches);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
+    // build an EvalLoader for HellaSwag
+    EvalLoader eval_loader;
+    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
+    evalloader_init(&eval_loader, hellaswag_path, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+
     // pretty print in a table the multi-gpu configuration as well
     set_zero_configs(&multi_gpu_config, zero_stage, model.num_parameters);
     printf0("| num_processes         | %-50d |\n", multi_gpu_config.num_processes);
@@ -2729,9 +2740,49 @@ int main(int argc, char *argv[]) {
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
-            val_loss = multi_gpu_cpu_float_mean(val_loss, &multi_gpu_config);
+            val_loss = multi_gpu_cpu_float_sum(val_loss) / multi_gpu_config.num_processes;
             printf0("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
+        }
+
+        // once in a while estimate HellaSwag accuracy
+        if (step % val_loss_every == 0 || last_step) {
+            NvtxRange evaluation_range("evaluation");
+            float eval_acc_norm = 0.0f;
+            evalloader_reset(&eval_loader);
+            int eval_num_batches = eval_loader.end_example_index - eval_loader.start_example_index;
+            for (int i = 0; i < eval_num_batches; i++) {
+                evalloader_next_batch(&eval_loader);
+                gpt2_forward(&model, eval_loader.inputs, eval_loader.targets, B, T);
+                // so at this stage we have model->cpu_losses giving the loss at each (b,t) position
+                // now we want to iterate in each row (b=0..3) and average the loss at mask=1 positions
+                float min_loss;
+                int min_loss_index;
+                for (int b = 0; b < eval_loader.num_completions; b++) {
+                    float average_loss = 0.0f;
+                    int count = 0;
+                    for (int t = 0; t < T; t++) {
+                        char mask = eval_loader.mask[b * T + t];
+                        if (mask == 1) {
+                            average_loss += (float)model.cpu_losses[b * T + t];
+                            count++;
+                        }
+                    }
+                    if (count > 0) { average_loss /= count; }
+                    if (b == 0 || average_loss < min_loss) {
+                        min_loss = average_loss;
+                        min_loss_index = b;
+                    }
+                }
+                if (min_loss_index == eval_loader.label) {
+                    eval_acc_norm += 1.0f;
+                }
+            }
+            // careful because not all ranks may have the exact same allocation of number of examples
+            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm);
+            eval_acc_norm /= eval_loader.num_examples;
+            printf0("HellaSwag: %f\n", eval_acc_norm);
+            logger_log_eval(&logger, step, eval_acc_norm);
         }
 
         // once in a while do model inference to print generated text

@@ -1,6 +1,7 @@
 """
 Downloads and evaluates HellaSwag in Python.
 This then acts as the reference file for llm.c
+Also writes the data (tokens, labels) to .bin files for parallel evaluation in C.
 https://github.com/rowanz/hellaswag
 
 Example HellaSwag json item:
@@ -22,6 +23,8 @@ gpt2 (124M)
 gpt2-xl (1558M)
 - eleuther harness reports acc 40.04%, acc_norm 50.89% (multiple choice style)
 - this script: 10042 acc: 0.3842 acc_norm: 0.4893 (completion style)
+
+The validation set of HellaSwag has a total of 10,042 examples.
 """
 
 import os
@@ -33,7 +36,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from transformers import GPT2LMHeadModel
-from data_common import download_file
+from data_common import download_file, write_evalfile
 
 # -----------------------------------------------------------------------------
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "hellaswag")
@@ -68,14 +71,23 @@ def render_example(example):
     label = example["label"]
     endings = example["endings"]
 
+    # data needed to reproduce this eval on the C size
+    data = {
+        "label": label,
+        "ctx_tokens": None,
+        "ending_tokens": [],
+    }
+
     # gather up all the tokens
     ctx_tokens = enc.encode(ctx)
+    data["ctx_tokens"] = ctx_tokens
     tok_rows = []
     mask_rows = []
     for end in endings:
         end_tokens = enc.encode(" " + end) # note: prepending " " because GPT-2 tokenizer
         tok_rows.append(ctx_tokens + end_tokens)
         mask_rows.append([0]*len(ctx_tokens) + [1]*len(end_tokens))
+        data["ending_tokens"].append(end_tokens)
 
     # have to be careful during the collation because the number of tokens in each row can differ
     max_len = max(len(row) for row in tok_rows)
@@ -85,16 +97,21 @@ def render_example(example):
         tokens[i, :len(tok_row)] = torch.tensor(tok_row)
         mask[i, :len(mask_row)] = torch.tensor(mask_row)
 
-    return tokens, mask, label
+    return data, tokens, mask, label
 
 def iterate_examples(split):
     # there are 10,042 examples in total in val
-
+    n = 0
     download(split)
     with open(os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl"), "r") as f:
         for line in f:
             example = json.loads(line)
+            n += 1
             yield example
+
+            # DEBUGGING, TODO REMOVE
+            if n >= 100:
+                break
 
 @torch.no_grad()
 def evaluate(model_type, device):
@@ -105,11 +122,13 @@ def evaluate(model_type, device):
     model.to(device)
     # model = torch.compile(model)
 
+    datas = []
     num_correct_norm = 0
     num_correct = 0
     num_total = 0
     for example in iterate_examples("val"):
-        tokens, mask, label = render_example(example)
+        data, tokens, mask, label = render_example(example)
+        datas.append(data)
         tokens = tokens.to(device)
         mask = mask.to(device)
 
@@ -146,7 +165,11 @@ def evaluate(model_type, device):
             print(f"Endings:")
             for i, end in enumerate(example["endings"]):
                 print(f"{i} (loss: {avg_loss[i].item():.4f}) {end}")
-            print(f"predicted: {pred}, actual: {label}")
+            print(f"predicted: {pred_norm}, actual: {label}")
+
+    # now write the data to a .bin file
+    filename = os.path.join(DATA_CACHE_DIR, f"hellaswag_val.bin")
+    write_evalfile(filename, datas)
 
 if __name__ == "__main__":
     import argparse
