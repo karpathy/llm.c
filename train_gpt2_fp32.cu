@@ -1525,12 +1525,10 @@ void logger_free(Logger *logger) {
 // CLI, poor man's argparse
 
 void error_usage() {
-    // default run = debugging run with TinyShakespeare
-    // bigger run = train on TinyStories! e.g. val/sample less often, but sample more tokens, write to logfile
     fprintf(stderr, "Usage:   ./train_gpt2fp32cu [options]\n");
-    fprintf(stderr, "Example: ./train_gpt2fp32cu -i dev/data/tinystories/TinyStories -v 100 -s 100 -g 144 -o stories.log\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -i <string> input dataset prefix (default = data/tiny_shakespeare)\n");
+    fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
+    fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
     fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
     fprintf(stderr, "  -b <int>    batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
@@ -1547,7 +1545,8 @@ void error_usage() {
 int main(int argc, char *argv[]) {
 
     // read in the (optional) command line arguments
-    const char* input_dataset_prefix = "dev/data/tinyshakespeare/tiny_shakespeare"; // or e.g. data/TinyStories
+    const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+    const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* output_log_file = NULL;
     int B = 4; // batch size
     int T = 1024; // sequence length max
@@ -1561,7 +1560,8 @@ int main(int argc, char *argv[]) {
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
         // read in the args
-        if (argv[i][1] == 'i') { input_dataset_prefix = argv[i+1]; }
+        if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
+        else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'o') { output_log_file = argv[i+1]; }
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); }
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
@@ -1575,7 +1575,8 @@ int main(int argc, char *argv[]) {
     printf("+-----------------------+----------------------------------------------------+\n");
     printf("| Parameter             | Value                                              |\n");
     printf("+-----------------------+----------------------------------------------------+\n");
-    printf("| input dataset prefix  | %-50s |\n", input_dataset_prefix);
+    printf("| train data pattern    | %-50s |\n", train_data_pattern);
+    printf("| val data pattern      | %-50s |\n", val_data_pattern);
     printf("| output log file       | %-50s |\n", output_log_file == NULL ? "NULL" : output_log_file);
     printf("| batch size B          | %-50d |\n", B);
     printf("| sequence length T     | %-50d |\n", T);
@@ -1617,14 +1618,9 @@ int main(int argc, char *argv[]) {
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val
-    char train_tokens_filename[128];
-    char val_tokens_filename[128];
-    assert(strlen(input_dataset_prefix) < 100); // being bit lazy here, make sure we don't overflow
-    sprintf(train_tokens_filename, "%s_train.bin", input_dataset_prefix);
-    sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_tokens_filename, B, T, 0, 1);
-    dataloader_init(&val_loader, val_tokens_filename, B, T, 0, 1);
+    dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1);
+    dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1);
     int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default for now
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
     printf("| train_num_batches     | %-50d |\n", train_num_batches);
