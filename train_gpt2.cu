@@ -2675,6 +2675,7 @@ void error_usage() {
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
     fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
     fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
+    fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
     fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
     fprintf(stderr, "  -m <int>    val_max_batches, up to how many val batches to estimate val loss? (default = 20)\n");
@@ -2702,6 +2703,7 @@ int main(int argc, char *argv[]) {
     int T = 1024; // sequence length max
     int total_batch_size = -1; // will be calculated down below later, if not provided
     float learning_rate = 3e-4f;
+    float weight_decay = 0.0f;
     int val_loss_every = 20; // every how many steps do we eval validation loss?
     int val_max_batches = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
@@ -2726,6 +2728,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
         else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
         else if (argv[i][1] == 'l') { learning_rate = atof(argv[i+1]); }
+        else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'm') { val_max_batches = atoi(argv[i+1]); }
@@ -2754,6 +2757,7 @@ int main(int argc, char *argv[]) {
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
     printf0("| learning rate         | %-50e |\n", learning_rate);
+    printf0("| weight decay          | %-50e |\n", weight_decay);
     printf0("| grad_clip             | %-50e |\n", grad_clip);
     printf0("| max_steps             | %-50d |\n", max_steps);
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
@@ -2982,7 +2986,7 @@ int main(int argc, char *argv[]) {
         model.mean_loss = lossf;
         // update the parameters
         gpt2_multi_gpu_accumulate(&model, &multi_gpu_config);
-        float grad_norm = gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, grad_clip, step+1, &multi_gpu_config);
+        float grad_norm = gpt2_update(&model, learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_clip, step+1, &multi_gpu_config);
         gpt2_multi_gpu_gather(&model, &multi_gpu_config);
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);

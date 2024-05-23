@@ -599,7 +599,7 @@ if __name__ == "__main__":
 
     # init the optimizer
     adam_use_fused = device == "cuda" # only works on CUDA (?)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, fused=adam_use_fused)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0, fused=adam_use_fused)
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
