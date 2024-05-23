@@ -2886,7 +2886,7 @@ int main(int argc, char *argv[]) {
 
         // once in a while estimate HellaSwag accuracy
         if (hellaswag_available &&
-           (step % val_loss_every == 0 || last_step)) {
+           ((step > 0 && step % val_loss_every == 0) || last_step)) {
             NvtxRange evaluation_range("evaluation");
             float eval_acc_norm = 0.0f;
             evalloader_reset(&eval_loader);
