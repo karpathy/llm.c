@@ -2893,7 +2893,7 @@ int main(int argc, char *argv[]) {
     // free and destroy everything
     cudaCheck(cudaEventDestroy(end));
     cudaCheck(cudaEventDestroy(start));
-    evalloader_free(&eval_loader);
+    if (hellaswag_available) { evalloader_free(&eval_loader); }
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
