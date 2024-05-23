@@ -57,7 +57,9 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 // defines: evalloader_init, evalloader_reset, evalloader_next_batch, evalloader_free
 #include "dataloader.h"
-
+// defines: manual_seed, normal_
+// numerically identical to PyTorch's torch.manual_seed and torch.normal
+#include "rand.h"
 // ----------------------------------------------------------------------------
 // CUDA precision settings
 
@@ -2035,6 +2037,110 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->recompute = 1; // default to recompute gelu during backward
 }
 
+void gpt2_build_from_random(GPT2 *model, int depth) {
+    // init random (training from scratch)
+
+    // parameterize the size of gpt2 based only on the depth of the model (num_layers)
+    model->config.num_layers = depth;
+    // follows GPT-2 sizes
+    int channels, num_heads;
+    if      (depth == 12) { channels = 768; num_heads = 12; } // gpt2 (124M)
+    else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
+    else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
+    else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
+    else { fprintf(stderr, "Unsupported depth for now\n"); exit(EXIT_FAILURE); }
+    model->config.channels = channels;
+    model->config.num_heads = num_heads;
+    model->config.max_seq_len = 1024;
+    model->config.vocab_size = 50257;
+    model->config.padded_vocab_size = 50304; // padded to 128
+
+    // fill in all the parameter tensor dimensions and types
+    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
+    model->num_parameters = 0;
+    model->num_parameters_bytes = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        model->num_parameters += model->param_elements[i];
+        model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
+    }
+    // create memory for model parameters on the device
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
+
+    // allocate and random init the memory for all the parameters with GPT-2 schema
+    // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
+    // NOTE: assuming all parameters are of the type floatX, could be relaxed later
+    mt19937_state init_rng;
+    manual_seed(&init_rng, 42);
+    floatX* params_memory_cpu = (floatX*)mallocCheck(model->num_parameters_bytes);
+    memset(params_memory_cpu, 0, model->num_parameters_bytes);
+    // fill in all the weights with random values
+    float residual_scale = 1.0f / sqrtf(2.0f * model->config.num_layers);
+    // we have to init all these tensors exactly in the order that PyTorch initializes them
+    // so that we can match them up and get correctness and exactly the same initial conditions
+    size_t L = model->config.num_layers;
+    size_t offset = 0;
+    for (int l = 0; l < L; l++) {
+        offset = 0;
+        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            // the layernorm parameters are all initialized to 1
+            if (l == 0 && (i == 2 || i == 8 || i == 14)) { // only at l = 0 to init these just once
+                for (size_t j = 0; j < model->param_elements[i]; j++) {
+                    params_memory_cpu[offset + j] = 1.0f;
+                }
+            }
+            // weights tensors are handled here
+            if ((l == 0 && (i == 0 || i == 1)) // only at l = 0, init the wte and wpe tensors
+              || i == 4 || i == 6 || i == 10 || i == 12) {
+                int n = model->param_elements[i];
+                size_t layer_offset = 0;
+                if (i == 0) {
+                    // for wte tensor (padded vocab) override to init V instead of Vp rows
+                    n = model->config.vocab_size * model->config.channels;
+                }
+                if (i == 4 || i == 6 || i == 10 || i == 12) {
+                    // weight tensors, we are only initializing layer l
+                    assert(n % L == 0);
+                    n = n / L;
+                    layer_offset = l * n;
+                }
+                // in GPT-2, the projections back into the residual stream are additionally
+                // scaled by 1/sqrt(2*L) for training stability
+                float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
+                // okay let's draw the random numbers and write them
+                float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
+                normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
+                for (size_t j = 0; j < n; j++) {
+                    params_memory_cpu[offset + layer_offset + j] = (floatX)fp32_buffer[j];
+                }
+                free(fp32_buffer);
+            }
+            offset += model->param_elements[i];
+        }
+    }
+
+    // copy them to GPU
+    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
+    free(params_memory_cpu);
+
+    // other inits and defaults
+    model->acts_memory = NULL;
+    model->grads_memory = NULL;
+    model->m_memory = NULL;
+    model->v_memory = NULL;
+    model->master_weights = NULL;
+    model->grads_acts_memory = NULL;
+    model->inputs = NULL;
+    model->targets = NULL;
+    model->cpu_losses = NULL;
+    model->cpu_losses_fp32 = NULL;
+    model->batch_size = 0;
+    model->seq_len = 0;
+    model->mean_loss = -1.0f; // -1.0f designates no loss
+    model->rng_state = 13371337;
+    model->use_master_weights = 1; // keep master weights copy in float for optim update?
+    model->recompute = 1; // default to recompute gelu during backward
+}
+
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, int grad_accum_steps=1) {
     NVTX_RANGE_FN();
     // targets are optional and could be NULL
@@ -2529,9 +2635,9 @@ void logger_init(Logger *logger, const char *filename) {
     if (filename != NULL) { logger->logfile = fopenCheck(filename, "w"); }
 }
 
-void logger_log_eval(Logger *logger, int step, float val_loss) {
+void logger_log_eval(Logger *logger, int step, float val) {
     if (logger->logfile != NULL) {
-        fprintf(logger->logfile, "s:%d eval:%.4f\n", step, val_loss);
+        fprintf(logger->logfile, "s:%d eval:%.4f\n", step, val);
     }
 }
 
@@ -2666,9 +2772,23 @@ int main(int argc, char *argv[]) {
     printf0("| precision             | %-50s |\n", precision_str);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
-    // build the GPT-2 model from a checkpoint
+    // build the GPT-2 model
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, load_filename);
+    // if load_filename is of the form "dX" where X is an integer (e.g. d12), then we build
+    // a random model with the depth of the model specified by X (e.g. 12). otherwise interpret
+    // this variable as a checkpoint filename, and load that checkpoint
+    assert(strlen(load_filename) >= 2);
+    if (load_filename[0] == 'd') {
+        int depth = atoi(load_filename + 1);
+        if (depth > 1 && depth <= 1000) { // we're not going to train models this big right? heh
+            gpt2_build_from_random(&model, depth);
+        } else {
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        gpt2_build_from_checkpoint(&model, load_filename);
+    }
+
     model.use_master_weights = use_master_weights;
     model.recompute = recompute;
     printf0("| load_filename         | %-50s |\n", load_filename);
@@ -2780,7 +2900,7 @@ int main(int argc, char *argv[]) {
             // careful because not all ranks may have the exact same allocation of number of examples
             eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm);
             printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
-            logger_log_eval(&logger, step, eval_acc_norm);
+            logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
         }
 
         // once in a while do model inference to print generated text
