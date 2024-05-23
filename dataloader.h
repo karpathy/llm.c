@@ -1,6 +1,8 @@
 /*
 Implements a medium simple DataLoader for a distributed training setup.
 */
+#ifndef DATALOADER_H
+#define DATALOADER_H
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,30 +15,85 @@ Implements a medium simple DataLoader for a distributed training setup.
 #include "utils.h"
 
 // ----------------------------------------------------------------------------
-// we need glob to list files matching a pattern
-// windows does not have glob, so we fall back on a very simple implementation
-// this implementation doesn't actually do a glob, it assumes that the "pattern"
-// is exactly the single file of interest
+// implementation of glob for Windows
 #ifndef _WIN32
 #include <glob.h>
 #else
 
 typedef struct glob_t {
-    size_t gl_pathc;
-    char **gl_pathv;
+    size_t gl_pathc;    // Count of matched pathnames
+    char **gl_pathv;    // List of matched pathnames
 } glob_t;
 
-int glob(const char *pattern, int flags, void *unused, glob_t *pglob) {
-    assert(strstr(pattern, "*") == NULL); // we don't support * here
-    pglob->gl_pathc = 1;
-    pglob->gl_pathv = (char **)malloc(sizeof(char *));
-    if (pglob->gl_pathv == NULL) { exit(EXIT_FAILURE); } // ??? oom?
-    pglob->gl_pathv[0] = (char *)pattern;
-    return 0;
+void replace_forward_slashes(char* str) {
+    while (*str) {
+        if (*str == '/') {
+            *str = '\\';
+        }
+        str++;
+    }
 }
 
-void globfree(glob_t* pglob) {
-    free(pglob->gl_pathv);
+void globfree(glob_t *pglob) {
+    for (size_t i = 0; i < pglob->gl_pathc; ++i) {
+		free(pglob->gl_pathv[i]); // Free the allocated memory for each filename
+    }
+	free(pglob->gl_pathv); // Free the allocated memory for the list of filenames
+}
+
+int glob(const char* pattern, int ignored_flags, int (*ignored_errfunc)(const char* epath, int eerrno), glob_t* pglob){
+    struct _finddata_t find_file_data;
+	char full_path[576]; // stored in pglob->gl_pathv[n]
+    char directory_path[512] = {0}; // Store the directory path from the pattern
+	char pattern_copy[512]; // Copy of the pattern to modify
+
+	strncpy_s(pattern_copy, sizeof(pattern_copy) - 1, pattern, sizeof(pattern_copy) - 1);
+
+    replace_forward_slashes (pattern_copy); // Replace forward slashes with backslashes
+    
+	if (strchr(pattern_copy, '\\') != NULL) {
+		strncpy_s(directory_path, sizeof(directory_path) - 1, pattern_copy, strrchr(pattern_copy, '\\') - pattern_copy + 1);
+		directory_path[strrchr(pattern_copy, '\\') - pattern_copy + 1] = '\0';
+	}
+	
+    // find the first file matching the pattern in the directory
+    intptr_t find_handle = _findfirst(pattern_copy, &find_file_data);
+
+    if (find_handle == -1) {
+        return 1; // No files found
+    }
+
+    size_t file_count = 0;
+    size_t max_files = 64000; // hard-coded limit for the number of files
+
+	pglob->gl_pathv = (char **) malloc(max_files * sizeof(char*)); // freed in globfree
+
+    if (pglob->gl_pathv == NULL) {
+        _findclose(find_handle);
+        return 2; // Memory allocation failed
+    }
+
+    do {
+        if (file_count >= max_files) {
+            _findclose(find_handle);
+			return 2; // Too many files found
+            }
+
+        snprintf(full_path, sizeof(full_path), "%s%s", directory_path, find_file_data.name);
+
+		pglob->gl_pathv[file_count] = _strdup(full_path); // freed in globfree
+
+        if (pglob->gl_pathv[file_count] == NULL) {
+            _findclose(find_handle);
+            return 2; // Memory allocation for filename failed
+        }
+        file_count++;
+    } while (_findnext(find_handle, &find_file_data) == 0);
+
+    _findclose(find_handle);
+
+    pglob->gl_pathc = file_count;
+    return 0;
 }
 #endif
 
@@ -461,3 +518,5 @@ void evalloader_free(EvalLoader *loader) {
     free(loader->label);
     fcloseCheck(loader->eval_file);
 }
+
+#endif // DATALOADER_H
