@@ -2063,37 +2063,61 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
         model->num_parameters += model->param_elements[i];
         model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
     }
-
     // create memory for model parameters on the device
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
     // NOTE: assuming all parameters are of the type floatX, could be relaxed later
-    mt19937_state rng_state;
-    manual_seed(&rng_state, 42);
+    mt19937_state init_rng;
+    manual_seed(&init_rng, 42);
     floatX* params_memory_cpu = (floatX*)mallocCheck(model->num_parameters_bytes);
     memset(params_memory_cpu, 0, model->num_parameters_bytes);
     // fill in all the weights with random values
-    size_t offset = 0;
     float residual_scale = 1.0f / sqrtf(2.0f * model->config.num_layers);
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        // hard-coding the positions of the weights tensors here
-        if (i == 0 || i == 1 || i == 2 || i == 4 || i == 6 || i == 8 || i == 10
-         || i == 12 || i == 14) {
-            // in GPT-2, the projections back into the residual stream are additionally
-            // scaled by 1/sqrt(2*L) for training stability
-            float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
-            int n = model->param_elements[i];
-            float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
-            normal_(fp32_buffer, n, 0.0f, scale, &rng_state);
-            for (size_t j = 0; j < n; j++) {
-                params_memory_cpu[offset + j] = (floatX)fp32_buffer[j];
+    // we have to init all these tensors exactly in the order that PyTorch initializes them
+    // so that we can match them up and get correctness and exactly the same initial conditions
+    size_t L = model->config.num_layers;
+    size_t offset = 0;
+    for (int l = 0; l < L; l++) {
+        offset = 0;
+        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            // the layernorm parameters are all initialized to 1
+            if (l == 0 && (i == 2 || i == 8 || i == 14)) { // only at l = 0 to init these just once
+                for (size_t j = 0; j < model->param_elements[i]; j++) {
+                    params_memory_cpu[offset + j] = 1.0f;
+                }
             }
-            free(fp32_buffer);
+            // weights tensors are handled here
+            if ((l == 0 && (i == 0 || i == 1)) // only at l = 0, init the wte and wpe tensors
+              || i == 4 || i == 6 || i == 10 || i == 12) {
+                int n = model->param_elements[i];
+                size_t layer_offset = 0;
+                if (i == 0) {
+                    // for wte tensor (padded vocab) override to init V instead of Vp rows
+                    n = model->config.vocab_size * model->config.channels;
+                }
+                if (i == 4 || i == 6 || i == 10 || i == 12) {
+                    // weight tensors, we are only initializing layer l
+                    assert(n % L == 0);
+                    n = n / L;
+                    layer_offset = l * n;
+                }
+                // in GPT-2, the projections back into the residual stream are additionally
+                // scaled by 1/sqrt(2*L) for training stability
+                float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
+                // okay let's draw the random numbers and write them
+                float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
+                normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
+                for (size_t j = 0; j < n; j++) {
+                    params_memory_cpu[offset + layer_offset + j] = (floatX)fp32_buffer[j];
+                }
+                free(fp32_buffer);
+            }
+            offset += model->param_elements[i];
         }
-        offset += model->param_elements[i];
     }
+
     // copy them to GPU
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     free(params_memory_cpu);
