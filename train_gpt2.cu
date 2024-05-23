@@ -2630,9 +2630,12 @@ typedef struct {
 } Logger;
 
 void logger_init(Logger *logger, const char *filename) {
-    logger->flush_every = 20;
+    logger->flush_every = 10;
     logger->logfile = NULL;
-    if (filename != NULL) { logger->logfile = fopenCheck(filename, "w"); }
+    // only rank 0 process will log
+    if (filename != NULL && multi_gpu_config.process_rank == 0) {
+        logger->logfile = fopenCheck(filename, "w");
+    }
 }
 
 void logger_log_eval(Logger *logger, int step, float val) {
@@ -2650,7 +2653,7 @@ void logger_log_val(Logger *logger, int step, float val_loss) {
 void logger_log_train(Logger *logger, int step, float train_loss) {
     if (logger->logfile != NULL) {
         fprintf(logger->logfile, "s:%d trl:%.4f\n", step, train_loss);
-        if (step % 10 == 0) { fflush(logger->logfile); }
+        if (step % logger->flush_every == 0) { fflush(logger->logfile); }
     }
 }
 
@@ -2844,9 +2847,11 @@ int main(int argc, char *argv[]) {
             B, T, multi_gpu_config.num_processes, total_batch_size);
     printf0("=> setting grad_accum_steps=%d\n", grad_accum_steps);
 
-    // set up the Logger & Tokenizer
+    // set up the Logger
     Logger logger;
     logger_init(&logger, output_log_file);
+
+    // set up the Tokenizer
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
