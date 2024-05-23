@@ -7,7 +7,7 @@
 
 # data directories
 dev/data/__pycache__/
-dev/data/fineweb/
+dev/data/fineweb10B/
 dev/data/hellaswag/
 dev/data/mmlu/
 dev/data/tinyshakespeare/

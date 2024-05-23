@@ -55,6 +55,7 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
 #include "tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
+// defines: evalloader_init, evalloader_reset, evalloader_next_batch, evalloader_free
 #include "dataloader.h"
 
 // ----------------------------------------------------------------------------
@@ -1946,6 +1947,7 @@ typedef struct {
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float accumulated_mean_loss; // Mean loss after aggregating it on all GPUs
     floatX* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
+    float* cpu_losses_fp32; // same but fp32
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
     int use_master_weights;
     int recompute;
@@ -2024,6 +2026,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->inputs = NULL;
     model->targets = NULL;
     model->cpu_losses = NULL;
+    model->cpu_losses_fp32 = NULL;
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
@@ -2077,6 +2080,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(floatX)));
+        cudaCheck(cudaMallocHost((void**)&model->cpu_losses_fp32, B * T * sizeof(float)));
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -2181,7 +2185,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost));
         float mean_loss = 0.0f;
-        for (int i = 0; i < B*T; i++) { mean_loss += (float)(model->cpu_losses[i]); }
+        for (int i = 0; i < B*T; i++) {
+            float loss = (float)(model->cpu_losses[i]);
+            model->cpu_losses_fp32[i] = loss;
+            mean_loss += loss;
+        }
         mean_loss /= B*T*grad_accum_steps;
         model->mean_loss = mean_loss;
     } else {
@@ -2337,13 +2345,13 @@ void gpt2_backward(GPT2 *model) {
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C, random_u32(&model->rng_state));
 }
 
-// Compute a mean of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
-float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_config) {
+// Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
+float multi_gpu_cpu_float_sum(float value) {
 #ifdef MULTI_GPU
-    // MPI doesn't support all reduce with mean, so we sum up, then divide.
+    // note MPI doesn't support all reduce with mean, only sum
     float result;
     mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
-    return result / multi_gpu_config->num_processes;
+    return result;
 #else
     return value;
 #endif
@@ -2356,7 +2364,7 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
     if (multi_gpu_config->num_processes == 1) { return; }
     // Average all losses.
-    model->accumulated_mean_loss = multi_gpu_cpu_float_mean(model->mean_loss, multi_gpu_config);
+    model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss) / multi_gpu_config->num_processes;
     if(multi_gpu_config->zero_stage == 0) {
         //  no ZERO == standard DDP: Average all gradients.
         ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
@@ -2450,6 +2458,7 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->inputs));
     cudaCheck(cudaFree(model->targets));
     cudaFreeHost(model->cpu_losses);
+    cudaFreeHost(model->cpu_losses_fp32);
 }
 
 // ----------------------------------------------------------------------------
@@ -2518,6 +2527,12 @@ void logger_init(Logger *logger, const char *filename) {
     logger->flush_every = 20;
     logger->logfile = NULL;
     if (filename != NULL) { logger->logfile = fopenCheck(filename, "w"); }
+}
+
+void logger_log_eval(Logger *logger, int step, float val_loss) {
+    if (logger->logfile != NULL) {
+        fprintf(logger->logfile, "s:%d eval:%.4f\n", step, val_loss);
+    }
 }
 
 void logger_log_val(Logger *logger, int step, float val_loss) {
@@ -2676,12 +2691,27 @@ int main(int argc, char *argv[]) {
     printf0("| val_num_batches       | %-50d |\n", val_num_batches);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
+    // build an EvalLoader for HellaSwag
+    EvalLoader eval_loader;
+    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
+    const char hellaswag_available = access(hellaswag_path, F_OK) == 0;
+    if (hellaswag_available) {
+        evalloader_init(&eval_loader, hellaswag_path, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    }
+    printf0("| hellaswag available   | %-50s |\n", hellaswag_available ? "yes" : "no");
+    printf0("+-----------------------+----------------------------------------------------+\n");
+
     // pretty print in a table the multi-gpu configuration as well
     set_zero_configs(&multi_gpu_config, zero_stage, model.num_parameters);
     printf0("| num_processes         | %-50d |\n", multi_gpu_config.num_processes);
     printf0("| zero_stage            | %-50d |\n", multi_gpu_config.zero_stage);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
+    // prints outside of pretty table to here and below
+    if (!hellaswag_available) {
+        printf0("HellaSwag eval not found at %s, skipping its evaluation\n", hellaswag_path);
+        printf0("You can run `python dev/data/hellaswag.py` to export and use it.\n");
+    }
     // more prints related to allocations from gpt2_build_from_checkpoint down here to not mess up our table above
     printf0("num_parameters: %zu => bytes: %zu\n", model.num_parameters, model.num_parameters_bytes);
     printf0("allocated %d MiB for model parameters\n", (int)round(model.num_parameters_bytes / (1024 * 1024)));
@@ -2729,9 +2759,28 @@ int main(int argc, char *argv[]) {
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
-            val_loss = multi_gpu_cpu_float_mean(val_loss, &multi_gpu_config);
+            val_loss = multi_gpu_cpu_float_sum(val_loss) / multi_gpu_config.num_processes;
             printf0("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
+        }
+
+        // once in a while estimate HellaSwag accuracy
+        if (hellaswag_available &&
+           (step % val_loss_every == 0 || last_step)) {
+            NvtxRange evaluation_range("evaluation");
+            float eval_acc_norm = 0.0f;
+            evalloader_reset(&eval_loader);
+            for (int i = 0; i < eval_loader.num_batches; i++) {
+                if (i % 10 == 0) { printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches); }
+                evalloader_next_batch(&eval_loader);
+                gpt2_forward(&model, eval_loader.inputs, eval_loader.targets, B, T);
+                int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses_fp32);
+                eval_acc_norm += (float)correct;
+            }
+            // careful because not all ranks may have the exact same allocation of number of examples
+            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm);
+            printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
+            logger_log_eval(&logger, step, eval_acc_norm);
         }
 
         // once in a while do model inference to print generated text
@@ -2844,6 +2893,7 @@ int main(int argc, char *argv[]) {
     // free and destroy everything
     cudaCheck(cudaEventDestroy(end));
     cudaCheck(cudaEventDestroy(start));
+    if (hellaswag_available) { evalloader_free(&eval_loader); }
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
@@ -2852,7 +2902,6 @@ int main(int argc, char *argv[]) {
     free(gen_tokens);
     logger_free(&logger);
     multi_gpu_config_free(&multi_gpu_config);
-
     common_free(model);
     return 0;
 }
