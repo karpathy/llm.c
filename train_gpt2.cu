@@ -57,7 +57,9 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 // defines: evalloader_init, evalloader_reset, evalloader_next_batch, evalloader_free
 #include "dataloader.h"
-
+// defines: manual_seed, normal_
+// numerically identical to PyTorch's torch.manual_seed and torch.normal
+#include "rand.h"
 // ----------------------------------------------------------------------------
 // CUDA precision settings
 
@@ -2042,10 +2044,10 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     model->config.num_layers = depth;
     // follows GPT-2 sizes
     int channels, num_heads;
-    if      (depth == 12) { channels = 12; num_heads = 12; } // gpt2 (124M)
-    else if (depth == 24) { channels = 16; num_heads = 16; } // gpt2-medium (350M)
-    else if (depth == 36) { channels = 20; num_heads = 20; } // gpt2-large (774M)
-    else if (depth == 48) { channels = 25; num_heads = 25; } // gpt2-xl (1558M)
+    if      (depth == 12) { channels = 768; num_heads = 12; } // gpt2 (124M)
+    else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
+    else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
+    else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
     else { fprintf(stderr, "Unsupported depth for now\n"); exit(EXIT_FAILURE); }
     model->config.channels = channels;
     model->config.num_heads = num_heads;
@@ -2068,7 +2070,8 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
     // NOTE: assuming all parameters are of the type floatX, could be relaxed later
-    unsigned long long init_rng_state = 42;
+    mt19937_state rng_state;
+    manual_seed(&rng_state, 42);
     floatX* params_memory_cpu = (floatX*)mallocCheck(model->num_parameters_bytes);
     memset(params_memory_cpu, 0, model->num_parameters_bytes);
     // fill in all the weights with random values
@@ -2081,12 +2084,13 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
             // in GPT-2, the projections back into the residual stream are additionally
             // scaled by 1/sqrt(2*L) for training stability
             float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
-            for (size_t j = 0; j < model->param_elements[i]; j++) {
-                float f = random_f32(&init_rng_state); // random float in [0, 1]
-                f *= scale;
-                f -= 0.5f * scale; // mean 0
-                params_memory_cpu[offset + j] = (floatX)f;
+            int n = model->param_elements[i];
+            float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
+            normal_(fp32_buffer, n, 0.0f, scale, &rng_state);
+            for (size_t j = 0; j < n; j++) {
+                params_memory_cpu[offset + j] = (floatX)fp32_buffer[j];
             }
+            free(fp32_buffer);
         }
         offset += model->param_elements[i];
     }
