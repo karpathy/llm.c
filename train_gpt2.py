@@ -128,6 +128,21 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
+        # init all weights
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx, targets=None, return_logits=True):
         device = idx.device
         b, t = idx.size()
@@ -395,7 +410,7 @@ if __name__ == "__main__":
     # python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
-    parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl")
+    parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
@@ -412,8 +427,7 @@ if __name__ == "__main__":
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
     assert args.dtype in {"float32", "float16", "bfloat16"}
-    assert args.model in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
-    model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
+    assert args.model in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl", "d12", "d24", "d36", "d48"}
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -480,8 +494,19 @@ if __name__ == "__main__":
     if master_process and args.write_tensors: # tokenizer is technically not tensors but ok
         write_tokenizer(enc, "gpt2_tokenizer.bin")
 
-    # load the GPT-2 model weights
-    model = GPT.from_pretrained(args.model)
+    # init the model, either from scratch or from OpenAI pretrained checkpoint
+    if args.model[0] == "d":
+        # from scratch (random weights)
+        model_config = {
+            "d12": GPTConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768),
+            "d24": GPTConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024),
+            "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
+            "d48": GPTConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600),
+        }[args.model]
+        model = GPT(model_config)
+    else:
+        # load the GPT-2 model weights
+        model = GPT.from_pretrained(args.model)
     model.train()
     model.to(device)
     if args.compile:
@@ -549,7 +574,9 @@ if __name__ == "__main__":
         logits, loss = model(x, y)
         loss.backward()
         # save model params, in both float32 and bfloat16
-        model_size_str = model_to_size[args.model] # e.g. "124M"
+        model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
+        model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
+        model_size_str = model_to_size[args.model] # e.g. "124M", or "d12"
         write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
         write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
         # save x, y, logits, loss, and parameter gradients, for debugging C
