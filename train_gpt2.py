@@ -394,7 +394,7 @@ if __name__ == "__main__":
     # if you'd like to e.g. time the forward pass only, call this script as:
     # python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_bin", type=str, default="data/tiny_shakespeare_val.bin", help="input .bin to train on")
+    parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl")
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
@@ -495,10 +495,28 @@ if __name__ == "__main__":
 
     # load the tokens
     # note we're using val by default instead of train split just because it is smaller/faster
-    assert os.path.isfile(args.input_bin)
+    if not os.path.isfile(args.input_bin):
+        print0(f"ERROR: input .bin file not found: {args.input_bin}")
+        print0("---> HINT: Try to re-run the data prepro script. these recently moved to dev/data")
+        print0("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        exit(1)
     print0(f"loading cached tokens in {args.input_bin}")
     with open(args.input_bin, "rb") as f:
-        tokens = np.frombuffer(f.read(), dtype=np.int32)
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        if header[0] != 20240520:
+            print0("ERROR: magic number mismatch in the data .bin file!")
+            print0("---> HINT: Are you passing in a correct file with --input_bin?")
+            print0("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
+            print0("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+            exit(1)
+        assert header[1] == 1, "unsupported version"
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+        # convert tokens to int32 because torch can't handle uint16 sad
+        tokens = tokens.astype(np.int32)
+        assert len(tokens) == ntok, "number of tokens read does not match header?"
 
     # np -> tensor, long, on device
     tokens = torch.tensor(tokens)

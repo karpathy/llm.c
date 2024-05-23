@@ -31,6 +31,8 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include "utils.h"
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
 #include "tokenizer.h"
+// defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
+#include "dataloader.h"
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -1453,75 +1455,6 @@ void gpt2_free(GPT2 *model) {
 
 #ifndef TESTING
 // if we are TESTING (see test_gpt2.cu), we'll skip the int main below
-
-// ----------------------------------------------------------------------------
-// data loader lite: returns random batches of data from a file of integers
-
-typedef struct {
-    // hyperparameters
-    int B;
-    int T;
-    // input handling and its state
-    FILE* tokens_file;
-    long file_size;
-    long current_position;
-    // output memory
-    int* batch;
-    int* inputs;
-    int* targets;
-    // convenience variables
-    long num_batches;
-} DataLoader;
-
-void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
-    loader->B = B;
-    loader->T = T;
-
-    // open the input file for reading
-    loader->tokens_file = fopenCheck(filename, "rb");
-
-    // determine the file size
-    fseekCheck(loader->tokens_file, 0, SEEK_END);
-    loader->file_size = ftell(loader->tokens_file);
-    fseekCheck(loader->tokens_file, 0, SEEK_SET);
-    if (loader->file_size < (B * T + 1) * sizeof(int)) {
-        printf("Error: file size is too small for the batch size and sequence length\n");
-        exit(EXIT_FAILURE);
-    }
-    loader->current_position = 0; // start at the beginning
-
-    // allocate space for B*T + 1 integers to store the inputs and targets
-    // Using CUDA CPU pinned memory for faster PCI Express transfers to GPU
-    // See: https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/
-    cudaMallocHost((void**)&loader->batch, (B * T + 1) * sizeof(int));
-    loader->inputs = loader->batch;
-    loader->targets = loader->batch + 1; // targets are shifted by one
-    loader->num_batches = loader->file_size / (B * T * sizeof(int));
-}
-
-void dataloader_reset(DataLoader *loader) {
-    loader->current_position = 0;
-}
-
-void dataloader_next_batch(DataLoader *loader) {
-    int B = loader->B;
-    int T = loader->T;
-    // if we are at the end of the file, loop back to the beginning
-    if (loader->current_position + (B*T+1) * sizeof(int) > loader->file_size) {
-        loader->current_position = 0;
-    }
-    // read the B*T+1 integers from the file into batch
-    fseekCheck(loader->tokens_file, loader->current_position, SEEK_SET);
-    freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
-    // advance the current position by B*T integers
-    loader->current_position += B*T * sizeof(int);
-}
-
-void dataloader_free(DataLoader *loader) {
-    fcloseCheck(loader->tokens_file);
-    cudaFreeHost(loader->batch);
-}
-
 // ----------------------------------------------------------------------------
 // sampler: takes probabilities and samples integers from them
 
@@ -1592,12 +1525,10 @@ void logger_free(Logger *logger) {
 // CLI, poor man's argparse
 
 void error_usage() {
-    // default run = debugging run with TinyShakespeare
-    // bigger run = train on TinyStories! e.g. val/sample less often, but sample more tokens, write to logfile
     fprintf(stderr, "Usage:   ./train_gpt2fp32cu [options]\n");
-    fprintf(stderr, "Example: ./train_gpt2fp32cu -i data/TinyStories -v 100 -s 100 -g 144 -o stories.log\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -i <string> input dataset prefix (default = data/tiny_shakespeare)\n");
+    fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
+    fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
     fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
     fprintf(stderr, "  -b <int>    batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
@@ -1614,7 +1545,8 @@ void error_usage() {
 int main(int argc, char *argv[]) {
 
     // read in the (optional) command line arguments
-    const char* input_dataset_prefix = "data/tiny_shakespeare"; // or e.g. data/TinyStories
+    const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+    const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* output_log_file = NULL;
     int B = 4; // batch size
     int T = 1024; // sequence length max
@@ -1628,7 +1560,8 @@ int main(int argc, char *argv[]) {
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
         // read in the args
-        if (argv[i][1] == 'i') { input_dataset_prefix = argv[i+1]; }
+        if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
+        else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'o') { output_log_file = argv[i+1]; }
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); }
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
@@ -1642,7 +1575,8 @@ int main(int argc, char *argv[]) {
     printf("+-----------------------+----------------------------------------------------+\n");
     printf("| Parameter             | Value                                              |\n");
     printf("+-----------------------+----------------------------------------------------+\n");
-    printf("| input dataset prefix  | %-50s |\n", input_dataset_prefix);
+    printf("| train data pattern    | %-50s |\n", train_data_pattern);
+    printf("| val data pattern      | %-50s |\n", val_data_pattern);
     printf("| output log file       | %-50s |\n", output_log_file == NULL ? "NULL" : output_log_file);
     printf("| batch size B          | %-50d |\n", B);
     printf("| sequence length T     | %-50d |\n", T);
@@ -1684,15 +1618,9 @@ int main(int argc, char *argv[]) {
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val
-    char train_tokens_filename[128];
-    char val_tokens_filename[128];
-    assert(strlen(input_dataset_prefix) < 100); // being bit lazy here, make sure we don't overflow
-    sprintf(train_tokens_filename, "%s_train.bin", input_dataset_prefix);
-    sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
-    DataLoader train_loader;
-    dataloader_init(&train_loader, train_tokens_filename, B, T);
-    DataLoader val_loader;
-    dataloader_init(&val_loader, val_tokens_filename, B, T);
+    DataLoader train_loader, val_loader;
+    dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1);
+    dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1);
     int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default for now
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
     printf("| train_num_batches     | %-50d |\n", train_num_batches);

@@ -54,6 +54,9 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #include "utils.h"
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
 #include "tokenizer.h"
+// defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
+// defines: evalloader_init, evalloader_reset, evalloader_next_batch, evalloader_free
+#include "dataloader.h"
 
 // ----------------------------------------------------------------------------
 // CUDA precision settings
@@ -1944,6 +1947,7 @@ typedef struct {
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float accumulated_mean_loss; // Mean loss after aggregating it on all GPUs
     floatX* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
+    float* cpu_losses_fp32; // same but fp32
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
     int use_master_weights;
     int recompute;
@@ -2022,6 +2026,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->inputs = NULL;
     model->targets = NULL;
     model->cpu_losses = NULL;
+    model->cpu_losses_fp32 = NULL;
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
@@ -2075,6 +2080,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(floatX)));
+        cudaCheck(cudaMallocHost((void**)&model->cpu_losses_fp32, B * T * sizeof(float)));
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -2179,7 +2185,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost));
         float mean_loss = 0.0f;
-        for (int i = 0; i < B*T; i++) { mean_loss += (float)(model->cpu_losses[i]); }
+        for (int i = 0; i < B*T; i++) {
+            float loss = (float)(model->cpu_losses[i]);
+            model->cpu_losses_fp32[i] = loss;
+            mean_loss += loss;
+        }
         mean_loss /= B*T*grad_accum_steps;
         model->mean_loss = mean_loss;
     } else {
@@ -2335,13 +2345,13 @@ void gpt2_backward(GPT2 *model) {
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C, random_u32(&model->rng_state));
 }
 
-// Compute a mean of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
-float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_config) {
+// Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
+float multi_gpu_cpu_float_sum(float value) {
 #ifdef MULTI_GPU
-    // MPI doesn't support all reduce with mean, so we sum up, then divide.
+    // note MPI doesn't support all reduce with mean, only sum
     float result;
     mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
-    return result / multi_gpu_config->num_processes;
+    return result;
 #else
     return value;
 #endif
@@ -2354,7 +2364,7 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
     if (multi_gpu_config->num_processes == 1) { return; }
     // Average all losses.
-    model->accumulated_mean_loss = multi_gpu_cpu_float_mean(model->mean_loss, multi_gpu_config);
+    model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss) / multi_gpu_config->num_processes;
     if(multi_gpu_config->zero_stage == 0) {
         //  no ZERO == standard DDP: Average all gradients.
         ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
@@ -2448,6 +2458,7 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->inputs));
     cudaCheck(cudaFree(model->targets));
     cudaFreeHost(model->cpu_losses);
+    cudaFreeHost(model->cpu_losses_fp32);
 }
 
 // ----------------------------------------------------------------------------
@@ -2481,85 +2492,7 @@ void common_free(GPT2 &model) {
 }
 
 #ifndef TESTING
-// if we are TESTING (see test_gpt2.cu), we'll skip the int main below
-// ----------------------------------------------------------------------------
-// data loader lite: returns random batches of data from a file of integers
-
-typedef struct {
-    // Distributed data parallel specifics.
-    // Each worker loads it's own chunk of data.
-    int process_rank;
-    int num_processes;
-    // hyperparameters. use size_t to prevent overflow
-    size_t B;
-    size_t T;
-    // input handling and its state
-    FILE* tokens_file;
-    long file_size;
-    long current_position;
-    // output memory
-    int* batch;
-    int* inputs;
-    int* targets;
-    // convenience variables
-    size_t num_batches;
-} DataLoader;
-
-void dataloader_init(DataLoader *loader, const MultiGpuConfig* multi_gpu_config, const char* filename, size_t B, size_t T) {
-    loader->process_rank = multi_gpu_config->process_rank;
-    loader->num_processes = multi_gpu_config->num_processes;
-    loader->B = B;
-    loader->T = T;
-
-    // open the input file for reading
-    loader->tokens_file = fopenCheck(filename, "rb");
-
-    // determine the file size
-    fseekCheck(loader->tokens_file, 0, SEEK_END);
-    loader->file_size = ftell(loader->tokens_file);
-    fseekCheck(loader->tokens_file, 0, SEEK_SET);
-    if (loader->file_size < (B * T + 1) * sizeof(int)) {
-        printf("Error: file size is too small for the batch size and sequence length\n");
-        exit(EXIT_FAILURE);
-    }
-    loader->current_position = loader->process_rank * B * T * sizeof(int); // start at the beginning
-
-    // allocate space for B*T + 1 integers to store the inputs and targets
-    // Using CUDA CPU pinned memory for faster PCI Express transfers to GPU
-    // See: https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/
-    cudaMallocHost((void**)&loader->batch, (B * T + 1) * sizeof(int));
-    loader->inputs = loader->batch;
-    loader->targets = loader->batch + 1; // targets are shifted by one
-    // note: we definitely want to advance by B * T; That is the "stride" by which we move
-    // the window of tokens. We only load B * T + 1 tokens because our targets are offset by 1
-    loader->num_batches = loader->file_size / (loader->num_processes * B * T * sizeof(int));
-}
-
-void dataloader_reset(DataLoader *loader) {
-    loader->current_position = 0;
-}
-
-void dataloader_next_batch(DataLoader *loader) {
-    NVTX_RANGE_FN();
-    size_t B = loader->B;
-    size_t T = loader->T;
-    // if we are at the end of the file, loop back to the beginning
-    if (loader->current_position + (loader->num_processes * B * T + 1) * sizeof(int) > loader->file_size) {
-        loader->current_position = loader->process_rank * B * T * sizeof(int);
-    }
-    // read the B*T+1 integers from the file into batch
-    fseekCheck(loader->tokens_file, loader->current_position, SEEK_SET);
-    freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
-    // advance the current position by B*T*num_processes integers
-    // note: the "stride" of tokens by which we move each time is definitely B * T
-    loader->current_position += loader->num_processes * B * T * sizeof(int);
-}
-
-void dataloader_free(DataLoader *loader) {
-    fcloseCheck(loader->tokens_file);
-    cudaFreeHost(loader->batch);
-}
-
+// if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
 // ----------------------------------------------------------------------------
 // sampler: takes probabilities and samples integers from them
 
@@ -2596,6 +2529,12 @@ void logger_init(Logger *logger, const char *filename) {
     if (filename != NULL) { logger->logfile = fopenCheck(filename, "w"); }
 }
 
+void logger_log_eval(Logger *logger, int step, float val_loss) {
+    if (logger->logfile != NULL) {
+        fprintf(logger->logfile, "s:%d eval:%.4f\n", step, val_loss);
+    }
+}
+
 void logger_log_val(Logger *logger, int step, float val_loss) {
     if (logger->logfile != NULL) {
         fprintf(logger->logfile, "s:%d tel:%.4f\n", step, val_loss);
@@ -2617,13 +2556,11 @@ void logger_free(Logger *logger) {
 // CLI, poor man's argparse
 
 void error_usage() {
-    // default run = debugging run with TinyShakespeare
-    // bigger run = train on TinyStories! e.g. val/sample less often, but sample more tokens, write to logfile
     fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
-    fprintf(stderr, "Example: ./train_gpt2cu -i data/TinyStories -v 100 -s 100 -g 144 -o stories.log\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -i <string> input dataset prefix (default = data/tiny_shakespeare)\n");
-    fprintf(stderr, "  -e <string> input model filename (default = gpt2_124M_bf16.bin)\n");
+    fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
+    fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
+    fprintf(stderr, "  -e <string> input from model at this filename (default = gpt2_124M_bf16.bin)\n");
     fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
     fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
@@ -2648,7 +2585,8 @@ int main(int argc, char *argv[]) {
     multi_gpu_config = multi_gpu_config_init(&argc, &argv);
 
     // read in the (optional) command line arguments
-    const char* input_dataset_prefix = "data/tiny_shakespeare"; // or e.g. data/TinyStories
+    const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+    const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* output_log_file = NULL;
     int B = 4; // batch size
@@ -2671,7 +2609,8 @@ int main(int argc, char *argv[]) {
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
         // read in the args
-        if (argv[i][1] == 'i') { input_dataset_prefix = argv[i+1]; }
+        if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
+        else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
         else if (argv[i][1] == 'o') { output_log_file = argv[i+1]; }
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
@@ -2693,10 +2632,14 @@ int main(int argc, char *argv[]) {
     }
     // calculate a sensible default for total batch size by assuming no gradient accumulation
     if (total_batch_size == -1) { total_batch_size = B * T * multi_gpu_config.num_processes; }
+    // if we're only overfitting a single batch for debugging, let's overfit the first batch
+    // from val instead of train split, because val is smaller and faster. (train_gpt2.py does the same)
+    if (overfit_single_batch == 1) { train_data_pattern = val_data_pattern; }
     printf0("+-----------------------+----------------------------------------------------+\n");
     printf0("| Parameter             | Value                                              |\n");
     printf0("+-----------------------+----------------------------------------------------+\n");
-    printf0("| input dataset prefix  | %-50s |\n", input_dataset_prefix);
+    printf0("| train data pattern    | %-50s |\n", train_data_pattern);
+    printf0("| val data pattern      | %-50s |\n", val_data_pattern);
     printf0("| output log file       | %-50s |\n", output_log_file == NULL ? "NULL" : output_log_file);
     printf0("| micro batch size B    | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
@@ -2739,20 +2682,23 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val
-    char train_tokens_filename[128], val_tokens_filename[128];
-    assert(strlen(input_dataset_prefix) < 100); // being bit lazy here, make sure we don't overflow
-    // if we're only overfitting a single batch for debugging, let's overfit the first batch
-    // from val instead of train split, because val is smaller and a bit faster
-    const char* train_split = (overfit_single_batch == 1) ? "val" : "train";
-    sprintf(train_tokens_filename, "%s_%s.bin", input_dataset_prefix, train_split);
-    sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, &multi_gpu_config, train_tokens_filename, B, T);
-    dataloader_init(&val_loader, &multi_gpu_config, val_tokens_filename, B, T);
+    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
     int train_num_batches = (max_steps == -1) ? train_loader.num_batches : max_steps; // default = 1 epoch
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
     printf0("| train_num_batches     | %-50d |\n", train_num_batches);
     printf0("| val_num_batches       | %-50d |\n", val_num_batches);
+    printf0("+-----------------------+----------------------------------------------------+\n");
+
+    // build an EvalLoader for HellaSwag
+    EvalLoader eval_loader;
+    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
+    const char hellaswag_available = access(hellaswag_path, F_OK) == 0;
+    if (hellaswag_available) {
+        evalloader_init(&eval_loader, hellaswag_path, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    }
+    printf0("| hellaswag available   | %-50s |\n", hellaswag_available ? "yes" : "no");
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // pretty print in a table the multi-gpu configuration as well
@@ -2761,6 +2707,11 @@ int main(int argc, char *argv[]) {
     printf0("| zero_stage            | %-50d |\n", multi_gpu_config.zero_stage);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
+    // prints outside of pretty table to here and below
+    if (!hellaswag_available) {
+        printf0("HellaSwag eval not found at %s, skipping its evaluation\n", hellaswag_path);
+        printf0("You can run `python dev/data/hellaswag.py` to export and use it.\n");
+    }
     // more prints related to allocations from gpt2_build_from_checkpoint down here to not mess up our table above
     printf0("num_parameters: %zu => bytes: %zu\n", model.num_parameters, model.num_parameters_bytes);
     printf0("allocated %d MiB for model parameters\n", (int)round(model.num_parameters_bytes / (1024 * 1024)));
@@ -2808,9 +2759,28 @@ int main(int argc, char *argv[]) {
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
-            val_loss = multi_gpu_cpu_float_mean(val_loss, &multi_gpu_config);
+            val_loss = multi_gpu_cpu_float_sum(val_loss) / multi_gpu_config.num_processes;
             printf0("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
+        }
+
+        // once in a while estimate HellaSwag accuracy
+        if (hellaswag_available &&
+           (step % val_loss_every == 0 || last_step)) {
+            NvtxRange evaluation_range("evaluation");
+            float eval_acc_norm = 0.0f;
+            evalloader_reset(&eval_loader);
+            for (int i = 0; i < eval_loader.num_batches; i++) {
+                if (i % 10 == 0) { printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches); }
+                evalloader_next_batch(&eval_loader);
+                gpt2_forward(&model, eval_loader.inputs, eval_loader.targets, B, T);
+                int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses_fp32);
+                eval_acc_norm += (float)correct;
+            }
+            // careful because not all ranks may have the exact same allocation of number of examples
+            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm);
+            printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
+            logger_log_eval(&logger, step, eval_acc_norm);
         }
 
         // once in a while do model inference to print generated text
@@ -2923,6 +2893,7 @@ int main(int argc, char *argv[]) {
     // free and destroy everything
     cudaCheck(cudaEventDestroy(end));
     cudaCheck(cudaEventDestroy(start));
+    if (hellaswag_available) { evalloader_free(&eval_loader); }
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
@@ -2931,7 +2902,6 @@ int main(int argc, char *argv[]) {
     free(gen_tokens);
     logger_free(&logger);
     multi_gpu_config_free(&multi_gpu_config);
-
     common_free(model);
     return 0;
 }
