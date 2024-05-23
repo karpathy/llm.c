@@ -2676,6 +2676,7 @@ void error_usage() {
     fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
     fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
     fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
+    fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
     fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
     fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
@@ -2705,6 +2706,7 @@ int main(int argc, char *argv[]) {
     int total_batch_size = -1; // will be calculated down below later, if not provided
     float learning_rate = 3e-4f;
     int warmup_iterations = 0;
+    float final_learning_rate_frac = 1.0f; // final fraction of learning rate, at end of training
     float weight_decay = 0.0f;
     int val_loss_every = 20; // every how many steps do we eval validation loss?
     int val_max_batches = 20; // how many batches max do we eval for validation loss?
@@ -2731,6 +2733,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
         else if (argv[i][1] == 'l') { learning_rate = atof(argv[i+1]); }
         else if (argv[i][1] == 'u') { warmup_iterations = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'q') { final_learning_rate_frac = atof(argv[i+1]); }
         else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
@@ -2745,6 +2748,8 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else { error_usage(); }
     }
+    // should do a bit more error checking here
+    assert(warmup_iterations >= 0);
     // calculate a sensible default for total batch size by assuming no gradient accumulation
     if (total_batch_size == -1) { total_batch_size = B * T * multi_gpu_config.num_processes; }
     // if we're only overfitting a single batch for debugging, let's overfit the first batch
@@ -2759,8 +2764,9 @@ int main(int argc, char *argv[]) {
     printf0("| micro batch size B    | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
-    printf0("| learning rate         | %-50e |\n", learning_rate);
+    printf0("| learning rate (LR)    | %-50e |\n", learning_rate);
     printf0("| warmup iterations     | %-50d |\n", warmup_iterations);
+    printf0("| final LR fraction     | %-50e |\n", final_learning_rate_frac);
     printf0("| weight decay          | %-50e |\n", weight_decay);
     printf0("| grad_clip             | %-50e |\n", grad_clip);
     printf0("| max_steps             | %-50d |\n", max_steps);
@@ -2990,11 +2996,17 @@ int main(int argc, char *argv[]) {
         model.mean_loss = lossf;
         // update the parameters
         gpt2_multi_gpu_accumulate(&model, &multi_gpu_config);
-        // learning rate schedule
+        // learning rate schedule: warmup linearly to max LR, then cosine decay to LR * final_learning_rate_frac
         float step_learning_rate = learning_rate;
-        if (warmup_iterations > 0) {
-            float lr_scale = fminf(1.0f, (float)(step + 1) / warmup_iterations);
-            step_learning_rate *= lr_scale;
+        if (step < warmup_iterations) {
+            step_learning_rate = learning_rate * ((float)(step + 1)) / warmup_iterations;
+        } else {
+            float decay_ratio = ((float)(step - warmup_iterations)) / (train_num_batches - warmup_iterations);
+            assert(0.0f <= decay_ratio && decay_ratio <= 1.0f);
+            float coeff = 0.5f * (1.0f + cosf(M_PI * decay_ratio)); // coeff starts at 1 and goes to 0
+            assert(0.0f <= coeff && coeff <= 1.0f);
+            float min_lr = learning_rate * final_learning_rate_frac;
+            step_learning_rate = min_lr + coeff * (learning_rate - min_lr);
         }
         // update the model parameters
         float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_clip, step+1, &multi_gpu_config);
