@@ -2635,9 +2635,9 @@ void logger_init(Logger *logger, const char *filename) {
     if (filename != NULL) { logger->logfile = fopenCheck(filename, "w"); }
 }
 
-void logger_log_eval(Logger *logger, int step, float val_loss) {
+void logger_log_eval(Logger *logger, int step, float val) {
     if (logger->logfile != NULL) {
-        fprintf(logger->logfile, "s:%d eval:%.4f\n", step, val_loss);
+        fprintf(logger->logfile, "s:%d eval:%.4f\n", step, val);
     }
 }
 
@@ -2900,7 +2900,7 @@ int main(int argc, char *argv[]) {
             // careful because not all ranks may have the exact same allocation of number of examples
             eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm);
             printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
-            logger_log_eval(&logger, step, eval_acc_norm);
+            logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
         }
 
         // once in a while do model inference to print generated text
