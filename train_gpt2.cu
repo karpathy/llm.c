@@ -1955,6 +1955,31 @@ typedef struct {
     int recompute;
 } GPT2;
 
+void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
+    // write the model to a checkpoint file
+    printf0("Writing model to %s\n", checkpoint_path);
+    FILE *model_file = fopenCheck(checkpoint_path, "wb");
+    // write the header first
+    int model_header[256];
+    model_header[0] = 20240326;
+    assert(PRECISION_MODE == PRECISION_FP32 || PRECISION_MODE == PRECISION_BF16);
+    model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : 5;
+    model_header[2] = model->config.max_seq_len;
+    model_header[3] = model->config.vocab_size;
+    model_header[4] = model->config.num_layers;
+    model_header[5] = model->config.num_heads;
+    model_header[6] = model->config.channels;
+    model_header[7] = model->config.padded_vocab_size;
+    fwrite(model_header, sizeof(int), 256, model_file);
+    // write the parameters
+    void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
+    cudaCheck(cudaMemcpy(params_memory_cpu, model->params_memory, model->num_parameters_bytes, cudaMemcpyDeviceToHost));
+    fwrite(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
+    free(params_memory_cpu);
+    // close file, we're done
+    fcloseCheck(model_file);
+}
+
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     if (PRECISION_MODE == PRECISION_FP16) {
