@@ -1210,7 +1210,7 @@ struct SoftmaxParams {
     float Offset;
 };
 
-__device__ SoftmaxParams prepare_softmax_blockwide3(int idx, const floatX* inp, int V, int P) {
+__device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* inp, int V, int P) {
     // same but not float4
     // one row of inp, i.e. inp[idx, :] of shape (V,)
 
@@ -1267,7 +1267,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     // note: idx is small enough that it easily fits into 32 bit;
     // by making it a long here, we ensure that any offsets calculated with it (e.g., idx * P)
     // are done is 64 bit
-    long idx = gridDim.x - (blockIdx.x+1); // reverse order for cache hits on matmul data
+    int64_t idx = gridDim.x - (blockIdx.x+1); // reverse order for cache hits on matmul data
     int ix = targets[idx];
 
     // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
