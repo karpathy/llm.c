@@ -986,10 +986,10 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 }
 
 __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with only 1024 threads?
-                layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
-                                            const floatX* dout, const floatX* inp, const floatX* weight,
-                                            const floatX* mean, const floatX* rstd,
-                                            int B, int T, int C) {
+    layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+                                const floatX* dout, const floatX* inp, const floatX* weight,
+                                const floatX* mean, const floatX* rstd,
+                                int B, int T, int C) {
     extern __shared__ float shared[]; // size = 2*C + 2*block_size + 1
     int warpsInBlock = blockDim.x / WARP_SIZE; //number of warps in block
     int warpId = threadIdx.x / WARP_SIZE; // warp index within a block
