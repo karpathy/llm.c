@@ -36,8 +36,11 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 
 #include <unistd.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
 // GPU / CUDA related
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -2649,17 +2652,30 @@ int sample_softmax(const float* logits, int n, float coin) {
 // ----------------------------------------------------------------------------
 // Logger lite, will probably grow/change some over time
 
+void create_dir_if_not_exists(const char *dir) {
+    struct stat st = {0};
+    if (stat(dir, &st) == -1) {
+        if (mkdir(dir, 0700) == -1) {
+            printf0("ERROR: could not create directory: %s\n", dir);
+            exit(EXIT_FAILURE);
+        }
+        printf0("created directory: %s\n", dir);
+    }
+}
+
 typedef struct {
     FILE *logfile;
     int flush_every; // every how many steps to flush the log
 } Logger;
 
-void logger_init(Logger *logger, const char *filename) {
+void logger_init(Logger *logger, const char *log_dir, int process_rank) {
     logger->flush_every = 10;
     logger->logfile = NULL;
-    // only rank 0 process will log
-    if (filename != NULL && multi_gpu_config.process_rank == 0) {
-        logger->logfile = fopenCheck(filename, "w");
+    if (log_dir != NULL && process_rank == 0) {
+        char output_log_file[256];
+        assert(strlen(log_dir) < 200); // being a bit lazy, can relax later maybe
+        snprintf(output_log_file, 256, "%s/main.log", log_dir);
+        logger->logfile = fopenCheck(output_log_file, "w");
     }
 }
 
@@ -2695,7 +2711,7 @@ void error_usage() {
     fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
     fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
     fprintf(stderr, "  -e <string> input from model at this filename (default = gpt2_124M_bf16.bin)\n");
-    fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
+    fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
     fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
     fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
@@ -2726,7 +2742,7 @@ int main(int argc, char *argv[]) {
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
-    const char* output_log_file = NULL;
+    const char* output_log_dir = NULL;
     int B = 4; // batch size
     int T = 1024; // sequence length max
     int total_batch_size = -1; // will be calculated down below later, if not provided
@@ -2754,7 +2770,7 @@ int main(int argc, char *argv[]) {
         if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
-        else if (argv[i][1] == 'o') { output_log_file = argv[i+1]; }
+        else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
         else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
@@ -2778,6 +2794,12 @@ int main(int argc, char *argv[]) {
     }
     // should do a bit more error checking here
     assert(warmup_iterations >= 0);
+    // check if output_log_dir has a "." in it, because this behavior changed May 24, 2024. take out later
+    if (output_log_dir != NULL && strstr(output_log_dir, ".") != NULL) {
+        fprintf(stderr, "-o (output_log_dir) has a '.', are you specifying a file instead of dir?\n");
+        fprintf(stderr, "(note that this option changed recently, -o used to be file, became dir.)\n");
+        exit(EXIT_FAILURE);
+    }
     // calculate a sensible default for total batch size by assuming no gradient accumulation
     if (total_batch_size == -1) { total_batch_size = B * T * multi_gpu_config.num_processes; }
     // if we're only overfitting a single batch for debugging, let's overfit the first batch
@@ -2788,7 +2810,7 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
     printf0("| train data pattern    | %-50s |\n", train_data_pattern);
     printf0("| val data pattern      | %-50s |\n", val_data_pattern);
-    printf0("| output log file       | %-50s |\n", output_log_file == NULL ? "NULL" : output_log_file);
+    printf0("| output log dir        | %-50s |\n", output_log_dir == NULL ? "NULL" : output_log_dir);
     printf0("| micro batch size B    | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
@@ -2890,9 +2912,10 @@ int main(int argc, char *argv[]) {
             B, T, multi_gpu_config.num_processes, total_batch_size);
     printf0("=> setting grad_accum_steps=%d\n", grad_accum_steps);
 
-    // set up the Logger
+    // set up logging
+    create_dir_if_not_exists(output_log_dir);
     Logger logger;
-    logger_init(&logger, output_log_file);
+    logger_init(&logger, output_log_dir, multi_gpu_config.process_rank);
 
     // set up the Tokenizer
     Tokenizer tokenizer;
