@@ -2037,7 +2037,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 
     // read in all the parameters from file and copy them to device
-    float* params_memory_cpu = (float*)mallocCheck(model->num_parameters_bytes);
+    void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
     freadCheck(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     free(params_memory_cpu);
