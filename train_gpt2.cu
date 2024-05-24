@@ -3022,10 +3022,10 @@ int main(int argc, char *argv[]) {
         float time_elapsed_ms;
         cudaCheck(cudaEventElapsedTime(&time_elapsed_ms, start, end));
         size_t tokens_processed = (size_t)multi_gpu_config.num_processes * B * T * grad_accum_steps;
-        float tokens_per_second = tokens_processed / time_elapsed_ms * 1000.0;
+        float tokens_per_second = tokens_processed / time_elapsed_ms * 1000.0f;
         float bias_corrected_ema_tokens_per_second = tokens_per_second; // by default set to non-ema version
         if (step > 0) { // consider the first batch to be a warmup (e.g. cuBLAS/cuDNN initialisation)
-            total_sum_iteration_time_s += time_elapsed_ms / 1000.0;
+            total_sum_iteration_time_s += time_elapsed_ms / 1000.0f;
             // smooth out the tok/s with an exponential moving average, and bias correct just like in AdamW
             ema_tokens_per_second = 0.95f * ema_tokens_per_second + 0.05f * tokens_per_second;
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
