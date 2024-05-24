@@ -29,7 +29,7 @@ from data_common import write_datafile
 # ------------------------------------------
 
 parser = argparse.ArgumentParser(description="FineWeb dataset preprocessing")
-parser.add_argument("-s", "--shard_size", type=int, default=10**9, help="Size of each shard in tokens")
+parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each shard in tokens")
 args = parser.parse_args()
 
 # create the cache directory if it doesn't exist yet
