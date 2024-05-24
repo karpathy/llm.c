@@ -1264,7 +1264,10 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
                 fused_classifier_kernel5(floatX* logits, floatX* losses, floatX* probs,
                                          const float dloss, const int* targets,
                                          int B, int T, int V, int P) {
-    int idx = gridDim.x - (blockIdx.x+1); // reverse order for cache hits on matmul data
+    // note: idx is small enough that it easily fits into 32 bit;
+    // by making it a long here, we ensure that any offsets calculated with it (e.g., idx * P)
+    // are done is 64 bit
+    long idx = gridDim.x - (blockIdx.x+1); // reverse order for cache hits on matmul data
     int ix = targets[idx];
 
     // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
@@ -2044,7 +2047,8 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     model->config.num_layers = depth;
     // follows GPT-2 sizes
     int channels, num_heads;
-    if      (depth == 12) { channels = 768; num_heads = 12; } // gpt2 (124M)
+    if      (depth == 6)  { channels = 384; num_heads = 6; } // gpt2-tiny (30M)
+    else if (depth == 12) { channels = 768; num_heads = 12; } // gpt2 (124M)
     else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
     else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
     else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
