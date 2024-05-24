@@ -47,6 +47,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -84,6 +85,7 @@ class MLP(nn.Module):
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu    = NewGELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -126,7 +128,26 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        # init all weights, use a torch rng object to be very careful
+        self.init_rng = torch.Generator()
+        self.init_rng.manual_seed(42)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # apply special scaled init to the residual projections, per GPT-2 paper
+            std = 0.02 if not hasattr(module, 'LLMC_RESIDUAL_SCALE_FLAG') else 0.02/math.sqrt(2 * self.config.n_layer)
+            # we want to skip initializing lm_head, which shares parameters with wte
+            # and wte was already initialized down below during the Embedding init
+            if not hasattr(module, 'LLMC_SKIP_INIT'):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=std, generator=self.init_rng)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
 
     def forward(self, idx, targets=None, return_logits=True):
         device = idx.device
@@ -395,7 +416,7 @@ if __name__ == "__main__":
     # python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
-    parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl")
+    parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
@@ -408,12 +429,12 @@ if __name__ == "__main__":
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
     parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
+    parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
     args = parser.parse_args()
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
     assert args.dtype in {"float32", "float16", "bfloat16"}
-    assert args.model in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
-    model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
+    assert args.model in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl", "d12", "d24", "d36", "d48"}
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -427,8 +448,10 @@ if __name__ == "__main__":
         device = f'cuda:{ddp_local_rank}'
         torch.cuda.set_device(device)
         master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-        seed_offset = ddp_rank # each process gets a different seed
+        seed_offset = 0 # each process gets the exact same seed
     else:
+        ddp_rank = 0
+        ddp_local_rank = 0
         ddp_world_size = 1
         master_process = True
         seed_offset = 0
@@ -449,8 +472,9 @@ if __name__ == "__main__":
     tokens_per_fwdbwd = B * T * ddp_world_size
     assert args.total_batch_size % tokens_per_fwdbwd == 0
     grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
-    print(f"total desired batch size: {args.total_batch_size}")
-    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    if master_process:
+        print(f"total desired batch size: {args.total_batch_size}")
+        print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
     # set up a context manager following the desired dtype and device
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
@@ -480,8 +504,19 @@ if __name__ == "__main__":
     if master_process and args.write_tensors: # tokenizer is technically not tensors but ok
         write_tokenizer(enc, "gpt2_tokenizer.bin")
 
-    # load the GPT-2 model weights
-    model = GPT.from_pretrained(args.model)
+    # init the model, either from scratch or from OpenAI pretrained checkpoint
+    if args.model[0] == "d":
+        # from scratch (random weights)
+        model_config = {
+            "d12": GPTConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768),
+            "d24": GPTConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024),
+            "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
+            "d48": GPTConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600),
+        }[args.model]
+        model = GPT(model_config)
+    else:
+        # load the GPT-2 model weights
+        model = GPT.from_pretrained(args.model)
     model.train()
     model.to(device)
     if args.compile:
@@ -526,18 +561,20 @@ if __name__ == "__main__":
     def get_batch():
         assert B*T+1 <= len(tokens), "not enough tokens"
         # for 338,025 tokens. E.g. with B=8 T=1024, this will yield 41 batches before looping
-        i = 0
+        i = B*T*ddp_rank
         while True:
             x = tokens[i:i+B*T].view(B, T)
             y = tokens[i+1:i+B*T+1].view(B, T)
             yield x, y
-            i += B*T
+            i += B*T*ddp_world_size
             if i + B*T + 1 >= len(tokens):
                 i = 0 # in prod we'd want to randomize the start point a bit
+                print("We do not expect to reach here in PyTorch right now")
+                import sys; sys.exit()
 
-    # fetch one batch of data, which we will overfit to
+    # fetch one batch of data
     data_iter = iter(get_batch())
-    x, y = next(data_iter) # we'll overfit this batch below
+    x, y = next(data_iter)
     x = x.to(device)
     y = y.to(device)
 
@@ -549,7 +586,9 @@ if __name__ == "__main__":
         logits, loss = model(x, y)
         loss.backward()
         # save model params, in both float32 and bfloat16
-        model_size_str = model_to_size[args.model] # e.g. "124M"
+        model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
+        model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
+        model_size_str = model_to_size[args.model] # e.g. "124M", or "d12"
         write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
         write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
         # save x, y, logits, loss, and parameter gradients, for debugging C
@@ -566,7 +605,7 @@ if __name__ == "__main__":
 
     # init the optimizer
     adam_use_fused = device == "cuda" # only works on CUDA (?)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, fused=adam_use_fused)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0, fused=adam_use_fused)
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -587,12 +626,17 @@ if __name__ == "__main__":
                 # instead of a SUM we want MEAN, so we scale the loss here
                 loss = loss / grad_accum_steps
                 lossf += loss.item() # keep track of the mean loss
+            # advance the dataset for the next batch
+            if not args.overfit_single_batch:
+                x, y = next(data_iter)
+                x = x.to(device)
+                y = y.to(device)
+            # backward pass
             if ddp:
                 # we want only the last micro-step to sync grads in a DDP model
                 # the official way to do this is with model.no_sync(), but that is a
                 # context manager that bloats the code, so we just toggle this variable
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-            # backward pass
             if not args.inference_only:
                 loss.backward()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -608,7 +652,7 @@ if __name__ == "__main__":
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
         tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
-        print0(f"iteration {step+1}, loss: {lossf:.4f}, time: {(t1-t0)*1000:.3f}ms, tok/s: {tokens_per_second:.2f}, norm: {norm:.3f}")
+        print0(f"step {step+1:4d}/{args.num_iterations}: train loss {lossf:.6f} norm {norm:.4f} lr 1.00e-04 ({(t1-t0)*1000:.3f} ms, {tokens_per_second:.0f} tok/s)")
         if step > 0 and step > args.num_iterations - 20:
             timings.append(t1-t0)
 
