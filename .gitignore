@@ -34,3 +34,6 @@ dev/cuda/global_norm
 
 # log files
 *.log
+
+# build system related files
+build/*

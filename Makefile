@@ -74,7 +74,7 @@ else
   endif
   CC := cl
   CFLAGS = /Idev /Zi /nologo /Wall /WX- /diagnostics:column /sdl /O2 /Oi /Ot /GL /D _DEBUG /D _CONSOLE /D _UNICODE /D UNICODE /Gm- /EHsc /MD /GS /Gy /fp:fast /Zc:wchar_t /Zc:forScope /Zc:inline /permissive- \
-   /external:W3 /Gd /TP /wd4996 /Fd$@.pdb /FC /openmp:llvm
+   /external:W3 /Gd /TP /wd4996 /Fd$@.pdb /FC
   LDFLAGS :=
   LDLIBS :=
   INCLUDES :=
@@ -175,6 +175,8 @@ else
         $(info ✗ OpenMP not found)
       endif
     endif
+  else
+    CFLAGS += /D OMP /openmp:llvm
   endif
 endif
 
