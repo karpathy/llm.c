@@ -15,88 +15,10 @@ Implements a medium simple DataLoader for a distributed training setup.
 #include "utils.h"
 
 // ----------------------------------------------------------------------------
-// implementation of glob for Windows
+// implementation of glob for Windows is in dev/unistd.h 
 #ifndef _WIN32
 #include <glob.h>
-#else
-
-typedef struct glob_t {
-    size_t gl_pathc;    // Count of matched pathnames
-    char **gl_pathv;    // List of matched pathnames
-} glob_t;
-
-void replace_forward_slashes(char* str) {
-    while (*str) {
-        if (*str == '/') {
-            *str = '\\';
-        }
-        str++;
-    }
-}
-
-void globfree(glob_t *pglob) {
-    for (size_t i = 0; i < pglob->gl_pathc; ++i) {
-		free(pglob->gl_pathv[i]); // Free the allocated memory for each filename
-    }
-	free(pglob->gl_pathv); // Free the allocated memory for the list of filenames
-}
-
-int glob(const char* pattern, int ignored_flags, int (*ignored_errfunc)(const char* epath, int eerrno), glob_t* pglob){
-    struct _finddata_t find_file_data;
-	char full_path[576]; // stored in pglob->gl_pathv[n]
-    char directory_path[512] = {0}; // Store the directory path from the pattern
-	char pattern_copy[512]; // Copy of the pattern to modify
-
-	strncpy_s(pattern_copy, sizeof(pattern_copy) - 1, pattern, sizeof(pattern_copy) - 1);
-
-    replace_forward_slashes (pattern_copy); // Replace forward slashes with backslashes
-    
-	if (strchr(pattern_copy, '\\') != NULL) {
-		strncpy_s(directory_path, sizeof(directory_path) - 1, pattern_copy, strrchr(pattern_copy, '\\') - pattern_copy + 1);
-		directory_path[strrchr(pattern_copy, '\\') - pattern_copy + 1] = '\0';
-	}
-	
-    // find the first file matching the pattern in the directory
-    intptr_t find_handle = _findfirst(pattern_copy, &find_file_data);
-
-    if (find_handle == -1) {
-        return 1; // No files found
-    }
-
-    size_t file_count = 0;
-    size_t max_files = 64000; // hard-coded limit for the number of files
-
-	pglob->gl_pathv = (char **) malloc(max_files * sizeof(char*)); // freed in globfree
-
-    if (pglob->gl_pathv == NULL) {
-        _findclose(find_handle);
-        return 2; // Memory allocation failed
-    }
-
-    do {
-        if (file_count >= max_files) {
-            _findclose(find_handle);
-			return 2; // Too many files found
-            }
-
-        snprintf(full_path, sizeof(full_path), "%s%s", directory_path, find_file_data.name);
-
-		pglob->gl_pathv[file_count] = _strdup(full_path); // freed in globfree
-
-        if (pglob->gl_pathv[file_count] == NULL) {
-            _findclose(find_handle);
-            return 2; // Memory allocation for filename failed
-        }
-        file_count++;
-    } while (_findnext(find_handle, &find_file_data) == 0);
-
-    _findclose(find_handle);
-
-    pglob->gl_pathc = file_count;
-    return 0;
-}
 #endif
-
 // ----------------------------------------------------------------------------
 // Distributed Data Loader
 #define HEADER_SIZE 256
@@ -113,8 +35,8 @@ typedef struct {
     glob_t glob_result; // stores the result of glob, for all shards we want to iterate
     int current_shard; // the current shard we are reading from
     FILE* tokens_file;
-    long file_size;
-    long current_position;
+    int64_t file_size;
+    int64_t current_position;
     uint16_t* buffer; // we fread data from file into this buffer
     // public variables that could be accessed from outside
     size_t num_batches;
@@ -122,7 +44,7 @@ typedef struct {
     int* targets; // target tokens for the transformer
 } DataLoader;
 
-long dataloader_load_shard_(DataLoader *loader, int shard_index) {
+int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
     // use the first glob match as the filename for now
     const char* filename = loader->glob_result.gl_pathv[shard_index];
     // open the input file for reading. also only a single file can be opened at a time
@@ -140,14 +62,14 @@ long dataloader_load_shard_(DataLoader *loader, int shard_index) {
         exit(EXIT_FAILURE);
     }
     if (header[1] != 1) { printf("Bad version in data file\n"); exit(EXIT_FAILURE); }
-    long ntok = header[2]; // number of tokens in the file
+    int64_t ntok = header[2]; // number of tokens in the file
     assert(ntok > 0); // we expect some tokens in the file. this should never trip, right?
     // determine the file size and make sure it is consistent with the number of tokens
     fseekCheck(loader->tokens_file, 0, SEEK_END); // seek to end of file
     loader->file_size = ftell(loader->tokens_file); // read the offset, i.e. file size
     fseekCheck(loader->tokens_file, 0, SEEK_SET); // seek back to the beginning
     // we expect ntok in the file to be consistent with filesize, assert that is the case
-    long expected_file_size = HEADER_SIZE * sizeof(int) + ntok * sizeof(uint16_t);
+    int64_t expected_file_size = HEADER_SIZE * sizeof(int) + ntok * sizeof(uint16_t);
     if (loader->file_size != expected_file_size) {
         printf("Error: file size is not as expected\n");
         exit(EXIT_FAILURE);
@@ -158,8 +80,8 @@ long dataloader_load_shard_(DataLoader *loader, int shard_index) {
 void dataloader_reset(DataLoader *loader) {
     // fully resets the DataLoader object to init configuration
     // each process starts at a different offset in the file
-    long header_bytes = HEADER_SIZE * sizeof(int);
-    long token_bytes_offset = loader->process_rank * loader->B * loader->T * sizeof(uint16_t);
+    int64_t header_bytes = HEADER_SIZE * sizeof(int);
+    int64_t token_bytes_offset = loader->process_rank * loader->B * loader->T * sizeof(uint16_t);
     loader->current_shard = 0;
     loader->current_position = header_bytes + token_bytes_offset;
     dataloader_load_shard_(loader, loader->current_shard);
@@ -172,8 +94,8 @@ void dataloader_advance_(DataLoader *loader) {
         loader->current_shard = (loader->current_shard + 1) % loader->glob_result.gl_pathc;
         dataloader_load_shard_(loader, loader->current_shard);
     }
-    long header_bytes = HEADER_SIZE * sizeof(int);
-    long token_bytes_offset = loader->process_rank * loader->B * loader->T * sizeof(uint16_t);
+    int64_t header_bytes = HEADER_SIZE * sizeof(int);
+    int64_t token_bytes_offset = loader->process_rank * loader->B * loader->T * sizeof(uint16_t);
     loader->current_position = header_bytes + token_bytes_offset;
 }
 
@@ -202,9 +124,9 @@ void dataloader_init(DataLoader *loader,
 
     // inspect and validate all shards so we don't get any runtime errors later
     // if too slow / too many shards, may wish to revisit later
-    long ntok_total = 0;
+    int64_t ntok_total = 0;
     for (int shard_index = 0; shard_index < loader->glob_result.gl_pathc; shard_index++) {
-        long shard_ntok = dataloader_load_shard_(loader, shard_index);
+        int64_t shard_ntok = dataloader_load_shard_(loader, shard_index);
         // we need at least one batch/shard, the way things are written right now.
         // can be relaxed a lot later.
         assert(shard_ntok >= num_processes * B * T + 1);
@@ -286,7 +208,7 @@ typedef struct {
     size_t T; // maximum context length of the model
     // input handling and its state
     FILE* eval_file;
-    long file_size;
+    int64_t file_size;
     uint16_t* buffer; // we fread data from file into this buffer
     // public variables that could be accessed from outside
     int num_examples; // in total across all processes
@@ -318,7 +240,7 @@ void evalloader_reset(EvalLoader *loader) {
     }
     // now seek through the file to the start of that example
     // utilize <EXAMPLE_BYTES> for efficiency
-    long header_bytes = HEADER_SIZE * sizeof(int);
+    int64_t header_bytes = HEADER_SIZE * sizeof(int);
     fseekCheck(loader->eval_file, header_bytes, SEEK_SET);
     for (int i = 0; i < loader->start_example_index; i++) {
         uint16_t example_header[3];
