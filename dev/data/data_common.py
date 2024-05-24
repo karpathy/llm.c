@@ -35,11 +35,14 @@ def write_datafile(filename, toks):
     header[0] = 20240520 # magic
     header[1] = 1 # version
     header[2] = len(toks) # number of tokens after the 256*4 bytes of header (each 2 bytes as uint16)
-    # validate that no token exceeds a uint16
-    maxtok = 2**16
-    assert all(0 <= t < maxtok for t in toks), "token dictionary too large for uint16"
-    # construct the tokens numpy array
-    toks_np = np.array(toks, dtype=np.uint16)
+    # construct the tokens numpy array, if not already
+    if not isinstance(toks, np.ndarray) or not toks.dtype == np.uint16:
+        # validate that no token exceeds a uint16
+        maxtok = 2**16
+        assert all(0 <= t < maxtok for t in toks), "token dictionary too large for uint16"
+        toks_np = np.array(toks, dtype=np.uint16)
+    else:
+        toks_np = toks
     # write to file
     print(f"writing {len(toks):,} tokens to {filename}")
     with open(filename, "wb") as f:
