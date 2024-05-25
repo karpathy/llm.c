@@ -2859,6 +2859,7 @@ int sample_softmax(const float* logits, int n, float coin) {
 // Logger lite, will probably grow/change some over time
 
 void create_dir_if_not_exists(const char *dir) {
+    if (dir == NULL) { return; }
     struct stat st = {0};
     if (stat(dir, &st) == -1) {
         if (mkdir(dir, 0700) == -1) {
