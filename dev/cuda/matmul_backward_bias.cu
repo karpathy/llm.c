@@ -27,6 +27,26 @@ sudo ncu --set full --import-source yes -o bias -f ./matmul_backward_bias 1
 #define ENABLE_BF16
 #include "common.h"
 
+
+// ----------------------------------------------------------------------------
+// utility functions
+__host__ __device__ bool isPowerOfTwo(int n) {
+    return (n > 0) && ((n & (n - 1)) == 0);
+}
+
+__host__ __device__ int largestPowerOfTwoLessOrEqual(int n) {
+    // Return the largest power of 2 less than or equal to n
+    if (n < 1) {
+        return 0;
+    }
+
+    while ((n & (n - 1)) > 0) {
+        n = n & (n - 1);
+    }
+
+    return n;
+}
+
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -421,6 +441,8 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 // version1: simple cuBLAS calls
 void matmul_backward_bias1(floatX* dbias, const floatX* dout,
                       int B, int T, int OC, int block_size) {
+    block_size = largestPowerOfTwoLessOrEqual(block_size);
+    assert(isPowerOfTwo(block_size)); // block_size needs to be power of 2 due to the reduction
     dim3 block_dim(block_size);
     dim3 grid_dim(OC);
     size_t shared_mem_size = block_size * sizeof(float);
