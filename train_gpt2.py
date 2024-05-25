@@ -29,6 +29,7 @@ from torch.nn import functional as F
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed.optim import ZeroRedundancyOptimizer
 
 class NewGELU(nn.Module):
     """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
@@ -430,6 +431,7 @@ if __name__ == "__main__":
     parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
     parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
+    parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
     args = parser.parse_args()
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
@@ -449,9 +451,12 @@ if __name__ == "__main__":
         torch.cuda.set_device(device)
         master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
         seed_offset = 0 # each process gets the exact same seed
+        zero_stage = args.zero_stage
+        zero_stage = 0 if zero_stage not in {0, 1, 2, 3} else zero_stage
     else:
         ddp_rank = 0
         ddp_local_rank = 0
+        zero_stage = 0
         ddp_world_size = 1
         master_process = True
         seed_offset = 0
@@ -605,7 +610,10 @@ if __name__ == "__main__":
 
     # init the optimizer
     adam_use_fused = device == "cuda" # only works on CUDA (?)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0, fused=adam_use_fused)
+    if zero_stage == 1:
+        optimizer = ZeroRedundancyOptimizer(model.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0, fused=adam_use_fused, optimizer_class=torch.optim.Adam)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0, fused=adam_use_fused)
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
