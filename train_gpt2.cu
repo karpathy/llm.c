@@ -2785,6 +2785,24 @@ void gpt2_multi_gpu_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
 #endif
 }
 
+float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
+    // estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS
+    // see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+    // TODO this calculation is only valid for an A100: generalize it?
+    int N = model->num_parameters;
+    int L = model->config.num_layers;
+    int H = model->config.num_heads;
+    int Q = model->config.channels / model->config.num_heads;
+    int T = model->seq_len;
+    size_t flops_per_token = (size_t)6 * N + (size_t)12 * L * H * Q * T;
+    size_t flops_per_step = flops_per_token * num_tokens;
+    // express our flops throughput as ratio of A100 bfloat16 peak flops
+    float flops_achieved = (float)flops_per_step * (1.0f / dt); // per second
+    float flops_promised = 312e12f; // A100 GPU bfloat16 peak flops is 312 TFLOPS
+    float mfu = flops_achieved / flops_promised;
+    return mfu;
+}
+
 void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->params_memory));
     cudaCheck(cudaFree(model->grads_memory));
@@ -3290,9 +3308,10 @@ int main(int argc, char *argv[]) {
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
-        printf0("step %4d/%d: train loss %f norm %.4f lr %.2e (%.2f ms, %.0f tok/s)\n",
+        float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
+        printf0("step %4d/%d | train loss %7.4f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% A100 fp16 MFU | %.0f tok/s\n",
                 step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
-                time_elapsed_ms, bias_corrected_ema_tokens_per_second);
+                time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
 
         // disable the profiler after 3 steps of optimization
