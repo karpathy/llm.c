@@ -19,6 +19,7 @@ torchrun --standalone --nproc_per_node=4 train_gpt2.py --write_tensors=0 --num_i
 import os
 import math
 import struct
+import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass
 
@@ -228,6 +229,31 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+        return optimizer
+
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
@@ -429,6 +455,7 @@ if __name__ == "__main__":
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
     parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
     parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
     args = parser.parse_args()
     B, T = args.batch_size, args.sequence_length
@@ -467,6 +494,7 @@ if __name__ == "__main__":
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 device = "mps"
     print(f"using device: {device}")
+    device_type = 'cuda' if 'cuda' in device else 'cpu'
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
@@ -478,7 +506,7 @@ if __name__ == "__main__":
 
     # set up a context manager following the desired dtype and device
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
-    ctx = torch.amp.autocast(device_type="cuda", dtype=ptdtype) if device == "cuda" else nullcontext()
+    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
 
     # seed the random number generators (in DDP we want different processes to use different offsets)
     # in the code below we don't actually use random numbers because there is no active dataloader
@@ -604,8 +632,9 @@ if __name__ == "__main__":
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
     # init the optimizer
-    adam_use_fused = device == "cuda" # only works on CUDA (?)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0, fused=adam_use_fused)
+    optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
+                                               learning_rate=1e-4, betas=(0.9, 0.95),
+                                               device_type=device)
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()

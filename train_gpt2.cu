@@ -2711,14 +2711,34 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
 
     // AdamW update
     int block_size = 512;
-    int num_blocks = CEIL_DIV(num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
-    adamw_kernel3<<<num_blocks, block_size>>>(params_memory, model->master_weights, grads_memory,
-                                              model->m_memory, model->v_memory, num_parameters,
-                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
-                                              grad_scale, seed);
+
+    // individually call the adamw_kernel3 on all parameter tensors separately
+    floatX* params_memory_iter = params_memory;
+    float* master_weights_iter = model->master_weights;
+    floatX* grads_memory_iter = grads_memory;
+    float* m_memory_iter = (float*)model->m_memory;
+    float* v_memory_iter = (float*)model->v_memory;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        size_t num_parameters = model->param_elements[i];
+        int num_blocks = CEIL_DIV(num_parameters, block_size);
+        // we only want to weight decay the 2D tensors and leave all 1D tensors alone
+        // in particular this also decays the embedding weights, but this is ok:
+        // - the token embeddings are weight shared and participate in the final projection to logits
+        // - the position embeddings actively participate at every forward/backward pass
+        float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
+        adamw_kernel3<<<num_blocks, block_size>>>(params_memory_iter, master_weights_iter, grads_memory_iter,
+                                                  m_memory_iter, v_memory_iter, num_parameters,
+                                                  learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, wd,
+                                                  grad_scale, seed);
+        params_memory_iter += num_parameters;
+        if (master_weights_iter != NULL) { master_weights_iter += num_parameters; }
+        grads_memory_iter += num_parameters;
+        m_memory_iter += num_parameters;
+        v_memory_iter += num_parameters;
+    }
     cudaCheck(cudaGetLastError());
     return grad_norm_cpu;
 }
