@@ -25,7 +25,7 @@ static inline int clock_gettime(int ignore_variable, struct timespec* tv)
 #define TURN_ON_FP_FAST  __pragma(float_control(pop)) // Restore file's default settings
 
 #include <direct.h> /* for _mkdir and _stat */
-#define mkdir _mkdir // add mkdir into namespace for windows
+#define mkdir(path, mode) _mkdir(path) /* sketchy way to get mkdir to work on windows */
 #define stat _stat
 
 typedef struct glob_t {
