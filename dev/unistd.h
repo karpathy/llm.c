@@ -6,7 +6,6 @@
 #define _USE_MATH_DEFINES
 
 #include <stdio.h>
-
 #include <math.h>
 //#define gen_max_length 64 // compile as C++ to skip this VLA issue
 #include <time.h>
@@ -18,14 +17,16 @@ static inline int clock_gettime(int ignore_variable, struct timespec* tv)
 }
 
 #define OMP /* turn it on */
-#include  <io.h> /* needed for access below */
+#include <io.h> /* needed for access below */
 #define F_OK 0
 #define access _access
 
 #define TURN_OFF_FP_FAST __pragma(float_control( precise, on, push )) // Save current setting and turn on /fp:precise
 #define TURN_ON_FP_FAST  __pragma(float_control(pop)) // Restore file's default settings
 
-#define mkdir _mkdir // add mkdir into namespace for windows
+#include <direct.h> /* for _mkdir and _stat */
+#define mkdir(path, mode) _mkdir(path) /* sketchy way to get mkdir to work on windows */
+#define stat _stat
 
 typedef struct glob_t {
     size_t gl_pathc;    // Count of matched pathnames
@@ -57,7 +58,7 @@ static inline int glob(const char* pattern, int ignored_flags, int (*ignored_err
     strncpy_s(pattern_copy, sizeof(pattern_copy) - 1, pattern, sizeof(pattern_copy) - 1);
 
     replace_forward_slashes (pattern_copy); // Replace forward slashes with backslashes
-    
+
     if (strchr(pattern_copy, '\\') != NULL) {
         strncpy_s(directory_path, sizeof(directory_path) - 1, pattern_copy, strrchr(pattern_copy, '\\') - pattern_copy + 1);
         directory_path[strrchr(pattern_copy, '\\') - pattern_copy + 1] = '\0';
