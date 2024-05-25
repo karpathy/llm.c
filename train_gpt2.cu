@@ -2897,9 +2897,9 @@ void logger_init(Logger *logger, const char *log_dir, int process_rank) {
     logger->flush_every = 10;
     logger->logfile = NULL;
     if (log_dir != NULL && process_rank == 0) {
-        char output_log_file[256];
-        assert(strlen(log_dir) < 200); // being a bit lazy, can relax later maybe
-        snprintf(output_log_file, 256, "%s/main.log", log_dir);
+        char output_log_file[512];
+        assert(strlen(log_dir) < 500); // being a bit lazy, can relax later maybe
+        snprintf(output_log_file, 512, "%s/main.log", log_dir);
         logger->logfile = fopenCheck(output_log_file, "w");
     }
 }
@@ -2929,32 +2929,42 @@ void logger_free(Logger *logger) {
 
 // ----------------------------------------------------------------------------
 // CLI, poor man's argparse
+// unclaimed flags lol: k,p,y
 
 void error_usage() {
     fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
     fprintf(stderr, "Options:\n");
+    // file system input / output
     fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
     fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
     fprintf(stderr, "  -e <string> input from model at this filename (default = gpt2_124M_bf16.bin)\n");
     fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
+    fprintf(stderr, "  -n <int>    write optimization checkpoints every how many steps? (default 0, don't)\n");
+    // token layout for each step of the optimization
     fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
     fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
+    // workload (number of steps)
+    fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
+    // optimization
     fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
     fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
     fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
     fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
-    fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
+    // evaluation
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
     fprintf(stderr, "  -m <int>    val_max_batches, up to how many val batches to estimate val loss? (default = 20)\n");
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
+    fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
+    // debugging
     fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
+    // numerics
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
+    // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: saves memory at cost of speed. (default = 1), 0 = none. 1 = recompute gelu\n");
-    fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
     exit(EXIT_FAILURE);
 }
 
@@ -2968,6 +2978,7 @@ int main(int argc, char *argv[]) {
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* output_log_dir = NULL;
+    int checkpoint_every = 0; // write optimization checkpoints every how many steps?
     int B = 4; // batch size
     int T = 1024; // sequence length max
     int total_batch_size = -1; // will be calculated down below later, if not provided
@@ -2996,6 +3007,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
         else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
+        else if (argv[i][1] == 'n') { checkpoint_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
         else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
@@ -3019,6 +3031,7 @@ int main(int argc, char *argv[]) {
     }
     // should do a bit more error checking here
     assert(warmup_iterations >= 0);
+    assert(strlen(output_log_dir) < 400); // careful bunch of hardcoded snprintf around this
     // check if output_log_dir has a "." in it, because this behavior changed May 24, 2024. take out later
     if (output_log_dir != NULL && strstr(output_log_dir, ".") != NULL) {
         fprintf(stderr, "-o (output_log_dir) has a '.', are you specifying a file instead of dir?\n");
@@ -3055,11 +3068,9 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     common_start(override_enable_tf32, false); // common init code for train/test/profile
-
     const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
                               : (PRECISION_MODE == PRECISION_FP16 ? "FP16" : "BF16");
-
     printf0("| device                | %-50s |\n", deviceProp.name);
     printf0("| precision             | %-50s |\n", precision_str);
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -3242,6 +3253,14 @@ int main(int argc, char *argv[]) {
                 fflush(stdout);
             }
             printf("\n---\n");
+        }
+
+        // once in a while checkpoint the optimization state
+        if (checkpoint_every > 0 && output_log_dir != NULL
+            && step > 0 && step % checkpoint_every == 0) {
+            char checkpoint_filename[512];
+            snprintf(checkpoint_filename, 512, "%s/model_%08d.bin", output_log_dir, step);
+            gpt2_write_to_checkpoint(&model, checkpoint_filename);
         }
 
         // bit confusing: we want to make sure to eval and sample on 0th iteration
