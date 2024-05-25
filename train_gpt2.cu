@@ -2702,21 +2702,22 @@ void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 
 float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_clip, int t, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
-    size_t num_parameters = multi_gpu_config->shard_num_parameters;
-    floatX* params_memory = (floatX*)model->params_memory + multi_gpu_config->shard_offset;
-    floatX* grads_memory = (floatX*)model->grads_memory + multi_gpu_config->shard_offset;
+    size_t shard_num_parameters = multi_gpu_config->shard_num_parameters;
+    size_t shard_offset = multi_gpu_config->shard_offset;
+    floatX* params_memory = (floatX*)model->params_memory;
+    floatX* grads_memory = (floatX*)model->grads_memory;
 
     if (model->m_memory == NULL) {
-        printf0("allocating %zu MiB for AdamW optimizer state m\n", (num_parameters * sizeof(float)) >> 20);
-        printf0("allocating %zu MiB for AdamW optimizer state v\n", (num_parameters * sizeof(float)) >> 20);
-        cudaCheck(cudaMalloc((void**)&model->m_memory, num_parameters * sizeof(float)));
-        cudaCheck(cudaMalloc((void**)&model->v_memory, num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->m_memory, 0, num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, num_parameters * sizeof(float)));
+        printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
+        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
+        cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->m_memory, 0, shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->v_memory, 0, shard_num_parameters * sizeof(float)));
         if (model->use_master_weights == 1) {
-            printf0("allocating %zu MiB for master copy of params\n", (num_parameters * sizeof(float)) >> 20);
-            cudaCheck(cudaMalloc((void**)&model->master_weights, num_parameters * sizeof(float)));
-            copy_and_cast_kernel<<<CEIL_DIV(num_parameters, 512), 512>>>(model->master_weights, params_memory, num_parameters);
+            printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
+            cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
+            copy_and_cast_kernel<<<CEIL_DIV(shard_num_parameters, 512), 512>>>(model->master_weights, params_memory + shard_offset, shard_num_parameters);
             cudaCheck(cudaGetLastError());
         }
     }
@@ -2744,28 +2745,52 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     unsigned int seed = random_u32(&model->rng_state);
 
     // individually call the adamw_kernel3 on all parameter tensors separately
-    floatX* params_memory_iter = params_memory;
-    float* master_weights_iter = model->master_weights;
-    floatX* grads_memory_iter = grads_memory;
-    float* m_memory_iter = (float*)model->m_memory;
-    float* v_memory_iter = (float*)model->v_memory;
+    size_t offset = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         size_t num_parameters = model->param_elements[i];
         int num_blocks = CEIL_DIV(num_parameters, block_size);
-        // we only want to weight decay the 2D tensors and leave all 1D tensors alone
-        // in particular this also decays the embedding weights, but this is ok:
-        // - the token embeddings are weight shared and participate in the final projection to logits
-        // - the position embeddings actively participate at every forward/backward pass
-        float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
-        adamw_kernel3<<<num_blocks, block_size>>>(params_memory_iter, master_weights_iter, grads_memory_iter,
-                                                  m_memory_iter, v_memory_iter, num_parameters,
-                                                  learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, wd,
-                                                  grad_scale, seed);
-        params_memory_iter += num_parameters;
-        if (master_weights_iter != NULL) { master_weights_iter += num_parameters; }
-        grads_memory_iter += num_parameters;
-        m_memory_iter += num_parameters;
-        v_memory_iter += num_parameters;
+        // check if this part of the weight tensor is the responsibility of the current GPU:
+        // If the current weight ends after the beginning of my shard, and begins before the ending of my shard,
+        // I've got work to do
+        if(offset + num_parameters >= shard_offset && offset < shard_offset + shard_num_parameters) {
+            // we only want to weight decay the 2D tensors and leave all 1D tensors alone
+            // in particular this also decays the embedding weights, but this is ok:
+            // - the token embeddings are weight shared and participate in the final projection to logits
+            // - the position embeddings actively participate at every forward/backward pass
+            floatX* params_ptr = params_memory + offset;
+            floatX* grad_ptr = grads_memory + offset;
+            float* m_ptr = NULL;
+            float* v_ptr = NULL;
+            float* master_ptr = NULL;
+            size_t local_params = 0;
+            // another GPU is doing the beginning of this parameter, start in the middle
+            if(offset < shard_offset) {
+                params_ptr = params_memory + shard_offset;
+                grad_ptr = grads_memory + shard_offset;
+                master_ptr = model->master_weights;
+                m_ptr = model->m_memory;
+                v_ptr = model->v_memory;
+                // (shard_offset - offset) parameters have been handled by another  PU.
+                local_params = min(shard_num_parameters, offset + num_parameters - shard_offset);
+            } else {
+                params_ptr = params_memory + offset;
+                grad_ptr = grads_memory + offset;
+                if(model->master_weights)
+                    master_ptr = model->master_weights + (offset - shard_offset);
+                m_ptr = model->m_memory + (offset - shard_offset);
+                v_ptr = model->v_memory + (offset - shard_offset);
+                local_params = min(num_parameters, shard_num_parameters - (offset - shard_offset));
+            }
+
+            float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
+            adamw_kernel3<<<num_blocks, block_size>>>(params_ptr, master_ptr, grad_ptr,
+                                                      m_ptr, v_ptr, local_params,
+                                                      learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, wd,
+                                                      grad_scale, seed);
+        }
+
+
+        offset += num_parameters;
     }
     cudaCheck(cudaGetLastError());
     return grad_norm_cpu;
