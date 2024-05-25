@@ -29,7 +29,7 @@ from data_common import write_datafile
 # ------------------------------------------
 
 parser = argparse.ArgumentParser(description="FineWeb dataset preprocessing")
-parser.add_argument("-s", "--shard_size", type=int, default=10**9, help="Size of each shard in tokens")
+parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each shard in tokens")
 args = parser.parse_args()
 
 # create the cache directory if it doesn't exist yet
@@ -52,39 +52,49 @@ eot = enc._special_tokens['<|endoftext|>'] # end of text token
 
 # helper functions
 def tokenize(doc):
-    return enc.encode_ordinary(doc["text"])
+    # validate tokens in individual threads
+    tokens = np.array([eot] + enc.encode_ordinary(doc["text"]))
+    assert (0 <= tokens).all() and (tokens < 2**16).all(), "token dictionary too large for uint16"
+    return tokens.astype(np.uint16)
+
+# don't hog the entire system
+nprocs = max(1, os.cpu_count() - 2)
 
 # main loop write files
-with mp.Pool() as pool:
+with mp.Pool(nprocs) as pool:
     shard_index = 0
-    all_tokens = []
+    # preallocate buffer to hold current shard
+    all_tokens_np = np.empty((args.shard_size,), dtype=np.uint16)
+    token_count = 0
     progress_bar = None
-    for tokens in pool.imap(tokenize, fw):
+    for tokens in pool.imap(tokenize, fw, chunksize=16):
+        # enough space to add this document fully?
+        if token_count+len(tokens) < args.shard_size:
+            all_tokens_np[token_count:token_count+len(tokens)] = tokens
+            token_count += len(tokens)
 
-        # record the tokens and make sure to separate documents
-        all_tokens.append(eot)
-        all_tokens.extend(tokens)
-
-        # update progress bar
-        if progress_bar is None:
-            progress_bar = tqdm(total=args.shard_size, unit="tokens", desc=f"Shard {shard_index}")
-        progress_bar.update(len(tokens))
-
-        # if we reach shard_size tokens, write shard to disk
-        if len(all_tokens) >= args.shard_size:
+            # update progress bar
+            if progress_bar is None:
+                progress_bar = tqdm(total=args.shard_size, unit="tokens", desc=f"Shard {shard_index}")
+            progress_bar.update(len(tokens))
+        else:
             split = "val" if shard_index == 0 else "train"
             filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{split}_{shard_index:06d}.bin")
-            write_tokens = all_tokens[:args.shard_size]
-            rest_tokens = all_tokens[args.shard_size:]
-            write_datafile(filename, write_tokens)
+
+            # split the last document
+            remainder = args.shard_size - token_count
+            progress_bar.update(remainder)
+            all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
+            write_datafile(filename, all_tokens_np)
             shard_index += 1
             progress_bar = None
-            # note: create a copy so Python can free the all_tokens memory above
-            # the list rest_tokens is expected to be very small
-            all_tokens = [t for t in rest_tokens]
+
+            # populate the next shard with the leftovers of the current doc
+            all_tokens_np[0:len(tokens)-remainder] = tokens[remainder:]
+            token_count = len(tokens)-remainder
 
     # write any remaining tokens as the last shard
-    if len(all_tokens) > 0:
+    if token_count != 0:
         split = "val" if shard_index == 0 else "train"
         filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{split}_{shard_index:06d}.bin")
-        write_datafile(filename, all_tokens)
+        write_datafile(filename, all_tokens_np[:token_count])
