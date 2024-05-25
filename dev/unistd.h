@@ -25,7 +25,7 @@ static inline int clock_gettime(int ignore_variable, struct timespec* tv)
 #define TURN_OFF_FP_FAST __pragma(float_control( precise, on, push )) // Save current setting and turn on /fp:precise
 #define TURN_ON_FP_FAST  __pragma(float_control(pop)) // Restore file's default settings
 
-#define _mkdir mkdir // add mkdir into namespace for windows
+#define mkdir _mkdir // add mkdir into namespace for windows
 
 typedef struct glob_t {
     size_t gl_pathc;    // Count of matched pathnames
