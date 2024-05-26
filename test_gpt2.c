@@ -36,8 +36,32 @@ int check_tensor(float *a, float *b, int n, const char* label) {
     return ok;
 }
 
-int main(int argc, char *argv[]) {
+struct timespec clock_gettime_monotonic()
+{ 
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t;
+}
 
+double timespec_difference_ms(struct timespec start, struct timespec end)
+{
+    double ms = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1e6;
+    return ms;
+}
+
+int main(int argc, char *argv[]) {
+#if _WIN32
+    SetCurrentDirectory("C:\\git\\oss\\llm.c");
+    char buffer[MAX_PATH];
+    if (GetCurrentDirectory(MAX_PATH, buffer)) {
+        printf("Current working directory: %s\n", buffer);
+    }
+    else {
+        printf("Error getting current directory\n");
+    }
+
+
+#endif
     // build the GPT-2 model from a checkpoint
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
@@ -100,15 +124,13 @@ int main(int argc, char *argv[]) {
     };
     for (int step = 0; step < 10; step++) {
 
-        struct timespec start, end;
-        clock_gettime(CLOCK_MONOTONIC, &start);
-
+        struct timespec t0 = clock_gettime_monotonic();
         gpt2_forward(&model, x, y, B, T);
+        struct timespec t1 = clock_gettime_monotonic();
         gpt2_zero_grad(&model);
+        struct timespec t2 = clock_gettime_monotonic();
         gpt2_backward(&model);
-
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        struct timespec t3 = clock_gettime_monotonic();
 
         if (step == 0) {
             // error checking at step 0 for reference activations/gradients
@@ -169,7 +191,15 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        struct timespec t4 = clock_gettime_monotonic();
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1);
+        struct timespec t5 = clock_gettime_monotonic();
+
+        double forward_ms = timespec_difference_ms(t0, t1);
+        double zero_ms = timespec_difference_ms(t1, t2);
+        double backward_ms = timespec_difference_ms(t2, t3);
+        double update_ms = timespec_difference_ms(t4, t5);
+        double total_ms = forward_ms + zero_ms + backward_ms + update_ms;
 
         // compare the losses
         float expected_loss = expected_losses[step];
@@ -178,7 +208,9 @@ int main(int argc, char *argv[]) {
         allok = allok && step_loss_ok;
 
         // print the timing information at the end
-        printf("step %d: loss %f (took %f ms) OK = %d\n", step, model.mean_loss, time_elapsed_s * 1000, step_loss_ok);
+        printf("step %d: loss %f OK = %d (%5.0f ms = forward %4.0f ms zero_grad %2.0f ms backward %4.0f ms update %4.0f ms)\n", 
+            step, model.mean_loss, step_loss_ok, 
+            total_ms, forward_ms, zero_ms, backward_ms, update_ms);
     }
 
     // final judgement
