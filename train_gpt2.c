@@ -674,6 +674,28 @@ typedef struct {
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
 } GPT2;
 
+void gpt2_write_to_checkpoint(GPT2 *model, const char *checkpoint_path)
+{
+    FILE *model_file = fopenCheck(checkpoint_path, "wb");
+    if (model_file == NULL) { printf("Error opening model file\n"); exit(1); }
+
+    int model_header[256] = {
+        20240326,
+        3,
+        model->config.max_seq_len,
+        model->config.vocab_size,
+        model->config.num_layers,
+        model->config.num_heads,
+        model->config.channels,
+        model->config.padded_vocab_size
+    };
+
+    fwriteCheck(model_header, sizeof(model_header), model_file);
+    fwriteCheck(model->params_memory, sizeof(float) * model->num_parameters, model_file);
+
+    fcloseCheck(model_file);
+}
+
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in model from a checkpoint file
@@ -1163,6 +1185,9 @@ int main() {
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
         printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
     }
+
+    // save model
+    gpt2_write_to_checkpoint(&model, "gpt2_124M_trained.bin");
 
     // free
     dataloader_free(&train_loader);

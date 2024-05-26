@@ -67,6 +67,17 @@ void fclose_check(FILE *fp, const char *file, int line) {
 
 #define fcloseCheck(fp) fclose_check(fp, __FILE__, __LINE__)
 
+void fwrite_check(const void *data, size_t len, FILE *stream, const char *file, int line) {
+    if (fwrite(data, 1, len, stream) != len) {
+        fprintf(stderr, "Error: Failed to write file at %d\n", line);
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  Line: %d\n", line);
+        exit(EXIT_FAILURE);
+    }
+}
+
+#define fwriteCheck(data, len, stream) fwrite_check(data, len, stream, __FILE__, __LINE__)
+
 void fseek_check(FILE *fp, long off, int whence, const char *file, int line) {
     if (fseek(fp, off, whence) != 0) {
         fprintf(stderr, "Error: Failed to seek in file at %s:%d\n", file, line);
