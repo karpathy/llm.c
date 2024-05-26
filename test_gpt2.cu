@@ -203,7 +203,7 @@ int main(int argc, char *argv[]) {
         clock_gettime(CLOCK_MONOTONIC, &start);
         gpt2_forward(&model, x, y, B, T);
         gpt2_zero_grad(&model);
-        gpt2_backward(&model);
+        gpt2_backward(&model, x);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
@@ -274,7 +274,7 @@ int main(int argc, char *argv[]) {
             allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", 2e-2f);
         }
 
-        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, 1.f, step+1, &multi_gpu_config);
+        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+1, &multi_gpu_config);
 
         // print the timing information at the end
         printf("step %d: loss %f (took %f ms)\n", step+1, model.mean_loss, time_elapsed_s * 1000);
@@ -285,14 +285,14 @@ int main(int argc, char *argv[]) {
     float expected_losses[10] = {
         5.2700,
         4.0607,
-        3.3166,
-        2.7115,
-        2.1702,
-        1.6349,
-        1.1419,
-        0.7038,
-        0.3769,
-        0.1743
+        3.3202,
+        2.7176,
+        2.1811,
+        1.6538,
+        1.1680,
+        0.7367,
+        0.4008,
+        0.1874
     };
 
     // compare

@@ -38,7 +38,7 @@ typedef Packed128<floatX> x128;
 void softmax_forward_cpu(float* out, const float* inp, int N, int C) {
     // inp is (N, C)
     // out is (N, C), each row of inp will get softmaxed
-    for (int i = 0; i < N; i++) {
+    for (int64_t i = 0; i < N; i++) {
         const float* inp_row = inp + i * C;
         float* out_row = out + i * C;
 
@@ -66,13 +66,11 @@ void crossentropy_forward_cpu(float* losses,
     // output: losses is (B,T) of the individual losses at each position
     // input: probs are (B,T,V) of the probabilities
     // input: targets is (B,T) of integers giving the correct index in logits
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            // loss = -log(probs[target])
-            const float* probs_bt = probs + b * T * V + t * V;
-            int ix = targets[b * T + t];
-            losses[b * T + t] = -logf(probs_bt[ix]);
-        }
+    for (int64_t bt = 0; bt < B * T; bt++) {
+        // loss = -log(probs[target])
+        const float* probs_bt = probs + bt * V;
+        int ix = targets[bt];
+        losses[bt] = -logf(probs_bt[ix]);
     }
 }
 
@@ -80,17 +78,15 @@ void crossentropy_softmax_backward_cpu(float* dlogits,
                                        const float* dlosses, const float* probs, const int* targets,
                                        int B, int T, int V) {
     // backwards through both softmax and crossentropy
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            float* dlogits_bt = dlogits + b * T * V + t * V;
-            const float* probs_bt = probs + b * T * V + t * V;
-            float dloss = dlosses[b * T + t];
-            int ix = targets[b * T + t];
-            for (int i = 0; i < V; i++) {
-                float p = probs_bt[i];
-                float indicator = i == ix ? 1.0f : 0.0f;
-                dlogits_bt[i] = (p - indicator) * dloss;
-            }
+    for (int64_t bt = 0; bt < B * T; bt++) {
+        float* dlogits_bt = dlogits + bt * V;
+        const float* probs_bt = probs + bt * V;
+        float dloss = dlosses[bt];
+        int ix = targets[bt];
+        for (int i = 0; i < V; i++) {
+            float p = probs_bt[i];
+            float indicator = i == ix ? 1.0f : 0.0f;
+            dlogits_bt[i] = (p - indicator) * dloss;
         }
     }
 }
@@ -115,7 +111,7 @@ struct SoftmaxParams {
 };
 namespace cg = cooperative_groups;
 __device__ SoftmaxParams prepare_softmax(cg::thread_block_tile<32>& warp,
-                                         int idx, const float* inp, int V, int P) {
+                                         int64_t idx, const float* inp, int V, int P) {
     // this warp (of 32) threads processes one row of inp, i.e. inp[idx, :] of shape (V,)
     // note that inp is actually (B * T, P) but we only use the first V elements
     // this function tehen calculates:
@@ -155,7 +151,7 @@ __global__ void fused_classifier_kernel1(float* dlogits, float* losses,
     // each block of 4 warps is in charge of 4 rows of the input, one warp per row
     // meta_group_size is the number of warps per block (e.g. 4)
     // meta_group_rank is the index of the warp in the block (e.g. 0, 1, 2, 3)
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    int64_t idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
     if (idx >= B * T) { // there are B * T rows in the input
         return;
     }
@@ -192,7 +188,7 @@ __device__ float vec_at(const float4& vec, int index) {
 }
 
 __device__ SoftmaxParams prepare_softmax_blockwide(cg::thread_block_tile<32>& warp,
-                                                   int idx, const float* inp, int V, int P) {
+                                                   int64_t idx, const float* inp, int V, int P) {
     // one row of inp, i.e. inp[idx, :] of shape (V,)
     // float4 to get 128-bit loads and memory level parallelism
     const float4* x_vec4 = reinterpret_cast<const float4*>(inp + idx * P);
@@ -256,7 +252,7 @@ __global__ void fused_classifier_kernel2(float* dlogits, float* losses, float* p
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int idx = blockIdx.x;
+    int64_t idx = blockIdx.x;
     int ix = targets[idx];
 
     // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
@@ -297,7 +293,7 @@ __global__ void fused_classifier_kernel2(float* dlogits, float* losses, float* p
 }
 
 __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_tile<32>& warp,
-                                                   int idx, const float* inp, int V, int P) {
+                                                            int64_t idx, const float* inp, int V, int P) {
     // same but not float4
     // one row of inp, i.e. inp[idx, :] of shape (V,)
 
@@ -353,7 +349,7 @@ __global__ void fused_classifier_kernel3(float* dlogits, float* losses, float* p
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int idx = blockIdx.x;
+    int64_t idx = blockIdx.x;
     int ix = targets[idx];
 
     // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
@@ -385,7 +381,7 @@ __global__ void fused_classifier_kernel3(float* dlogits, float* losses, float* p
     }
 }
 
-__device__ SoftmaxParams prepare_softmax_blockwide2(int idx, const floatX* inp, int V, int P) {
+__device__ SoftmaxParams prepare_softmax_blockwide2(int64_t idx, const floatX* inp, int V, int P) {
     // one row of inp, i.e. inp[idx, :] of shape (V,)
 
     const floatX* x = inp + idx * P;
@@ -443,7 +439,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide2(int idx, const floatX* inp, 
 __global__ void fused_classifier_kernel4(floatX* dlogits, floatX* losses, floatX* probs,
                                          const floatX* logits, const floatX* dlosses, const int* targets,
                                          int B, int T, int V, int P) {
-    int idx = blockIdx.x;
+    int64_t idx = blockIdx.x;
     int ix = targets[idx];
 
     // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
@@ -512,7 +508,7 @@ __device__ float blockReduce(float val, bool final_sync=false, float out_of_boun
     return block_val;
 }
 
-__device__ SoftmaxParams prepare_softmax_blockwide3(int idx, const floatX* inp, int V, int P) {
+__device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* inp, int V, int P) {
     // same but not float4
     // one row of inp, i.e. inp[idx, :] of shape (V,)
 
@@ -566,7 +562,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
                 fused_classifier_kernel5(floatX* dlogits, floatX* losses, floatX* probs,
                                          const floatX* logits, const floatX* dlosses, const int* targets,
                                          int B, int T, int V, int P) {
-    int idx = blockIdx.x;
+    int64_t idx = blockIdx.x;
     int ix = targets[idx];
 
     // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
@@ -702,10 +698,10 @@ void fused_classifier(int kernel_num, float* dlogits, float* losses,
 int main(int argc, char **argv) {
     srand(0);
 
-    int B = 8;              // batch size
-    int T = 1024;           // sequence length
-    int V = 50257;          // vocab size
-    int P = (V + 63) & ~63; // padded vocab size, up to nearest multiple of 64
+    int64_t B = 8;              // batch size
+    int64_t T = 1024;           // sequence length
+    int64_t V = 50257;          // vocab size
+    int64_t P = (V + 63) & ~63; // padded vocab size, up to nearest multiple of 64
 
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
