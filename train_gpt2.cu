@@ -2995,7 +2995,7 @@ void error_usage() {
     fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
     // evaluation
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
-    fprintf(stderr, "  -m <int>    val_max_batches, up to how many val batches to estimate val loss? (default = 20)\n");
+    fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
     fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
@@ -3029,7 +3029,7 @@ int main(int argc, char *argv[]) {
     float final_learning_rate_frac = 1.0f; // final fraction of learning rate, at end of training
     float weight_decay = 0.0f;
     int val_loss_every = 20; // every how many steps do we eval validation loss?
-    int val_max_batches = 20; // how many batches max do we eval for validation loss?
+    int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
@@ -3059,7 +3059,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'm') { val_max_batches = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
         else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
@@ -3082,8 +3082,12 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "(note that this option changed recently, -o used to be file, became dir.)\n");
         exit(EXIT_FAILURE);
     }
-    // calculate a sensible default for total batch size by assuming no gradient accumulation
-    if (total_batch_size == -1) { total_batch_size = B * T * multi_gpu_config.num_processes; }
+    int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
+    // calculate sensible default for total batch size as assuming no gradient accumulation
+    if (total_batch_size == -1) { total_batch_size = tokens_per_fwdbwd; }
+    // calculate the number of gradient accumulation steps from the desired total batch size
+    assert(total_batch_size % tokens_per_fwdbwd == 0);
+    int grad_accum_steps = total_batch_size / tokens_per_fwdbwd;
     // if we're only overfitting a single batch for debugging, let's overfit the first batch
     // from val instead of train split, because val is smaller and faster. (train_gpt2.py does the same)
     if (overfit_single_batch == 1) { train_data_pattern = val_data_pattern; }
@@ -3103,7 +3107,7 @@ int main(int argc, char *argv[]) {
     printf0("| grad_clip             | %-50e |\n", grad_clip);
     printf0("| max_steps             | %-50d |\n", max_steps);
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
-    printf0("| val_max_batches       | %-50d |\n", val_max_batches);
+    printf0("| val_max_steps         | %-50d |\n", val_max_steps);
     printf0("| sample_every          | %-50d |\n", sample_every);
     printf0("| genT                  | %-50d |\n", genT);
     printf0("| overfit_single_batch  | %-50d |\n", overfit_single_batch);
@@ -3152,8 +3156,22 @@ int main(int argc, char *argv[]) {
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
     dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
-    int train_num_batches = (max_steps == -1) ? train_loader.num_batches : max_steps; // default = 1 epoch
-    int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
+    // figure out the number of training steps we will run for
+    int train_num_batches = max_steps; // passed in from command line
+    if (train_num_batches == -1) {
+        // sensible default is to train for exactly one epoch
+        size_t ntok = train_loader.num_tokens;
+        // the number of (outer loop) steps each process should take for us to reach one epoch
+        train_num_batches = ntok / total_batch_size;
+    }
+    // figure out the number of validation steps to run for
+    int val_num_batches = val_max_steps; // passed in from command line
+    if (val_num_batches == -1) {
+        // sensible default is to evaluate the full validation split
+        size_t ntok = val_loader.num_tokens;
+        // note that unlike the training loop, there is no gradient accumulation inner loop here
+        val_num_batches = ntok / tokens_per_fwdbwd;
+    }
     printf0("| train_num_batches     | %-50d |\n", train_num_batches);
     printf0("| val_num_batches       | %-50d |\n", val_num_batches);
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -3183,11 +3201,7 @@ int main(int argc, char *argv[]) {
     // more prints related to allocations from gpt2_build_from_checkpoint down here to not mess up our table above
     printf0("num_parameters: %zu => bytes: %zu\n", model.num_parameters, model.num_parameters_bytes);
     printf0("allocated %d MiB for model parameters\n", (int)round(model.num_parameters_bytes / (1024 * 1024)));
-
-    // figure out gradient accumulation from the desired total batch size
-    int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
-    assert(total_batch_size % tokens_per_fwdbwd == 0);
-    int grad_accum_steps = total_batch_size / tokens_per_fwdbwd;
+    // few more prints for gradient accumulation math up above
     printf0("batch_size B=%d * seq_len T=%d * num_processes=%d and total_batch_size=%d\n",
             B, T, multi_gpu_config.num_processes, total_batch_size);
     printf0("=> setting grad_accum_steps=%d\n", grad_accum_steps);
@@ -3255,7 +3269,8 @@ int main(int argc, char *argv[]) {
         }
 
         // once in a while do model inference to print generated text
-        if (multi_gpu_config.process_rank == 0 && (step > 0 && (step % sample_every) == 0 || last_step)) {
+        if (multi_gpu_config.process_rank == 0 && sample_every > 0 &&
+           (step > 0 && (step % sample_every) == 0 || last_step)) {
             NvtxRange generation_range("generation");
             // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
             int eot_token = tokenizer.eot_token;
@@ -3372,7 +3387,7 @@ int main(int argc, char *argv[]) {
         }
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
         float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
-        printf0("step %4d/%d | train loss %7.4f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% A100 fp16 MFU | %.0f tok/s\n",
+        printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% A100 fp16 MFU | %.0f tok/s\n",
                 step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
