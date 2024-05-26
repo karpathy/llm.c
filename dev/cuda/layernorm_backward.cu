@@ -1036,6 +1036,10 @@ __global__ void layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX
 }
 
 
+// similar to kernel 9, but uses vectors to access shared memory, which also avoids the bank conflict problems,
+// and makes use require fewer barriers, at the cost of increased shared memory consumption.
+// warning: this kernel is _extremely_ close to getting register spills, so many "optimizations" turn out to be unhelpful
+// or need to be implemented in a very specific way.
 __global__ void __launch_bounds__(512, 2)
 layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                             const floatX* dout, const floatX* inp, const floatX* weight,
@@ -1056,8 +1060,11 @@ layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float*
     // the first half of shared memory is bias, second is weight
     float* dbias_shared = shared;
     float* dweight_shared = shared + C;
-    float* dbias_tmp_shared = shared + 2 * C;
-    float* dweight_tmp_shared = shared + 2 * C + f128::size * BLOCK_SIZE;
+    // warp zero doesn't actually write to the _tmp_shared memory locations, so we don't need to reserve memory
+    // the obvious solution is to change the addressing below to use (threadId.x-32) as offset, but that causes
+    // register spills, so instead we mess with the base pointer here, which doesn't increase register usage.
+    float* dbias_tmp_shared = shared + 2 * C - WARP_SIZE * f128::size;
+    float* dweight_tmp_shared = shared + 2 * C + f128::size * BLOCK_SIZE - 2 * WARP_SIZE * f128::size;
 
     // init shared memory to zero
     for(int i = threadIdx.x * f128::size; i < C; i += BLOCK_SIZE * f128::size) {
@@ -1197,9 +1204,8 @@ layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float*
         }
         __syncthreads();
 
-        // reorder from atomic/shared memory-friendly index to real global memory index
-        // and convert from float/FP32 to floatX/BF16 for the final write
-        // this is separate also because it cannot use as many warps as the above (f128 vs x128)
+        // convert from float/FP32 to floatX/BF16 for the final write
+        // this is separate because it cannot use as many warps as the above (f128 vs x128)
         // todo - if we split this code into another kernel, we could maybe do it at the same time?
         for (int c = warpId; c < iterations_C; c += warpsInBlock) {
             int global_index = (warpThreadIdx * x128::size) + (c * C_per_iteration);
@@ -1339,7 +1345,7 @@ void layernorm_backward10(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* 
 
         assert(C % 32 * x128::size == 0  && "Channels must be divisible by (32 * x128::size)");
         const int grid_size = (1024/block_size) * cuda_num_SMs; // todo - heuristics for other GPUs?
-        size_t shared_mem_size = (2 * C + 2 * block_size * f128::size + 1) * sizeof(float);
+        size_t shared_mem_size = (2 * C + 2 * (block_size - 32) * f128::size) * sizeof(float);
 
         cudaCheck(cudaMemset(scratch, 0, 1 * sizeof(float))); // just need to memset the flag for this version
         layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
@@ -1401,7 +1407,7 @@ int main(int argc, char **argv) {
 
     int B = 8;
     int T = 1024;
-    int C = 768;
+    int C = 1280;
 
     // first do the forward pass in CPU
     float* out = (float*)malloc(B * T * C * sizeof(float));
