@@ -993,8 +993,8 @@ __global__ void layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX
         // todo - there isn't enough parallelism even inside that single SM...
         // ==> so could maybe split into another kernel with YET ANOTHER level of reduction?!
         for(int i = threadIdx.x * f128::size; i < C; i+= BLOCK_SIZE * f128::size) {
-            f128 dbias_accum(make_int4(0, 0, 0, 0));
-            f128 dweight_accum(make_int4(0, 0, 0, 0));
+            f128 dbias_accum = f128::zeros();
+            f128 dweight_accum = f128::zeros();
 
             for (int read_block_idx = 0; read_block_idx < gridDim.x; read_block_idx++) {
                 int offset = i + 2*C*read_block_idx;
@@ -1059,11 +1059,10 @@ __global__ void layernorm_backward_kernel10(floatX* dinp, floatX* dweight, float
     float* dweight_tmp_shared = shared + 2 * C + f128::size * BLOCK_SIZE;
 
     // init shared memory to zero
-    for(int i = threadIdx.x; i < C; i+= BLOCK_SIZE){
-        dbias_shared[i] = 0.0f;
-        dweight_shared[i] = 0.0f;
+    for(int i = threadIdx.x * f128::size; i < C; i += BLOCK_SIZE * f128::size) {
+        store128(dbias_shared + i, f128::zeros());
+        store128(dweight_shared + i, f128::zeros());
     }
-    unsigned int *tmp_flag = (unsigned int*)(shared + 2*C + 2*BLOCK_SIZE);
     __syncthreads();
 
     for (int bt = baseIdx; bt < B * T; bt += warpsInGrid) {
@@ -1164,12 +1163,14 @@ __global__ void layernorm_backward_kernel10(floatX* dinp, floatX* dweight, float
     scratch += 32;
     float* scratch_dbias = scratch;
     float* scratch_dweight = scratch + C;
-    for(int i = threadIdx.x; i < C; i+= BLOCK_SIZE) {
+    for(int i = threadIdx.x * f128::size; i < C; i += BLOCK_SIZE * f128::size) {
         // Write to global memory in the same "shared memory banking friendly" order
-        scratch_dbias[i + 2*C*blockIdx.x] = dbias_shared[i];
-        scratch_dweight[i + 2*C*blockIdx.x] = dweight_shared[i];
+        store128(scratch_dbias + i + 2*C*blockIdx.x, load128(dbias_shared + i));
+        store128(scratch_dweight + i + 2*C*blockIdx.x, load128(dweight_shared + i));
     }
     __syncthreads();
+    // that portion of shared memory is no longer used, so we can repurpose it for the scratch flag.
+    unsigned int *tmp_flag = (unsigned int*)(shared + 2*C);
     if (threadIdx.x == 0) {
         *tmp_flag = atomicInc(scratchFlag, gridDim.x);
     }
@@ -1179,8 +1180,8 @@ __global__ void layernorm_backward_kernel10(floatX* dinp, floatX* dweight, float
         // todo - there isn't enough parallelism even inside that single SM...
         // ==> so could maybe split into another kernel with YET ANOTHER level of reduction?!
         for(int i = threadIdx.x * f128::size; i < C; i+= BLOCK_SIZE * f128::size) {
-            f128 dbias_accum(make_int4(0, 0, 0, 0));
-            f128 dweight_accum(make_int4(0, 0, 0, 0));
+            f128 dbias_accum = f128::zeros();
+            f128 dweight_accum = f128::zeros();
 
             for (int read_block_idx = 0; read_block_idx < gridDim.x; read_block_idx++) {
                 int offset = i + 2*C*read_block_idx;
