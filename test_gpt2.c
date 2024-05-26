@@ -50,18 +50,6 @@ double timespec_difference_ms(struct timespec start, struct timespec end)
 }
 
 int main(int argc, char *argv[]) {
-#if _WIN32
-    SetCurrentDirectory("C:\\git\\oss\\llm.c");
-    char buffer[MAX_PATH];
-    if (GetCurrentDirectory(MAX_PATH, buffer)) {
-        printf("Current working directory: %s\n", buffer);
-    }
-    else {
-        printf("Error getting current directory\n");
-    }
-
-
-#endif
     // build the GPT-2 model from a checkpoint
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
