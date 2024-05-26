@@ -45,7 +45,7 @@ struct timespec clock_gettime_monotonic()
 
 double timespec_difference_ms(struct timespec start, struct timespec end)
 {
-    double ms = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1e6;
+    double ms = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) * 0.000001;
     return ms;
 }
 
