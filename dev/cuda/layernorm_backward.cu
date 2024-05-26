@@ -1036,10 +1036,11 @@ __global__ void layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX
 }
 
 
-__global__ void layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
-                                            const floatX* dout, const floatX* inp, const floatX* weight,
-                                            const floatX* mean, const floatX* rstd,
-                                            int B, int T, int C) {
+__global__ void __launch_bounds__(512, 2)
+layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+                            const floatX* dout, const floatX* inp, const floatX* weight,
+                            const floatX* mean, const floatX* rstd,
+                            int B, int T, int C) {
     constexpr int WARP_SIZE = 32;
     int BLOCK_SIZE = blockDim.x;
     int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
@@ -1089,14 +1090,8 @@ __global__ void layernorm_backward_kernel10(floatX* dinp, floatX* dweight, float
         dnorm_mean = warpReduceSum(dnorm_mean) / C;
         dnorm_norm_mean = warpReduceSum(dnorm_norm_mean) / C * rstd_bt - dnorm_mean * mean_bt;
 
-        // now iterate again and accumulate all the gradients
-        // unfortunately we cannot use the same index for x128 arrays and shared memory
-        // as atomics can only be 32-bit rather than 128-bit (at least pre-SM90/Hopper)
-        // so this would result in an 8-way bank conflict, and kill performance
-        // so instead, we use a shared memory friendly index, and reorder before the final write
         for (int c = 0; c < iterations_C; c++) {
             int global_index = (warpThreadIdx * x128::size) + (c * C_per_iteration);
-            int shared_index = warpThreadIdx + (c * C_per_iteration);
             if (global_index >= C) {
                 break;
             }
@@ -1126,6 +1121,10 @@ __global__ void layernorm_backward_kernel10(floatX* dinp, floatX* dweight, float
 
                 if (warpId != 0) {
                     store128(dbias_tmp_shared + threadIdx.x * f128::size, dbias_f);
+                    // this seems to generate a 64-bit store, instead of 128-bit.
+                    // however, forcing 128-bit (e.g., using inline ptx), results in register
+                    // spilling and much worse performance, so we'll keep it like this for now
+                    // but ideally, we could reduce the register pressure a little.
                     store128(dweight_tmp_shared + threadIdx.x * f128::size, dweight_f);
                 }
                 __syncthreads();
@@ -1141,13 +1140,14 @@ __global__ void layernorm_backward_kernel10(floatX* dinp, floatX* dweight, float
                 }
                 __syncthreads();
                 if (warpId == 0) {
+                    f128 db_old = load128(dbias_shared + global_index + f128::size * o);
+                    f128 dw_old = load128(dweight_shared + global_index + f128::size * o);
                     for(int i = 0; i < f128::size; ++i) {
-                        int x = i + f128::size * o;
-                        // gradient contribution to bias (using shared memory friendly index)
-                        dbias_shared[shared_index + x * WARP_SIZE] += dbias_f[i];
-                        // gradient contribution to weight (using shared memory friendly index)
-                        dweight_shared[shared_index + x * WARP_SIZE] += dweight_f[i];
+                        dbias_f[i] += db_old[i];
+                        dweight_f[i] += dw_old[i];
                     }
+                    store128(dbias_shared + global_index + f128::size * o, dbias_f);
+                    store128(dweight_shared + global_index + f128::size * o, dweight_f);
                 }
             }
             // cache in L2 as this is read by the next kernel, but bypass L1 to minimise thrashing
@@ -1179,7 +1179,7 @@ __global__ void layernorm_backward_kernel10(floatX* dinp, floatX* dweight, float
         // Reduction of the partial sums by the final block
         // todo - there isn't enough parallelism even inside that single SM...
         // ==> so could maybe split into another kernel with YET ANOTHER level of reduction?!
-        for(int i = threadIdx.x * f128::size; i < C; i+= BLOCK_SIZE * f128::size) {
+        for(int i = threadIdx.x * f128::size; i < C; i += BLOCK_SIZE * f128::size) {
             f128 dbias_accum = f128::zeros();
             f128 dweight_accum = f128::zeros();
 
@@ -1201,20 +1201,22 @@ __global__ void layernorm_backward_kernel10(floatX* dinp, floatX* dweight, float
         // and convert from float/FP32 to floatX/BF16 for the final write
         // this is separate also because it cannot use as many warps as the above (f128 vs x128)
         // todo - if we split this code into another kernel, we could maybe do it at the same time?
-        for (int i = warpId; i < iterations_C; i += warpsInBlock) {
-            int global_index = (warpThreadIdx * x128::size) + (i * C_per_iteration);
-            int shared_index = warpThreadIdx + (i * C_per_iteration);
+        for (int c = warpId; c < iterations_C; c += warpsInBlock) {
+            int global_index = (warpThreadIdx * x128::size) + (c * C_per_iteration);
             if (global_index >= C) {
                 break;
             }
 
             x128 dbias128 = load128(dbias + global_index);
             x128 dweight128 = load128(dweight + global_index);
-            for (int x = 0; x < x128::size; x++) {
-                float s_db = dbias_shared[shared_index + x*WARP_SIZE];
-                float s_dw = dweight_shared[shared_index + x*WARP_SIZE];
-                dbias128[x] = (floatX)(s_db + (float)dbias128[x]);
-                dweight128[x] = (floatX)(s_dw + (float)dweight128[x]);
+            for(int o = 0; o < x128::size / f128::size; ++o) {
+                f128 s_db = load128(dbias_shared + global_index + o * f128::size);
+                f128 s_dw = load128(dweight_shared + global_index + o * f128::size);
+                for(int i = 0; i < f128::size; ++i) {
+                    int x = o * f128::size + i;
+                    dbias128[x] = (floatX)(s_db[i] + (float)dbias128[x]);
+                    dweight128[x] = (floatX)(s_dw[i] + (float)dweight128[x]);
+                }
             }
             store128(dbias + global_index, dbias128);
             store128(dweight + global_index, dweight128);
@@ -1331,6 +1333,9 @@ template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 void layernorm_backward10(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                          const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                          int B, int T, int C, int block_size) {
+        if(block_size == 1024) {
+            block_size = 512;
+        }
 
         assert(C % 32 * x128::size == 0  && "Channels must be divisible by (32 * x128::size)");
         const int grid_size = (1024/block_size) * cuda_num_SMs; // todo - heuristics for other GPUs?
