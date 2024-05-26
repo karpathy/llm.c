@@ -15,7 +15,7 @@ Implements a medium simple DataLoader for a distributed training setup.
 #include "utils.h"
 
 // ----------------------------------------------------------------------------
-// implementation of glob for Windows is in dev/unistd.h 
+// implementation of glob for Windows is in dev/unistd.h
 #ifndef _WIN32
 #include <glob.h>
 #endif
@@ -39,7 +39,7 @@ typedef struct {
     int64_t current_position;
     uint16_t* buffer; // we fread data from file into this buffer
     // public variables that could be accessed from outside
-    size_t num_batches;
+    size_t num_tokens; // total number of tokens
     int* inputs;  // input tokens into transformer
     int* targets; // target tokens for the transformer
 } DataLoader;
@@ -140,7 +140,7 @@ void dataloader_init(DataLoader *loader,
     loader->buffer = (uint16_t*)malloc((B * T + 1) * sizeof(uint16_t));
     loader->inputs = (int*)malloc(B * T * sizeof(int));
     loader->targets = (int*)malloc(B * T * sizeof(int));
-    loader->num_batches = ntok_total / (num_processes * B * T); // useful to know
+    loader->num_tokens = ntok_total;
 
     // reset the loader, to initialize it
     dataloader_reset(loader);

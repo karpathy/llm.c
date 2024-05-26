@@ -1534,7 +1534,7 @@ void error_usage() {
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
     fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
-    fprintf(stderr, "  -m <int>    val_max_batches, up to how many val batches to estimate val loss? (default = 20)\n");
+    fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
     exit(EXIT_FAILURE);
@@ -1552,7 +1552,7 @@ int main(int argc, char *argv[]) {
     int T = 1024; // sequence length max
     float learning_rate = 3e-4f;
     int val_loss_every = 20; // every how many steps do we eval validation loss?
-    int val_max_batches = 20; // how many batches max do we eval for validation loss?
+    int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
     for (int i = 1; i < argc; i+=2) {
@@ -1567,7 +1567,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
         else if (argv[i][1] == 'l') { learning_rate = atof(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'm') { val_max_batches = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
         else { error_usage(); }
@@ -1582,7 +1582,7 @@ int main(int argc, char *argv[]) {
     printf("| sequence length T     | %-50d |\n", T);
     printf("| learning rate         | %-50f |\n", learning_rate);
     printf("| val_loss_every        | %-50d |\n", val_loss_every);
-    printf("| val_max_batches       | %-50d |\n", val_max_batches);
+    printf("| val_max_steps         | %-50d |\n", val_max_steps);
     printf("| sample_every          | %-50d |\n", sample_every);
     printf("| genT                  | %-50d |\n", genT);
     printf("+-----------------------+----------------------------------------------------+\n");
@@ -1621,8 +1621,9 @@ int main(int argc, char *argv[]) {
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1);
     dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1);
-    int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default for now
-    int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
+    int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
+    int val_num_batches = val_loader.num_tokens / (B*T);
+    if (val_num_batches > val_max_steps) { val_num_batches = val_max_steps; }
     printf("| train_num_batches     | %-50d |\n", train_num_batches);
     printf("| val_num_batches       | %-50d |\n", val_num_batches);
     printf("+-----------------------+----------------------------------------------------+\n");
