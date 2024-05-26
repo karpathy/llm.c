@@ -860,6 +860,12 @@ __global__ void layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX
                                             const floatX* dout, const floatX* inp, const floatX* weight,
                                             const floatX* mean, const floatX* rstd,
                                             int B, int T, int C) {
+    if(C % (32 * x128::size) != 0) {
+        if(threadIdx.x == 0 && blockIdx.x == 0) {
+            printf("Number of channels is not a multiple of 32 * x128::size");
+        }
+        __trap();       // prefer to crash here than run into a deadlock later on
+    }
     constexpr int WARP_SIZE = 32;
     int BLOCK_SIZE = blockDim.x;
     int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
@@ -1045,6 +1051,12 @@ layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float*
                             const floatX* dout, const floatX* inp, const floatX* weight,
                             const floatX* mean, const floatX* rstd,
                             int B, int T, int C) {
+    if(C % (32 * x128::size) != 0) {
+        if(threadIdx.x == 0 && blockIdx.x == 0) {
+            printf("Number of channels is not a multiple of 32 * x128::size");
+        }
+        __trap();       // prefer to crash here than run into a deadlock later on
+    }
     constexpr int WARP_SIZE = 32;
     int BLOCK_SIZE = blockDim.x;
     int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
@@ -1327,7 +1339,7 @@ void layernorm_backward9(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* s
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C, int block_size) {
 
-        assert(C % 32 * x128::size == 0  && "Channels must be divisible by (32 * x128::size)");
+        assert(C % (32 * x128::size) == 0  && "Channels must be divisible by (32 * x128::size)");
         const int grid_size = (1024/block_size) * cuda_num_SMs; // todo - heuristics for other GPUs?
         size_t shared_mem_size = (2 * C + 2 * block_size + 1) * sizeof(float);
 
@@ -1342,8 +1354,7 @@ void layernorm_backward10(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* 
         if(block_size == 1024) {
             block_size = 512;
         }
-
-        assert(C % 32 * x128::size == 0  && "Channels must be divisible by (32 * x128::size)");
+        assert(C % (32 * x128::size) == 0  && "Channels must be divisible by (32 * x128::size)");
         const int grid_size = (1024/block_size) * cuda_num_SMs; // todo - heuristics for other GPUs?
         size_t shared_mem_size = (2 * C + 2 * (block_size - 32) * f128::size) * sizeof(float);
 
@@ -1407,7 +1418,7 @@ int main(int argc, char **argv) {
 
     int B = 8;
     int T = 1024;
-    int C = 1280;
+    int C = 1600;
 
     // first do the forward pass in CPU
     float* out = (float*)malloc(B * T * C * sizeof(float));
