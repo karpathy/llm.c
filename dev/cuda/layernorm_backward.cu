@@ -20,7 +20,7 @@ version 2 moves a lot of reduction to shared memory over global memory
 
 #define ENABLE_BF16
 #include "common.h"
-
+// typedef unsigned int uint;       // required on windows
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -188,7 +188,7 @@ __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* d
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 __global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
-                        int B, int T, int C) {
+                        int B, int T, int C, float* dweight_tmp, float* dbias_tmp) {
     extern __shared__ float shared[]; // size = 2 * C
 
     namespace cg = cooperative_groups;
@@ -253,8 +253,16 @@ __global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparam
 
     // write to global memory
     for(int i = threadIdx.x; i < C; i+= blockDim.x) {
-        atomicAddX(&dbias[i], (Tparams)dbias_shared[i]);
-        atomicAddX(&dweight[i], (Tparams)dweight_shared[i]);
+        atomicAdd(&dbias_tmp[i], dbias_shared[i]);
+        atomicAdd(&dweight_tmp[i], dweight_shared[i]);
+    }
+}
+
+template <typename Tparams>
+__global__ void copy_to_dweight_dbias(int C, Tparams* dbias, Tparams* dweight, float* dbias_tmp, float* dweight_tmp) {
+    for (int i = threadIdx.x + blockDim.x * blockIdx.x; i < C; i += blockDim.x * gridDim.x) {
+        dbias[i] = (Tparams)dbias_tmp[i];
+        dweight[i] = (Tparams)dweight_tmp[i];
     }
 }
 
@@ -1262,7 +1270,14 @@ void layernorm_backward2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
     const int N = B * T;
     const int grid_size = ceil_div(32*N, block_size);
     size_t shared_mem_size = 2 * C * sizeof(float);
-    layernorm_backward_kernel2<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+    float* dweight_tmp;
+    float* dbias_tmp;
+    cudaCheck(cudaMalloc(&dweight_tmp, C * sizeof(float)));
+    cudaCheck(cudaMalloc(&dbias_tmp, C * sizeof(float)));
+    cudaMemset(dweight_tmp, 0, C * sizeof(float));
+    cudaMemset(dbias_tmp, 0, C * sizeof(float));
+    layernorm_backward_kernel2<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, dweight_tmp, dbias_tmp);
+    copy_to_dweight_dbias<<<1, 512>>>(C, dweight, dbias, dweight_tmp, dbias_tmp);
 }
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
