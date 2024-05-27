@@ -744,7 +744,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     int warpThreadIdx = threadIdx.x % warpSize; // Thread index within the warp
     int warpsInGrid = gridDim.x * warpsInBlock;
     int C_per_iteration = warpSize * x128::size;
-    int iterations_C = C / C_per_iteration;
+    int iterations_C = ceil_div(C, C_per_iteration);
 
     // the first half of shared memory is bias, second is weight
     float* dbias_shared = shared;
@@ -1325,7 +1325,7 @@ template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 void layernorm_backward8(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C, int block_size) {
-        assert(C % (32 * x128::size) == 0  && "Channels must be divisible by (32 * x128::size)");
+        // assert(C % (32 * x128::size) == 0  && "Channels must be divisible by (32 * x128::size)");
         const int grid_size = (1024/block_size) * cuda_num_SMs;
         size_t shared_mem_size = (2 * C + 1) * sizeof(float);
 
