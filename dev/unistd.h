@@ -104,4 +104,77 @@ static inline int glob(const char* pattern, int ignored_flags, int (*ignored_err
     return 0;
 }
 
+// dirent.h support
+
+#define MAX_PATH_LENGTH 512
+
+typedef struct DIR DIR;
+
+typedef struct dirent {
+    char d_name[MAX_PATH_LENGTH];
+} dirent;
+
+DIR *opendir(const char *name);
+struct dirent *readdir(DIR *directory);
+int closedir(DIR *directory);
+
+struct DIR {
+    intptr_t handle;
+    struct _finddata_t findFileData;
+    int firstRead;
+};
+
+
+DIR *opendir(const char *name) {
+    DIR *dir = (DIR *)malloc(sizeof(DIR));
+    if (dir == NULL) {
+        return NULL;
+    }
+
+    char searchPath[MAX_PATH_LENGTH];
+
+    strncpy(searchPath, name, MAX_PATH_LENGTH);
+
+    snprintf(searchPath, MAX_PATH_LENGTH, "%s\\*.*", name);
+
+    dir->handle = _findfirst(searchPath, &dir->findFileData);
+    if (dir->handle == -1) {
+        free(dir);
+        return NULL;
+    }
+
+    dir->firstRead = 1;
+    return dir;
+}
+
+struct dirent *readdir(DIR *directory) {
+    static struct dirent result;
+
+    if (directory->firstRead) {
+        directory->firstRead = 0;
+    } else {
+        if (_findnext(directory->handle, &directory->findFileData) != 0) {
+            return NULL;
+        }
+    }
+
+    strncpy(result.d_name, directory->findFileData.name, MAX_PATH_LENGTH);
+    result.d_name[MAX_PATH_LENGTH - 1] = '\0'; // Ensure null termination
+    return &result;
+}
+
+int closedir(DIR *directory) {
+    if (directory == NULL) {
+        return -1;
+    }
+
+    if (_findclose(directory->handle) != 0) {
+        return -1;
+    }
+
+    free(directory);
+    return 0;
+}
+
+
 #endif
