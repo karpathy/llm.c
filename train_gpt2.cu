@@ -38,7 +38,6 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
-#include <dirent.h>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -46,6 +45,10 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #include <algorithm>
 #include <functional>
 #include <unordered_map>
+// implementation of dirent for Windows is in dev/unistd.h
+#ifndef _WIN32
+#include <dirent.h>
+#endif
 // GPU / CUDA related
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
