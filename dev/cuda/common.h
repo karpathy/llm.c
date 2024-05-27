@@ -80,6 +80,22 @@ struct alignas(16) Packed128 {
         memcpy(&payload, &bits, sizeof(bits));
     }
 
+    __device__  static Packed128 constant(ElementType value) {
+        Packed128 result;
+        for(int k = 0; k < size; ++k) {
+            result.payload[k] = value;
+        }
+        return result;
+    }
+
+    __device__ static Packed128 zeros() {
+        return constant(0);
+    }
+
+    __device__ static Packed128 ones() {
+        return constant(1);
+    }
+
     __device__ ElementType& operator[](int index) {
         return payload[index];
     }

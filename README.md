@@ -334,33 +334,7 @@ done
 # screen -ls | grep -E "tr[0-3]" | cut -d. -f1 | xargs -I {} screen -X -S {} quit
 ```
 
-This example opens up 4 screen sessions and runs the four commands with different LRs. This writes the log files `stories$i.log` with all the losses, which you can plot as you wish in Python. Here's a quick example script to plot the losses in a Jupyter notebook, obviously can become more sophisticated later:
-
-```python
-import matplotlib.pyplot as plt
-%matplotlib inline
-
-def parse_log(logfile):
-  # look for lines like e.g. "s:100 tel:1.6952", step 100, val 1.6952
-    val_steps, val_losses = [], []
-    with open(logfile, "r") as f:
-        lines = f.readlines()
-    for line in lines:
-        if "tel" in line:
-            parts = line.split()
-            step = parts[0].split(":")[1]
-            loss = parts[1].split(":")[1]
-            val_steps.append(int(step))
-            val_losses.append(float(loss))
-    return val_steps, val_losses
-
-results = [parse_log(f"stories{i}.log") for i in range(0, 4)]
-for i, (val_steps, val_losses) in enumerate(results):
-    plt.plot(val_steps, val_losses, label="run {}".format(i))
-plt.xlabel("steps")
-plt.ylabel("loss")
-plt.legend()
-```
+This example opens up 4 screen sessions and runs the four commands with different LRs. This writes the log files `stories$i.log` with all the losses, which you can plot as you wish in Python. A quick example of how to parse and plot these logfiles is in [dev/vislog.ipynb](dev/vislog.ipynb).
 
 ## repo philosophy
 
