@@ -1102,7 +1102,7 @@ layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float*
         const float mean_bt = (float)mean[bt];
         const float rstd_bt = (float)rstd[bt];
         dnorm_mean = warpReduceSum(dnorm_mean) / C;
-        dnorm_norm_mean = warpReduceSum(dnorm_norm_mean) / C * rstd_bt - dnorm_mean * mean_bt;
+        dnorm_norm_mean = warpReduceSum(dnorm_norm_mean) / C * rstd_bt - dnorm_mean * mean_bt * rstd_bt;
 
         for (int c = 0; c < iterations_C; c++) {
             int global_index = (warpThreadIdx * x128::size) + (c * C_per_iteration);
