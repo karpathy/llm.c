@@ -62,15 +62,15 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #endif
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
-#include "utils.h"
+#include "llmc/utils.h"
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
-#include "tokenizer.h"
+#include "llmc/tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 // defines: evalloader_init, evalloader_reset, evalloader_next_batch, evalloader_free
-#include "dataloader.h"
+#include "llmc/dataloader.h"
 // defines: manual_seed, normal_
 // numerically identical to PyTorch's torch.manual_seed and torch.normal
-#include "rand.h"
+#include "llmc/rand.h"
 // ----------------------------------------------------------------------------
 // CUDA precision settings
 
