@@ -1278,6 +1278,8 @@ void layernorm_backward2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
     cudaMemset(dbias_tmp, 0, C * sizeof(float));
     layernorm_backward_kernel2<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, dweight_tmp, dbias_tmp);
     copy_to_dweight_dbias<<<1, 512>>>(C, dweight, dbias, dweight_tmp, dbias_tmp);
+    cudaCheck(cudaFree(dweight_tmp));
+    cudaCheck(cudaFree(dbias_tmp));
 }
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
