@@ -401,8 +401,8 @@ int evalloader_stat_losses(EvalLoader *loader, float* losses) {
     // iterate the examples in this batch
     int can_fit_examples = B / ASSUMED_NUM_COMPLETIONS;
     for (int i = 0; i < can_fit_examples; i++) {
-        float min_loss;
-        int min_loss_index;
+        float min_loss = 0.0f;
+        int min_loss_index = -1;
         char active = 0; // is this example active or fully empty?
         // iterate the completions in this example
         for (int b = 0; b < ASSUMED_NUM_COMPLETIONS; b++) {
