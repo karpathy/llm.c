@@ -38,6 +38,7 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <dirent.h>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -2762,13 +2763,13 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->m_memory, 0, shard_num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->v_memory, 0, shard_num_parameters * sizeof(float)));
-        if (model->use_master_weights == 1) {
-            printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
-            cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
-            size_t grid_size = CEIL_DIV(shard_num_parameters, 512);
-            copy_and_cast_kernel<<<grid_size, 512>>>(model->master_weights, params_memory + shard_offset, shard_num_parameters);
-            cudaCheck(cudaGetLastError());
-        }
+    }
+    if (model->use_master_weights == 1 && model->master_weights == NULL) {
+        printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
+        cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
+        size_t grid_size = CEIL_DIV(shard_num_parameters, 512);
+        copy_and_cast_kernel<<<grid_size, 512>>>(model->master_weights, params_memory + shard_offset, shard_num_parameters);
+        cudaCheck(cudaGetLastError());
     }
 
     // gradient clipping
@@ -3021,6 +3022,26 @@ void logger_log_train(Logger *logger, int step, float train_loss) {
 // the goal is that we can resume optimization from any checkpoint, bit-perfect
 // note that "state" refers to things not already saved in the model checkpoint file
 
+int find_max_step(const char* output_log_dir) {
+    // find the DONE file in the log dir with highest step count
+    if (output_log_dir == NULL) { return -1; }
+    DIR* dir;
+    struct dirent* entry;
+    int max_step = -1;
+    dir = opendir(output_log_dir);
+    if (dir == NULL) { return -1; }
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "DONE_", 5) == 0) {
+            int step = atoi(entry->d_name + 5);
+            if (step > max_step) {
+                max_step = step;
+            }
+        }
+    }
+    closedir(dir);
+    return max_step;
+}
+
 void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
     printf("Writing state to %s\n", filename);
     FILE *state_file = fopenCheck(filename, "wb");
@@ -3046,16 +3067,36 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     cudaCheck(cudaMemcpy(cpu_buffer, model->v_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    if (model->master_weights != NULL) {
-        cudaCheck(cudaMemcpy(cpu_buffer, model->master_weights, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
-        fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    }
     free(cpu_buffer);
     fclose(state_file);
 }
 
 void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename) {
-    // TODO
+    FILE *state_file = fopenCheck(filename, "rb");
+    int state_header[256];
+    freadCheck(state_header, sizeof(int), 256, state_file);
+    assert(state_header[0] == 20240527); // magic number
+    assert(state_header[1] == 1); // version number
+    assert(state_header[2] == multi_gpu_config.num_processes); // number of processes
+    assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
+    *step = state_header[10]; // step of the optimization
+    model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
+    loader->current_shard = state_header[30]; // shard of the dataset
+    loader->current_position = *((int64_t*)&state_header[31]); // position in shard
+    // read AdamW m, v (they are all float)
+    // also allocate the m, v memory in the model, if it does not yet exist
+    size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
+    if (model->m_memory == NULL) {
+        printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
+        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
+        cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
+    }
+    float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
+    freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    cudaCheck(cudaMemcpy(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+    freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    cudaCheck(cudaMemcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
 }
 
 // ----------------------------------------------------------------------------
@@ -3217,13 +3258,29 @@ int main(int argc, char *argv[]) {
     printf0("| precision             | %-50s |\n", precision_str);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
+    // figure out if we are going to be resuming the optimization
+    char filename_buffer[512];
+    int resuming = 0;
+    int resume_max_step = find_max_step(output_log_dir);
+    if (resume == 1) {
+        // find the DONE file with the highest step count
+        assert(output_log_dir != NULL);
+        if (resume_max_step == -1) {
+        } else {
+            resuming = 1;
+            snprintf(filename_buffer, 512, "%s/model_%08d.bin", output_log_dir, resume_max_step);
+        }
+    }
+
     // build the GPT-2 model
     GPT2 model;
     // if load_filename is of the form "dX" where X is an integer (e.g. d12), then we build
     // a random model with the depth of the model specified by X (e.g. 12). otherwise interpret
     // this variable as a checkpoint filename, and load that checkpoint
     assert(strlen(load_filename) >= 2);
-    if (load_filename[0] == 'd') {
+    if (resuming == 1) {
+        gpt2_build_from_checkpoint(&model, filename_buffer);
+    } else if (load_filename[0] == 'd') {
         int depth = atoi(load_filename + 1);
         if (depth > 1 && depth <= 1000) { // we're not going to train models this big right? heh
             gpt2_build_from_random(&model, depth);
@@ -3314,10 +3371,12 @@ int main(int argc, char *argv[]) {
     floatX* cpu_logits_raw = (floatX*)mallocCheck(model.config.vocab_size * sizeof(floatX));
     float*  cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
-    // attempt to resume the optimization, if resume = 1
+    // if we found a checkpoint to resume from, load the optimization state
     int step = 0;
-    // TODO: actually resume
-    // TODO: "just_resumed" flag, to skip re-writing a checkpoint below right away
+    if (resuming == 1) {
+        snprintf(filename_buffer, 512, "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
+        load_state(&step, &model, &train_loader, filename_buffer);
+    }
 
     // train
     cudaEvent_t start, end;
@@ -3326,7 +3385,7 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaProfilerStart());
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
-    for (step = 0; step <= train_num_batches; step++) {
+    for (; step <= train_num_batches; step++) {
         NvtxRange step_range("Train step", step);
 
         int last_step = step == train_num_batches;
@@ -3414,29 +3473,27 @@ int main(int argc, char *argv[]) {
         }
 
         // once in a while checkpoint the optimization state (all ranks)
-        if ((checkpoint_every > 0 && output_log_dir != NULL) &&
+        if ((checkpoint_every > 0 && output_log_dir != NULL && resuming == 0) &&
             ((step > 0 && step % checkpoint_every == 0) || last_step)) {
-            char checkpoint_filename[512];
             assert(strlen(output_log_dir) < 400); // being a bit lazy here
             // only rank 0 writes the model file because it is the same across all ranks
             if (multi_gpu_config.process_rank == 0) {
-                snprintf(checkpoint_filename, 512, "%s/model_%08d.bin",
-                         output_log_dir, step);
-                gpt2_write_to_checkpoint(&model, checkpoint_filename);
+                snprintf(filename_buffer, 512, "%s/model_%08d.bin", output_log_dir, step);
+                gpt2_write_to_checkpoint(&model, filename_buffer);
             }
             // all ranks write their state file
-            snprintf(checkpoint_filename, 512, "%s/state_%08d_%05d.bin",
-                     output_log_dir, step, multi_gpu_config.process_rank);
-            save_state(checkpoint_filename, step, &model, &train_loader);
+            snprintf(filename_buffer, 512, "%s/state_%08d_%05d.bin", output_log_dir, step, multi_gpu_config.process_rank);
+            save_state(filename_buffer, step, &model, &train_loader);
             // DONE file is a signal that this checkpoint as a whole is complete
             multi_gpu_barrier(&multi_gpu_config);
             if (multi_gpu_config.process_rank == 0) {
-                snprintf(checkpoint_filename, 512, "%s/DONE_%08d", output_log_dir, step);
-                FILE* done_file = fopenCheck(checkpoint_filename, "w");
+                snprintf(filename_buffer, 512, "%s/DONE_%08d", output_log_dir, step);
+                FILE* done_file = fopenCheck(filename_buffer, "w");
                 fclose(done_file);
             }
             multi_gpu_barrier(&multi_gpu_config);
         }
+        resuming = 0;
 
         // bit confusing: we want to make sure to eval and sample on 0th iteration
         // but also after the very last iteration. so we loop for step <= train_num_batches
