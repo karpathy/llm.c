@@ -2171,9 +2171,10 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     FILE *model_file = fopenCheck(checkpoint_path, "wb");
     // write the header first
     int model_header[256];
-    model_header[0] = 20240326;
+    memset(model_header, 0, sizeof(model_header));
+    model_header[0] = 20240326; // magic number
     assert(PRECISION_MODE == PRECISION_FP32 || PRECISION_MODE == PRECISION_BF16);
-    model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : 5;
+    model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : 5; // version
     model_header[2] = model->config.max_seq_len;
     model_header[3] = model->config.vocab_size;
     model_header[4] = model->config.num_layers;
@@ -2949,6 +2950,7 @@ int sample_softmax(const float* logits, int n, float coin) {
 
 // ----------------------------------------------------------------------------
 // Logger lite, will probably grow/change some over time
+// Logger is stateless, uses append mode to write to file
 
 void create_dir_if_not_exists(const char *dir) {
     if (dir == NULL) { return; }
@@ -2963,47 +2965,94 @@ void create_dir_if_not_exists(const char *dir) {
 }
 
 typedef struct {
-    FILE *logfile;
-    int flush_every; // every how many steps to flush the log
+    int active;
+    char output_log_file[512];
 } Logger;
 
-void logger_init(Logger *logger, const char *log_dir, int process_rank) {
-    logger->flush_every = 10;
-    logger->logfile = NULL;
+void logger_init(Logger *logger, const char *log_dir, int process_rank, int resume) {
+    // currently, only rank 0 writes logs
+    logger->active = 0;
     if (log_dir != NULL && process_rank == 0) {
-        char output_log_file[512];
-        assert(strlen(log_dir) < 500); // being a bit lazy, can relax later maybe
-        snprintf(output_log_file, 512, "%s/main.log", log_dir);
-        logger->logfile = fopenCheck(output_log_file, "w");
+        logger->active = 1;
+        assert(strlen(log_dir) < 500); // being a bit lazy, could relax later
+        snprintf(logger->output_log_file, 512, "%s/main.log", log_dir);
+        if (resume == 0) {
+            // wipe any existing logfile clean if we're starting fresh
+            FILE *logfile = fopenCheck(logger->output_log_file, "w");
+            fclose(logfile);
+        }
     }
 }
 
 void logger_log_eval(Logger *logger, int step, float val) {
-    if (logger->logfile != NULL) {
-        fprintf(logger->logfile, "s:%d eval:%.4f\n", step, val);
+    if (logger->active == 1) {
+        FILE *logfile = fopenCheck(logger->output_log_file, "a");
+        fprintf(logfile, "s:%d eval:%.4f\n", step, val);
+        fclose(logfile);
     }
 }
 
 void logger_log_val(Logger *logger, int step, float val_loss) {
-    if (logger->logfile != NULL) {
-        fprintf(logger->logfile, "s:%d tel:%.4f\n", step, val_loss);
+    if (logger->active == 1) {
+        FILE *logfile = fopenCheck(logger->output_log_file, "a");
+        fprintf(logfile, "s:%d tel:%.4f\n", step, val_loss);
+        fclose(logfile);
     }
 }
 
 void logger_log_train(Logger *logger, int step, float train_loss) {
-    if (logger->logfile != NULL) {
-        fprintf(logger->logfile, "s:%d trl:%.4f\n", step, train_loss);
-        if (step % logger->flush_every == 0) { fflush(logger->logfile); }
+    if (logger->active == 1) {
+        FILE *logfile = fopenCheck(logger->output_log_file, "a");
+        fprintf(logfile, "s:%d trl:%.4f\n", step, train_loss);
+        fclose(logfile);
     }
 }
 
-void logger_free(Logger *logger) {
-    if (logger->logfile != NULL) { fclose(logger->logfile); }
+// ----------------------------------------------------------------------------
+// training resumption logic, very useful when jobs crash once in a while
+// the goal is that we can resume optimization from any checkpoint, bit-perfect
+// note that "state" refers to things not already saved in the model checkpoint file
+
+void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
+    printf("Writing state to %s\n", filename);
+    FILE *state_file = fopenCheck(filename, "wb");
+    int state_header[256];
+    memset(state_header, 0, sizeof(state_header));
+    // basic identifying information
+    state_header[0] = 20240527; // magic number
+    state_header[1] = 1; // version number
+    state_header[2] = multi_gpu_config.num_processes; // number of processes
+    state_header[3] = multi_gpu_config.process_rank; // rank of this process
+    // int main state, start at 10 to leave some padding
+    state_header[10] = step; // step of the optimization
+    // model state, state, start at 20 to leave some padding
+    *((unsigned long long*)&state_header[20]) = model->rng_state; // random number generator state
+    // dataloader state, start at 30 to leave some padding
+    state_header[30] = loader->current_shard; // shard of the dataset
+    *((int64_t*)&state_header[31]) = loader->current_position; // position in shard
+    fwrite(state_header, sizeof(int), 256, state_file);
+    // write AdamW m, v, and master_weights here (they are all float)
+    size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
+    float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
+    cudaCheck(cudaMemcpy(cpu_buffer, model->m_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
+    fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    cudaCheck(cudaMemcpy(cpu_buffer, model->v_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
+    fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    if (model->master_weights != NULL) {
+        cudaCheck(cudaMemcpy(cpu_buffer, model->master_weights, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
+        fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    }
+    free(cpu_buffer);
+    fclose(state_file);
+}
+
+void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename) {
+    // TODO
 }
 
 // ----------------------------------------------------------------------------
 // CLI, poor man's argparse
-// unclaimed flags lol: k,p,y
+// unclaimed flags lol: k,p
 
 void error_usage() {
     fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
@@ -3014,6 +3063,7 @@ void error_usage() {
     fprintf(stderr, "  -e <string> input from model at this filename (default = gpt2_124M_bf16.bin)\n");
     fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
     fprintf(stderr, "  -n <int>    write optimization checkpoints every how many steps? (default 0, don't)\n");
+    fprintf(stderr, "  -y <int>    resume optimization found inside output log dir? (0=restart/overwrite, 1=resume/append)\n");
     // token layout for each step of the optimization
     fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
@@ -3053,6 +3103,7 @@ int main(int argc, char *argv[]) {
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write optimization checkpoints every how many steps?
+    int resume = 0; // resume the optimization, if one is found inside output_log_dir?
     int B = 4; // batch size
     int T = 1024; // sequence length max
     int total_batch_size = -1; // will be calculated down below later, if not provided
@@ -3082,6 +3133,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
         else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
         else if (argv[i][1] == 'n') { checkpoint_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'y') { resume = atoi(argv[i+1]); }
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
         else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
@@ -3129,6 +3181,8 @@ int main(int argc, char *argv[]) {
     printf0("| train data pattern    | %-50s |\n", train_data_pattern);
     printf0("| val data pattern      | %-50s |\n", val_data_pattern);
     printf0("| output log dir        | %-50s |\n", output_log_dir == NULL ? "NULL" : output_log_dir);
+    printf0("| checkpoint_every      | %-50d |\n", checkpoint_every);
+    printf0("| resume                | %-50d |\n", resume);
     printf0("| micro batch size B    | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
@@ -3241,17 +3295,21 @@ int main(int argc, char *argv[]) {
     // set up logging
     create_dir_if_not_exists(output_log_dir);
     Logger logger;
-    logger_init(&logger, output_log_dir, multi_gpu_config.process_rank);
+    logger_init(&logger, output_log_dir, multi_gpu_config.process_rank, resume);
 
     // set up the Tokenizer
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
     // some memory for generating samples from the model
-    unsigned long long rng_state = 1337;
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     floatX* cpu_logits_raw = (floatX*)mallocCheck(model.config.vocab_size * sizeof(floatX));
     float*  cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
+
+    // attempt to resume the optimization, if resume = 1
+    int step = 0;
+    // TODO: actually resume
+    // TODO: "just_resumed" flag, to skip re-writing a checkpoint below right away
 
     // train
     cudaEvent_t start, end;
@@ -3260,12 +3318,12 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaProfilerStart());
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
-    for (int step = 0; step <= train_num_batches; step++) {
+    for (step = 0; step <= train_num_batches; step++) {
         NvtxRange step_range("Train step", step);
 
         int last_step = step == train_num_batches;
 
-        // once in a while estimate the validation loss
+        // once in a while estimate the validation loss (all processes collaborate)
         if (step % val_loss_every == 0 || last_step) {
             NvtxRange validation_range("validation");
             float val_loss = 0.0f;
@@ -3281,7 +3339,7 @@ int main(int argc, char *argv[]) {
             logger_log_val(&logger, step, val_loss);
         }
 
-        // once in a while estimate HellaSwag accuracy
+        // once in a while estimate HellaSwag accuracy (all processes collaborate)
         if (run_hellaswag &&
            ((step > 0 && step % val_loss_every == 0) || last_step)) {
             NvtxRange evaluation_range("evaluation");
@@ -3300,10 +3358,11 @@ int main(int argc, char *argv[]) {
             logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
         }
 
-        // once in a while do model inference to print generated text
+        // once in a while do model inference to print generated text (only rank 0)
         if (multi_gpu_config.process_rank == 0 && sample_every > 0 &&
            (step > 0 && (step % sample_every) == 0 || last_step)) {
             NvtxRange generation_range("generation");
+            unsigned long long sample_rng_state = 1337;
             // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
             int eot_token = tokenizer.eot_token;
             for(int i = 0; i < B * T; ++i) {
@@ -3329,8 +3388,8 @@ int main(int argc, char *argv[]) {
                 for (int i = 0; i < model.config.vocab_size; i++) {
                     cpu_logits[i] = (float)cpu_logits_raw[i];
                 }
-
-                float coin = random_f32(&rng_state);
+                // sample the next token
+                float coin = random_f32(&sample_rng_state);
                 int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
                 // print the generated token, either using the Tokenizer or a fallback
@@ -3346,12 +3405,29 @@ int main(int argc, char *argv[]) {
             printf("\n---\n");
         }
 
-        // once in a while checkpoint the optimization state
+        // once in a while checkpoint the optimization state (all ranks)
         if ((checkpoint_every > 0 && output_log_dir != NULL) &&
             ((step > 0 && step % checkpoint_every == 0) || last_step)) {
             char checkpoint_filename[512];
-            snprintf(checkpoint_filename, 512, "%s/model_%08d.bin", output_log_dir, step);
-            gpt2_write_to_checkpoint(&model, checkpoint_filename);
+            assert(strlen(output_log_dir) < 400); // being a bit lazy here
+            // only rank 0 writes the model file because it is the same across all ranks
+            if (multi_gpu_config.process_rank == 0) {
+                snprintf(checkpoint_filename, 512, "%s/model_%08d.bin",
+                         output_log_dir, step);
+                gpt2_write_to_checkpoint(&model, checkpoint_filename);
+            }
+            // all ranks write their state file
+            snprintf(checkpoint_filename, 512, "%s/state_%08d_%05d.bin",
+                     output_log_dir, step, multi_gpu_config.process_rank);
+            save_state(checkpoint_filename, step, &model, &train_loader);
+            // DONE file is a signal that this checkpoint as a whole is complete
+            if (multi_gpu_config.num_processes > 1) { MPI_Barrier(MPI_COMM_WORLD); }
+            if (multi_gpu_config.process_rank == 0) {
+                snprintf(checkpoint_filename, 512, "%s/DONE_%08d", output_log_dir, step);
+                FILE* done_file = fopenCheck(checkpoint_filename, "w");
+                fclose(done_file);
+            }
+            if (multi_gpu_config.num_processes > 1) { MPI_Barrier(MPI_COMM_WORLD); }
         }
 
         // bit confusing: we want to make sure to eval and sample on 0th iteration
@@ -3440,7 +3516,6 @@ int main(int argc, char *argv[]) {
     free(cpu_logits_raw);
     free(cpu_logits);
     free(gen_tokens);
-    logger_free(&logger);
     multi_gpu_config_free(&multi_gpu_config);
     common_free(model);
     return 0;
