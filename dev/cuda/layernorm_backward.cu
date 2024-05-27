@@ -21,7 +21,6 @@ version 2 moves a lot of reduction to shared memory over global memory
 #define ENABLE_BF16
 #include "common.h"
 
-// typedef unsigned int uint;              needed on windows
 // ----------------------------------------------------------------------------
 // CPU code reference
 
