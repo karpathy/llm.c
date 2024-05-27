@@ -107,33 +107,23 @@ static inline int glob(const char* pattern, int ignored_flags, int (*ignored_err
 // dirent.h support
 
 #define MAX_PATH_LENGTH 512
-
-typedef struct DIR DIR;
-
 typedef struct dirent {
     char d_name[MAX_PATH_LENGTH];
 } dirent;
 
-DIR *opendir(const char *name);
-struct dirent *readdir(DIR *directory);
-int closedir(DIR *directory);
-
-struct DIR {
+typedef struct DIR {
     intptr_t handle;
     struct _finddata_t findFileData;
     int firstRead;
-};
+} DIR;
 
-
-DIR *opendir(const char *name) {
+static inline DIR *opendir(const char *name) {
     DIR *dir = (DIR *)malloc(sizeof(DIR));
     if (dir == NULL) {
         return NULL;
     }
 
     char searchPath[MAX_PATH_LENGTH];
-
-    strncpy(searchPath, name, MAX_PATH_LENGTH);
 
     snprintf(searchPath, MAX_PATH_LENGTH, "%s\\*.*", name);
 
@@ -147,7 +137,7 @@ DIR *opendir(const char *name) {
     return dir;
 }
 
-struct dirent *readdir(DIR *directory) {
+static inline struct dirent *readdir(DIR *directory) {
     static struct dirent result;
 
     if (directory->firstRead) {
@@ -163,7 +153,7 @@ struct dirent *readdir(DIR *directory) {
     return &result;
 }
 
-int closedir(DIR *directory) {
+static inline int closedir(DIR *directory) {
     if (directory == NULL) {
         return -1;
     }
@@ -175,6 +165,4 @@ int closedir(DIR *directory) {
     free(directory);
     return 0;
 }
-
-
-#endif
+#endif // UNISTD_H
