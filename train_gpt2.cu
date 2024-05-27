@@ -1117,7 +1117,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
         const float mean_bt = (float)mean[bt];
         const float rstd_bt = (float)rstd[bt];
         dnorm_mean = warpReduceSum(dnorm_mean) / C;
-        dnorm_norm_mean = warpReduceSum(dnorm_norm_mean) / C * rstd_bt - dnorm_mean * mean_bt;
+        dnorm_norm_mean = warpReduceSum(dnorm_norm_mean) / C * rstd_bt - dnorm_mean * mean_bt * rstd_bt;
 
         for (int c = 0; c < iterations_C; c++) {
             int global_index = (warpThreadIdx * x128::size) + (c * C_per_iteration);
