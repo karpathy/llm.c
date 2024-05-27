@@ -21,6 +21,7 @@ version 2 moves a lot of reduction to shared memory over global memory
 #define ENABLE_BF16
 #include "common.h"
 
+// typedef unsigned int uint;              needed on windows
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -1325,6 +1326,7 @@ template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 void layernorm_backward8(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C, int block_size) {
+        assert(C % (32 * x128::size) == 0  && "Channels must be divisible by (32 * x128::size)");
         const int grid_size = (1024/block_size) * cuda_num_SMs;
         size_t shared_mem_size = (2 * C + 1) * sizeof(float);
 
