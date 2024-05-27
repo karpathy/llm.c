@@ -472,6 +472,14 @@ void multi_gpu_config_free(const MultiGpuConfig* multi_gpu_config) {
 #endif
 }
 
+void multi_gpu_barrier(const MultiGpuConfig* multi_gpu_config) {
+#ifdef MULTI_GPU
+    if (multi_gpu_config->num_processes > 1) {
+        mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
+    }
+#endif
+}
+
 // convenience function that only prints if the rank of process is zero
 void printf0(const char *format, ...) {
     if (multi_gpu_config.process_rank == 0) {
@@ -3421,13 +3429,13 @@ int main(int argc, char *argv[]) {
                      output_log_dir, step, multi_gpu_config.process_rank);
             save_state(checkpoint_filename, step, &model, &train_loader);
             // DONE file is a signal that this checkpoint as a whole is complete
-            if (multi_gpu_config.num_processes > 1) { MPI_Barrier(MPI_COMM_WORLD); }
+            multi_gpu_barrier(&multi_gpu_config);
             if (multi_gpu_config.process_rank == 0) {
                 snprintf(checkpoint_filename, 512, "%s/DONE_%08d", output_log_dir, step);
                 FILE* done_file = fopenCheck(checkpoint_filename, "w");
                 fclose(done_file);
             }
-            if (multi_gpu_config.num_processes > 1) { MPI_Barrier(MPI_COMM_WORLD); }
+            multi_gpu_barrier(&multi_gpu_config);
         }
 
         // bit confusing: we want to make sure to eval and sample on 0th iteration
