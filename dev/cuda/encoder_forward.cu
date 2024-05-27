@@ -178,8 +178,9 @@ void encoder_forward4(floatX* out,
                       int B, int T, int C,
                       const int block_size) {
     const int num_c_blocks = ceil_div(C, x128::size * block_size);
+    const int actual_block_size = (C < x128::size * block_size) ? (C / x128::size) : block_size;
     dim3 grid_size(num_c_blocks, T, B);
-    encoder_forward_kernel4<<<grid_size, block_size>>>(out, inp, wte, wpe, C);
+    encoder_forward_kernel4<<<grid_size, actual_block_size>>>(out, inp, wte, wpe, C);
     cudaCheck(cudaGetLastError());
 }
 
