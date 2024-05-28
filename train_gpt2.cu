@@ -2872,6 +2872,74 @@ void gpt2_multi_gpu_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
 #endif
 }
 
+float get_flops_promised(const char* device) {
+    // for the non-top models, actual performance numbers aren't that easy to find, e.g.,
+    // here https://www.techpowerup.com/gpu-specs/rtx-a4000.c3756, does "Theoretical Performance"
+    // seems to be without tensor cores.
+    // So, instead we use that all these cards just use the same types of tensor cores in different
+    // numbers and at different frequencies. Then we just need to look up these two easily accesible
+    // numbers for all the other GPUs.
+    // linear scaling seems to work: comparing spec sheet and calculation:
+    // 4080: 304TCs, 2505 GHz; 97.5TFlops = 165.2/512*304 /2520 * 2505
+    //
+    // Original numbers for the top GPUS are from.
+    // https://resources.nvidia.com/en-us-tensor-core
+    // https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf
+
+    struct PerfData {
+        float TF_32;       // tensor-core performance 32 bit
+        float BF_16_32;    // bf16 with 32 bit accumulate
+        float FP_16_32;    // fp16 with 32 bit accumulate
+        float FP_16_16;    // fp16 with 16 bit accumulate
+        float FP_8_32;     // and so on
+        float FP_8_16;
+        float CLOCK;        // clock frequency from the spec sheet
+        float CORES;        // #TCs from the spec sheet
+    };
+
+    // basic data from the nvidia whitepapers
+    static const PerfData AMPERE = {156.f, 312.f, 312.f, 312.f, -1, -1, 1410.f, 432.f};
+    static const PerfData HOPPER = {378.f, 756.f, 756.f, 756.f, 1513.f, 1513.f, 1620.f, 456.f};
+    static const PerfData ADA = {82.6f, 165.2f, 165.2f, 330.3f, 330.3f, 660.6f, 2520.f, 512.f};
+
+    // helper to get the value for a particular GPU with different #TCs and clock frequency.
+    auto adjust = [](const PerfData& orig, float new_cores, float new_mhz){
+        float value;
+        switch (PRECISION_MODE) {
+            case PRECISION_BF16:
+                value = orig.BF_16_32;
+                break;
+            case PRECISION_FP32:
+                value = orig.TF_32;
+                break;
+             case PRECISION_FP16:
+                value = orig.FP_16_32;
+                break;
+            default:
+                fprintf(stderr, "Invalid precision mode, how did this even compile?");
+                exit(1);
+        }
+        return value / orig.CORES * new_cores / orig.CLOCK * new_mhz;
+    };
+
+    // TODO fill in more GPUs
+    static std::pair<std::string_view, float> gpu_db[] = {
+        {"NVIDIA A100-PCIE-40GB", adjust(AMPERE, 432, 1410)},
+        {"NVIDIA GeForce RTX 4060 Ti", adjust(ADA, 136, 2535)},
+        {"NVIDIA RTX A4000", adjust(AMPERE, 192, 1560)},
+    };
+
+    // just do a linear search until you find our GPU
+    for(const auto& entry : gpu_db) {
+        if(entry.first == device) {
+            return entry.second;
+        }
+    }
+
+    // signal that we don't know
+    return -1;
+}
+
 float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
     // estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS
     // see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
@@ -2885,7 +2953,10 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
     size_t flops_per_step = flops_per_token * num_tokens;
     // express our flops throughput as ratio of A100 bfloat16 peak flops
     float flops_achieved = (float)flops_per_step * (1.0f / dt); // per second
-    float flops_promised = 312e12f; // A100 GPU bfloat16 peak flops is 312 TFLOPS
+    float flops_promised = get_flops_promised(deviceProp.name) * 1e12f;
+    if(flops_promised < 0) {
+        return -1.f;   // don't know
+    }
     float mfu = flops_achieved / flops_promised;
     return mfu;
 }
@@ -3258,6 +3329,7 @@ int main(int argc, char *argv[]) {
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
                               : (PRECISION_MODE == PRECISION_FP16 ? "FP16" : "BF16");
     printf0("| device                | %-50s |\n", deviceProp.name);
+    printf0("| TFlops                | %-50.1f |\n", get_flops_promised(deviceProp.name));
     printf0("| precision             | %-50s |\n", precision_str);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
@@ -3563,7 +3635,7 @@ int main(int argc, char *argv[]) {
         }
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
         float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
-        printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% A100 fp16 MFU | %.0f tok/s\n",
+        printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
                 step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
