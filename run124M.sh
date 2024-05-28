@@ -39,6 +39,7 @@ while true; do
                 -q 0.0 \
                 -u 700 \
                 -n 5000 \
+                -y 1 \
                 -e "d12"
 
     sleep 1
