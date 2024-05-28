@@ -28,8 +28,8 @@ mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
 
 If you'd like to see train_gpt2.cu produce identical results to
 `python train_gpt2.py`, you can run it like this:
-make train_gpt2cu && ./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -f 0
-make train_gpt2cu PRECISION=FP32 && ./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -f 0
+make train_gpt2cu && ./train_gpt2cu -b 4 -t 64 -l 0.0001 -v 200 -s 200 -a 1 -x 10 -f 0
+make train_gpt2cu PRECISION=FP32 && ./train_gpt2cu -b 4 -t 64 -l 0.0001 -v 200 -s 200 -a 1 -x 10 -f 0
 This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 -a 1 is "overfit single batch", -x 10 is 10 iterations, and -f 0 disables tf32
 */
