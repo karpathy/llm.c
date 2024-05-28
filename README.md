@@ -4,6 +4,8 @@ LLM training in simple, pure C/CUDA. There is no need for 245MB of PyTorch or 10
 
 Our current goal is to reproduce GPT-2. For an overview of current ongoing work, see the latest [State of the Union](https://github.com/karpathy/llm.c/discussions/344) post.
 
+Update May 28, 2024: A useful recent post may be ["Reproducing GPT-2 (124M) in llm.c in 90 minutes for $20"](https://github.com/karpathy/llm.c/discussions/481) where I detail the steps to go from scratch to reproducing the GPT-2 miniseries for 124M/350M models. The files themselves that show the launch commands are [run124M.sh](run124M.sh) and [run350M.sh](run350M.sh).
+
 I'd like this repo to only maintain C and CUDA code. Ports of this repo to other languages are very welcome, but should be done in separate repos, and then I am happy to link to them below in the "notable forks" section, just like I did in [llama2.c notable forks](https://github.com/karpathy/llama2.c/tree/master?tab=readme-ov-file#notable-forks).
 
 ## quick start (GPU, slow but stable and educational)
