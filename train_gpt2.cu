@@ -2899,6 +2899,7 @@ float get_flops_promised(const char* device) {
     };
 
     // basic data from the nvidia whitepapers
+    static const PerfData VOLTA = {125.0f, -1, 125.f, -1, -1, -1, 1530.f, 640.f};
     static const PerfData AMPERE = {156.f, 312.f, 312.f, 312.f, -1, -1, 1410.f, 432.f};
     static const PerfData HOPPER = {378.f, 756.f, 756.f, 756.f, 1513.f, 1513.f, 1620.f, 456.f};
     static const PerfData ADA = {82.6f, 165.2f, 165.2f, 330.3f, 330.3f, 660.6f, 2520.f, 512.f};
@@ -2925,9 +2926,42 @@ float get_flops_promised(const char* device) {
 
     // TODO fill in more GPUs
     static std::pair<std::string_view, float> gpu_db[] = {
+        {"Tesla V100-SXM2-16GB", adjust(VOLTA, 640, 1530)},
+        {"Tesla V100-PCIE-32GB", adjust(VOLTA, 640, 1530)},
         {"NVIDIA A100-PCIE-40GB", adjust(AMPERE, 432, 1410)},
-        {"NVIDIA GeForce RTX 4060 Ti", adjust(ADA, 136, 2535)},
+        {"NVIDIA A100-PCIE-80GB", adjust(AMPERE, 432, 1410)},
+        {"NVIDIA A100-SXM4-40GB", adjust(AMPERE, 432, 1410)},
+        {"NVIDIA A100-SXM4-80GB", adjust(AMPERE, 432, 1410)},
+        {"NVIDIA RTX A2000", adjust(AMPERE, 104, 1200)},
         {"NVIDIA RTX A4000", adjust(AMPERE, 192, 1560)},
+        {"NVIDIA RTX A4500", adjust(AMPERE, 224, 1650)},
+        {"NVIDIA RTX A5000", adjust(AMPERE, 256, 1695)},
+        {"NVIDIA RTX A5500", adjust(AMPERE, 320, 1770)},
+        {"NVIDIA RTX A6000", adjust(AMPERE, 336, 1800)},
+        {"NVIDIA GeForce RTX 3090 Ti", adjust(AMPERE, 336, 1860)},
+        {"NVIDIA GeForce RTX 3090", adjust(AMPERE, 328, 1695)},
+        {"NVIDIA GeForce RTX 3080 Ti", adjust(AMPERE, 320, 1665)},
+        {"NVIDIA GeForce RTX 3080", adjust(AMPERE, 272, 1710)},
+        {"NVIDIA GeForce RTX 3070 Ti", adjust(AMPERE, 192, 1770)},
+        {"NVIDIA GeForce RTX 3070", adjust(AMPERE, 184, 1725)},
+        {"NVIDIA GeForce RTX 3060 Ti", adjust(AMPERE, 152, 1665)},
+        {"NVIDIA GeForce RTX 3060", adjust(AMPERE, 112, 1777)},
+        {"NVIDIA RTX A2000 ADA", adjust(ADA, 88, 2130)},
+        {"NVIDIA RTX A4000 ADA", adjust(ADA, 192, 2175)},
+        {"NVIDIA RTX A4500 ADA", adjust(ADA, 224, 2580)},
+        {"NVIDIA RTX A5000 ADA", adjust(ADA, 400, 2550)},
+        {"NVIDIA RTX A5880 ADA", adjust(ADA, 440, 2460)},
+        {"NVIDIA RTX A6000 ADA", adjust(ADA, 568, 2505)},
+        {"NVIDIA GeForce RTX 4090", adjust(ADA, 512, 2520)},
+        {"NVIDIA GeForce RTX 4080 SUPER", adjust(ADA, 320, 2550)},
+        {"NVIDIA GeForce RTX 4080", adjust(ADA, 304, 2505)},
+        {"NVIDIA GeForce RTX 4070 Ti SUPER", adjust(ADA, 264, 2610)},
+        {"NVIDIA GeForce RTX 4070 Ti", adjust(ADA, 240, 2610)},
+        {"NVIDIA GeForce RTX 4070 SUPER", adjust(ADA, 224, 2475)},
+        {"NVIDIA GeForce RTX 4070", adjust(ADA, 184, 2475)},
+        {"NVIDIA GeForce RTX 4070", adjust(ADA, 184, 2475)},
+        {"NVIDIA GeForce RTX 4060 Ti", adjust(ADA, 136, 2535)},
+        {"NVIDIA GeForce RTX 4060", adjust(ADA, 96, 2460)},
         {"NVIDIA H100 80GB HBM3", adjust(HOPPER, 528, 1830)},       // HBM3 = SXM5
     };
 
