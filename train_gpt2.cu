@@ -2928,6 +2928,7 @@ float get_flops_promised(const char* device) {
         {"NVIDIA A100-PCIE-40GB", adjust(AMPERE, 432, 1410)},
         {"NVIDIA GeForce RTX 4060 Ti", adjust(ADA, 136, 2535)},
         {"NVIDIA RTX A4000", adjust(AMPERE, 192, 1560)},
+        {"NVIDIA H100 80GB HBM3", adjust(HOPPER, 528, 1830)},       // HBM3 = SXM5
     };
 
     // just do a linear search until you find our GPU
