@@ -52,25 +52,37 @@ void matmul_forward_cpu(float* out,
 // ----------------------------------------------------------------------------
 // GPU kernels
 
-// kernel 1: naive kernel, every thread handles one output element, direct global memory access
+// Optimized kernel 1: using shared memory for better performance
 __global__ void matmul_forward_kernel1(float* out,
-                                       const float* inp, const float* weight, const float* bias,
-                                       int BT, int C, int OC) {
-    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
-    // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    // in the naive kernel, every thread handles one element of out
+                                                 const float* inp, const float* weight, const float* bias,
+                                                 int BT, int C, int OC) {
+    extern __shared__ float shared_mem[];
+    float* shared_weight = shared_mem;
+    float* shared_inp = shared_mem + blockDim.y * C;
+
     int bt = blockIdx.x * blockDim.x + threadIdx.x;
     int oc = blockIdx.y * blockDim.y + threadIdx.y;
+
     if (bt < BT && oc < OC) {
+        // Load weight into shared memory
+        for (int i = threadIdx.x; i < C; i += blockDim.x) {
+            shared_weight[threadIdx.y * C + i] = weight[oc * C + i];
+        }
+        // Load input into shared memory
+        for (int i = threadIdx.y; i < C; i += blockDim.y) {
+            shared_inp[threadIdx.x * C + i] = inp[bt * C + i];
+        }
+        __syncthreads();
+
+        // Perform matrix multiplication
         float val = (bias != NULL) ? bias[oc] : 0.0f;
-        const float* wrow = weight + oc * C;
-        const float* inp_bt = inp + bt * C;
         for (int i = 0; i < C; i++) {
-            val += inp_bt[i] * wrow[i];
+            val += shared_inp[threadIdx.x * C + i] * shared_weight[threadIdx.y * C + i];
         }
         out[bt * OC + oc] = val;
     }
 }
+
 
 // is there no better way other than just adding bias with a whole separate kernel?
 // this is a highly memory-bound operation, should be fused into the matmul kernel
@@ -87,16 +99,15 @@ __global__ void add_bias(float* out, const float* bias, int B, int T, int OC) {
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-// kernel 1 is the most naive matmul kernel
+// kernel 1 is the most naive matmul kernel, now with shared memory
 void matmul_forward1(float* out,
-                     const float* inp, const float* weight, const float* bias,
-                     int B, int T, int C, int OC,
-                     const int sqrt_block_size) {
-    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
-    // inp is (B,T,C), weight is (OC, C), bias is (OC)
+                              const float* inp, const float* weight, const float* bias,
+                              int B, int T, int C, int OC,
+                              const int sqrt_block_size) {
     dim3 gridDim(ceil_div(B * T, sqrt_block_size), ceil_div(OC, sqrt_block_size));
     dim3 blockDim(sqrt_block_size, sqrt_block_size);
-    matmul_forward_kernel1<<<gridDim, blockDim>>>(out, inp, weight, bias, B*T, C, OC);
+    int shared_mem_size = 2 * sqrt_block_size * C * sizeof(float); // Allocate shared memory
+    matmul_forward_kernel1_optimized<<<gridDim, blockDim, shared_mem_size>>>(out, inp, weight, bias, B*T, C, OC);
     cudaCheck(cudaGetLastError());
 }
 
