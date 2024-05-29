@@ -338,6 +338,18 @@ done
 
 This example opens up 4 screen sessions and runs the four commands with different LRs. This writes the log files `stories$i.log` with all the losses, which you can plot as you wish in Python. A quick example of how to parse and plot these logfiles is in [dev/vislog.ipynb](dev/vislog.ipynb).
 
+## realtime metrics visualization
+
+Following recipe enables ploting the useful metrics in wandb in realtime for the training runs lasting many hours.
+
+```bash
+# run wandb_logger pointing to the logging directory 
+python dev/wandb_logger.py -l log1558M_000
+# start the training pointing to the same logging directory
+mpirun -np 8 ./train_gpt2cu -i "dev/data/tinystories/TinyStories_train.bin" -j "dev/data/tinystories/TinyStories_val.bin" -o "log1558M_000" \
+             -v 10 -s 100 -g 100 -b 8 -t 1024 -d 524288 -r 0 -z 1 -c 0.1 -l 0.0003 -q 0.0 -u 80 -n 2000 -x 100 -e "d48" -h 1
+```
+
 ## repo philosophy
 
 A few more words on what I want this repo to be:

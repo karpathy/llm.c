@@ -3020,6 +3020,18 @@ void logger_log_train(Logger *logger, int step, float train_loss) {
     }
 }
 
+void logger_log_metrics(Logger *logger, int step, float norm, float lr, float latency, float mfu, float tokens) {
+    if (logger->active == 1) {
+        FILE *logfile = fopenCheck(logger->output_log_file, "a");
+        fprintf(logfile, "s:%d norm:%6.4f\n", step, norm);
+        fprintf(logfile, "s:%d lr:%.2e\n", step, lr);
+        fprintf(logfile, "s:%d latency:%.2f\n", step, latency);
+        fprintf(logfile, "s:%d mfu:%.1f\n", step, mfu);
+        fprintf(logfile, "s:%d tokens:%.0f\n", step, tokens);
+        fclose(logfile);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // training resumption logic, very useful when jobs crash once in a while
 // the goal is that we can resume optimization from any checkpoint, bit-perfect
@@ -3174,7 +3186,7 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     float grad_clip  = 1.0f;
-    int hellaswag_eval = 0;
+    int hellaswag_eval = 0; 
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -3339,7 +3351,7 @@ int main(int argc, char *argv[]) {
         evalloader_init(&eval_loader, hellaswag_path, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
     }
     printf0("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
-    printf0("+-----------------------+----------------------------------------------------+\n");
+        printf0("+-----------------------+----------------------------------------------------+\n");
 
     // pretty print in a table the multi-gpu configuration as well
     set_zero_configs(&multi_gpu_config, zero_stage, model.num_parameters);
@@ -3567,6 +3579,7 @@ int main(int argc, char *argv[]) {
                 step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
+        logger_log_metrics(&logger, step, grad_norm, step_learning_rate, time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
 
         // disable the profiler after 3 steps of optimization
         if (step == 3) { cudaProfilerStop(); }
