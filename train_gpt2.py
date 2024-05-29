@@ -245,17 +245,17 @@ class GPT(nn.Module):
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        print0(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print0(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
-        print(f"using fused AdamW: {use_fused}")
+        print0(f"using fused AdamW: {use_fused}")
         if zero_stage == 1:
             optimizer = ZeroRedundancyOptimizer(**optim_groups[0], optimizer_class=torch.optim.AdamW,
                                                 lr=learning_rate, betas=betas, fused=use_fused)
             optimizer.add_param_group(optim_groups[1])
-            print("using ZeroRedundancyOptimizer")
+            print0("using ZeroRedundancyOptimizer")
         else:
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
         return optimizer
@@ -447,23 +447,36 @@ if __name__ == "__main__":
     # if you'd like to e.g. time the forward pass only, call this script as:
     # python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024
     parser = argparse.ArgumentParser()
+    # file system input / output
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
-    parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
-    parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
-    parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
-    parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
-    parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
-    parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
-    parser.add_argument("--flash", type=int, default=0, help="use flash attention")
-    parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
+    # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
     parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
+    # workload (number of steps)
+    parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
+    parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
+    # optimization
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
+    parser.add_argument("--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
+    parser.add_argument("--learning_rate_decay_frac", type=float, default=1.0, help="learning rate warmup iterations")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
+    # evaluation
+    # ...
+    # debugging
     parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
+    # numerics
+    parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
+    # memory management
+    parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
+    parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
+    parser.add_argument("--flash", type=int, default=0, help="use flash attention")
+    parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
+    # python -> C bridge
+    parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     args = parser.parse_args()
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
@@ -642,8 +655,23 @@ if __name__ == "__main__":
 
     # init the optimizer
     optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
-                                               learning_rate=1e-4, betas=(0.9, 0.95),
+                                               learning_rate=args.learning_rate, betas=(0.9, 0.95),
                                                device_type=device, zero_stage=zero_stage)
+
+    # learning rate decay scheduler (cosine with warmup)
+    def get_lr(it):
+        min_lr = args.learning_rate * args.learning_rate_decay_frac
+        # 1) linear warmup for warmup_iters steps
+        if it < args.warmup_iters:
+            return args.learning_rate * (it+1) / args.warmup_iters
+        # 2) if it > lr_decay_iters, return min learning rate
+        if it > args.num_iterations:
+            return min_lr
+        # 3) in between, use cosine decay down to min learning rate
+        decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+        return min_lr + coeff * (args.learning_rate - min_lr)
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -678,6 +706,11 @@ if __name__ == "__main__":
             if not args.inference_only:
                 loss.backward()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        # determine and set the learning rate for this iteration
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        # step the optimizer
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
@@ -690,7 +723,7 @@ if __name__ == "__main__":
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
         tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
-        print0(f"step {step+1:4d}/{args.num_iterations}: train loss {lossf:.6f} norm {norm:.4f} lr 1.00e-04 ({(t1-t0)*1000:.3f} ms, {tokens_per_second:.0f} tok/s)")
+        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
         if step > 0 and step > args.num_iterations - 20:
             timings.append(t1-t0)
 
