@@ -32,6 +32,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from torch.distributed.optim import ZeroRedundancyOptimizer
 
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the GPT-2 model
+
 class NewGELU(nn.Module):
     """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
     def forward(self, input):
@@ -108,6 +111,9 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+
+# -----------------------------------------------------------------------------
+# The main GPT-2 model
 
 @dataclass
 class GPTConfig:
@@ -252,11 +258,12 @@ class GPT(nn.Module):
         use_fused = fused_available and device_type == 'cuda'
         print0(f"using fused AdamW: {use_fused}")
         if zero_stage == 1:
+            print0("using ZeroRedundancyOptimizer")
             optimizer = ZeroRedundancyOptimizer(**optim_groups[0], optimizer_class=torch.optim.AdamW,
                                                 lr=learning_rate, betas=betas, fused=use_fused)
             optimizer.add_param_group(optim_groups[1])
-            print0("using ZeroRedundancyOptimizer")
         else:
+            print0("using regular AdamW")
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
         return optimizer
 
@@ -287,7 +294,9 @@ class GPT(nn.Module):
 
         return idx
 
-# a few utilities for saving params/grads/activations to files for loading in C
+# -----------------------------------------------------------------------------
+# Python -> C bridge utilities for saving params/grads/activations to .bin files
+
 def write_fp32(tensor, file):
     t = tensor.detach().cpu().to(torch.float32)
     b = t.numpy().tobytes()
@@ -301,6 +310,7 @@ def write_bf16(tensor, file):
     file.write(b)
 
 def write_tensors(model_tensors, L, file, dtype):
+    # writes the GPT-2 model's weights to a binary file
     assert dtype in {"float32", "bfloat16"}
     write_fun = write_fp32 if dtype == "float32" else write_bf16
     write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
@@ -430,6 +440,9 @@ def write_tokenizer(enc, filename):
             file.write(b)  # Write the actual bytes
     print(f"wrote {filename}")
 
+# -----------------------------------------------------------------------------
+# int main
+
 def print0(*args, **kwargs):
     # modified print that only prints from the master process
     # if this is not a distributed run, it's just a print
@@ -444,8 +457,6 @@ if __name__ == "__main__":
 
     # default settings will overfit a tiny batch of data
     # and save model weights and debug state to disk on the first iteration
-    # if you'd like to e.g. time the forward pass only, call this script as:
-    # python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024
     parser = argparse.ArgumentParser()
     # file system input / output
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
@@ -478,6 +489,8 @@ if __name__ == "__main__":
     # python -> C bridge
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     args = parser.parse_args()
+
+    # args error checking and convenience variables
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
     assert args.dtype in {"float32", "float16", "bfloat16"}
@@ -522,21 +535,17 @@ if __name__ == "__main__":
     tokens_per_fwdbwd = B * T * ddp_world_size
     assert args.total_batch_size % tokens_per_fwdbwd == 0
     grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
-    if master_process:
-        print(f"total desired batch size: {args.total_batch_size}")
-        print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    print0(f"total desired batch size: {args.total_batch_size}")
+    print0(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
     # set up a context manager following the desired dtype and device
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
     ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
 
-    # seed the random number generators (in DDP we want different processes to use different offsets)
-    # in the code below we don't actually use random numbers because there is no active dataloader
-    # loading actual batches of data, etc. but it is a good practice and something to be careful with,
-    # explicit with and think about, so I am leaving this here.
-    torch.manual_seed(42 + seed_offset)
+    # rng / reproducibility
+    torch.manual_seed(42)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(42 + seed_offset)
+        torch.cuda.manual_seed(42)
 
     # set the torch precision mode to use TensorFloat32 (TF32) for matmuls
     # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
@@ -549,8 +558,6 @@ if __name__ == "__main__":
 
     # init (and write) the tokenizer
     enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-    decode = lambda l: enc.decode(l)
     if master_process and args.write_tensors: # tokenizer is technically not tensors but ok
         write_tokenizer(enc, "gpt2_tokenizer.bin")
 
@@ -576,10 +583,10 @@ if __name__ == "__main__":
         model = torch.compile(model)
 
     # -------------------------------------------------------------------------
-    # data loading related: long but it's just to get a single batch of data
+    # Our own version of a simple DistributedDataLoader
 
-    # load the tokens
-    # note we're using val by default instead of train split just because it is smaller/faster
+    # load tokens
+    # note that default args use val split just because it is smaller/faster
     if not os.path.isfile(args.input_bin):
         print0(f"ERROR: input .bin file not found: {args.input_bin}")
         print0("---> HINT: Try to re-run the data prepro script. these recently moved to dev/data")
@@ -610,7 +617,6 @@ if __name__ == "__main__":
     # lightweight dataloader
     def get_batch():
         assert B*T+1 <= len(tokens), "not enough tokens"
-        # for 338,025 tokens. E.g. with B=8 T=1024, this will yield 41 batches before looping
         i = B*T*ddp_rank
         while True:
             x = tokens[i:i+B*T].view(B, T)
@@ -619,7 +625,7 @@ if __name__ == "__main__":
             i += B*T*ddp_world_size
             if i + B*T + 1 >= len(tokens):
                 i = 0 # in prod we'd want to randomize the start point a bit
-                print("We do not expect to reach here in PyTorch right now")
+                print("We do not expect to reach here in PyTorch right now") # TODO
                 import sys; sys.exit()
 
     # fetch one batch of data
@@ -632,7 +638,7 @@ if __name__ == "__main__":
     # STAGE 1: weights / state logging for C to load later
 
     # do one forward pass to generate ground truth for our C tests
-    if master_process and (not args.inference_only and args.write_tensors):
+    if master_process and args.write_tensors and (not args.inference_only):
         logits, loss = model(x, y)
         loss.backward()
         # save model params, in both float32 and bfloat16
@@ -646,7 +652,7 @@ if __name__ == "__main__":
         write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
 
     # -------------------------------------------------------------------------
-    # STAGE 2: training loop to get timings
+    # STAGE 2: training loop
 
     # here we wrap model into DDP container
     if ddp:
@@ -738,8 +744,7 @@ if __name__ == "__main__":
 
         # before we end, let's also do one round of inference
         # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
-        start = "<|endoftext|>"
-        start_ids = encode(start)
+        start_ids = [enc.eot_token]
         x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
         # run generation for 16 time steps (tokens)
@@ -748,7 +753,7 @@ if __name__ == "__main__":
         top_k = 40
         raw_model.eval()
         y = raw_model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-        print0(decode(y[0].tolist()))
+        print0(enc.decode(y[0].tolist()))
         print0('---------------')
 
     # -------------------------------------------------------------------------
