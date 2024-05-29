@@ -3173,7 +3173,6 @@ int main(int argc, char *argv[]) {
     int use_master_weights = 1;
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
-    float grad_clip  = 1.0f;
     int hellaswag_eval = 0;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
@@ -3201,7 +3200,6 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'c') { grad_clip = atof(argv[i+1]); }
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
@@ -3242,7 +3240,6 @@ int main(int argc, char *argv[]) {
     printf0("| warmup iterations     | %-50d |\n", warmup_iterations);
     printf0("| final LR fraction     | %-50e |\n", final_learning_rate_frac);
     printf0("| weight decay          | %-50e |\n", weight_decay);
-    printf0("| grad_clip             | %-50e |\n", grad_clip);
     printf0("| max_steps             | %-50d |\n", max_steps);
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
     printf0("| val_max_steps         | %-50d |\n", val_max_steps);
@@ -3540,7 +3537,7 @@ int main(int argc, char *argv[]) {
             step_learning_rate = min_lr + coeff * (learning_rate - min_lr);
         }
         // update the model parameters
-        float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_clip, step+1, &multi_gpu_config);
+        float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
         gpt2_multi_gpu_gather(&model, &multi_gpu_config);
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
