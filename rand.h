@@ -164,9 +164,8 @@ void uniform_(float* data, unsigned int numel, float from, float to, mt19937_sta
 }
 
 // Box�Muller transform
-
+#define EPSILONE 1e-12
 void normal_fill_16(float* data, float mean, float std, mt19937_state* state) {
-    #define EPSILONE 1e-12
     for (unsigned int t = 0; t < 8; t++) {
         float u1 = 1 - data[t];
         float u2 = data[t + 8];
@@ -195,7 +194,6 @@ void normal_fill(float* data, unsigned int numel, float mean, float std, mt19937
 }
 
 void normal_(float* data, unsigned int numel, float mean, float std, mt19937_state* state) {
-    #define EPSILONE 1e-12
     if (numel >= 16) {
         normal_fill(data, numel, mean, std, state);
     }
