@@ -4,6 +4,7 @@
 # python train_gpt2.py ... (all the other arguments the same)
 torchrun --standalone --nproc_per_node=4 train_gpt2.py \
     --input_bin dev/data/fineweb10B/fineweb_train_000001.bin \
+    --output_dir pylog124M \
     --write_tensors 0 \
     --model d12 \
     --batch_size 32 \
