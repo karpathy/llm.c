@@ -3186,7 +3186,7 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     float grad_clip  = 1.0f;
-    int hellaswag_eval = 0; 
+    int hellaswag_eval = 0;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -3351,7 +3351,7 @@ int main(int argc, char *argv[]) {
         evalloader_init(&eval_loader, hellaswag_path, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
     }
     printf0("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
-        printf0("+-----------------------+----------------------------------------------------+\n");
+    printf0("+-----------------------+----------------------------------------------------+\n");
 
     // pretty print in a table the multi-gpu configuration as well
     set_zero_configs(&multi_gpu_config, zero_stage, model.num_parameters);

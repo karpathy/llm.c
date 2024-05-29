@@ -6,7 +6,7 @@ import wandb
 # Please follow https://docs.wandb.ai/quickstart and setup wandb server and python client
 
 logging_metrics = {
-    'eval'      : 'HellSwag Evaluation',
+    'eval'      : 'Hellaswag Evaluation',
     'tel'       : 'Validation Loss',
     'trl'       : 'Training Loss',
     'norm'      : 'Normalized Gradient',
