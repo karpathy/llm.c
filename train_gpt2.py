@@ -345,7 +345,10 @@ class DistributedDataLoader:
         self.ntok_total = ntok_total
         print0(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
 
-        # start at the start
+        # kick things off
+        self.reset()
+
+    def reset(self):
         self.current_shard = 0
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
@@ -730,9 +733,59 @@ if __name__ == "__main__":
         torch.cuda.reset_peak_memory_stats()
     timings = []
     norm = -1.0   # dummy value to print in inference-only mode
-    for step in range(args.num_iterations):
+    for step in range(args.num_iterations + 1):
         t0 = time.time()
+        last_step = (step == args.num_iterations)
 
+        # once in a while evaluate the validation dataset
+        if (args.val_loss_every > 0 \
+            and (step % args.val_loss_every == 0 or last_step)) \
+            and (val_loader is not None):
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                val_loss = 0.0
+                for _ in range(args.val_max_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    _, loss = model(x, y, return_logits=False)
+                    val_loss += loss.item()
+                val_loss /= args.val_max_steps
+            # log to console and to file
+            print0(f"val loss {val_loss}")
+            if master_process and logfile is not None:
+                with open(logfile, "a") as f:
+                    f.write("s:%d tel:%f\n" % (step, val_loss))
+
+        # once in a while perform model inference on the master process
+        if (args.sample_every > 0 \
+            and (step % args.sample_every == 0 or last_step)) \
+            and master_process:
+            # TODO I'm not sure why this sampling code (which worked fine)
+            # doesn't work anymore when placed here debug later
+            if False:
+                model.eval()
+                # before we end, let's also do one round of inference
+                # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
+                start_ids = [enc.eot_token]
+                x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+                max_new_tokens = 32
+                temperature = 1.0
+                top_k = 40
+                y = raw_model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+                print0('---------------')
+                print0(enc.decode(y[0].tolist()))
+                print0('---------------')
+
+        # bit confusing: we want to make sure to eval and sample on 0th iteration
+        # but also after the very last iteration. so we loop for step <= num_iterations
+        # instead of just < num_iterations (one extra due to <=), only to do
+        # the validation/sampling one last time, and then we break right here as we're done.
+        if last_step:
+            break
+
+        # --------------- TRAINING SECTION BEGIN -----------------
+        model.train()
         # micro-batch loop where we do gradient accumulation to reach desired total batch size
         lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
         for micro_step in range(grad_accum_steps):
@@ -765,6 +818,8 @@ if __name__ == "__main__":
         # step the optimizer
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        # --------------- TRAINING SECTION END -------------------
+        # everything that follows now is just diagnostics, prints, logging, etc.
 
         # wait on the CPU for all device work to end so we get accurate per-iteration timings below
         if device == "mps":
@@ -789,24 +844,6 @@ if __name__ == "__main__":
     timings = timings[-20:]
     print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
-
-    # -------------------------------------------------------------------------
-    # STAGE 3: Few steps of inference
-    if master_process:
-
-        # before we end, let's also do one round of inference
-        # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
-        start_ids = [enc.eot_token]
-        x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-
-        # run generation for 16 time steps (tokens)
-        max_new_tokens = 16
-        temperature = 1.0
-        top_k = 40
-        raw_model.eval()
-        y = raw_model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-        print0(enc.decode(y[0].tolist()))
-        print0('---------------')
 
     # -------------------------------------------------------------------------
     # clean up nice
