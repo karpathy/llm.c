@@ -2636,9 +2636,11 @@ void gpt2_backward(GPT2 *model, int* inputs) {
 
         // get the pointers of the weights for this layer
         floatX* l_ln1w = params.ln1w + l * C;
+        floatX* l_ln1b = params.ln1b + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_ln2w = params.ln2w + l * C;
+        floatX* l_ln2b = params.ln2b + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
@@ -2684,7 +2686,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C);
         gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C);
         if(model->recompute >= 1) {
-            layernorm_forward(acts.ln1, acts.ln1_mean, acts.ln1_rstd, l_residual2, params.ln1w, params.ln1b, B, T, C);
+            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
         }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
@@ -2703,9 +2705,8 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
         #endif
         if(model->recompute >= 1) {
-            layernorm_forward(acts.ln2, acts.ln2_mean, acts.ln2_rstd, residual, params.ln2w, params.ln2b, B, T, C);
+            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
         }
-
         // QKV parameter gradients
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
