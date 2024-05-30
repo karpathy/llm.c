@@ -1,5 +1,7 @@
 /*
-Implements a medium simple DataLoader for a distributed training setup.
+Implements:
+- DataLoader for model training. Reads and serves data shards.
+- EvalLoader for multiple-choice evaluation datasets, e.g. HellaSwag.
 */
 #ifndef DATALOADER_H
 #define DATALOADER_H
