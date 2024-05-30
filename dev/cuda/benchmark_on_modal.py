@@ -27,7 +27,7 @@ GPU_NAME_TO_MODAL_CLASS_MAP = {
 N_GPUS = int(os.environ.get("N_GPUS", 1))
 GPU_MEM = int(os.environ.get("GPU_MEM", 40))
 GPU_NAME = os.environ.get("GPU_NAME", "A100")
-GPU_CONFIG = GPU_NAME_TO_MODAL_CLASS_MAP[GPU_NAME](count=N_GPUS, memory=GPU_MEM)
+GPU_CONFIG = GPU_NAME_TO_MODAL_CLASS_MAP[GPU_NAME](count=N_GPUS, size=str(GPU_MEM)+'GB')
 
 APP_NAME = "llm.c benchmark run"
 
@@ -51,7 +51,7 @@ axolotl_image = (
     )
 )
 
-stub = Stub(APP_NAME)
+stub = modal.App(APP_NAME)
 
 
 def execute_command(command: str):
