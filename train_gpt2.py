@@ -746,9 +746,9 @@ if __name__ == "__main__":
             with torch.no_grad():
                 val_loss = 0.0
                 for _ in range(args.val_max_steps):
-                    x, y = val_loader.next_batch()
-                    x, y = x.to(device), y.to(device)
-                    _, loss = model(x, y, return_logits=False)
+                    x_val, y_val = val_loader.next_batch()
+                    x_val, y_val = x_val.to(device), y_val.to(device)
+                    _, loss = model(x_val, y_val, return_logits=False)
                     val_loss += loss.item()
                 val_loss /= args.val_max_steps
             # log to console and to file
@@ -768,13 +768,13 @@ if __name__ == "__main__":
                 # before we end, let's also do one round of inference
                 # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
                 start_ids = [enc.eot_token]
-                x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+                x_sample = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
                 max_new_tokens = 32
                 temperature = 1.0
                 top_k = 40
-                y = raw_model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+                y_sample = raw_model.generate(x_sample, max_new_tokens, temperature=temperature, top_k=top_k)
                 print0('---------------')
-                print0(enc.decode(y[0].tolist()))
+                print0(enc.decode(y_sample[0].tolist()))
                 print0('---------------')
 
         # bit confusing: we want to make sure to eval and sample on 0th iteration
