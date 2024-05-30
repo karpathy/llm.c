@@ -681,9 +681,9 @@ if __name__ == "__main__":
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
 
     # do one forward pass to generate ground truth for our C tests
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     if master_process and args.write_tensors and (not args.inference_only):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
         logits, loss = model(x, y)
         loss.backward()
         # save model params, in both float32 and bfloat16
@@ -695,8 +695,8 @@ if __name__ == "__main__":
         # save x, y, logits, loss, and parameter gradients, for debugging C
         # always store these in fp32 to have an accurate reference (?)
         write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
-    # reset the train_loader for the optimization below
-    train_loader.reset()
+        # reset the train_loader for the optimization below
+        train_loader.reset()
 
     # -------------------------------------------------------------------------
     # main training loop
