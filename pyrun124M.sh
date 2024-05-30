@@ -3,7 +3,7 @@
 # if you wish to train on just a single GPU, simply skip the torchrun part, i.e.
 # python train_gpt2.py ... (all the other arguments the same)
 torchrun --standalone --nproc_per_node=4 train_gpt2.py \
-    --input_bin dev/data/fineweb10B/fineweb_train_000001.bin \
+    --input_bin "dev/data/fineweb10B/fineweb_train_*.bin" \
     --output_dir pylog124M \
     --write_tensors 0 \
     --model d12 \
