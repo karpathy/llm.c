@@ -1603,7 +1603,7 @@ void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
 
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
 void matmul_forward_cublaslt(floatX* out,
-                     floatX* inp, floatX* weight, floatX* bias,
+                     const floatX* inp, const floatX* weight, const floatX* bias,
                      int B, int T, int C, int OC) {
     NVTX_RANGE_FN();
     int has_bias = (bias != NULL);
@@ -1781,7 +1781,7 @@ void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const in
 }
 
 void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
-                     floatX* dout, floatX* inp, floatX* weight,
+                     floatX* dout, const floatX* inp, const floatX* weight,
                      float* dbias_buffer,
                      int B, int T, int C, int OC) {
     NVTX_RANGE_FN();
@@ -1932,78 +1932,106 @@ typedef struct {
 
 // the parameters of the model
 constexpr const int NUM_PARAMETER_TENSORS = 16;
+
+
+/*
+ * This struct defines the layout of the GPT2 weights.
+ * We have singleton weights, that exist just once and directly
+ * provide a pointer, and transformer-block weights, that only
+ * give the offset inside the transformer block. Thus, to get
+ * the fcw for the L'th transformer block are stored at address
+ * `blocks + L*block_offset + fcw.`
+ *
+ * The weights are further grouped into multiplicative (w) and
+ * additive (b) weights. This allows us to handle weight decay
+ * (which is not applied to b) more easily.
+ */
 typedef struct {
+    // singleton weights
     floatX* wte; // (V, C)
     floatX* wpe; // (maxT, C)
-    floatX* ln1w; // (L, C)
-    floatX* ln1b; // (L, C)
-    floatX* qkvw; // (L, 3*C, C)
-    floatX* qkvb; // (L, 3*C)
-    floatX* attprojw; // (L, C, C)
-    floatX* attprojb; // (L, C)
-    floatX* ln2w; // (L, C)
-    floatX* ln2b; // (L, C)
-    floatX* fcw; // (L, 4*C, C)
-    floatX* fcb; // (L, 4*C)
-    floatX* fcprojw; // (L, C, 4*C)
-    floatX* fcprojb; // (L, C)
     floatX* lnfw; // (C)
     floatX* lnfb; // (C)
-} ParameterTensors;
-static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
+    floatX* blocks; // base pointer to the block memory
 
-void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
+    // per-block biases
+    ptrdiff_t ln1b; // (L, C)
+    ptrdiff_t ln2b; // (L, C)
+    ptrdiff_t qkvb; // (L, 3*C)
+    ptrdiff_t attprojb; // (L, C)
+    ptrdiff_t fcb; // (L, 4*C)
+    ptrdiff_t fcprojb; // (L, C)
+
+    // per-block weights
+    ptrdiff_t ln1w; // (L, C)
+    ptrdiff_t ln2w; // (L, C)
+    ptrdiff_t qkvw; // (L, 3*C, C)
+    ptrdiff_t attprojw; // (L, C, C)
+    ptrdiff_t fcw; // (L, 4*C, C)
+    ptrdiff_t fcprojw; // (L, C, 4*C)
+
+    ptrdiff_t block_offset;
+} ParameterTensors;
+
+void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
     size_t Vp = config.padded_vocab_size;
     size_t C = config.channels;
     size_t maxT = config.max_seq_len;
     size_t L = config.num_layers;
     param_sizes[0] = Vp * C; // wte
     param_sizes[1] = maxT * C; // wpe
-    param_sizes[2] = L * C; // ln1w
-    param_sizes[3] = L * C; // ln1b
-    param_sizes[4] = L * (3 * C) * C; // qkvw
-    param_sizes[5] = L * (3 * C); // qkvb
-    param_sizes[6] = L * C * C; // attprojw
-    param_sizes[7] = L * C; // attprojb
-    param_sizes[8] = L * C; // ln2w
-    param_sizes[9] = L * C; // ln2b
-    param_sizes[10] = L * (4 * C) * C; // fcw
-    param_sizes[11] = L * (4 * C); // fcb
-    param_sizes[12] = L * C * (4 * C); // fcprojw
-    param_sizes[13] = L * C; // fcprojb
-    param_sizes[14] = C; // lnfw
-    param_sizes[15] = C; // lnfb
+    param_sizes[2] = C; // lnfw
+    param_sizes[3] = C; // lnfb
 
-    // populate the parameter sizes in bytes (all the same for now, keeping for future use)
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        param_sizeof[i] = sizeof(floatX);
-    }
+    param_sizes[4] = C; // ln1b
+    param_sizes[5] = C; // ln2b
+    param_sizes[6] = 3 * C; // qkvb
+    param_sizes[7] = C; // attprojb
+    param_sizes[8] = 4 * C; // fcb
+    param_sizes[9] = C; // fcprojb
+
+    param_sizes[10] = C; // ln1w
+    param_sizes[11] = C; // ln2w
+    param_sizes[12] = (3 * C) * C; // qkvw
+    param_sizes[13] = C * C; // attprojw
+    param_sizes[14] = (4 * C) * C; // fcw
+    param_sizes[15] = C * (4 * C); // fcprojw
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
-void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof) {
-    // calculate the total number of parameters and bytes across all tensors
+size_t malloc_and_point_parameters(void** memory, ParameterTensors* params, GPT2Config config) {
+    size_t sizes[NUM_PARAMETER_TENSORS];
+    // allocate space for all the parameters and read them in
+    fill_in_parameter_sizes(sizes, config);
+
+    // calculate the total number of parameters across all tensors
     size_t num_parameters = 0;
-    size_t num_parameters_bytes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        num_parameters += param_elements[i];
-        num_parameters_bytes += param_elements[i] * param_sizeof[i];
+        int L = i < 4 ? 1 : config.num_layers;
+        num_parameters += L * sizes[i];
     }
+
     // malloc all parameters all at once on the device
-    void* params_memory;
-    cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
-    // assign all the tensors their place in the array
-    floatX** ptrs[] = {
-        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
-        &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
-    };
-    char* params_memory_iterator = (char*)params_memory;
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        *(ptrs[i]) = (floatX*)params_memory_iterator;
-        params_memory_iterator += param_elements[i] * param_sizeof[i];
+    cudaCheck(cudaMalloc((void**)memory, num_parameters * sizeof(floatX)));
+    // assign the pointers
+    floatX* iter = (floatX*)*memory;
+    floatX** assign[5] = {&params->wte, &params->wpe, &params->lnfw, &params->lnfb, &params->blocks};
+    for(int i = 0; i < 5; ++i) {
+        *assign[i] = iter;
+        iter += sizes[i];
     }
-    return params_memory;
+
+    // assign the offsets
+    ptrdiff_t* offsets[13] = {&params->ln1b, &params->ln2b, &params->qkvb, &params->attprojb, &params->fcb, &params->fcprojb,
+                              &params->ln1w, &params->ln2w, &params->qkvw, &params->attprojw, &params->fcw, &params->fcprojw,
+                              &params->block_offset};
+    // prefix-sum for offset pointers
+    *offsets[0] = 0;
+    for (int i = 5; i < NUM_PARAMETER_TENSORS + 1; i++) {
+        *offsets[i-4] = *offsets[i-5] + sizes[i-1];
+    }
+
+    return num_parameters;
 }
 
 #define NUM_ACTIVATION_TENSORS 21
@@ -2138,8 +2166,6 @@ typedef struct {
     GPT2Config config;
     // the weights of the model, and their sizes
     ParameterTensors params;
-    size_t param_elements[NUM_PARAMETER_TENSORS];
-    size_t param_sizeof[NUM_PARAMETER_TENSORS];
     void* params_memory;
     size_t num_parameters;
     size_t num_parameters_bytes;
@@ -2245,18 +2271,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->config.channels = model_header[6];
     model->config.padded_vocab_size = model_header[7];
 
-    // allocate space for all the parameters and read them in
-    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
-
-    model->num_parameters = 0;
-    model->num_parameters_bytes = 0;
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        model->num_parameters += model->param_elements[i];
-        model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
-    }
-
     // create memory for model parameters on the device
-    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
+    model->num_parameters = malloc_and_point_parameters(&model->params_memory, &model->params, model->config);
+    model->num_parameters_bytes = model->num_parameters * sizeof(floatX);
 
     // read in all the parameters from file and copy them to device
     void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
@@ -2459,24 +2476,25 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
 
     // first layernorm isn't fused
-    layernorm_forward(acts.ln1, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C);
+    layernorm_forward(acts.ln1, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.blocks + params.ln1w, params.blocks + params.ln1b, B, T, C);
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
 
         floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
+        const floatX* base_ptr = params.blocks + params.block_offset * l;
 
         // get the pointers of the weights for this layer
-        floatX* l_qkvw = params.qkvw + l * 3*C * C;
-        floatX* l_qkvb = params.qkvb + l * 3*C;
-        floatX* l_attprojw = params.attprojw + l * C * C;
-        floatX* l_attprojb = params.attprojb + l * C;
-        floatX* l_ln2w = params.ln2w + l * C;
-        floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcb = params.fcb + l * 4*C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
-        floatX* l_fcprojb = params.fcprojb + l * C;
+        const floatX* l_qkvw = base_ptr + params.qkvw;
+        const floatX* l_qkvb = base_ptr + params.qkvb;
+        const floatX* l_attprojw = base_ptr + params.attprojw ;
+        const floatX* l_attprojb = base_ptr + params.attprojb;
+        const floatX* l_ln2w = base_ptr + params.ln2w;
+        const floatX* l_ln2b = base_ptr + params.ln2b;
+        const floatX* l_fcw = base_ptr + params.fcw;
+        const floatX* l_fcb = base_ptr + params.fcb;
+        const floatX* l_fcprojw = base_ptr + params.fcprojw;
+        const floatX* l_fcprojb = base_ptr + params.fcprojb;
 
         // get the pointers of the activations for this layer
         floatX* l_ln1 = acts.ln1 + l * B * T * C;
@@ -2519,8 +2537,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
             floatX* l_ln1 = acts.ln1 + (l + 1) * B * T * C;
             floatX* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
             floatX* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
-            const floatX* l_ln1w = params.ln1w + (l + 1) * C;
-            const floatX* l_ln1b = params.ln1b + (l + 1) * C;
+            const floatX* l_ln1w = base_ptr + params.ln1w + params.block_offset;
+            const floatX* l_ln1b = base_ptr + params.ln1b + params.block_offset;
             fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, l_fcproj, l_ln1w, l_ln1b,
                                     B * T, C);
         } else {
@@ -2573,7 +2591,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
     if (model->grads_memory == NULL) {
         // allocate buffers for weight gradients
         printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
-        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
+        malloc_and_point_parameters(&model->grads_memory, &model->grads, model->config);
         // we're going to be clever for the activations backward pass. we don't need to exactly
         // mirror the forward pass activations and we will save memory.
         size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
@@ -2633,25 +2651,32 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
-        floatX* l_ln1w = params.ln1w + l * C;
-        floatX* l_qkvw = params.qkvw + l * 3*C * C;
-        floatX* l_attprojw = params.attprojw + l * C * C;
-        floatX* l_ln2w = params.ln2w + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
+        const floatX* base_ptr = params.blocks + params.block_offset * l;
+
+        // get the pointers of the weights for this layer
+        const floatX* l_qkvw = base_ptr + params.qkvw;
+        const floatX* l_attprojw = base_ptr + params.attprojw;
+        const floatX* l_ln1w = base_ptr + params.ln1w;
+        const floatX* l_ln2w = base_ptr + params.ln2w;
+        const floatX* l_fcw = base_ptr + params.fcw;
+        const floatX* l_fcprojw = base_ptr + params.fcprojw;
+
         // get the pointers of the gradients of the weights for this layer
-        floatX* dl_ln1w = grads.ln1w + l * C;
-        floatX* dl_ln1b = grads.ln1b + l * C;
-        floatX* dl_qkvw = grads.qkvw + l * 3*C * C;
-        floatX* dl_qkvb = grads.qkvb + l * 3*C;
-        floatX* dl_attprojw = grads.attprojw + l * C * C;
-        floatX* dl_attprojb = grads.attprojb + l * C;
-        floatX* dl_ln2w = grads.ln2w + l * C;
-        floatX* dl_ln2b = grads.ln2b + l * C;
-        floatX* dl_fcw = grads.fcw + l * 4*C * C;
-        floatX* dl_fcb = grads.fcb + l * 4*C;
-        floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
-        floatX* dl_fcprojb = grads.fcprojb + l * C;
+        floatX* g_base_ptr = grads.blocks + grads.block_offset * l;
+
+        floatX* dl_ln1w = grads.ln1w + g_base_ptr;
+        floatX* dl_ln1b = grads.ln1b + g_base_ptr;
+        floatX* dl_qkvw = grads.qkvw + g_base_ptr;
+        floatX* dl_qkvb = grads.qkvb + g_base_ptr;
+        floatX* dl_attprojw = grads.attprojw + g_base_ptr;
+        floatX* dl_attprojb = grads.attprojb + g_base_ptr;
+        floatX* dl_ln2w = grads.ln2w + g_base_ptr;
+        floatX* dl_ln2b = grads.ln2b + g_base_ptr;
+        floatX* dl_fcw = grads.fcw + g_base_ptr;
+        floatX* dl_fcb = grads.fcb + g_base_ptr;
+        floatX* dl_fcprojw = grads.fcprojw + g_base_ptr;
+        floatX* dl_fcprojb = grads.fcprojb + g_base_ptr;
+
         // get the pointers of the activations for this layer
         floatX* l_ln1 = acts.ln1 + l * B * T * C;
         floatX* l_ln1_mean = acts.ln1_mean + l * B * T;
