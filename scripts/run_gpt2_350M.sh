@@ -1,4 +1,3 @@
-
 # GPT-2 (350M) repro on FineWeb
 # 350M parameter model on ~30B tokens
 # => 6 * 350e6 * 31.5e9 = 6.615e19 ~= 7e19 capability model (10X 124M)
@@ -6,12 +5,9 @@
 # on 8X A100 80GB SXM ($14/hr) steps in ~820ms/iter
 # => training time 60,000 steps * 820ms = 13.7 hours ~= $200 (10X 124M)
 
-# if you are running out of memory on your GPU,
-# - try -r 1 (recompute GeLU, trading off speed and memory)
-# - start dividing -b 64 by 2 (i.e. 32, 16, ...) until it works
-
 make train_gpt2cu USE_CUDNN=1
-done_file="log350M/DONE_00060000"
+out_dir="log_gpt2_350M"
+done_file="$out_dir/DONE_00060000"
 
 # in case the training stalls or crashes, loop to resume (-y 1)
 while true; do
@@ -27,7 +23,7 @@ while true; do
     mpirun -np 8 ./train_gpt2cu \
                 -i "dev/data/fineweb100B/fineweb_train_*.bin" \
                 -j "dev/data/fineweb100B/fineweb_val_*.bin" \
-                -o log350M \
+                -o $out_dir \
                 -v 250 -s 100000 -g 144 \
                 -h 1 \
                 -b 64 -t 1024 \
