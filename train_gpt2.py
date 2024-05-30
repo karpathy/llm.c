@@ -18,6 +18,7 @@ torchrun --standalone --nproc_per_node=4 train_gpt2.py --write_tensors=0 --num_i
 
 import os
 import math
+import glob
 import struct
 import inspect
 from contextlib import nullcontext
@@ -295,6 +296,80 @@ class GPT(nn.Module):
         return idx
 
 # -----------------------------------------------------------------------------
+# Our own simple Distributed Data Loader
+
+def _peek_data_shard(filename):
+    # only reads the header, returns header data
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+    if header[0] != 20240520:
+        print("ERROR: magic number mismatch in the data .bin file!")
+        print("---> HINT: Are you passing in a correct file with --input_bin?")
+        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
+        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        exit(1)
+    assert header[1] == 1, "unsupported version"
+    ntok = header[2] # number of tokens (claimed)
+    return ntok # for now just return the number of tokens
+
+def _load_data_shard(filename):
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+        assert header[1] == 1, "unsupported version"
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+    assert len(tokens) == ntok, "number of tokens read does not match header?"
+    return tokens
+
+class DistributedDataLoader:
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B
+        self.T = T
+
+        # glob files that match the pattern
+        self.files = sorted(glob.glob(filename_pattern))
+        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
+
+        # load and validate all data shards, count number of tokens in total
+        ntok_total = 0
+        for fname in self.files:
+            shard_ntok = _peek_data_shard(fname)
+            assert shard_ntok >= num_processes * B * T + 1
+            ntok_total += shard_ntok
+        self.ntok_total = ntok_total
+        print0(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
+
+        # start at the start
+        self.current_shard = 0
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def advance(self): # advance to next data shard
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def next_batch(self):
+        B = self.B
+        T = self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance current position and load next shard if necessary
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.advance()
+        else:
+            self.current_position += B * T * self.num_processes
+        return x, y
+
+# -----------------------------------------------------------------------------
 # Python -> C bridge utilities for saving params/grads/activations to .bin files
 
 def write_fp32(tensor, file):
@@ -460,6 +535,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # file system input / output
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
+    parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
     # token layout for each step of the optimization
@@ -476,7 +552,9 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
     # evaluation
-    # ...
+    parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
+    parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
+    parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
     # debugging
     parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
     # numerics
@@ -587,53 +665,12 @@ if __name__ == "__main__":
     # Our own version of a simple DistributedDataLoader
 
     # load tokens
-    # note that default args use val split just because it is smaller/faster
-    if not os.path.isfile(args.input_bin):
-        print0(f"ERROR: input .bin file not found: {args.input_bin}")
-        print0("---> HINT: Try to re-run the data prepro script. these recently moved to dev/data")
-        print0("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
-        exit(1)
-    print0(f"loading cached tokens in {args.input_bin}")
-    with open(args.input_bin, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-        if header[0] != 20240520:
-            print0("ERROR: magic number mismatch in the data .bin file!")
-            print0("---> HINT: Are you passing in a correct file with --input_bin?")
-            print0("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
-            print0("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
-            exit(1)
-        assert header[1] == 1, "unsupported version"
-        ntok = header[2] # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
-        tokens = np.frombuffer(f.read(), dtype=np.uint16)
-        # convert tokens to int32 because torch can't handle uint16 sad
-        tokens = tokens.astype(np.int32)
-        assert len(tokens) == ntok, "number of tokens read does not match header?"
-
-    # np -> tensor, long, on device
-    tokens = torch.tensor(tokens)
-    tokens = tokens.to(torch.long)
-
-    # lightweight dataloader
-    def get_batch():
-        assert B*T+1 <= len(tokens), "not enough tokens"
-        i = B*T*ddp_rank
-        while True:
-            x = tokens[i:i+B*T].view(B, T)
-            y = tokens[i+1:i+B*T+1].view(B, T)
-            yield x, y
-            i += B*T*ddp_world_size
-            if i + B*T + 1 >= len(tokens):
-                i = 0 # in prod we'd want to randomize the start point a bit
-                print("We do not expect to reach here in PyTorch right now") # TODO
-                import sys; sys.exit()
-
-    # fetch one batch of data
-    data_iter = iter(get_batch())
-    x, y = next(data_iter)
-    x = x.to(device)
-    y = y.to(device)
+    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    val_loader = None
+    if args.input_val_bin:
+        val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
 
     # -------------------------------------------------------------------------
     # STAGE 1: weights / state logging for C to load later
@@ -710,9 +747,8 @@ if __name__ == "__main__":
                 lossf += loss.item() # keep track of the mean loss
             # advance the dataset for the next batch
             if not args.overfit_single_batch:
-                x, y = next(data_iter)
-                x = x.to(device)
-                y = y.to(device)
+                x, y = train_loader.next_batch()
+                x, y = x.to(device), y.to(device)
             # backward pass
             if ddp:
                 # we want only the last micro-step to sync grads in a DDP model
