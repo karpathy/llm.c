@@ -2,6 +2,13 @@
 
 These shell scripts hold the exact commands to llm.c that reproduce the GPT-2 and GPT-3 runs.
 
+### pytorch reference runs
+
+For all pyrun scripts, current restrictions:
+
+- does not write checkpoint, only logs of the train/val losses
+- does not evaluate hellaswag accuracy
+- cannot "resume training" (i.e. the `-y 1` flag)
 
 ### memory considerations
 
