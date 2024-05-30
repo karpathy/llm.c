@@ -18,6 +18,7 @@ torchrun --standalone --nproc_per_node=4 train_gpt2.py --write_tensors=0 --num_i
 
 import os
 import math
+import glob
 import struct
 import inspect
 from contextlib import nullcontext
@@ -31,6 +32,9 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from torch.distributed.optim import ZeroRedundancyOptimizer
+
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the GPT-2 model
 
 class NewGELU(nn.Module):
     """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
@@ -108,6 +112,9 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+
+# -----------------------------------------------------------------------------
+# The main GPT-2 model
 
 @dataclass
 class GPTConfig:
@@ -245,18 +252,19 @@ class GPT(nn.Module):
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        print0(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print0(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
-        print(f"using fused AdamW: {use_fused}")
+        print0(f"using fused AdamW: {use_fused}")
         if zero_stage == 1:
+            print0("using ZeroRedundancyOptimizer")
             optimizer = ZeroRedundancyOptimizer(**optim_groups[0], optimizer_class=torch.optim.AdamW,
                                                 lr=learning_rate, betas=betas, fused=use_fused)
             optimizer.add_param_group(optim_groups[1])
-            print("using ZeroRedundancyOptimizer")
         else:
+            print0("using regular AdamW")
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
         return optimizer
 
@@ -287,7 +295,86 @@ class GPT(nn.Module):
 
         return idx
 
-# a few utilities for saving params/grads/activations to files for loading in C
+# -----------------------------------------------------------------------------
+# Our own simple Distributed Data Loader
+
+def _peek_data_shard(filename):
+    # only reads the header, returns header data
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+    if header[0] != 20240520:
+        print("ERROR: magic number mismatch in the data .bin file!")
+        print("---> HINT: Are you passing in a correct file with --input_bin?")
+        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
+        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        exit(1)
+    assert header[1] == 1, "unsupported version"
+    ntok = header[2] # number of tokens (claimed)
+    return ntok # for now just return the number of tokens
+
+def _load_data_shard(filename):
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+        assert header[1] == 1, "unsupported version"
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+    assert len(tokens) == ntok, "number of tokens read does not match header?"
+    return tokens
+
+class DistributedDataLoader:
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B
+        self.T = T
+
+        # glob files that match the pattern
+        self.files = sorted(glob.glob(filename_pattern))
+        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
+
+        # load and validate all data shards, count number of tokens in total
+        ntok_total = 0
+        for fname in self.files:
+            shard_ntok = _peek_data_shard(fname)
+            assert shard_ntok >= num_processes * B * T + 1
+            ntok_total += shard_ntok
+        self.ntok_total = ntok_total
+        print0(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
+
+        # kick things off
+        self.reset()
+
+    def reset(self):
+        self.current_shard = 0
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def advance(self): # advance to next data shard
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def next_batch(self):
+        B = self.B
+        T = self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the start pointer in current shard
+        self.current_position += B * T * self.num_processes
+        # if loading the next batch would be out of bounds advance the shard
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.advance()
+        return x, y
+
+# -----------------------------------------------------------------------------
+# Python -> C bridge utilities for saving params/grads/activations to .bin files
+
 def write_fp32(tensor, file):
     t = tensor.detach().cpu().to(torch.float32)
     b = t.numpy().tobytes()
@@ -301,6 +388,7 @@ def write_bf16(tensor, file):
     file.write(b)
 
 def write_tensors(model_tensors, L, file, dtype):
+    # writes the GPT-2 model's weights to a binary file
     assert dtype in {"float32", "bfloat16"}
     write_fun = write_fp32 if dtype == "float32" else write_bf16
     write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
@@ -430,6 +518,9 @@ def write_tokenizer(enc, filename):
             file.write(b)  # Write the actual bytes
     print(f"wrote {filename}")
 
+# -----------------------------------------------------------------------------
+# int main
+
 def print0(*args, **kwargs):
     # modified print that only prints from the master process
     # if this is not a distributed run, it's just a print
@@ -444,27 +535,44 @@ if __name__ == "__main__":
 
     # default settings will overfit a tiny batch of data
     # and save model weights and debug state to disk on the first iteration
-    # if you'd like to e.g. time the forward pass only, call this script as:
-    # python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024
     parser = argparse.ArgumentParser()
+    # file system input / output
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
+    parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
+    parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
-    parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
-    parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
-    parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
-    parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
-    parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
-    parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
-    parser.add_argument("--flash", type=int, default=0, help="use flash attention")
-    parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
+    # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
     parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
+    # workload (number of steps)
+    parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
+    parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
+    # optimization
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
+    parser.add_argument("--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
+    parser.add_argument("--learning_rate_decay_frac", type=float, default=1.0, help="learning rate warmup iterations")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
+    # evaluation
+    parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
+    parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
+    parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
+    # debugging
     parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
+    # numerics
+    parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
+    # memory management
+    parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
+    parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
+    parser.add_argument("--flash", type=int, default=0, help="use flash attention")
+    parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
+    # python -> C bridge
+    parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     args = parser.parse_args()
+
+    # args error checking and convenience variables
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
     assert args.dtype in {"float32", "float16", "bfloat16"}
@@ -509,21 +617,17 @@ if __name__ == "__main__":
     tokens_per_fwdbwd = B * T * ddp_world_size
     assert args.total_batch_size % tokens_per_fwdbwd == 0
     grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
-    if master_process:
-        print(f"total desired batch size: {args.total_batch_size}")
-        print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    print0(f"total desired batch size: {args.total_batch_size}")
+    print0(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
     # set up a context manager following the desired dtype and device
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
     ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
 
-    # seed the random number generators (in DDP we want different processes to use different offsets)
-    # in the code below we don't actually use random numbers because there is no active dataloader
-    # loading actual batches of data, etc. but it is a good practice and something to be careful with,
-    # explicit with and think about, so I am leaving this here.
-    torch.manual_seed(42 + seed_offset)
+    # rng / reproducibility
+    torch.manual_seed(42)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(42 + seed_offset)
+        torch.cuda.manual_seed(42)
 
     # set the torch precision mode to use TensorFloat32 (TF32) for matmuls
     # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
@@ -536,8 +640,6 @@ if __name__ == "__main__":
 
     # init (and write) the tokenizer
     enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-    decode = lambda l: enc.decode(l)
     if master_process and args.write_tensors: # tokenizer is technically not tensors but ok
         write_tokenizer(enc, "gpt2_tokenizer.bin")
 
@@ -563,63 +665,21 @@ if __name__ == "__main__":
         model = torch.compile(model)
 
     # -------------------------------------------------------------------------
-    # data loading related: long but it's just to get a single batch of data
+    # Our own version of a simple DistributedDataLoader
 
-    # load the tokens
-    # note we're using val by default instead of train split just because it is smaller/faster
-    if not os.path.isfile(args.input_bin):
-        print0(f"ERROR: input .bin file not found: {args.input_bin}")
-        print0("---> HINT: Try to re-run the data prepro script. these recently moved to dev/data")
-        print0("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
-        exit(1)
-    print0(f"loading cached tokens in {args.input_bin}")
-    with open(args.input_bin, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-        if header[0] != 20240520:
-            print0("ERROR: magic number mismatch in the data .bin file!")
-            print0("---> HINT: Are you passing in a correct file with --input_bin?")
-            print0("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
-            print0("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
-            exit(1)
-        assert header[1] == 1, "unsupported version"
-        ntok = header[2] # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
-        tokens = np.frombuffer(f.read(), dtype=np.uint16)
-        # convert tokens to int32 because torch can't handle uint16 sad
-        tokens = tokens.astype(np.int32)
-        assert len(tokens) == ntok, "number of tokens read does not match header?"
-
-    # np -> tensor, long, on device
-    tokens = torch.tensor(tokens)
-    tokens = tokens.to(torch.long)
-
-    # lightweight dataloader
-    def get_batch():
-        assert B*T+1 <= len(tokens), "not enough tokens"
-        # for 338,025 tokens. E.g. with B=8 T=1024, this will yield 41 batches before looping
-        i = B*T*ddp_rank
-        while True:
-            x = tokens[i:i+B*T].view(B, T)
-            y = tokens[i+1:i+B*T+1].view(B, T)
-            yield x, y
-            i += B*T*ddp_world_size
-            if i + B*T + 1 >= len(tokens):
-                i = 0 # in prod we'd want to randomize the start point a bit
-                print("We do not expect to reach here in PyTorch right now")
-                import sys; sys.exit()
-
-    # fetch one batch of data
-    data_iter = iter(get_batch())
-    x, y = next(data_iter)
-    x = x.to(device)
-    y = y.to(device)
+    # load tokens
+    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    val_loader = None
+    if args.input_val_bin:
+        val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
 
     # -------------------------------------------------------------------------
     # STAGE 1: weights / state logging for C to load later
 
     # do one forward pass to generate ground truth for our C tests
-    if master_process and (not args.inference_only and args.write_tensors):
+    if master_process and args.write_tensors and (not args.inference_only):
         logits, loss = model(x, y)
         loss.backward()
         # save model params, in both float32 and bfloat16
@@ -633,7 +693,7 @@ if __name__ == "__main__":
         write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
 
     # -------------------------------------------------------------------------
-    # STAGE 2: training loop to get timings
+    # STAGE 2: training loop
 
     # here we wrap model into DDP container
     if ddp:
@@ -642,16 +702,90 @@ if __name__ == "__main__":
 
     # init the optimizer
     optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
-                                               learning_rate=1e-4, betas=(0.9, 0.95),
+                                               learning_rate=args.learning_rate, betas=(0.9, 0.95),
                                                device_type=device, zero_stage=zero_stage)
+
+    # learning rate decay scheduler (cosine with warmup)
+    def get_lr(it):
+        min_lr = args.learning_rate * args.learning_rate_decay_frac
+        # 1) linear warmup for warmup_iters steps
+        if it < args.warmup_iters:
+            return args.learning_rate * (it+1) / args.warmup_iters
+        # 2) if it > lr_decay_iters, return min learning rate
+        if it > args.num_iterations:
+            return min_lr
+        # 3) in between, use cosine decay down to min learning rate
+        decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+        return min_lr + coeff * (args.learning_rate - min_lr)
+
+    # create the logging directory if it does not exist
+    logfile = None
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        logfile = os.path.join(args.output_dir, "main.log")
+        # create the log file "main.log" inside it, and wipe it clean
+        with open(logfile, "w") as f:
+            pass
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     timings = []
     norm = -1.0   # dummy value to print in inference-only mode
-    for step in range(args.num_iterations):
+    for step in range(args.num_iterations + 1):
         t0 = time.time()
+        last_step = (step == args.num_iterations)
 
+        # once in a while evaluate the validation dataset
+        if (args.val_loss_every > 0 \
+            and (step % args.val_loss_every == 0 or last_step)) \
+            and (val_loader is not None):
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                val_loss = 0.0
+                for _ in range(args.val_max_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    _, loss = model(x, y, return_logits=False)
+                    val_loss += loss.item()
+                val_loss /= args.val_max_steps
+            # log to console and to file
+            print0(f"val loss {val_loss}")
+            if master_process and logfile is not None:
+                with open(logfile, "a") as f:
+                    f.write("s:%d tel:%f\n" % (step, val_loss))
+
+        # once in a while perform model inference on the master process
+        if (args.sample_every > 0 \
+            and (step % args.sample_every == 0 or last_step)) \
+            and master_process:
+            # TODO I'm not sure why this sampling code (which worked fine)
+            # doesn't work anymore when placed here debug later
+            if False:
+                model.eval()
+                # before we end, let's also do one round of inference
+                # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
+                start_ids = [enc.eot_token]
+                x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+                max_new_tokens = 32
+                temperature = 1.0
+                top_k = 40
+                y = raw_model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+                print0('---------------')
+                print0(enc.decode(y[0].tolist()))
+                print0('---------------')
+
+        # bit confusing: we want to make sure to eval and sample on 0th iteration
+        # but also after the very last iteration. so we loop for step <= num_iterations
+        # instead of just < num_iterations (one extra due to <=), only to do
+        # the validation/sampling one last time, and then we break right here as we're done.
+        if last_step:
+            break
+
+        # --------------- TRAINING SECTION BEGIN -----------------
+        model.train()
         # micro-batch loop where we do gradient accumulation to reach desired total batch size
         lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
         for micro_step in range(grad_accum_steps):
@@ -666,9 +800,8 @@ if __name__ == "__main__":
                 lossf += loss.item() # keep track of the mean loss
             # advance the dataset for the next batch
             if not args.overfit_single_batch:
-                x, y = next(data_iter)
-                x = x.to(device)
-                y = y.to(device)
+                x, y = train_loader.next_batch()
+                x, y = x.to(device), y.to(device)
             # backward pass
             if ddp:
                 # we want only the last micro-step to sync grads in a DDP model
@@ -678,8 +811,15 @@ if __name__ == "__main__":
             if not args.inference_only:
                 loss.backward()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        # determine and set the learning rate for this iteration
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        # step the optimizer
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        # --------------- TRAINING SECTION END -------------------
+        # everything that follows now is just diagnostics, prints, logging, etc.
 
         # wait on the CPU for all device work to end so we get accurate per-iteration timings below
         if device == "mps":
@@ -690,7 +830,13 @@ if __name__ == "__main__":
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
         tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
-        print0(f"step {step+1:4d}/{args.num_iterations}: train loss {lossf:.6f} norm {norm:.4f} lr 1.00e-04 ({(t1-t0)*1000:.3f} ms, {tokens_per_second:.0f} tok/s)")
+        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
+        # log to logile
+        if master_process and logfile is not None:
+            with open(logfile, "a") as f:
+                f.write("s:%d trl:%f\n" % (step, lossf))
+
+        # keep track of smooth timings, last 20 iterations
         if step > 0 and step > args.num_iterations - 20:
             timings.append(t1-t0)
 
@@ -698,25 +844,6 @@ if __name__ == "__main__":
     timings = timings[-20:]
     print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
-
-    # -------------------------------------------------------------------------
-    # STAGE 3: Few steps of inference
-    if master_process:
-
-        # before we end, let's also do one round of inference
-        # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
-        start = "<|endoftext|>"
-        start_ids = encode(start)
-        x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-
-        # run generation for 16 time steps (tokens)
-        max_new_tokens = 16
-        temperature = 1.0
-        top_k = 40
-        raw_model.eval()
-        y = raw_model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-        print0(decode(y[0].tolist()))
-        print0('---------------')
 
     # -------------------------------------------------------------------------
     # clean up nice
