@@ -365,11 +365,11 @@ class DistributedDataLoader:
         buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
         x = (buf[:-1]).view(B, T) # inputs
         y = (buf[1:]).view(B, T) # targets
-        # advance current position and load next shard if necessary
+        # advance the start pointer in current shard
+        self.current_position += B * T * self.num_processes
+        # if loading the next batch would be out of bounds advance the shard
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
-        else:
-            self.current_position += B * T * self.num_processes
         return x, y
 
 # -----------------------------------------------------------------------------
