@@ -2914,6 +2914,18 @@ void common_free(GPT2 &model) {
 #ifndef TESTING
 // if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
 
+void logger_log_metrics(Logger *logger, int step, float norm, float lr, float latency, float mfu, float tokens) {
+    if (logger->active == 1) {
+        FILE *logfile = fopenCheck(logger->output_log_file, "a");
+        fprintf(logfile, "s:%d norm:%6.4f\n", step, norm);
+        fprintf(logfile, "s:%d lr:%.2e\n", step, lr);
+        fprintf(logfile, "s:%d latency:%.2f\n", step, latency);
+        fprintf(logfile, "s:%d mfu:%.1f\n", step, mfu);
+        fprintf(logfile, "s:%d tokens:%.0f\n", step, tokens);
+        fclose(logfile);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // training resumption logic, very useful when jobs crash once in a while
 // the goal is that we can resume optimization from any checkpoint, bit-perfect
@@ -3438,6 +3450,7 @@ int main(int argc, char *argv[]) {
                 step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
+        logger_log_metrics(&logger, step, grad_norm, step_learning_rate, time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
 
         // disable the profiler after 3 steps of optimization
         if (step == 3) { cudaProfilerStop(); }
