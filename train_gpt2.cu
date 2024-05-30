@@ -1899,7 +1899,7 @@ void fused_classifier(Type* logits, Type* losses,
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = N;
-    fused_classifier_kernel5<<<grid_size, block_size, 512>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
+    fused_classifier_kernel5<<<grid_size, block_size>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
     cudaCheck(cudaGetLastError());
 }
 

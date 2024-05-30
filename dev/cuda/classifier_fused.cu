@@ -664,7 +664,7 @@ void fused_classifier5(float* dlogits, float* losses,
                       int B, int T, int V, int P, int block_size) {
     const int N = B * T;
     const int grid_size = N;
-    fused_classifier_kernel5<true,false><<<grid_size, block_size, 512>>>((floatX*)dlogits, (floatX*)losses, NULL, (floatX*)logits, (floatX*)dlosses, targets, B, T, V, P);
+    fused_classifier_kernel5<true,false><<<grid_size, block_size>>>((floatX*)dlogits, (floatX*)losses, NULL, (floatX*)logits, (floatX*)dlosses, targets, B, T, V, P);
     cudaCheck(cudaGetLastError());
 }
 
