@@ -1,6 +1,5 @@
 /*
 GPT-2 Transformer Neural Net trained in raw CUDA
-GPT-2 Transformer Neural Net trained in raw CUDA
 Non-trivial notes to be aware of:
 
 We are being clever in the backward pass to conserve memory.
