@@ -2019,7 +2019,8 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     size_t NH = config.num_heads;
     size_t C = config.channels;
     act_sizes[0] = B * T * C; // encoded
-    act_sizes[1] = L * B * T * C; // ln1
+    // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
+    act_sizes[1] = (recompute < 2) ? L * B * T * C : B * T * C; // ln1
     act_sizes[2] = L * B * T; // ln1_mean
     act_sizes[3] = L * B * T; // ln1_rstd
     act_sizes[4] = L * B * T * C; // atty
@@ -2031,7 +2032,8 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     #endif
     act_sizes[6] = L * B * T * C; // attproj
     act_sizes[7] = L * B * T * C; // residual2
-    act_sizes[8] = L * B * T * C; // ln2
+    // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
+    act_sizes[8] = (recompute < 2) ? L * B * T * C : B * T * C; // ln2
     act_sizes[9] = L * B * T; // ln2_mean
     act_sizes[10] = L * B * T; // ln2_rstd
     act_sizes[11] = L * B * T * 4*C; // fch
@@ -2259,7 +2261,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
     model->rng_state = 13371337;
     model->use_master_weights = 1; // keep master weights copy in float for optim update?
-    model->recompute = 1; // default to recompute gelu during backward
+    model->recompute = 2; // default to recompute gelu during backward
 }
 
 void gpt2_build_from_random(GPT2 *model, int depth) {
@@ -2364,7 +2366,7 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     model->mean_loss = -1.0f; // -1.0f designates no loss
     model->rng_state = 13371337;
     model->use_master_weights = 1; // keep master weights copy in float for optim update?
-    model->recompute = 1; // default to recompute gelu during backward
+    model->recompute = 2; // default to recompute gelu during backward
 }
 
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, int grad_accum_steps=1) {
@@ -2455,12 +2457,12 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         floatX* l_fcprojb = params.fcprojb + l * C;
 
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = acts.ln1 + l * B * T * C;
+        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.ln1;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_attproj = acts.attproj + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = acts.ln2 + l * B * T * C;
+        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.ln2;
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
@@ -2492,7 +2494,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
 
         // OK, fusion across blocks.
         if(l+1 != L) {
-            floatX* l_ln1 = acts.ln1 + (l + 1) * B * T * C;
+            floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.ln1;
             floatX* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
             floatX* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
@@ -2610,9 +2612,11 @@ void gpt2_backward(GPT2 *model, int* inputs) {
 
         // get the pointers of the weights for this layer
         floatX* l_ln1w = params.ln1w + l * C;
+        floatX* l_ln1b = params.ln1b + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_ln2w = params.ln2w + l * C;
+        floatX* l_ln2b = params.ln2b + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
@@ -2629,13 +2633,13 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
         floatX* dl_fcprojb = grads.fcprojb + l * C;
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = acts.ln1 + l * B * T * C;
+        floatX* l_ln1 = (model->recompute == 0) ? acts.ln1 + l * B * T * C : acts.ln1;
         floatX* l_ln1_mean = acts.ln1_mean + l * B * T;
         floatX* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = acts.ln2 + l * B * T * C;
+        floatX* l_ln2 = (model->recompute == 0) ? acts.ln2 + l * B * T * C : acts.ln2;
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
@@ -2657,6 +2661,9 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C);
         gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C);
+        if(model->recompute >= 2) {
+            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
@@ -2673,7 +2680,9 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         floatX* dl_preatt = (floatX*)grads_acts.preatt; // dedicated scratchpad allocation
         attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
         #endif
-
+        if(model->recompute >= 2) {
+            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+        }
         // QKV parameter gradients
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
