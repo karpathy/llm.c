@@ -3024,7 +3024,7 @@ void error_usage() {
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
-    fprintf(stderr, "  -r <int>    recompute: saves memory at cost of speed. (default = 1), 0 = none. 1 = recompute gelu\n");
+    fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
     exit(EXIT_FAILURE);
 }
 
