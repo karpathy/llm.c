@@ -1,36 +1,5 @@
 /*
-GPT-2 Transformer Neural Net trained in raw CUDA
-Non-trivial notes to be aware of:
-
-We are being clever in the backward pass to conserve memory.
-In particular, all parameters use a += in the backward pass, so we
-can later do gradient accumulation. But all activations have = instead of +=
-because these are faster (just read, no write). This is okay for all activations
-except for those in the residual stream, where the gradients have to add. We make
-sure that those parts work out ok and that we do a += as necessary. E.g.,
-the layernorms are connected to the residuals so we += in layernorm backward.
-
-In this file we are using Mixed Precision training, so different activations,
-parameters, grads and buffers may be kept at different precisions, to take
-advantage of the fast low-precision hardware in the latest GPUs (bf16/fp16),
-and fp8 (coming soon^TM).
-
-Compile:
-make train_gpt2cu
-
-Example launch using bfloat16 on 1 GPU batch size 8, sample/eval every 200 steps:
-Also we're using TinyStories here for example as it is a bigger dataset
-./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
-
-Example launch using bfloat16 on 4 GPUs, same as above:
-mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
-
-If you'd like to see train_gpt2.cu produce identical results to
-`python train_gpt2.py`, you can run it like this:
-make train_gpt2cu && ./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -f 0
-make train_gpt2cu PRECISION=FP32 && ./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -f 0
-This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
--a 1 is "overfit single batch", -x 10 is 10 iterations, and -f 0 disables tf32
+GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 
 #include <unistd.h>
@@ -38,16 +7,11 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string>
-#include <sys/stat.h>
 #include <sys/types.h>
 #include <vector>
 #include <algorithm>
 #include <functional>
 #include <unordered_map>
-// implementation of dirent for Windows is in dev/unistd.h
-#ifndef _WIN32
-#include <dirent.h>
-#endif
 // GPU / CUDA related
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -61,15 +25,19 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 #endif
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
-#include "utils.h"
+// defines: create_dir_if_not_exists, find_max_step
+#include "llmc/utils.h"
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
-#include "tokenizer.h"
+#include "llmc/tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 // defines: evalloader_init, evalloader_reset, evalloader_next_batch, evalloader_free
-#include "dataloader.h"
-// defines: manual_seed, normal_
-// numerically identical to PyTorch's torch.manual_seed and torch.normal
-#include "rand.h"
+#include "llmc/dataloader.h"
+// defines: manual_seed, normal_ (same as torch.manual_seed and torch.normal)
+#include "llmc/rand.h"
+// defines: sample_softmax
+#include "llmc/sampler.h"
+// defines: logger_init, logger_log_eval, logger_log_val, logger_log_train
+#include "llmc/logger.h"
 // ----------------------------------------------------------------------------
 // CUDA precision settings
 
@@ -542,6 +510,14 @@ void destroy_cudnn() {}
 
 // ----------------------------------------------------------------------------
 // all the kernels
+/*
+Note that we are being clever in the backward pass to conserve memory.
+All parameters use a += in the backward pass, so we can do gradient accumulation.
+But all activations have = instead of += because these are faster (just read, no write).
+This is okay for all activations except for those in the residual stream, where the
+gradients have to add. We make sure that we do a += as necessary.
+E.g., the layernorms are connected to the residuals so we += in layernorm backward.
+*/
 
 __global__ void encoder_forward_kernel3(floatX* out,
                                const int* inp, const floatX* wte, const floatX* wpe,
@@ -2937,112 +2913,11 @@ void common_free(GPT2 &model) {
 
 #ifndef TESTING
 // if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
-// ----------------------------------------------------------------------------
-// sampler: takes probabilities and samples integers from them
-
-int sample_softmax(const float* logits, int n, float coin) {
-    // sample index from logits (converted to probabilities using softmax)
-    // coin is a random number in [0, 1), usually from random_f32()
-    double norm = 0;
-    for (int i = 0; i < n; i++) {
-        norm += expf(logits[i]);
-    }
-    // instead of dividing all exp(logits), we can just multiply coin.
-    coin *= norm;
-    float cdf = 0.0f;
-    for (int i = 0; i < n; i++) {
-        cdf += expf(logits[i]);
-        if (coin < cdf) {
-            return i;
-        }
-    }
-    return n - 1; // in case of rounding errors
-}
-
-// ----------------------------------------------------------------------------
-// Logger lite, will probably grow/change some over time
-// Logger is stateless, uses append mode to write to file
-
-void create_dir_if_not_exists(const char *dir) {
-    if (dir == NULL) { return; }
-    struct stat st = {0};
-    if (stat(dir, &st) == -1) {
-        if (mkdir(dir, 0700) == -1) {
-            printf0("ERROR: could not create directory: %s\n", dir);
-            exit(EXIT_FAILURE);
-        }
-        printf0("created directory: %s\n", dir);
-    }
-}
-
-typedef struct {
-    int active;
-    char output_log_file[512];
-} Logger;
-
-void logger_init(Logger *logger, const char *log_dir, int process_rank, int resume) {
-    // currently, only rank 0 writes logs
-    logger->active = 0;
-    if (log_dir != NULL && process_rank == 0) {
-        logger->active = 1;
-        assert(strlen(log_dir) < 500); // being a bit lazy, could relax later
-        snprintf(logger->output_log_file, 512, "%s/main.log", log_dir);
-        if (resume == 0) {
-            // wipe any existing logfile clean if we're starting fresh
-            FILE *logfile = fopenCheck(logger->output_log_file, "w");
-            fclose(logfile);
-        }
-    }
-}
-
-void logger_log_eval(Logger *logger, int step, float val) {
-    if (logger->active == 1) {
-        FILE *logfile = fopenCheck(logger->output_log_file, "a");
-        fprintf(logfile, "s:%d eval:%.4f\n", step, val);
-        fclose(logfile);
-    }
-}
-
-void logger_log_val(Logger *logger, int step, float val_loss) {
-    if (logger->active == 1) {
-        FILE *logfile = fopenCheck(logger->output_log_file, "a");
-        fprintf(logfile, "s:%d tel:%.4f\n", step, val_loss);
-        fclose(logfile);
-    }
-}
-
-void logger_log_train(Logger *logger, int step, float train_loss) {
-    if (logger->active == 1) {
-        FILE *logfile = fopenCheck(logger->output_log_file, "a");
-        fprintf(logfile, "s:%d trl:%.4f\n", step, train_loss);
-        fclose(logfile);
-    }
-}
 
 // ----------------------------------------------------------------------------
 // training resumption logic, very useful when jobs crash once in a while
 // the goal is that we can resume optimization from any checkpoint, bit-perfect
 // note that "state" refers to things not already saved in the model checkpoint file
-
-int find_max_step(const char* output_log_dir) {
-    // find the DONE file in the log dir with highest step count
-    if (output_log_dir == NULL) { return -1; }
-    DIR* dir;
-    struct dirent* entry;
-    int max_step = -1;
-    dir = opendir(output_log_dir);
-    if (dir == NULL) { return -1; }
-    while ((entry = readdir(dir)) != NULL) {
-        if (strncmp(entry->d_name, "DONE_", 5) == 0) {
-            int step = atoi(entry->d_name + 5);
-            if (step > max_step) {
-                max_step = step;
-            }
-        }
-    }
-    closedir(dir);
-    return max_step;
-}
 
 void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
     printf("Writing state to %s\n", filename);
