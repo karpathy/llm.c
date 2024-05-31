@@ -699,7 +699,9 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
                                                const floatX* inp1, const floatX* inp2,
                                                const floatX* weight, const floatX* bias,
                                                int N, int C) {
-    assert(blockDim.x == WARP_SIZE);
+    constexpr int BLOCK_Y_SIZE = 256 / WARP_SIZE;
+    assert(WARP_SIZE == blockDim.x);
+    assert(BLOCK_Y_SIZE == blockDim.y);
 
     // load weights and biases into shared memory
     // do this before we allow any threads to exit!
@@ -711,13 +713,13 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     x128* s_res = reinterpret_cast<x128*>(params) + ((2 + threadIdx.y) * C / x128::size);
 
     int sidx = (threadIdx.x + WARP_SIZE * threadIdx.y) * x128::size;
-    for(int i = sidx; i < C; i += blockDim.y * WARP_SIZE * x128::size) {
+    for(int i = sidx; i < C; i += BLOCK_Y_SIZE * WARP_SIZE * x128::size) {
         s_weight[i/x128::size] = load128(weight + i);
         s_bias[i/x128::size] = load128(bias + i);
     }
     __syncthreads();
 
-    int idx = blockIdx.x * blockDim.y + threadIdx.y;
+    int idx = blockIdx.x * BLOCK_Y_SIZE + threadIdx.y;
     if(idx > N) return;
 
     // adjust pointers to current token
@@ -852,10 +854,12 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     // fuses the multiplication by scale inside attention
     // directly autoregressive, so we only compute the lower triangular part
     // uses the online softmax algorithm
+    constexpr int BLOCK_SIZE = 1024;
+    assert(BLOCK_SIZE == blockDim.x);
     assert(T % 4  == 0);
     int lane_id = threadIdx.x % WARP_SIZE;
     int warp_id = threadIdx.x / WARP_SIZE;
-    int num_warps = blockDim.x / WARP_SIZE;
+    constexpr int num_warps = BLOCK_SIZE / WARP_SIZE;
 
     // micro-optimization: we iterate backwards so that
     // after the softmax backward operation completes, the cache retains the
@@ -1054,7 +1058,8 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
                                 const floatX* dout, const floatX* inp, const floatX* weight,
                                 const floatX* mean, const floatX* rstd,
                                 int B, int T, int C) {
-    int BLOCK_SIZE = blockDim.x;
+    constexpr int BLOCK_SIZE = 512;
+    assert(BLOCK_SIZE == blockDim.x);
     int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
     extern __shared__ float shared[];
 
@@ -1349,11 +1354,13 @@ struct SoftmaxParams {
 __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* inp, int V, int P) {
     // same but not float4
     // one row of inp, i.e. inp[idx, :] of shape (V,)
+    constexpr int BLOCK_SIZE = 1024;
+    assert(BLOCK_SIZE == blockDim.x);
 
     const floatX* x = inp + idx * P;
     float thread_maxval = -INFINITY;
     float thread_sumval = 0.0f;
-    int i = (V+x128::size-1)/x128::size + threadIdx.x - blockDim.x;
+    int i = (V+x128::size-1)/x128::size + threadIdx.x - BLOCK_SIZE;
 
     // special-case loop to handle the unaligned elements at the end of the array
     // this lets us skip the bounds check in the main loop below, which improves performance
@@ -1368,11 +1375,11 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
             thread_sumval *= expf((old_maxval - thread_maxval));
             thread_sumval += expf(v - thread_maxval);
         }
-        i -= blockDim.x;
+        i -= BLOCK_SIZE;
     }
 
     // main loop for the bulk of the iterations (no bounds checking required!)
-    for (; i >= 0; i -= blockDim.x) {
+    for (; i >= 0; i -= BLOCK_SIZE) {
         x128 packed_x = load128(x + i * x128::size); // load and keep in cache until fused_classifier loop
         for(int k = 0; k < x128::size; ++k) {
             float v = (float)packed_x[k];
@@ -1400,6 +1407,9 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
                 fused_classifier_kernel5(floatX* logits, floatX* losses, floatX* probs,
                                          const float dloss, const int* targets,
                                          int B, int T, int V, int P) {
+    constexpr int BLOCK_SIZE = 1024;
+    assert(BLOCK_SIZE == blockDim.x);
+
     // note: idx is small enough that it easily fits into 32 bit;
     // by making it a long here, we ensure that any offsets calculated with it (e.g., idx * P)
     // are done is 64 bit
@@ -1418,7 +1428,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
     const floatX* logits_vec = logits + idx * P;
-    for (int i = threadIdx.x; i < V/x128::size; i += blockDim.x) {
+    for (int i = threadIdx.x; i < V/x128::size; i += BLOCK_SIZE) {
         // this is the 2nd read of logits after the one in prepare_softmax2
         // it will be overwritten by the logits gradients which is when we reduce cache persistence
         x128 packed_logits_vec = load128(logits_vec + i * x128::size); // rely on cs of store128cs
@@ -1718,7 +1728,7 @@ void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, flo
                              const floatX* weight, const floatX* bias,
                              int N, int C) {
     const int block_size = 256;
-    int block_y = block_size / WARP_SIZE;
+    constexpr int block_y = block_size / WARP_SIZE;
     const int grid_size = CEIL_DIV(N, block_y);
     size_t smem = (2 + block_y) * C * sizeof(floatX);
 
