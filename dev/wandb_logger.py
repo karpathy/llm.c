@@ -22,7 +22,7 @@ def parse_line(line):
             parts = line.split()
             step = int(parts[0].split(":")[1])
             value = float(parts[1].split(":")[1])
-            wandb.log({header: value}, step=step)
+            return {header: value}, step
 
 def wait_for_file(file_path):
     while not os.path.exists(file_path):
@@ -30,12 +30,13 @@ def wait_for_file(file_path):
         time.sleep(5)
     return open(file_path, 'r')
 
-def monitor_log_file(log_file_path):
+def process_log_file(log_file_path):
     f = wait_for_file(log_file_path)
     while True:
         line = f.readline()
         if line:
-            parse_line(line.strip())
+            data_dict, step = parse_line(line.strip())
+            wandb.log(data_dict, step=step)            
         time.sleep(1)
 
 if __name__ == "__main__":
@@ -43,6 +44,6 @@ if __name__ == "__main__":
     parser.add_argument("-l", "--log_dir", type=str, required=True, help="log directory of the training script")
     args = parser.parse_args()
     log_dir =  args.log_dir                         # same as the output log dir (-o <string>) used in ./train_gpt2cu
-    wandb.init(project="llmc-training", id=log_dir) # will use log_dir as the run_id 
+    wandb.init(project="llmc-training", id=log_dir) # will use log_dir as the run_id in wandb
 
-    monitor_log_file(log_dir + '/main.log')
+    process_log_file(log_dir + '/main.log')
