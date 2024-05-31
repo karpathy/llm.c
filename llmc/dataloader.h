@@ -79,6 +79,13 @@ int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
     return ntok;
 }
 
+void dataloader_resume(DataLoader *loader, int current_shard, int64_t current_position) {
+    // used during model resumption (-y 1) flag
+    loader->current_shard = current_shard;
+    loader->current_position = current_position;
+    dataloader_load_shard_(loader, loader->current_shard);
+}
+
 void dataloader_reset(DataLoader *loader) {
     // fully resets the DataLoader object to init configuration
     // each process starts at a different offset in the file

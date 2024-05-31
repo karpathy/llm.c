@@ -2968,8 +2968,9 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
-    loader->current_shard = state_header[30]; // shard of the dataset
-    loader->current_position = *((int64_t*)&state_header[31]); // position in shard
+    int current_shard = state_header[30]; // shard of the dataset
+    int64_t current_position = *((int64_t*)&state_header[31]); // position in shard
+    dataloader_resume(loader, current_shard, current_position);
     // read AdamW m, v (they are all float)
     // also allocate the m, v memory in the model, if it does not yet exist
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
