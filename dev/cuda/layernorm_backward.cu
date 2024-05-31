@@ -188,7 +188,7 @@ __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* d
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 __global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
-                        int B, int T, int C) {
+                        int B, int T, int C, float* dweight_tmp, float* dbias_tmp) {
     extern __shared__ float shared[]; // size = 2 * C
 
     namespace cg = cooperative_groups;
@@ -253,8 +253,16 @@ __global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparam
 
     // write to global memory
     for(int i = threadIdx.x; i < C; i+= blockDim.x) {
-        atomicAddX(&dbias[i], (Tparams)dbias_shared[i]);
-        atomicAddX(&dweight[i], (Tparams)dweight_shared[i]);
+        atomicAdd(&dbias_tmp[i], dbias_shared[i]);
+        atomicAdd(&dweight_tmp[i], dweight_shared[i]);
+    }
+}
+
+template <typename Tparams>
+__global__ void copy_to_dweight_dbias(int C, Tparams* dbias, Tparams* dweight, float* dbias_tmp, float* dweight_tmp) {
+    for (int i = threadIdx.x + blockDim.x * blockIdx.x; i < C; i += blockDim.x * gridDim.x) {
+        dbias[i] = (Tparams)dbias_tmp[i];
+        dweight[i] = (Tparams)dweight_tmp[i];
     }
 }
 
@@ -420,33 +428,33 @@ __global__ void layernorm_backward_kernel4(Tdinp* dinp, Tparams* dweight, Tparam
         __nv_bfloat162 new_dweight = add_dweight + current_dweight;
 
         // Write the result back to L2 cache using 32-bit integer atomic compare and exchange
-        uint current_dbias32b = *reinterpret_cast<uint*>(&current_dbias);
-        uint current_dweight32b = *reinterpret_cast<uint*>(&current_dweight);
+        unsigned int current_dbias32b = *reinterpret_cast<unsigned int*>(&current_dbias);
+        unsigned int current_dweight32b = *reinterpret_cast<unsigned int*>(&current_dweight);
 
-        uint new_dbias32b = *reinterpret_cast<uint*>(&new_dbias);
-        uint new_dweight32b = *reinterpret_cast<uint*>(&new_dweight);
+        unsigned int new_dbias32b = *reinterpret_cast<unsigned int*>(&new_dbias);
+        unsigned int new_dweight32b = *reinterpret_cast<unsigned int*>(&new_dweight);
 
-        uint old_dbias32b = atomicCAS((uint*)&dbiasVec2[i], current_dbias32b, new_dbias32b);
-        uint old_dweight32b = atomicCAS((uint*)&dweightVec2[i], current_dweight32b, new_dweight32b);
+        unsigned int old_dbias32b = atomicCAS((unsigned int*)&dbiasVec2[i], current_dbias32b, new_dbias32b);
+        unsigned int old_dweight32b = atomicCAS((unsigned int*)&dweightVec2[i], current_dweight32b, new_dweight32b);
 
         // If the value has changed between read and atomic, we need to try again
         while (old_dbias32b != current_dbias32b) {
             current_dbias32b = old_dbias32b;
             new_dbias = *reinterpret_cast<__nv_bfloat162*>(&current_dbias32b) + add_dbias;
-            new_dbias32b = *reinterpret_cast<uint*>(&new_dbias);
-            old_dbias32b = atomicCAS((uint*)&dbiasVec2[i], current_dbias32b, new_dbias32b);
+            new_dbias32b = *reinterpret_cast<unsigned int*>(&new_dbias);
+            old_dbias32b = atomicCAS((unsigned int*)&dbiasVec2[i], current_dbias32b, new_dbias32b);
         }
 
         while (old_dweight32b != current_dweight32b) {
             current_dweight32b = old_dweight32b;
             new_dweight = *reinterpret_cast<__nv_bfloat162*>(&current_dweight32b) + add_dweight;
-            new_dweight32b = *reinterpret_cast<uint*>(&new_dweight);
-            old_dweight32b = atomicCAS((uint*)&dweightVec2[i], current_dweight32b, new_dweight32b);
+            new_dweight32b = *reinterpret_cast<unsigned int*>(&new_dweight);
+            old_dweight32b = atomicCAS((unsigned int*)&dweightVec2[i], current_dweight32b, new_dweight32b);
         }
     }
 }
 
-// FP32 scratchpad per threadgroup, zero atomics except atomicAdd on uint for the flag (based on kernel3)
+// FP32 scratchpad per threadgroup, zero atomics except atomicAdd on unsigned int for the flag (based on kernel3)
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 __global__ void layernorm_backward_kernel5(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
@@ -468,7 +476,7 @@ __global__ void layernorm_backward_kernel5(Tdinp* dinp, Tparams* dweight, Tparam
        dbias_shared[i] = 0.0f;
        dweight_shared[i] = 0.0f;
     }
-    uint *tmp_flag = (uint*)(shared + C*2);
+    unsigned int *tmp_flag = (unsigned int*)(shared + C*2);
     __syncthreads();
 
     int warps_in_grid = gridDim.x * warp.meta_group_size();
@@ -518,7 +526,7 @@ __global__ void layernorm_backward_kernel5(Tdinp* dinp, Tparams* dweight, Tparam
 
     float* scratch_dbias = scratch;
     float* scratch_dweight = scratch + C * gridDim.x;
-    uint* scratchFlag = (uint*)(scratch + (2 * C * gridDim.x));
+    unsigned int* scratchFlag = (unsigned int*)(scratch + (2 * C * gridDim.x));
 
     for(int i = threadIdx.x; i < C; i+= blockDim.x) {
         scratch_dbias[i + C*blockIdx.x] = dbias_shared[i];
@@ -568,7 +576,7 @@ __global__ void layernorm_backward_kernel6(Tdinp* dinp, Tparams* dweight, Tparam
        dbias_shared[i] = 0.0f;
        dweight_shared[i] = 0.0f;
     }
-    uint *tmp_flag = (uint*)(shared + C*2);
+    unsigned int *tmp_flag = (unsigned int*)(shared + C*2);
     __syncthreads();
 
     int warps_in_grid = gridDim.x * warp.meta_group_size();
@@ -620,7 +628,7 @@ __global__ void layernorm_backward_kernel6(Tdinp* dinp, Tparams* dweight, Tparam
     __syncthreads();
     float* scratch_dbias = scratch;
     float* scratch_dweight = scratch + C;
-    uint* scratchFlag = (uint*)(scratch + (2 * C));
+    unsigned int* scratchFlag = (unsigned int*)(scratch + (2 * C));
     for(int i = threadIdx.x; i < C; i+= blockDim.x) {
         atomicAdd(&scratch_dbias[i], dbias_shared[i]);
         atomicAdd(&scratch_dweight[i], dweight_shared[i]);
@@ -661,7 +669,7 @@ __global__ void layernorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX
        dbias_shared[i] = 0.0f;
        dweight_shared[i] = 0.0f;
     }
-    uint *tmp_flag = (uint*)(shared + C*2);
+    unsigned int *tmp_flag = (unsigned int*)(shared + C*2);
     __syncthreads();
 
     for (int idx = base_idx; idx < B * T; idx += warps_in_grid) {
@@ -713,7 +721,7 @@ __global__ void layernorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX
     __syncthreads();
     float* scratch_dbias = scratch;
     float* scratch_dweight = scratch + C;
-    uint* scratchFlag = (uint*)(scratch + (2 * C));
+    unsigned int* scratchFlag = (unsigned int*)(scratch + (2 * C));
     for(int i = threadIdx.x; i < C; i+= blockDim.x) {
         atomicAdd(&scratch_dbias[i], dbias_shared[i]);
         atomicAdd(&scratch_dweight[i], dweight_shared[i]);
@@ -860,6 +868,12 @@ __global__ void layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX
                                             const floatX* dout, const floatX* inp, const floatX* weight,
                                             const floatX* mean, const floatX* rstd,
                                             int B, int T, int C) {
+    if(C % (32 * x128::size) != 0) {
+        if(threadIdx.x == 0 && blockIdx.x == 0) {
+            printf("Number of channels is not a multiple of 32 * x128::size");
+        }
+        __trap();       // prefer to crash here than run into a deadlock later on
+    }
     constexpr int WARP_SIZE = 32;
     int BLOCK_SIZE = blockDim.x;
     int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
@@ -993,8 +1007,8 @@ __global__ void layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX
         // todo - there isn't enough parallelism even inside that single SM...
         // ==> so could maybe split into another kernel with YET ANOTHER level of reduction?!
         for(int i = threadIdx.x * f128::size; i < C; i+= BLOCK_SIZE * f128::size) {
-            f128 dbias_accum(make_int4(0, 0, 0, 0));
-            f128 dweight_accum(make_int4(0, 0, 0, 0));
+            f128 dbias_accum = f128::zeros();
+            f128 dweight_accum = f128::zeros();
 
             for (int read_block_idx = 0; read_block_idx < gridDim.x; read_block_idx++) {
                 int offset = i + 2*C*read_block_idx;
@@ -1035,6 +1049,209 @@ __global__ void layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX
     }
 }
 
+
+// similar to kernel 9, but uses vectors to access shared memory, which also avoids the bank conflict problems,
+// and makes use require fewer barriers, at the cost of increased shared memory consumption.
+// warning: this kernel is _extremely_ close to getting register spills, so many "optimizations" turn out to be unhelpful
+// or need to be implemented in a very specific way.
+__global__ void __launch_bounds__(512, 2)
+layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+                            const floatX* dout, const floatX* inp, const floatX* weight,
+                            const floatX* mean, const floatX* rstd,
+                            int B, int T, int C) {
+    constexpr int WARP_SIZE = 32;
+    int BLOCK_SIZE = blockDim.x;
+    int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
+    extern __shared__ float shared[]; // size = 2 * C + 1
+
+    int warpId = threadIdx.x / WARP_SIZE; // warp index within a block
+    int baseIdx = blockIdx.x * warpsInBlock + warpId;
+    int warpThreadIdx = threadIdx.x % WARP_SIZE; // Thread index within the warp
+    int warpsInGrid = gridDim.x * warpsInBlock;
+    int C_per_iteration = WARP_SIZE * x128::size;
+    int iterations_C = ceil_div(C, C_per_iteration); // + 2;
+
+    // the first half of shared memory is bias, second is weight
+    size_t rounded_C = ceil_div(C, (32 * x128::size)) * (32 * x128::size);
+    float* dbias_shared = shared;
+    float* dweight_shared = shared + rounded_C;
+    // warp zero doesn't actually write to the _tmp_shared memory locations, so we don't need to reserve memory
+    // the obvious solution is to change the addressing below to use (threadId.x-32) as offset, but that causes
+    // register spills, so instead we mess with the base pointer here, which doesn't increase register usage.
+    float* dbias_tmp_shared = shared + 2 * rounded_C - WARP_SIZE * f128::size;
+    float* dweight_tmp_shared = shared + 2 * rounded_C + f128::size * BLOCK_SIZE - 2 * WARP_SIZE * f128::size;
+
+    // init shared memory to zero
+    for(int i = threadIdx.x * f128::size; i < rounded_C; i += BLOCK_SIZE * f128::size) {
+        store128(dbias_shared + i, f128::zeros());
+        store128(dweight_shared + i, f128::zeros());
+    }
+    __syncthreads();
+
+    for (int bt = baseIdx; bt < B * T; bt += warpsInGrid) {
+        const floatX* dout_bt = dout + bt * C;
+        const floatX* inp_bt = inp +bt * C;
+        floatX* dinp_bt = dinp + bt * C;
+
+        // first: two reduce operations
+        float dnorm_mean = 0.0f;
+        float dnorm_norm_mean = 0.0f;
+        for (int i = warpThreadIdx * x128::size; i < C; i += WARP_SIZE * x128::size) {
+            x128 dout128_i   = load128(dout_bt + i);
+            x128 inp128_i    = load128(inp_bt  + i);
+            x128 weight128_i = load128(weight  + i);
+            for (int k = 0; k < x128::size; k++) {
+                float dnorm_i = (float)weight128_i[k] * (float)dout128_i[k];
+                dnorm_mean += dnorm_i;
+                dnorm_norm_mean += dnorm_i * (float)inp128_i[k];
+            }
+        }
+
+        const float mean_bt = (float)mean[bt];
+        const float rstd_bt = (float)rstd[bt];
+        dnorm_mean = warpReduceSum(dnorm_mean) / C;
+        dnorm_norm_mean = warpReduceSum(dnorm_norm_mean) / C * rstd_bt - dnorm_mean * mean_bt * rstd_bt;
+
+        for (int c = 0; c < iterations_C; c++) {
+            int global_index = (warpThreadIdx * x128::size) + (c * C_per_iteration);
+
+            x128 dout128   = x128::zeros();
+            x128 inp128    = x128::zeros();
+            x128 dinp128   = x128::zeros();
+            x128 weight128 = x128::zeros();
+
+            if(global_index < C) {
+                dout128 = load128cs(dout_bt + global_index);
+                inp128 = load128cs(inp_bt + global_index);
+                dinp128 = load128(dinp_bt + global_index);
+                weight128 = load128(weight + global_index);
+            }
+
+            for(int o = 0; o < x128::size / f128::size; ++o) {
+                f128 dbias_f;
+                f128 dweight_f;
+                for(int i = 0; i < f128::size; ++i) {
+                    int x = o * f128::size + i;
+                    float dout_i = (float)dout128[x];
+                    float norm_bti = ((float)inp128[x] - mean_bt) * rstd_bt;
+                    dbias_f[i] = dout_i;
+                    dweight_f[i] = norm_bti * dout_i;
+
+                    float dval = 0.0f;
+                    dval += (float) weight128[x] * (float)dout128[x]; // term 1
+                    dval -= dnorm_mean; // term 2
+                    dval -= norm_bti * dnorm_norm_mean; // term 3
+                    dval *= rstd_bt; // final scale
+                    dinp128[x] = (floatX) ((float) dinp128[x] + dval);
+                }
+
+                if (warpId != 0) {
+                    store128(dbias_tmp_shared + threadIdx.x * f128::size, dbias_f);
+                    // this seems to generate a 64-bit store, instead of 128-bit.
+                    // however, forcing 128-bit (e.g., using inline ptx), results in register
+                    // spilling and much worse performance, so we'll keep it like this for now
+                    // but ideally, we could reduce the register pressure a little.
+                    store128(dweight_tmp_shared + threadIdx.x * f128::size, dweight_f);
+                }
+                __syncthreads();
+                if (warpId == 0) {
+                    for (int j = 1; j < warpsInBlock; j++) {
+                        f128 dbias_tmp = load128(dbias_tmp_shared + f128::size * (threadIdx.x + j * WARP_SIZE));
+                        f128 dweight_tmp = load128(dweight_tmp_shared + f128::size * (threadIdx.x + j * WARP_SIZE));
+                        for(int i = 0; i < f128::size; ++i) {
+                            dbias_f[i] += dbias_tmp[i];
+                            dweight_f[i] += dweight_tmp[i];
+                        }
+                    }
+                }
+                __syncthreads();
+                if (warpId == 0) {
+                    f128 db_old = load128(dbias_shared + global_index + f128::size * o);
+                    f128 dw_old = load128(dweight_shared + global_index + f128::size * o);
+                    for(int i = 0; i < f128::size; ++i) {
+                        dbias_f[i] += db_old[i];
+                        dweight_f[i] += dw_old[i];
+                    }
+                    store128(dbias_shared + global_index + f128::size * o, dbias_f);
+                    store128(dweight_shared + global_index + f128::size * o, dweight_f);
+                }
+            }
+            if(global_index < C) {
+                // cache in L2 as this is read by the next kernel, but bypass L1 to minimise thrashing
+                store128cg(dinp_bt + global_index, dinp128);
+            }
+        }
+    }
+    __syncthreads();
+    // Each block writes its partial sum to global memory
+    // The last block to finish becomes responsible for summing up all the partial sums
+    // This is done by atomically incrementing a flag (cleared to 0 before launching the kernel)
+    unsigned int* scratchFlag = (unsigned int*)(scratch);
+    // Increment scratch pointer by a full cacheline so that everything remains cacheline aligned
+    scratch += 32;
+    float* scratch_dbias = scratch;
+    float* scratch_dweight = scratch + C;
+    for(int i = threadIdx.x * f128::size; i < C; i += BLOCK_SIZE * f128::size) {
+        // Write to global memory in the same "shared memory banking friendly" order
+        store128(scratch_dbias + i + 2*C*blockIdx.x, load128(dbias_shared + i));
+        store128(scratch_dweight + i + 2*C*blockIdx.x, load128(dweight_shared + i));
+    }
+    __syncthreads();
+    // that portion of shared memory is no longer used, so we can repurpose it for the scratch flag.
+    unsigned int *tmp_flag = (unsigned int*)(shared + 2*rounded_C);
+    if (threadIdx.x == 0) {
+        *tmp_flag = atomicInc(scratchFlag, gridDim.x);
+    }
+    __syncthreads();
+    if (*tmp_flag == gridDim.x-1) {
+        // Reduction of the partial sums by the final block
+        // todo - there isn't enough parallelism even inside that single SM...
+        // ==> so could maybe split into another kernel with YET ANOTHER level of reduction?!
+        for(int i = threadIdx.x * f128::size; i < C; i += BLOCK_SIZE * f128::size) {
+            f128 dbias_accum = f128::zeros();
+            f128 dweight_accum = f128::zeros();
+
+            for (int read_block_idx = 0; read_block_idx < gridDim.x; read_block_idx++) {
+                int offset = i + 2*C*read_block_idx;
+                f128 dbias128 = load128(scratch_dbias + offset);
+                f128 dweight128 = load128(scratch_dweight + offset);
+                for(int k = 0; k < f128::size; k++) {
+                    dbias_accum[k] += dbias128[k];
+                    dweight_accum[k] += dweight128[k];
+                }
+            }
+            store128(dbias_shared + i, dbias_accum);
+            store128(dweight_shared + i, dweight_accum);
+        }
+        __syncthreads();
+
+        // convert from float/FP32 to floatX/BF16 for the final write
+        // this is separate because it cannot use as many warps as the above (f128 vs x128)
+        // todo - if we split this code into another kernel, we could maybe do it at the same time?
+        for (int c = warpId; c < iterations_C; c += warpsInBlock) {
+            int global_index = (warpThreadIdx * x128::size) + (c * C_per_iteration);
+            if (global_index >= C) {
+                break;
+            }
+
+            x128 dbias128 = load128(dbias + global_index);
+            x128 dweight128 = load128(dweight + global_index);
+            for(int o = 0; o < x128::size / f128::size; ++o) {
+                f128 s_db = load128(dbias_shared + global_index + o * f128::size);
+                f128 s_dw = load128(dweight_shared + global_index + o * f128::size);
+                for(int i = 0; i < f128::size; ++i) {
+                    int x = o * f128::size + i;
+                    dbias128[x] = (floatX)(s_db[i] + (float)dbias128[x]);
+                    dweight128[x] = (floatX)(s_dw[i] + (float)dweight128[x]);
+                }
+            }
+            store128(dbias + global_index, dbias128);
+            store128(dweight + global_index, dweight128);
+        }
+    }
+}
+
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -1053,7 +1270,16 @@ void layernorm_backward2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
     const int N = B * T;
     const int grid_size = ceil_div(32*N, block_size);
     size_t shared_mem_size = 2 * C * sizeof(float);
-    layernorm_backward_kernel2<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C);
+    float* dweight_tmp;
+    float* dbias_tmp;
+    cudaCheck(cudaMalloc(&dweight_tmp, C * sizeof(float)));
+    cudaCheck(cudaMalloc(&dbias_tmp, C * sizeof(float)));
+    cudaMemset(dweight_tmp, 0, C * sizeof(float));
+    cudaMemset(dbias_tmp, 0, C * sizeof(float));
+    layernorm_backward_kernel2<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, dweight_tmp, dbias_tmp);
+    copy_to_dweight_dbias<<<1, 512>>>(C, dweight, dbias, dweight_tmp, dbias_tmp);
+    cudaCheck(cudaFree(dweight_tmp));
+    cudaCheck(cudaFree(dbias_tmp));
 }
 
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
@@ -1131,11 +1357,29 @@ void layernorm_backward9(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* s
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
                         int B, int T, int C, int block_size) {
 
+        assert(C % (32 * x128::size) == 0  && "Channels must be divisible by (32 * x128::size)");
         const int grid_size = (1024/block_size) * cuda_num_SMs; // todo - heuristics for other GPUs?
         size_t shared_mem_size = (2 * C + 2 * block_size + 1) * sizeof(float);
 
         cudaMemset(scratch, 0, 1 * sizeof(float)); // just need to memset the flag for this version
         layernorm_backward_kernel9<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+}
+
+template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
+void layernorm_backward10(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
+                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
+                         int B, int T, int C, int block_size) {
+        if(block_size == 1024) {
+            block_size = 512;
+        }
+        //assert(C % (32 * x128::size) == 0  && "Channels must be divisible by (32 * x128::size)");
+        const int grid_size = (1024/block_size) * cuda_num_SMs; // todo - heuristics for other GPUs?
+        size_t rounded_C = ceil_div(C, (32 * x128::size)) * (32 * x128::size);
+        size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - 32) * f128::size) * sizeof(float);
+
+        cudaCheck(cudaMemset(scratch, 0, 1 * sizeof(float))); // just need to memset the flag for this version
+        layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+        cudaCheck(cudaGetLastError());
 }
 
 // kernel version dispatch
@@ -1176,6 +1420,9 @@ void layernorm_backward(int kernel_num,
         case 9:
             layernorm_backward9(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
             break;
+        case 10:
+            layernorm_backward10(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, block_size);
+            break;
     default:
             printf("Invalid kernel number\n");
             exit(1);
@@ -1190,7 +1437,7 @@ int main(int argc, char **argv) {
 
     int B = 8;
     int T = 1024;
-    int C = 768;
+    int C = 1600;   // this is the problematic size
 
     // first do the forward pass in CPU
     float* out = (float*)malloc(B * T * C * sizeof(float));

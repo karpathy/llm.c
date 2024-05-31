@@ -200,7 +200,7 @@ void normal_(float* data, unsigned int numel, float mean, float std, mt19937_sta
         normal_fill(data, numel, mean, std, state);
     }
     else {
-        double next_double_normal_sample;
+        double next_double_normal_sample = 0.0; // make compiler warning happy, won't be used
         int has_next_double_normal_sample = 0;
         for (unsigned int  t = 0; t < numel; t++) {
             if (has_next_double_normal_sample) {
