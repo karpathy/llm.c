@@ -22,11 +22,11 @@ There will be other versions of this code that specialize it and make it fast.
 #endif
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
-#include "utils.h"
+#include "llmc/utils.h"
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
-#include "tokenizer.h"
+#include "llmc/tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
-#include "dataloader.h"
+#include "llmc/dataloader.h"
 
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
