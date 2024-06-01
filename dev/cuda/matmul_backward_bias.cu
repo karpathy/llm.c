@@ -590,8 +590,8 @@ void matmul_backward_bias9(floatX* dbias, const floatX* dout,
 
 void matmul_backward_bias10(floatX* dbias, floatX* dout,
                       int B, int T, int OC, int block_size) {
-    if (block_size == 768) { block_size = 1024; } // block_size_y assumes power of 2, block_size_x for none power of 2 values are not supported, due to the reduction
     if (block_size < 256) { block_size = 256; }   // block size should be larger than block_size_y
+    if (!isPowerOfTwo(block_size)) { block_size = largestPowerOfTwoLessOrEqual(block_size); } // round down to power of 2
     const int coarse_factor = 8;
     const int block_size_y = 128; 
     const int block_size_x = block_size / block_size_y;
