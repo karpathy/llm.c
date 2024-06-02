@@ -2763,10 +2763,24 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     // gradient clipping
     // repurposing this buffer (which isn't needed now) to write grad norm into it
     float* grad_norm_squared = (float*)model->acts.output;
-    global_norm_squared(grad_norm_squared, (floatX*)model->grads_memory, model->num_parameters);
+    if (multi_gpu_config->zero_stage == 1) {
+        // ^1 because of the ncclReduceScatter() in gpt2_multi_gpu_accumulate,
+        // grads_memory only contains the averaged gradients at the local shard
+        // so we only calculate the grad norm at the grads_memory belonging to the local shard
+        global_norm_squared(grad_norm_squared, grads_memory + shard_offset, shard_num_parameters);
+    } else {
+        // the ncclAllReduce() in gpt2_multi_gpu_accumulate has averaged the gradients across all GPUs
+        // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
+        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters);
+    }
     // transfer the gradient norm to CPU
     float grad_norm_squared_cpu = 0.0f;
     cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
+    if (multi_gpu_config->zero_stage == 1) {
+        // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
+        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
+    }
+
     if(!isfinite(grad_norm_squared_cpu)) {
         // may happen due to some issue (e.g. overflow?)
         // TODO: later may want to keep a global counter of instabilities like this
