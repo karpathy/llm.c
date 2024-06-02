@@ -778,11 +778,11 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
 // inputs floatX, outputs FP32 (for current FP32-only activation path for this WIP)
 __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
                                const floatX* inp,
-                               int B, int N, int NH, int d) {
+                               int total_parameters, int N, int NH, int d) {
     // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
     // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * NH * N * d) { return; }
+    if (idx >= total_parameters) { return; }
 
     // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
     int b = idx / (NH * N * d);
@@ -799,9 +799,9 @@ __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
 
 __global__ void permute_kernel_backward(floatX* dinp,
                                         const floatX* dq, const floatX* dk, const floatX* dv,
-                                        int B, int N, int NH, int d) {
+                                        int total_parameters, int N, int NH, int d) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * NH * N * d) { return; }
+    if (idx >= total_parameters) { return; }
 
     int b = idx / (NH * N * d);
     int rest = idx % (NH * N * d);
@@ -816,12 +816,12 @@ __global__ void permute_kernel_backward(floatX* dinp,
     dinp[inp_idx + 2 * (NH * d)] = dv[idx];
 }
 
-__global__ void unpermute_kernel(floatX* inp, floatX *out, int B, int N, int NH, int d) {
+__global__ void unpermute_kernel(floatX* inp, floatX *out, int total_parameters, int N, int NH, int d) {
    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
 
     int idx = (blockIdx.x * blockDim.x + threadIdx.x);
     // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
-    if (idx >= B * NH * N * d) { return; }
+    if (idx >= total_parameters) { return; }
 
     int b = idx / (NH * N * d);
     int rest = idx % (NH * N * d);
@@ -833,9 +833,9 @@ __global__ void unpermute_kernel(floatX* inp, floatX *out, int B, int N, int NH,
     out[other_idx] = __ldcs(&inp[idx]);
 }
 
-__global__ void unpermute_kernel_backward(floatX* dinp, const floatX *dout, int B, int N, int NH, int d) {
+__global__ void unpermute_kernel_backward(floatX* dinp, const floatX *dout, int total_parameters, int N, int NH, int d) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * NH * N * d) { return; }
+    if (idx >= total_parameters) { return; }
 
     int b = idx / (NH * N * d);
     int rest = idx % (NH * N * d);
@@ -1669,7 +1669,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     v = qkvr + 2 * B * T * C;
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
-    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, total_threads, T, NH, HS);
 
 
     floatX* preatt = inp;
@@ -1700,7 +1700,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, total_threads, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1837,8 +1837,9 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* da
     dv = dqkvr + 2 * B * T * C;
 
     // backward through the unpermute operation
+    int total_parameters = B * T * NH * HS;
     int num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel_backward<<<num_blocks, block_size>>>(scratch, dout, B, T, NH, HS);
+    unpermute_kernel_backward<<<num_blocks, block_size>>>(scratch, dout, total_parameters, T, NH, HS);
     // backward into datt
     cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha,
                                            v, CUBLAS_LOWP, HS, T * HS, scratch, CUBLAS_LOWP, HS, T * HS, &beta,
@@ -1860,8 +1861,8 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* da
                                            q, CUBLAS_LOWP, HS, T * HS, dpreatt, CUBLAS_LOWP, T, T * T, &beta,
                                            dk, CUBLAS_LOWP, HS, T * HS, B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
     // backward into inp
-    num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
-    permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
+    num_blocks = CEIL_DIV(total_parameters, block_size);
+    permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, total_parameters, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
 
