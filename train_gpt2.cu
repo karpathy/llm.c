@@ -2775,7 +2775,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
     if (multi_gpu_config->zero_stage == 1) {
         // sum the squared norm across all GPUs as they're only partial (computed per shard)
-        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu)
+        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
     }
 
     if(!isfinite(grad_norm_squared_cpu)) {
