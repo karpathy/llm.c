@@ -2554,7 +2554,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
         // we're going to be clever for the activations backward pass. we don't need to exactly
         // mirror the forward pass activations and we will save memory.
-        size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
+        size_t bw_act_sizes[NUM_BACKWARD_TENSORS];
         fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, model->config);
         // count up and allocate the space
         model->num_grad_acts = 0;
@@ -2985,6 +2985,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     cudaCheck(cudaMemcpy(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     cudaCheck(cudaMemcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+    free(cpu_buffer);
 }
 
 // ----------------------------------------------------------------------------
