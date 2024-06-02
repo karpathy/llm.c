@@ -2986,6 +2986,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     cudaCheck(cudaMemcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     free(cpu_buffer);
+    fclose(state_file);
 }
 
 // ----------------------------------------------------------------------------
