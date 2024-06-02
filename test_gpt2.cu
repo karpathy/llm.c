@@ -320,5 +320,5 @@ int main(int argc, char *argv[]) {
     free(expected_grads_memory);
     free(grads_memory_cpu);
     free(grads_memory_cpu_float);
-    return 0;
+    return allok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
