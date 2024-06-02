@@ -2830,7 +2830,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
             // - the position embeddings actively participate at every forward/backward pass
             float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
             // ok finally call the kernel
-            size_t num_blocks = CEIL_DIV(num_parameters, block_size);
+            size_t num_blocks = CEIL_DIV(local_params, block_size);
             adamw_kernel3<<<num_blocks, block_size>>>(params_ptr, master_ptr, grad_ptr,
                                                       m_ptr, v_ptr, local_params, learning_rate,
                                                       beta1, beta2, beta1_correction, beta2_correction,
