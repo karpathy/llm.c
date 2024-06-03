@@ -309,6 +309,7 @@ int main(int argc, char *argv[]) {
     printf("overall okay: %d\n", allok);
 
     // free everything
+    gpt2_free(&model);
     common_free(model);
     free(x);
     free(y);

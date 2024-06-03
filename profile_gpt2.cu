@@ -59,6 +59,7 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
 
     // free
+    gpt2_free(&model);
     common_free(model);
     return 0;
 }
