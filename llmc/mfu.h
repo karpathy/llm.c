@@ -1,10 +1,6 @@
 #ifndef MFU_H
 #define MFU_H
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
 // tied to enum PrecisionMode, in a future refactor make them the same
 #define MFUH_PRECISION_FP32 0
 #define MFUH_PRECISION_FP16 1

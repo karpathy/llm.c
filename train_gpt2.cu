@@ -2,14 +2,8 @@
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 
-#include <unistd.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <stdarg.h>
 #include <string>
-#include <string_view>
-#include <sys/stat.h>
-#include <sys/types.h>
 #ifdef MULTI_GPU
 #include <mpi.h>
 #include <nccl.h>

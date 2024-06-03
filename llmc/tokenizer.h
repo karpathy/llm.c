@@ -6,8 +6,6 @@ If we wanted to later prompt the model, we'd have to add decoding.
 Which could be tricky in C because of the regex involved, to look into later.
 */
 
-#include <stdint.h>
-#include <ctype.h>
 #include <assert.h>
 // our own utilities
 // defines fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck

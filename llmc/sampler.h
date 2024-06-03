@@ -4,8 +4,6 @@ Implements a simple Sampler, used during model inference to sample tokens.
 #ifndef SAMPLER_H
 #define SAMPLER_H
 
-#include <math.h>
-
 // Simple xorshift RNG
 unsigned int random_u32(unsigned long long *state) {
     // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A

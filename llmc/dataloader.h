@@ -6,12 +6,6 @@ Implements:
 #ifndef DATALOADER_H
 #define DATALOADER_H
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <assert.h>
-#include <string.h>
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck
 // defines: mallocCheck
 #include "utils.h"

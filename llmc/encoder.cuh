@@ -6,8 +6,6 @@ In the backward pass, the gradients flow to both, handled by different kernels
 #include <assert.h>
 #include <vector>
 #include <algorithm>
-#include <functional>
-#include <unordered_map>
 // llmc internal imports
 #include "cuda_common.h"
 #include "cuda_utils.cuh"

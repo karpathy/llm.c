@@ -83,8 +83,6 @@ Both output:
 #ifndef RAND_H
 #define RAND_H
 
-#include <math.h>
-
 #define MERSENNE_STATE_M 397u
 #define MERSENNE_STATE_N 624u
 
