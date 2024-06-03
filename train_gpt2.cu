@@ -34,7 +34,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/cuda_common.h"
 // defines:
 // Packed128, f128, x128
-// warpReduceSum, warpReduceMax, blockReduce
+// warpReduceSum, warpReduceMax, blockReduce, copy_and_cast_kernel
 #include "llmc/cuda_utils.cuh"
 // defines: CUBLAS_LOWP, cublasCheck, cublaslt_workspace_size, cublaslt_workspace
 // defines: cublas_compute, cublaslt_handle, cublas_handle
@@ -247,37 +247,6 @@ void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t t
     else{
         printf0("| Disabling Zero Optimization, Zero Stage2 and Stage3 are not yet supported  |\n");
         multi_gpu_config->zero_stage = 0;
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Kernels
-
-// device functions and the kernel to cast data between types
-template<typename Td, typename Ts>
-__device__ Td cast_value(Ts val);
-
-template<>
-__device__ float cast_value<float, float>(float val) {
-    return val;
-}
-
-template<>
-__device__ float cast_value<float, half>(half val) {
-    return __half2float(val);
-}
-
-template<>
-__device__ float cast_value<float, __nv_bfloat16>(__nv_bfloat16 val) {
-    return __bfloat162float(val);
-}
-
-template<typename Td, typename Ts>
-__global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // need to try grid stride looping for more perf later
-    if (idx < n) {
-        dst[idx] = cast_value<Td, Ts>(src[idx]);
     }
 }
 
