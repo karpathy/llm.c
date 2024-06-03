@@ -525,9 +525,8 @@ E.g., the layernorms are connected to the residuals so we += in layernorm backwa
 
 __global__ void encoder_forward_kernel3(floatX* out,
                                const int* inp, const floatX* wte, const floatX* wpe,
-                               int B, int T, int C) {
+                               int N, int T, int C) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-    int N = B * T * C;
     if (idx >= N) { return; }
 
     int bt = idx / C;
@@ -1498,7 +1497,7 @@ void encoder_forward(floatX* out,
     const int block_size = 256;
     const int N = B * T * C;
     const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
-    encoder_forward_kernel3<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
+    encoder_forward_kernel3<<<grid_size, block_size>>>(out, inp, wte, wpe, N, T, C);
     cudaCheck(cudaGetLastError());
 }
 
