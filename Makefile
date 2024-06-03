@@ -30,13 +30,6 @@ else
   $(shell mkdir -p $(BUILD_DIR))
 endif
 
-# Define path separator based on OS, yay Windows
-ifeq ($(OS),Windows_NT)
-    PATH_SEP := \\
-else
-    PATH_SEP := /
-endif
-
 # Function to check if a file exists in the PATH
 ifneq ($(OS), Windows_NT)
 define file_exists_in_path
@@ -252,7 +245,7 @@ train_gpt2: train_gpt2.c
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
-$(NVCC_CUDNN): llmc$(PATH_SEP)cudnn_att.cpp
+$(NVCC_CUDNN): llmc/cudnn_att.cpp
 	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_INCLUDES) $(CUDA_OUTPUT_FILE)
 
 train_gpt2cu: train_gpt2.cu $(NVCC_CUDNN)
