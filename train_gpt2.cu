@@ -699,6 +699,31 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __re
     }
 }
 
+__global__ void layernorm_forward_kernel_optimized(floatX* __restrict__ out, floatX* __restrict__ mean, floatX* __restrict__ rstd,
+                                    const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
+                                    const floatX* __restrict__ bias, int N, int C) {
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int num_warps = blockDim.x / WARP_SIZE;
+
+    int idx = blockIdx.x * num_warps + warp_id;
+    if(idx >= N) { return; } // guard
+
+    float m = mean[idx];
+    float s = rstd[idx];
+    const floatX* x = inp + idx * C;
+    floatX* o = out + idx * C;
+    
+    for (int c = lane_id; c < C; c += WARP_SIZE) {
+        // load and store using the .cs "streaming" hint to the compiler,
+        // indicating that this data will not be reused soon, and can be streamed through the caches
+        // this allows the threads to get more cache-hits for the (shared) weight and bias parameters        
+        float n = s * ((float)__ldcs(x+c) - m);
+        __stcs(o+c, (floatX)(n * (float)weight[c] + (float)bias[c]));
+    }
+}
+
+
 __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
                                                const floatX* inp1, const floatX* inp2,
                                                const floatX* weight, const floatX* bias,
@@ -1580,6 +1605,18 @@ void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
     layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
+
+void layernorm_forward_optimized(floatX* out, floatX* mean, floatX* rstd,
+                       floatX* inp, const floatX* weight, const floatX* bias,
+                       int B, int T, int C) {
+    NVTX_RANGE_FN();
+    const int block_size = 512;
+    const int N = B * T;
+    const int grid_size = CEIL_DIV(N * WARP_SIZE, block_size);
+    layernorm_forward_kernel_optimized<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
 
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
 void matmul_forward_cublaslt(floatX* out,
@@ -2663,7 +2700,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         gelu_backward_inplace(dl_bt4c, l_fch, B*T*4*C);
         if(model->recompute >= 2) {
             // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
-            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+            layernorm_forward_optimized(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
         }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
@@ -2682,7 +2719,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
         #endif
         if(model->recompute >= 2) {
-            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+            layernorm_forward_optimized(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
         }
         // QKV parameter gradients
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C);
