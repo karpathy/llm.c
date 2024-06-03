@@ -37,10 +37,12 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/mfu.h"
 // defines:
 // WARP_SIZE, MAX_1024_THREADS_BLOCKS, CEIL_DIV, cudaCheck, PRECISION_MODE
-// Packed128, f128, x128
-// warpReduceSum, warpReduceMax, blockReduce
 // NVTX_RANGE_FN
 #include "llmc/cuda_common.h"
+// defines:
+// Packed128, f128, x128
+// warpReduceSum, warpReduceMax, blockReduce
+#include "llmc/cuda_utils.cuh"
 // defines: CUBLAS_LOWP, cublasCheck, cublaslt_workspace_size, cublaslt_workspace
 // defines: cublas_compute, cublaslt_handle, cublas_handle
 #include "llmc/cublas_common.h"

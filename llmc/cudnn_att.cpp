@@ -3,7 +3,19 @@
 // TODO this currently duplicates some of the utilities from the main file
 
 #include "cudnn_att.h"
+#include <cudnn_frontend.h>
+
 namespace fe = cudnn_frontend;
+
+// Specific configurations based on the enabled precision
+#if defined(ENABLE_FP32)
+static_assert(false, "cuDNN is not supported in FP32 mode.")
+// use fp16 (note: this may require gradient scaler, currently not implemented!)
+#elif defined(ENABLE_FP16)
+#define CUDNN_16BIT fe::DataType_t::HALF
+#else // Default to bfloat16
+#define CUDNN_16BIT fe::DataType_t::BFLOAT16
+#endif
 
 static cudnnHandle_t cudnn_handle;
 static size_t cudnn_workspace_size = 0; // dynamically allocated as needed (up to 256MiB!)
