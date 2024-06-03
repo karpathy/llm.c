@@ -11,7 +11,7 @@ The best introduction to the llm.c repo today is reproducing the GPT-2 (124M) mo
 If you won't be training on multiple nodes, aren't interested in mixed precision, and are interested in learning CUDA, the fp32 (legacy) files might be of interest to you. These are files that were "checkpointed" early in the history of llm.c and frozen in time. They are simpler, more portable, and possibly easier to understand. Run the 1 GPU, fp32 code like this:
 
 ```bash
-./download_gpt2weights_and_tinyshakespeare_dataset.sh
+./scripts/download_gpt2weights_and_tinyshakespeare_dataset.sh
 make train_gpt2fp32cu
 ./train_gpt2fp32cu
 ```
@@ -23,7 +23,7 @@ The above lines (1) downloads a tokenized [tinyshakespeare](https://raw.githubus
 The "I am so GPU poor that I don't even have one GPU" section. You can still enjoy seeing llm.c train! But you won't go too far. Just like the fp32 version above, the CPU version is an even earlier checkpoint in the history of llm.c, back when it was just a simple reference implementation in C. For example, instead of training from scratch, you can finetune a GPT-2 small (124M) to output Shakespeare-like text, as an example:
 
 ```bash
-./download_gpt2weights_and_tinyshakespeare_dataset.sh
+./scripts/download_gpt2weights_and_tinyshakespeare_dataset.sh
 make train_gpt2
 OMP_NUM_THREADS=8 ./train_gpt2
 ```
