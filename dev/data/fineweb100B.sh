@@ -11,7 +11,7 @@ SAVE_DIR="fineweb100B"
 mkdir -p "$SAVE_DIR"
 
 # Function to download, decompress, and delete files
-download_and_decompress() {
+download() {
     local FILE_URL=$1
     local FILE_NAME=$(basename $FILE_URL | cut -d'?' -f1)
     local FILE_PATH="${SAVE_DIR}/${FILE_NAME}"
@@ -21,34 +21,40 @@ download_and_decompress() {
     echo "Downloaded $FILE_NAME to $SAVE_DIR"
 }
 
-# Function to manage parallel jobs in increments of a given size
+# Function to manage parallel jobs
 run_in_parallel() {
-    local batch_size=$1
+    local max_jobs=$1
     shift
     local commands=("$@")
+    local job_count=0
 
-    for ((i = 0; i < ${#commands[@]}; i += batch_size)); do
-        for ((j = 0; j < batch_size && (i + j) < ${#commands[@]}; j++)); do
-            eval "${commands[i + j]}" &
-        done
-        # Wait for the current batch of jobs to finish
+    for cmd in "${commands[@]}"; do
+        eval "$cmd" &
+        ((job_count++))
+        if (( job_count >= max_jobs )); then
+            wait -n
+            ((job_count--))
+        fi
     done
+
+    # Wait for any remaining jobs to finish
+    wait
 }
 
 # Export the function so it's available in subshells
-export -f download_and_decompress
+export -f download
 
-# Download, decompress, and delete the single validation file in the background
-download_and_decompress "$VAL_URL" &
+# Download
+download "$VAL_URL" &
 
 # Generate train file commands
 train_commands=()
-for i in $(seq -f "%06g" 1 1024); do
+for i in $(seq -f "%06g" 1 1028); do
     FILE_URL="${TRAIN_BASE_URL}${i}.bin?download=true"
-    train_commands+=("download_and_decompress \"$FILE_URL\"")
+    train_commands+=("download \"$FILE_URL\"")
 done
 
-# Run the train file commands in parallel in batches of 8
+# Run the train file commands in parallel
 run_in_parallel 40 "${train_commands[@]}"
 
 echo "All files downloaded, decompressed, and cleaned up in $SAVE_DIR"
