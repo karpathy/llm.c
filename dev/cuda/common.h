@@ -1,3 +1,4 @@
+#include <driver_types.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <cuda_runtime.h>
@@ -197,6 +198,15 @@ float* make_random_float_01(size_t N) {
 
 float* make_random_float(size_t N) {
     float* arr = (float*)malloc(N * sizeof(float));
+    for (size_t i = 0; i < N; i++) {
+        arr[i] = ((float)rand() / RAND_MAX) * 2.0 - 1.0; // range -1..1
+    }
+    return arr;
+}
+
+float* make_random_float_pinned(size_t N) {
+    float *arr;
+    cudaHostAlloc(&arr, N * sizeof(float), cudaHostAllocDefault);
     for (size_t i = 0; i < N; i++) {
         arr[i] = ((float)rand() / RAND_MAX) * 2.0 - 1.0; // range -1..1
     }
