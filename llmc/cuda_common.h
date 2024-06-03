@@ -4,6 +4,7 @@ Common utilities for CUDA code.
 #ifndef CUDA_COMMON_H
 #define CUDA_COMMON_H
 
+#include <math.h>
 #include <string>
 #include <cuda_runtime.h>
 #include <nvtx3/nvToolsExt.h>
