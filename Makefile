@@ -245,7 +245,7 @@ train_gpt2: train_gpt2.c
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
-$(NVCC_CUDNN): llmc/cudnn_att.cu
+$(NVCC_CUDNN): llmc/cudnn_att.cpp
 	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_INCLUDES) $(CUDA_OUTPUT_FILE)
 
 train_gpt2cu: train_gpt2.cu $(NVCC_CUDNN)
