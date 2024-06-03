@@ -217,7 +217,6 @@ typedef struct {
     size_t T; // maximum context length of the model
     // input handling and its state
     FILE* eval_file;
-    int64_t file_size;
     uint16_t* buffer; // we fread data from file into this buffer
     // public variables that could be accessed from outside
     int num_examples; // in total across all processes
@@ -286,7 +285,7 @@ void evalloader_init(EvalLoader *loader,
     freadCheck(header, sizeof(int), HEADER_SIZE, loader->eval_file);
     if (header[0] != 20240522) { printf("Bad magic in eval file\n"); exit(EXIT_FAILURE); }
     if (header[1] != 1) { printf("Bad version in data file\n"); exit(EXIT_FAILURE); }
-    loader->num_examples = header[2]; // number of tokens in the file
+    loader->num_examples = header[2]; // number of examples in the file
     assert(loader->num_examples >= num_processes); // avoid headaches for now
     size_t longest_example_bytes = header[3]; // longest example in the file
     // basic sensibility check we could relax later. but roughly each example
@@ -299,8 +298,8 @@ void evalloader_init(EvalLoader *loader,
     // allocate all the space we'll need
     int can_fit_examples = B / ASSUMED_NUM_COMPLETIONS;
     loader->buffer = (uint16_t*)malloc(longest_example_bytes);
-    loader->inputs = (int*)malloc(B * T * sizeof(int));
-    loader->targets = (int*)malloc(B * T * sizeof(int));
+    loader->inputs = (int*)calloc(B * T, sizeof(int));
+    loader->targets = (int*)calloc(B * T, sizeof(int));
     loader->mask = (char*)malloc(B * T * sizeof(char));
     loader->label = (int*)malloc(can_fit_examples * sizeof(int));
 
@@ -380,10 +379,8 @@ void evalloader_next_example_(EvalLoader *loader, int example_batch_index) {
 void evalloader_next_batch(EvalLoader *loader) {
     size_t B = loader->B;
     size_t T = loader->T;
-    // init all inputs, targets, mask to zeros
-    // TODO: I think only mask is necessary to reset?
-    memset(loader->inputs, 0, B * T * sizeof(int));
-    memset(loader->targets, 0, B * T * sizeof(int));
+    // init mask to zeros, no need to do it for inputs & targets, the values where the mask
+    // is set will be correctly overwritten every time.
     memset(loader->mask, 0, B * T * sizeof(char));
     // ok here is the problem we are solving
     // we have a batch dimension of B, which we want to take full advantage of
