@@ -1678,10 +1678,10 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 
     floatX* preatt = inp;
     cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
-                                     CUBLAS_OP_T, CUBLAS_OP_N,
+                                     CUBLAS_OP_N, CUBLAS_OP_T,
                                      T, T, HS, &alpha,
-                                     k, CUBLAS_LOWP, HS, T * HS,
-                                     q, CUBLAS_LOWP, HS, T * HS,
+                                     q, CUBLAS_LOWP, T, T * HS,
+                                     k, CUBLAS_LOWP, T, T * HS,
                                      &beta, preatt, CUBLAS_LOWP, T, T * T,
                                      B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
 
@@ -1695,10 +1695,10 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
                                      CUBLAS_OP_N, CUBLAS_OP_N,
-                                     HS, T, T, &alpha,
-                                     v, CUBLAS_LOWP, HS, T * HS,
+                                     T, HS, T, &alpha,
                                      att, CUBLAS_LOWP, T, T * T,
-                                     &beta, vaccum, CUBLAS_LOWP, HS, T * HS,
+                                     v, CUBLAS_LOWP, T, T * HS,
+                                     &beta, vaccum, CUBLAS_LOWP, T, T * HS,
                                      B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
 
     // now unpermute
