@@ -14,8 +14,6 @@ Common utilities for CUDA code.
 // ----------------------------------------------------------------------------
 // Global defines and settings
 
-cudaDeviceProp deviceProp;
-
 // WarpSize is not a compile time constant
 // Defining here like this possibly allows the compiler to optimize better
 #define WARP_SIZE 32U
@@ -35,7 +33,7 @@ cudaDeviceProp deviceProp;
 // Error checking
 
 // CUDA error checking
-void cudaCheck(cudaError_t error, const char *file, int line) {
+void inline cudaCheck(cudaError_t error, const char *file, int line) {
   if (error != cudaSuccess) {
     printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line, cudaGetErrorString(error));
     exit(EXIT_FAILURE);

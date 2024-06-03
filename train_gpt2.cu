@@ -36,7 +36,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines: get_flops_promised
 #include "llmc/mfu.h"
 // defines:
-// WARP_SIZE, MAX_1024_THREADS_BLOCKS, CEIL_DIV, cudaCheck, PRECISION_MODE, deviceProp
+// WARP_SIZE, MAX_1024_THREADS_BLOCKS, CEIL_DIV, cudaCheck, PRECISION_MODE
 // Packed128, f128, x128
 // warpReduceSum, warpReduceMax, blockReduce
 // NVTX_RANGE_FN
@@ -48,6 +48,10 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #ifdef ENABLE_CUDNN
 #include "llmc/cudnn_att.h"
 #endif
+
+// ----------------------------------------------------------------------------
+// global var containing information about the GPU this process is running on
+cudaDeviceProp deviceProp; // fills in common_start()
 
 // ----------------------------------------------------------------------------
 // Multi-GPU related
