@@ -44,6 +44,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/cublas_common.h"
 // defines: encoder_forward, encoder_backward
 #include "llmc/encoder.cuh"
+// defines: gelu_forward, gelu_backward_inplace
+#include "llmc/gelu.cuh"
 // defines: create_cudnn, destroy_cudnn, attention_forward_cudnn, attention_backward_cudnn
 #ifdef ENABLE_CUDNN
 #include "llmc/cudnn_att.h"
@@ -519,41 +521,6 @@ __global__ void residual_forward_kernel(floatX* out, const floatX* inp1, const f
         packed_out[k] = (floatX)((float)packed_inp1[k] + (float)packed_inp2[k]);
     }
     store128(out + idx, packed_out);
-}
-
-#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__global__ void gelu_forward_kernel2(floatX* out, const floatX* inp) {
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-
-    x128 packed_out;
-    x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
-    for(int k = 0; k < packed_inp.size; ++k) {
-        float xi = (float)packed_inp[k];
-        float cube = 0.044715f * xi * xi * xi;
-        packed_out[k] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
-    }
-    // store instead of storecs (without cache streaming) in case it is useful for the
-    // data to be in the cache for the next operation after this GeLU
-    store128(out + idx, packed_out);
-}
-
-__global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const floatX* inp) {
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-
-    x128 packed_dinp;
-    x128 packed_inp = load128cs(inp + idx);
-    x128 packed_dout = load128(d_in_out + idx);
-    for (int k = 0; k < packed_inp.size; ++k) {
-        float x = (float)packed_inp[k];
-        float cube = 0.044715f * x * x * x;
-        float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
-        float tanh_out = tanhf(tanh_arg);
-        float coshf_out = coshf(tanh_arg);
-        float sech_out = 1.0f / (coshf_out * coshf_out);
-        float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
-        packed_dinp[k] = (floatX)(local_grad * (float)packed_dout[k]);
-    }
-    store128(d_in_out + idx, packed_dinp);
 }
 
 template<typename OutFloat, bool UseAuxBuffer>
@@ -1250,25 +1217,6 @@ void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, flo
         residual_forward(residual, inp1, inp2, N*C);
         layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C);
     }
-    cudaCheck(cudaGetLastError());
-}
-
-
-void gelu_forward(floatX* out, const floatX* inp, int N) {
-    NVTX_RANGE_FN();
-    const int block_size = 512;
-    assert(N % block_size == 0);
-    const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_forward_kernel2<<<grid_size, block_size>>>(out, inp);
-    cudaCheck(cudaGetLastError());
-}
-
-void gelu_backward_inplace(floatX* d_in_out, const floatX* inp, const int N) {
-    NVTX_RANGE_FN();
-    const int block_size = 128;
-    assert(N % block_size == 0);
-    const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_backward_inplace_kernel<<<grid_size, block_size>>>(d_in_out, inp);
     cudaCheck(cudaGetLastError());
 }
 
