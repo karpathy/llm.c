@@ -2889,7 +2889,7 @@ int main(int argc, char *argv[]) {
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
                               : (PRECISION_MODE == PRECISION_FP16 ? "FP16" : "BF16");
     printf0("| device                | %-50s |\n", deviceProp.name);
-    printf0("| TFlops                | %-50.1f |\n", get_flops_promised(deviceProp.name, PRECISION_MODE));
+    printf0("| peak TFlops           | %-50.1f |\n", get_flops_promised(deviceProp.name, PRECISION_MODE));
     printf0("| precision             | %-50s |\n", precision_str);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
@@ -2928,7 +2928,7 @@ int main(int argc, char *argv[]) {
 
     model.use_master_weights = use_master_weights;
     model.recompute = recompute;
-    printf0("| load_filename         | %-50s |\n", load_filename);
+    printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : (load_filename[0] == 'd' ? "random" : "OpenAI's GPT-2 checkpoint"));
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
     printf0("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
