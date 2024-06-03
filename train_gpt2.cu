@@ -699,7 +699,6 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
                                                const floatX* inp1, const floatX* inp2,
                                                const floatX* weight, const floatX* bias,
                                                int N, int C) {
-    assert(blockDim.x == WARP_SIZE);
 
     // load weights and biases into shared memory
     // do this before we allow any threads to exit!
@@ -852,7 +851,6 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     // fuses the multiplication by scale inside attention
     // directly autoregressive, so we only compute the lower triangular part
     // uses the online softmax algorithm
-    assert(T % 4  == 0);
     int lane_id = threadIdx.x % WARP_SIZE;
     int warp_id = threadIdx.x / WARP_SIZE;
     int num_warps = blockDim.x / WARP_SIZE;
@@ -966,8 +964,6 @@ __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout
                                              std::bool_constant<UseAuxBuffer>) {
     constexpr const int bdx = 4;
     constexpr const int bdy = WARP_SIZE / bdx;
-    assert(blockDim.x == bdx);
-    assert(blockDim.y == bdy);
 
     int warp_d = (int)threadIdx.x;
     int warp_c = (int)threadIdx.y;
@@ -1030,7 +1026,6 @@ __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout
 
 __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, size_t m) {
     const size_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * f128::size;
-    assert(n % x128::size == 0);
     if (idx < n) {
         f128 acc;
         for(int k = 0; k < f128::size; ++k) {
@@ -1684,6 +1679,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
     int grid_size = CEIL_DIV(B * NH * T * 32, block_size);
+    assert(T % 4  == 0);
     softmax_forward_kernel5<<<grid_size, block_size>>>(att, scale, preatt, B * NH, T);
 
     // new approach: first cuBLAS another batched matmul
@@ -1718,17 +1714,19 @@ void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, flo
                              const floatX* weight, const floatX* bias,
                              int N, int C) {
     const int block_size = 256;
-    int block_y = block_size / WARP_SIZE;
+    const int block_x = WARP_SIZE;
+    const int block_y = block_size / WARP_SIZE;
     const int grid_size = CEIL_DIV(N, block_y);
     size_t smem = (2 + block_y) * C * sizeof(floatX);
 
+    assert(block_x == WARP_SIZE);
     // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
     // this may fail, in which case we fall back to the smem free implementation.
     cudaCheck(cudaGetLastError());
     auto status = cudaFuncSetAttribute(fused_residual_forward_kernel5, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaGetLastError();
     if(status == cudaSuccess) {
-        fused_residual_forward_kernel5<<<grid_size, dim3(WARP_SIZE, block_y), smem>>>(residual, normed, mean, rstd, inp1, inp2,
+        fused_residual_forward_kernel5<<<grid_size, dim3(block_x, block_y), smem>>>(residual, normed, mean, rstd, inp1, inp2,
                                                                                weight, bias, N, C);
     } else {
         residual_forward(residual, inp1, inp2, N*C);
@@ -1777,6 +1775,8 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
 
         // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
         // and write results directly to the output.
+        assert(block_dim.x == 4);
+        assert(block_dim.y == WARP_SIZE / 4);
         if(grid_size_y == 1) {
             matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
             cudaCheck(cudaGetLastError());
@@ -1784,6 +1784,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
             // kernel 9 overwrites temp buffer, so no need to memset
             matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
             cudaCheck(cudaGetLastError());
+            assert(OC % x128::size == 0);
             reduce_add_sum_kernel<<<CEIL_DIV(OC, 256 * f128::size), 256>>>(dbias, dbias_buffer, OC, grid_size_y);
             cudaCheck(cudaGetLastError());
         }
