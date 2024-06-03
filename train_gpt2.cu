@@ -2003,7 +2003,7 @@ typedef struct {
     floatX* fch_gelu; // (L, B, T, 4*C)
     floatX* fcproj; // (L, B, T, C)
     floatX* residual3; // (L, B, T, C)
-    floatX* lnf; // (B, T, C)
+    floatX* lnf; // (B, T, C);   if LN recomputation is enabled (-r 2 and above), will be used for _all_ layernorms
     floatX* lnf_mean; // (B, T)
     floatX* lnf_rstd; // (B, T)
     floatX* losses; // (B, T)
@@ -2024,7 +2024,7 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     size_t C = config.channels;
     act_sizes[0] = B * T * C; // encoded
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
-    act_sizes[1] = (recompute < 2) ? L * B * T * C : B * T * C; // ln1
+    act_sizes[1] = (recompute < 2) ? L * B * T * C : 0; // ln1
     act_sizes[2] = L * B * T; // ln1_mean
     act_sizes[3] = L * B * T; // ln1_rstd
     act_sizes[4] = L * B * T * C; // atty
@@ -2037,7 +2037,7 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     act_sizes[6] = L * B * T * C; // attproj
     act_sizes[7] = L * B * T * C; // residual2
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
-    act_sizes[8] = (recompute < 2) ? L * B * T * C : B * T * C; // ln2
+    act_sizes[8] = (recompute < 2) ? L * B * T * C : 0; // ln2
     act_sizes[9] = L * B * T; // ln2_mean
     act_sizes[10] = L * B * T; // ln2_rstd
     act_sizes[11] = L * B * T * 4*C; // fch
@@ -2090,8 +2090,13 @@ void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n) {
     cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(floatX)));
     char* acts_memory_iterator = (char*)acts_memory;
     for (size_t i = 0; i < n; i++) {
-        *(targets[i]) = (floatX*)acts_memory_iterator;
-        acts_memory_iterator += act_sizes[i] * sizeof(floatX);
+        // extra protection so we don't accidentally use an empty buffer
+        if(act_sizes[i] == 0) {
+            *(targets[i]) = NULL;
+        }else {
+            *(targets[i]) = (floatX*) acts_memory_iterator;
+            acts_memory_iterator += act_sizes[i] * sizeof(floatX);
+        }
     }
     return acts_memory;
 }
@@ -2457,12 +2462,12 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
         floatX* l_fcprojb = params.fcprojb + l * C;
 
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.ln1;
+        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_attproj = acts.attproj + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.ln2;
+        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
@@ -2494,7 +2499,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, in
 
         // OK, fusion across blocks.
         if(l+1 != L) {
-            floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.ln1;
+            floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
             floatX* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
             floatX* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
@@ -2604,6 +2609,10 @@ void gpt2_backward(GPT2 *model, int* inputs) {
     floatX* dresidual = (floatX*)grads_acts.residual3; // the main buffer holding the gradient in the backward pass
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
 
+    // from this point on, we no longer need the values stored in the last residual, so we can reuse that memory as generic
+    // scratch for backward computations
+    floatX* dl_btc = residual;
+
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
         NvtxRange layer_range("Layer", l);
@@ -2633,13 +2642,13 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
         floatX* dl_fcprojb = grads.fcprojb + l * C;
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.ln1;
+        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
         floatX* l_ln1_mean = acts.ln1_mean + l * B * T;
         floatX* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.ln2;
+        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
@@ -2648,9 +2657,6 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
 
-        // we need a B x T x C buffer; thankfully, the forward activation for lnf isn't needed anymore,
-        // so we can co-opt it here.
-        floatX* dl_btc = (floatX*)acts.lnf;
         floatX* dl_bt4c = (floatX*)grads_acts.bt4c;
 
         // start the backward pass for this layer
