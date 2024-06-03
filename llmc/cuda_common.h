@@ -14,7 +14,9 @@ Common utilities for CUDA code.
 // ----------------------------------------------------------------------------
 // Global defines and settings
 
-// Device properties, get populated by the main program
+// Device properties of the CUDA device used in this process
+// defined as extern here because the individual kernels wish to use it
+// but it is actually created and instantiated in the main program file
 extern cudaDeviceProp deviceProp;
 
 // WarpSize is not a compile time constant
