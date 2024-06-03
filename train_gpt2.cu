@@ -7,6 +7,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string>
+#include <string_view>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <vector>
 #include <algorithm>
@@ -38,6 +40,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/sampler.h"
 // defines: logger_init, logger_log_eval, logger_log_val, logger_log_train
 #include "llmc/logger.h"
+// defines: get_flops_promised
+#include "llmc/mfu.h"
 // ----------------------------------------------------------------------------
 // CUDA precision settings
 
@@ -228,10 +232,10 @@ struct alignas(16) Packed128 {
         return result;
     }
     __device__ static Packed128 zeros() {
-        return constant(0);
+        return constant(0.f);
     }
     __device__ static Packed128 ones() {
-        return constant(1);
+        return constant(1.f);
     }
 
     __device__ ElementType& operator[](int index) {
@@ -942,12 +946,12 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp) {
     store128(out + idx, packed_out);
 }
 
-__global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floatX* dout) {
+__global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const floatX* inp) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
 
     x128 packed_dinp;
     x128 packed_inp = load128cs(inp + idx);
-    x128 packed_dout = load128cs(dout + idx);
+    x128 packed_dout = load128(d_in_out + idx);
     for (int k = 0; k < packed_inp.size; ++k) {
         float x = (float)packed_inp[k];
         float cube = 0.044715f * x * x * x;
@@ -958,7 +962,7 @@ __global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floa
         float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
         packed_dinp[k] = (floatX)(local_grad * (float)packed_dout[k]);
     }
-    store128(dinp + idx, packed_dinp);
+    store128(d_in_out + idx, packed_dinp);
 }
 
 template<typename OutFloat, bool UseAuxBuffer>
@@ -1747,12 +1751,12 @@ void gelu_forward(floatX* out, const floatX* inp, int N) {
     cudaCheck(cudaGetLastError());
 }
 
-void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
+void gelu_backward_inplace(floatX* d_in_out, const floatX* inp, const int N) {
     NVTX_RANGE_FN();
     const int block_size = 128;
     assert(N % block_size == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout);
+    gelu_backward_inplace_kernel<<<grid_size, block_size>>>(d_in_out, inp);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1874,7 +1878,7 @@ void fused_classifier(Type* logits, Type* losses,
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = N;
-    fused_classifier_kernel5<<<grid_size, block_size, 512>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
+    fused_classifier_kernel5<<<grid_size, block_size>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2147,12 +2151,42 @@ typedef struct {
     floatX* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
     float* cpu_losses_fp32; // same but fp32
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
-    int use_master_weights;
-    int recompute;
+    int use_master_weights; // keep master weights copy in float for optim update? 0|1
+    int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
 } GPT2;
+
+void gpt2_init_common(GPT2 *model) {
+    // common inits outside of the model weights
+    // the weights are initialized either in:
+    // - gpt2_build_from_checkpoint() if loading from a checkpoint
+    // - gpt2_build_from_random() if starting from scratch
+    // memory lazily initialized in forward()
+    model->acts_memory = NULL;
+    model->inputs = NULL;
+    model->targets = NULL;
+    model->cpu_losses = NULL;
+    model->cpu_losses_fp32 = NULL;
+    // the B,T params are determined and set, fixed on first batch in forward()
+    model->batch_size = 0;
+    model->seq_len = 0;
+    model->mean_loss = -1.0f; // -1.0f designates no loss, set at end of forward()
+    // memory lazily initialized in backward()
+    model->grads_memory = NULL;
+    model->grads_acts_memory = NULL;
+    model->workload_indices = NULL; // on cpu, for encoder_backward
+    model->bucket_info = NULL; // on cpu, for encoder_backward
+    // memory lazily initialized in update()
+    model->m_memory = NULL;
+    model->v_memory = NULL;
+    model->master_weights = NULL;
+    // other default settings
+    model->rng_state = 13371337; // used in stochastic rounding
+    model->use_master_weights = 1; // safe default: do keep master weights in fp32
+    model->recompute = 1; // good default: recompute gelu but not layernorm
+}
 
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     // write the model to a checkpoint file
@@ -2243,25 +2277,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     free(params_memory_cpu);
     fcloseCheck(model_file);
 
-    // other inits
-    model->acts_memory = NULL;
-    model->grads_memory = NULL;
-    model->m_memory = NULL;
-    model->v_memory = NULL;
-    model->master_weights = NULL;
-    model->grads_acts_memory = NULL;
-    model->inputs = NULL;
-    model->targets = NULL;
-    model->cpu_losses = NULL;
-    model->cpu_losses_fp32 = NULL;
-    model->workload_indices = NULL;
-    model->bucket_info = NULL;
-    model->batch_size = 0;
-    model->seq_len = 0;
-    model->mean_loss = -1.0f; // -1.0f will designate no loss
-    model->rng_state = 13371337;
-    model->use_master_weights = 1; // keep master weights copy in float for optim update?
-    model->recompute = 1; // default to recompute gelu during backward
+    gpt2_init_common(model);
 }
 
 void gpt2_build_from_random(GPT2 *model, int depth) {
@@ -2350,23 +2366,7 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     free(params_memory_cpu);
 
-    // other inits and defaults
-    model->acts_memory = NULL;
-    model->grads_memory = NULL;
-    model->m_memory = NULL;
-    model->v_memory = NULL;
-    model->master_weights = NULL;
-    model->grads_acts_memory = NULL;
-    model->inputs = NULL;
-    model->targets = NULL;
-    model->cpu_losses = NULL;
-    model->cpu_losses_fp32 = NULL;
-    model->batch_size = 0;
-    model->seq_len = 0;
-    model->mean_loss = -1.0f; // -1.0f designates no loss
-    model->rng_state = 13371337;
-    model->use_master_weights = 1; // keep master weights copy in float for optim update?
-    model->recompute = 1; // default to recompute gelu during backward
+    gpt2_init_common(model);
 }
 
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, int grad_accum_steps=1) {
@@ -2554,7 +2554,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
         // we're going to be clever for the activations backward pass. we don't need to exactly
         // mirror the forward pass activations and we will save memory.
-        size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
+        size_t bw_act_sizes[NUM_BACKWARD_TENSORS];
         fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, model->config);
         // count up and allocate the space
         model->num_grad_acts = 0;
@@ -2660,7 +2660,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
             gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
         }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C);
-        gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C);
+        gelu_backward_inplace(dl_bt4c, l_fch, B*T*4*C);
         if(model->recompute >= 2) {
             // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
             layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
@@ -2763,10 +2763,24 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     // gradient clipping
     // repurposing this buffer (which isn't needed now) to write grad norm into it
     float* grad_norm_squared = (float*)model->acts.output;
-    global_norm_squared(grad_norm_squared, (floatX*)model->grads_memory, model->num_parameters);
+    if (multi_gpu_config->zero_stage == 1) {
+        // ^1 because of the ncclReduceScatter() in gpt2_multi_gpu_accumulate,
+        // grads_memory only contains the averaged gradients at the local shard
+        // so we only calculate the grad norm at the grads_memory belonging to the local shard
+        global_norm_squared(grad_norm_squared, grads_memory + shard_offset, shard_num_parameters);
+    } else {
+        // the ncclAllReduce() in gpt2_multi_gpu_accumulate has averaged the gradients across all GPUs
+        // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
+        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters);
+    }
     // transfer the gradient norm to CPU
     float grad_norm_squared_cpu = 0.0f;
     cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
+    if (multi_gpu_config->zero_stage == 1) {
+        // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
+        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
+    }
+
     if(!isfinite(grad_norm_squared_cpu)) {
         // may happen due to some issue (e.g. overflow?)
         // TODO: later may want to keep a global counter of instabilities like this
@@ -2830,7 +2844,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
             // - the position embeddings actively participate at every forward/backward pass
             float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
             // ok finally call the kernel
-            size_t num_blocks = CEIL_DIV(num_parameters, block_size);
+            size_t num_blocks = CEIL_DIV(local_params, block_size);
             adamw_kernel3<<<num_blocks, block_size>>>(params_ptr, master_ptr, grad_ptr,
                                                       m_ptr, v_ptr, local_params, learning_rate,
                                                       beta1, beta2, beta1_correction, beta2_correction,
@@ -2870,7 +2884,10 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
     size_t flops_per_step = flops_per_token * num_tokens;
     // express our flops throughput as ratio of A100 bfloat16 peak flops
     float flops_achieved = (float)flops_per_step * (1.0f / dt); // per second
-    float flops_promised = 312e12f; // A100 GPU bfloat16 peak flops is 312 TFLOPS
+    float flops_promised = get_flops_promised(deviceProp.name, PRECISION_MODE) * 1e12f;
+    if(flops_promised < 0) {
+        return -1.f;   // don't know
+    }
     float mfu = flops_achieved / flops_promised;
     return mfu;
 }
@@ -2885,8 +2902,8 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->grads_acts_memory));
     cudaCheck(cudaFree(model->inputs));
     cudaCheck(cudaFree(model->targets));
-    cudaFreeHost(model->cpu_losses);
-    cudaFreeHost(model->cpu_losses_fp32);
+    cudaCheck(cudaFreeHost(model->cpu_losses));
+    cudaCheck(cudaFreeHost(model->cpu_losses_fp32));
     free(model->workload_indices);
     free(model->bucket_info);
 }
@@ -2985,6 +3002,8 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     cudaCheck(cudaMemcpy(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     cudaCheck(cudaMemcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+    free(cpu_buffer);
+    fclose(state_file);
 }
 
 // ----------------------------------------------------------------------------
@@ -3140,6 +3159,7 @@ int main(int argc, char *argv[]) {
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
                               : (PRECISION_MODE == PRECISION_FP16 ? "FP16" : "BF16");
     printf0("| device                | %-50s |\n", deviceProp.name);
+    printf0("| TFlops                | %-50.1f |\n", get_flops_promised(deviceProp.name, PRECISION_MODE));
     printf0("| precision             | %-50s |\n", precision_str);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
@@ -3445,7 +3465,7 @@ int main(int argc, char *argv[]) {
         }
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
         float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
-        printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% A100 fp16 MFU | %.0f tok/s\n",
+        printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
                 step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
