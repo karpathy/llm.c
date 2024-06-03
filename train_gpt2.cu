@@ -1407,7 +1407,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
-    int grid_size = CEIL_DIV(B * NH * T * 32, block_size);
+    int grid_size = CEIL_DIV(B * NH * T * WARP_SIZE, block_size);
     softmax_forward_kernel5<<<grid_size, block_size>>>(att, scale, preatt, B * NH, T);
 
     // new approach: first cuBLAS another batched matmul
@@ -1683,10 +1683,8 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
 // allocate memory for the parameters and point the individual tensors to the right places
 void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof) {
     // calculate the total number of parameters and bytes across all tensors
-    size_t num_parameters = 0;
     size_t num_parameters_bytes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        num_parameters += param_elements[i];
         num_parameters_bytes += param_elements[i] * param_sizeof[i];
     }
     // malloc all parameters all at once on the device
@@ -2433,7 +2431,7 @@ float multi_gpu_cpu_float_sum(float value) {
 
 // Averages out the loss and gradients across all GPUs. No-op when multi-GPU is disabled.
 // todo - this version only works if all the parameters are the same size (floatX)
-void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
+void gpt2_multi_gpu_grad_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
     NVTX_RANGE_FN();
     if (multi_gpu_config->num_processes == 1) { return; }
@@ -2490,12 +2488,12 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     // repurposing this buffer (which isn't needed now) to write grad norm into it
     float* grad_norm_squared = (float*)model->acts.output;
     if (multi_gpu_config->zero_stage == 1) {
-        // ^1 because of the ncclReduceScatter() in gpt2_multi_gpu_accumulate,
+        // ^1 because of the ncclReduceScatter() in gpt2_multi_gpu_grad_reduce,
         // grads_memory only contains the averaged gradients at the local shard
         // so we only calculate the grad norm at the grads_memory belonging to the local shard
         global_norm_squared(grad_norm_squared, grads_memory + shard_offset, shard_num_parameters);
     } else {
-        // the ncclAllReduce() in gpt2_multi_gpu_accumulate has averaged the gradients across all GPUs
+        // the ncclAllReduce() in gpt2_multi_gpu_grad_reduce has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
         global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters);
     }
@@ -2583,7 +2581,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     return grad_norm_cpu;
 }
 
-void gpt2_multi_gpu_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
+void gpt2_multi_gpu_param_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
 {
 #ifdef MULTI_GPU
     if (multi_gpu_config->num_processes == 1) { return; } // 1 process => noop
@@ -3160,7 +3158,7 @@ int main(int argc, char *argv[]) {
         // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
         model.mean_loss = lossf;
         // update the parameters
-        gpt2_multi_gpu_accumulate(&model, &multi_gpu_config);
+        gpt2_multi_gpu_grad_reduce(&model, &multi_gpu_config);
         // learning rate schedule: warmup linearly to max LR, then cosine decay to LR * final_learning_rate_frac
         float step_learning_rate = learning_rate;
         if (step < warmup_iterations) {
@@ -3175,7 +3173,7 @@ int main(int argc, char *argv[]) {
         }
         // update the model parameters
         float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
-        gpt2_multi_gpu_gather(&model, &multi_gpu_config);
+        gpt2_multi_gpu_param_gather(&model, &multi_gpu_config);
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
         cudaCheck(cudaEventRecord(end));
