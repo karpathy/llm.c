@@ -10,10 +10,6 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <string_view>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <vector>
-#include <algorithm>
-#include <functional>
-#include <unordered_map>
 #ifdef MULTI_GPU
 #include <mpi.h>
 #include <nccl.h>
@@ -46,7 +42,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines: CUBLAS_LOWP, cublasCheck, cublaslt_workspace_size, cublaslt_workspace
 // defines: cublas_compute, cublaslt_handle, cublas_handle
 #include "llmc/cublas_common.h"
-// defines: encoder_forward_kernel3, wte_backward_kernel, wpe_backward_kernel
+// defines: encoder_forward, encoder_backward
 #include "llmc/encoder.cuh"
 // defines: create_cudnn, destroy_cudnn, attention_forward_cudnn, attention_backward_cudnn
 #ifdef ENABLE_CUDNN
@@ -1085,85 +1081,6 @@ __global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n) {
 
 // ----------------------------------------------------------------------------
 // kernel launchers
-
-void encoder_forward(floatX* out,
-                     const int* inp, const floatX* wte, const floatX* wpe,
-                     int B, int T, int C) {
-    NVTX_RANGE_FN();
-    const int block_size = 256;
-    const int N = B * T * C;
-    const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
-    encoder_forward_kernel3<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
-    cudaCheck(cudaGetLastError());
-}
-
-// Fully deterministic (see comments in wte_backward_kernel and wpe_backward_kernel for more details)
-void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu outputs & scratch
-                      int* workload_indices, int4* bucket_info,    // cpu scratch buffers
-                      const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
-                      int B, int T, int C, unsigned int seed) {
-    NVTX_RANGE_FN();
-
-    // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
-    const int block_size = 256;
-    const int N = T * C / x128::size;
-    const int grid_size = CEIL_DIV(N, block_size);
-    wpe_backward_kernel<<<grid_size, block_size, 0>>>(dwpe, dout, inp, B, T, C, seed);
-    cudaCheck(cudaGetLastError());
-
-    // check the GPU scratch buffer is large enough to hold the bucket info and workload indices
-    // todo - this is trivially true given hardcoded scratch buffer size here, is this useful?
-    int num_c_groups = CEIL_DIV(C, x128::size * WARP_SIZE);
-    assert(B*T*num_c_groups * (sizeof(int4)+sizeof(int)) <= B*T*3*C * sizeof(floatX));
-
-    // Step 1: Sort inputs into buckets
-    int total_items = 0;
-    std::unordered_map<uint64_t, std::vector<uint64_t>> buckets;
-    for (uint64_t bt = 0; bt < B * T; bt++) {
-        for (uint64_t c_group = 0; c_group < num_c_groups; c_group++) {
-            // todo - passing c_group/inputs_cpu[bt] in data to avoid a second hash lookup is a bit hacky
-            uint64_t data = bt + (c_group<<32ULL) + ((uint64_t)inputs_cpu[bt]<<42ULL);
-            buckets[c_group + num_c_groups * inputs_cpu[bt]].push_back(data);
-            total_items++;
-        }
-    }
-
-    // Step 2: Sort buckets by size in descending order
-    // this is so the largest buckets are processed first by the GPU
-    // otherwise, if they started late, they would still be running with the rest of the GPU idle
-    std::vector<std::pair<uint64_t, std::vector<uint64_t>>> sortedBuckets(buckets.begin(), buckets.end());
-    std::sort(sortedBuckets.begin(), sortedBuckets.end(), // ugly because we don't have a typedef for the std::pair
-              [](const std::pair<uint64_t, std::vector<uint64_t>>& a, const std::pair<uint64_t, std::vector<uint64_t>>& b) {
-                  return a.second.size() > b.second.size();
-              });
-
-    int num_buckets = buckets.size();
-    int bucket_index = 0;
-    int workload_index = 0;
-    for (const auto& bucket : sortedBuckets) {
-        bucket_info[bucket_index].x = workload_index; // bucket start
-        bucket_info[bucket_index].y = bucket.second.size(); // bucket size
-        bucket_info[bucket_index].z = (bucket.second[0] >> 42ULL) & ((1ULL<<20ULL)-1); // bucket ix
-        bucket_info[bucket_index].w = (bucket.second[0] >> 32ULL) & ((1ULL<<10ULL)-1); // bucket c
-
-        for (uint64_t idx : bucket.second) {
-            workload_indices[workload_index++] = (int)(idx & ((1ULL<<31ULL)-1ULL));
-        }
-        bucket_index++;
-    }
-
-    // Step 3: Copy data from host to device (async until the last one to avoid synchronising CPU/GPU twice)
-    // todo - could use CUDA events (even without streams) to avoid CPU/GPU synchronisation completely
-    int4* d_bucket_info = (int4*)scratch;
-    int*  d_workload_indices = (int*)(scratch + B*T*num_c_groups * sizeof(int4));
-    cudaCheck(cudaMemcpyAsync(d_bucket_info, bucket_info, num_buckets * sizeof(int4), cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(d_workload_indices, workload_indices, total_items * sizeof(int), cudaMemcpyHostToDevice));
-
-    // Launch wte kernel
-    // todo - profile block sizes on more content (depends on number of buckets and on GPU?)
-    wte_backward_kernel<256><<<num_buckets, 256>>>(dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C);
-    cudaCheck(cudaGetLastError());
-}
 
 void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
                        floatX* inp, const floatX* weight, const floatX* bias,
