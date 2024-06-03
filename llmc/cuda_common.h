@@ -4,10 +4,11 @@ Common utilities for CUDA code.
 #ifndef CUDA_COMMON_H
 #define CUDA_COMMON_H
 
-// GPU / CUDA related
+#include <string>
 #include <cuda_runtime.h>
 #include <nvtx3/nvToolsExt.h>
 #include <cuda_profiler_api.h>
+#include <cuda_bf16.h>
 
 // ----------------------------------------------------------------------------
 // Global defines and settings
@@ -159,14 +160,14 @@ typedef Packed128<floatX> x128;
 // Warp/Block communication primitives
 
 // warp-level reduction for summing values
-__device__ float warpReduceSum(float val) {
+__device__ inline float warpReduceSum(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
         val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
     }
     return val;
 }
 // warp-level reduction for finding the maximum value
-__device__ float warpReduceMax(float val) {
+__device__ inline float warpReduceMax(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
         val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
     }
@@ -178,7 +179,7 @@ __device__ float warpReduceMax(float val) {
 // but if called inside a loop, the shared memory will be implicitly reused, so set final_sync to 1
 using reduction_func_t = float (*) (float);
 template<reduction_func_t warp_reduction>
-__device__ float blockReduce(float val, bool final_sync=false, float out_of_bounds=0.0f) {
+__device__ inline float blockReduce(float val, bool final_sync=false, float out_of_bounds=0.0f) {
     // two reductions of up to 1024 threads:
     // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
     __shared__ float shared_val[WARP_SIZE];

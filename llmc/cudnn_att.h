@@ -5,6 +5,19 @@ cuDNN (flash) attention
 #define CUDNN_ATT_H
 
 #include "cuda_common.h"
+#include <cudnn_frontend.h>
+
+// Specific configurations based on the enabled precision
+#if defined(ENABLE_FP32)
+static_assert(false, "cuDNN is not supported in FP32 mode.")
+// use fp16 (note: this may require gradient scaler, currently not implemented!)
+#elif defined(ENABLE_FP16)
+typedef half floatX;
+#define CUDNN_16BIT fe::DataType_t::HALF
+#else // Default to bfloat16
+typedef __nv_bfloat16 floatX;
+#define CUDNN_16BIT fe::DataType_t::BFLOAT16
+#endif
 
 // forward declarations of functions defined in cudnn_att.cpp
 void create_cudnn();
