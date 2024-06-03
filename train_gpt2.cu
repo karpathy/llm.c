@@ -7,6 +7,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string>
+#include <string_view>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <vector>
 #include <algorithm>
@@ -38,6 +40,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/sampler.h"
 // defines: logger_init, logger_log_eval, logger_log_val, logger_log_train
 #include "llmc/logger.h"
+// defines: get_flops_promised
+#include "llmc/mfu.h"
 // ----------------------------------------------------------------------------
 // CUDA precision settings
 
@@ -2884,7 +2888,10 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
     size_t flops_per_step = flops_per_token * num_tokens;
     // express our flops throughput as ratio of A100 bfloat16 peak flops
     float flops_achieved = (float)flops_per_step * (1.0f / dt); // per second
-    float flops_promised = 312e12f; // A100 GPU bfloat16 peak flops is 312 TFLOPS
+    float flops_promised = get_flops_promised(deviceProp.name, PRECISION_MODE) * 1e12f;
+    if(flops_promised < 0) {
+        return -1.f;   // don't know
+    }
     float mfu = flops_achieved / flops_promised;
     return mfu;
 }
@@ -3156,6 +3163,7 @@ int main(int argc, char *argv[]) {
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
                               : (PRECISION_MODE == PRECISION_FP16 ? "FP16" : "BF16");
     printf0("| device                | %-50s |\n", deviceProp.name);
+    printf0("| TFlops                | %-50.1f |\n", get_flops_promised(deviceProp.name, PRECISION_MODE));
     printf0("| precision             | %-50s |\n", precision_str);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
@@ -3461,7 +3469,7 @@ int main(int argc, char *argv[]) {
         }
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
         float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
-        printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% A100 fp16 MFU | %.0f tok/s\n",
+        printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
                 step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
