@@ -217,7 +217,6 @@ typedef struct {
     size_t T; // maximum context length of the model
     // input handling and its state
     FILE* eval_file;
-    int64_t file_size;
     uint16_t* buffer; // we fread data from file into this buffer
     // public variables that could be accessed from outside
     int num_examples; // in total across all processes
@@ -286,7 +285,7 @@ void evalloader_init(EvalLoader *loader,
     freadCheck(header, sizeof(int), HEADER_SIZE, loader->eval_file);
     if (header[0] != 20240522) { printf("Bad magic in eval file\n"); exit(EXIT_FAILURE); }
     if (header[1] != 1) { printf("Bad version in data file\n"); exit(EXIT_FAILURE); }
-    loader->num_examples = header[2]; // number of tokens in the file
+    loader->num_examples = header[2]; // number of examples in the file
     assert(loader->num_examples >= num_processes); // avoid headaches for now
     size_t longest_example_bytes = header[3]; // longest example in the file
     // basic sensibility check we could relax later. but roughly each example
