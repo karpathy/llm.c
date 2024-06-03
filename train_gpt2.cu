@@ -3199,7 +3199,6 @@ int main(int argc, char *argv[]) {
     model.use_master_weights = use_master_weights;
     model.recompute = recompute;
     printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : (load_filename[0] == 'd' ? "random" : "OpenAI's GPT-2 checkpoint"));
-    printf0("| load_filename         | %-50s |\n", load_filename);
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
     printf0("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
