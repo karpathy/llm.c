@@ -699,6 +699,7 @@ if __name__ == "__main__":
         train_loader.reset()
         # clear the grads here explicitly because otherwise we'd have a duplicate grad accumulation
         # since in the training loop we do a backward() and then zero_grad() at the end of the loop
+        # this would cause an incorrect first training step
         model.zero_grad()
 
     # -------------------------------------------------------------------------
