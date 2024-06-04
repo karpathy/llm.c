@@ -169,7 +169,7 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
     const int block_size = 256;
     const int N = T * C / x128::size;
     const int grid_size = CEIL_DIV(N, block_size);
-    wpe_backward_kernel<<<grid_size, block_size, 0>>>(dwpe, dout, inp, B, T, C, seed);
+    wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
     cudaCheck(cudaGetLastError());
 
     // check the GPU scratch buffer is large enough to hold the bucket info and workload indices
