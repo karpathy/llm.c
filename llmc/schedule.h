@@ -3,8 +3,13 @@ Defines the schedule for the hyperparameters.
 Only supports Cosine and WSD for now.
 Planning on adding batch size schedule later.
 
-Guide on best practice when using WSD :
-- 
+lr_schedule_type = 0 if cosine schedule, and 1 if WSD schedule.
+
+Guide on best practices when using WSD:
+- The maximum learning rate should be around half the optimal one for cosine.
+- The final_learning_rate_frac should be 0.0.
+- For the number of decay_iterations, 20% of max_iterations seems like a good value. However, you can achieve good results (almost matching cosine) with 10% of max_iterations.
+For more information, see this paper: https://arxiv.org/abs/2405.18392
 */
 
 #include <stdint.h>
@@ -20,7 +25,7 @@ typedef struct {
     int lr_schedule_type; //cos (0) or wsd (1).
     int max_iterations;
     int warmup_iterations;
-    int decay_iterations; //-1 if cos.
+    int decay_iterations; // -1 if cos.
 } LRSchedule;
 
 
