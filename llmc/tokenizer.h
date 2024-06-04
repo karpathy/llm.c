@@ -90,7 +90,7 @@ const char *tokenizer_decode(Tokenizer *tokenizer, uint32_t token_id) {
     if (token_id < tokenizer->vocab_size) {
         return tokenizer->token_table[token_id];
     } else {
-        printf("invalid token id %d!\n", token_id);
+        printf("invalid token id %u!\n", token_id);
         return NULL;
     }
 }

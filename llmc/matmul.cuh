@@ -2,6 +2,7 @@
 Matrix Multiplication, with help from cuBLASLt
 */
 #include <assert.h>
+#include <type_traits>      // std::bool_constant
 // llmc internal imports
 #include "cuda_common.h"
 #include "cuda_utils.cuh"
