@@ -40,11 +40,14 @@ GPU_CONFIG = GPU_NAME_TO_MODAL_CLASS_MAP[GPU_NAME](count=N_GPUS, size=str(GPU_ME
 
 APP_NAME = "llm.c benchmark run"
 
+AXOLOTL_REGISTRY_SHA = (
+    "d5b941ba2293534c01c23202c8fc459fd2a169871fa5e6c45cb00f363d474b6a"
+)
 axolotl_image = (
-    # Custom image built with cuda tools and nsight system along with axolotl
-    Image.from_registry("totallyvyom/cuda-env:latest")
+    Image.from_registry("winglian/axolotl:main-20240604-py3.10-cu118-2.1.2")
     .run_commands(
-        "cd /root/axolotl && git checkout v0.4.0"
+        "git clone https://github.com/OpenAccess-AI-Collective/axolotl /root/axolotl",
+        "cd /root/axolotl && git checkout v0.4.0",
     )
     .pip_install("huggingface_hub==0.20.3", "hf-transfer==0.1.5")
     .env(
@@ -55,6 +58,11 @@ axolotl_image = (
         )
     )
     .run_commands(
+        "wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-nsight-systems-12-5_12.5.0-1_amd64.deb",
+        "apt-get update",
+        # "dpkg -i cuda-nsight-12-5_12.5.39-1_amd64.deb",
+        "apt-get install -y cuda-nsight-systems-12-5",
+        "apt-get install -f -y",
         "wget -q https://github.com/Kitware/CMake/releases/download/v3.28.1/cmake-3.28.1-Linux-x86_64.sh",
         "bash cmake-3.28.1-Linux-x86_64.sh --skip-license --prefix=/usr/local",
         "rm cmake-3.28.1-Linux-x86_64.sh",
@@ -63,10 +71,13 @@ axolotl_image = (
     .run_commands(
         "apt-get update",
         "apt-get install -y --allow-change-held-packages libcudnn8 libcudnn8-dev",
-        "apt-get install -y openmpi-bin openmpi-doc libopenmpi-dev kmod sudo",
         "git clone https://github.com/NVIDIA/cudnn-frontend.git /root/cudnn-frontend",
         "cd /root/cudnn-frontend && mkdir build && cd build && cmake .. && make"
     )
+    .run_commands(
+        "apt-get install -y cuda-toolkit-12-5",
+    )
+
 )
 
 stub = modal.App(APP_NAME)
@@ -100,7 +111,8 @@ def run_benchmark(compile_command: str, run_command: str):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
     execute_command("mkdir report1_" + timestamp)
-    execute_command("mv /root/report1.qdrep /root/report1_" + timestamp + "/")
+    execute_command("mv /root/report1.nsys-rep /root/report1_" + timestamp + "/")
+    execute_command("mv /root/report1.sqlite /root/report1_" + timestamp + "/")
     execute_command("mv /root/report1_" + timestamp + "/" + " /cuda-env/")
 
     return None
