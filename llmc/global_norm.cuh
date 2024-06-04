@@ -34,7 +34,7 @@ __global__ void global_norm_squared_kernel(float* out, const T* data, size_t cou
 // kernel launcher
 
 template<typename T>
-void global_norm_squared(float* out, const T* values, size_t count) {
+void global_norm_squared(float* out, const T* values, size_t count, cudaStream_t stream) {
     const int block_size = 512;
     // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
     // having one block less than possible is a tiny performance hit, having
@@ -45,7 +45,7 @@ void global_norm_squared(float* out, const T* values, size_t count) {
     assert(grid_size > 0);      // gives a better error than letting the call below fail
     // initialize out with zero
     cudaCheck(cudaMemset(out, 0, sizeof(float)));
-    global_norm_squared_kernel<<<grid_size, block_size>>>(out, values, count);
+    global_norm_squared_kernel<<<grid_size, block_size, 0, stream>>>(out, values, count);
     cudaCheck(cudaGetLastError());
 }
 
