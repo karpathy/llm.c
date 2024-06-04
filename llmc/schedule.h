@@ -11,9 +11,6 @@ Guide on best practice when using WSD :
 #include <ctype.h>
 #include <assert.h>
 #include <math.h>
-// our own utilities
-// defines fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
-#include "utils.h"
 
 typedef struct {
     float learning_rate;
