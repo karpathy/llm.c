@@ -4,6 +4,9 @@ cuBLAS related utils
 #ifndef CUBLAS_COMMON_H
 #define CUBLAS_COMMON_H
 
+#include <stddef.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
 
