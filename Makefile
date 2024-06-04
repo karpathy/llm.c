@@ -26,8 +26,10 @@ USE_CUDNN ?= 0
 BUILD_DIR = build
 ifeq ($(OS), Windows_NT)
   $(shell if not exist $(BUILD_DIR) mkdir $(BUILD_DIR))
+  REMOVE_BUILD_OBJECT_FILES := del $(BUILD_DIR)\*.obj
 else
   $(shell mkdir -p $(BUILD_DIR))
+  REMOVE_BUILD_OBJECT_FILES := rm -f $(BUILD_DIR)/*.o
 endif
 
 # Function to check if a file exists in the PATH
@@ -81,7 +83,7 @@ else
     NVCC :=
   endif
   CC := cl
-  CFLAGS = /Idev /Zi /nologo /Wall /WX- /diagnostics:column /sdl /O2 /Oi /Ot /GL /D _DEBUG /D _CONSOLE /D _UNICODE /D UNICODE /Gm- /EHsc /MD /GS /Gy /fp:fast /Zc:wchar_t /Zc:forScope /Zc:inline /permissive- \
+  CFLAGS = /Idev /Zi /nologo /W4 /WX- /diagnostics:column /sdl /O2 /Oi /Ot /GL /D _DEBUG /D _CONSOLE /D _UNICODE /D UNICODE /Gm- /EHsc /MD /GS /Gy /fp:fast /Zc:wchar_t /Zc:forScope /Zc:inline /permissive- \
    /external:W3 /Gd /TP /wd4996 /Fd$@.pdb /FC /openmp:llvm
   LDFLAGS :=
   LDLIBS :=
@@ -246,7 +248,7 @@ test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
 $(NVCC_CUDNN): llmc/cudnn_att.cpp
-	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_INCLUDES) $(CUDA_OUTPUT_FILE)
+	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_INCLUDES) -o $@
 
 train_gpt2cu: train_gpt2.cu $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
@@ -264,4 +266,5 @@ profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE)
 
 clean:
-	$(REMOVE_FILES) $(TARGETS) $(NVCC_CUDNN)
+	$(REMOVE_FILES) $(TARGETS) 
+	$(REMOVE_BUILD_OBJECT_FILES)

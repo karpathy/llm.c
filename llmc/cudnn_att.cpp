@@ -2,6 +2,7 @@
 // we change some unrelated piece of the code.
 // TODO this currently duplicates some of the utilities from the main file
 
+#define NOMINMAX
 #include "cudnn_att.h"
 #include <cudnn_frontend.h>
 
