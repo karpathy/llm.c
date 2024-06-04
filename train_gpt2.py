@@ -549,7 +549,7 @@ if __name__ == "__main__":
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
-    parser.add_argument("--total_batch_size", type=int, default=256 * 2, help="total desired batch size, in units of #tokens")
+    parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
     # workload (number of steps)
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
