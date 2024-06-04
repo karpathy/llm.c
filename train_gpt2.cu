@@ -881,7 +881,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
         const float dloss = 1.0f / (B * T * grad_accum_steps); // results in the uniform average loss over all elements
         fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, main_stream);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
-        cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaMemcpyAsync(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost, model->main_stream));
+        cudaCheck(cudaDeviceSynchronize());     // wait for the loss to be available
         float mean_loss = 0.0f;
         for (int i = 0; i < B*T; i++) {
             float loss = (float)(model->cpu_losses[i]);
@@ -1149,7 +1150,8 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     }
     // transfer the gradient norm to CPU
     float grad_norm_squared_cpu = 0.0f;
-    cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpyAsync(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost, model->main_stream));
+    cudaCheck(cudaDeviceSynchronize());     // wait for the norm to be available
     if (multi_gpu_config->zero_stage == 1) {
         // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
         grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
@@ -1734,7 +1736,8 @@ int main(int argc, char *argv[]) {
                 // get the V-dimensional vector probs[0, t-1, :]
                 floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
                 // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
-                cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost));
+                cudaCheck(cudaMemcpyAsync(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost, model.main_stream));
+                cudaCheck(cudaDeviceSynchronize());     // wait for the logits to become available
                 // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
                 for (int i = 0; i < model.config.vocab_size; i++) {
                     cpu_logits[i] = (float)cpu_logits_raw[i];

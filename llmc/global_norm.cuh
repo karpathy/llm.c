@@ -44,7 +44,7 @@ void global_norm_squared(float* out, const T* values, size_t count, cudaStream_t
     const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
     assert(grid_size > 0);      // gives a better error than letting the call below fail
     // initialize out with zero
-    cudaCheck(cudaMemset(out, 0, sizeof(float)));
+    cudaCheck(cudaMemsetAsync(out, 0, sizeof(float), stream));
     global_norm_squared_kernel<<<grid_size, block_size, 0, stream>>>(out, values, count);
     cudaCheck(cudaGetLastError());
 }
