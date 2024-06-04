@@ -748,16 +748,9 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
     const size_t NH = model->config.num_heads;
     const size_t C = model->config.channels;
 
-    // validate inputs, all indices must be in the range [0, V)
-    for(int i = 0; i < B * T; i++) {
-        assert(0 <= inputs[i] && inputs[i] < V);
-        if (targets != NULL) {
-            assert(0 <= targets[i] && targets[i] < V);
-        }
-    }
-
     // allocate space for all the activations if needed (done here, lazily)
     if(model->acts_memory == NULL) {
+        NvtxRange rng("InitActs");
         // record the current B,T as well
         model->batch_size = B;
         model->seq_len = T;
@@ -791,6 +784,15 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
     }
 
     cudaStream_t main_stream = model->main_stream;
+
+    // validate inputs, all indices must be in the range [0, V)
+    // we can do this while the copies are already underway
+    for(int i = 0; i < B * T; i++) {
+        assert(0 <= inputs[i] && inputs[i] < V);
+        if (targets != NULL) {
+            assert(0 <= targets[i] && targets[i] < V);
+        }
+    }
 
     // forward pass
     ParameterTensors params = model->params; // for brevity
@@ -912,6 +914,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
+        NvtxRange rng("InitGrads");
         // allocate buffers for weight gradients
         printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
@@ -1114,6 +1117,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
 
     // lazily allocate m,v memory and master weights (usually on the first iteration)
     if (model->m_memory == NULL) {
+        NvtxRange rng("InitOpt");
         printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
         printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
         cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
