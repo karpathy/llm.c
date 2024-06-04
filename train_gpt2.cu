@@ -10,6 +10,9 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <string_view>
 #include <sys/stat.h>
 #include <sys/types.h>
+// ----------- Training utilities -----------
+// defines: lr_schedule
+#include "llmc/schedule.h"
 // ----------- CPU utilities -----------
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 // defines: create_dir_if_not_exists, find_max_step
@@ -1427,7 +1430,7 @@ int main(int argc, char *argv[]) {
     int total_batch_size = -1; // will be calculated down below later, if not provided
     float learning_rate = 3e-4f;
     int warmup_iterations = 0;
-    int lr_schedule = 0; // 0 for cosine schedule, 1 for wsd.
+    int lr_schedule_type = 0; // 0 for cosine schedule, 1 for wsd.
     int decay_iterations = -1; // number of decay steps to do with the WSD schedule, usally around 20% to get good result
     float final_learning_rate_frac = 1.0f; // final fraction of learning rate, at end of training
     float weight_decay = 0.0f;
@@ -1456,12 +1459,12 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
         else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'k') { decay_iterations = atoi(argv[i + 1]); } // to sepcify only if lr_schedule=wsd
+        else if (argv[i][1] == 'k') { decay_iterations = atoi(argv[i + 1]); } // to sepcify only if schedule_type=wsd
         else if (argv[i][1] == 'l') { learning_rate = atof(argv[i+1]); }
         else if (argv[i][1] == 'u') { warmup_iterations = atoi(argv[i+1]); }
         else if (argv[i][1] == 'q') { final_learning_rate_frac = atof(argv[i+1]); }
         else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
-        else if (argv[i][1] == 'p') { lr_schedule = atoi(argv[i + 1]); } // cosine 0 or wsd 1
+        else if (argv[i][1] == 'p') { lr_schedule_type = atoi(argv[i + 1]); } // cosine 0 or wsd 1
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
@@ -1495,7 +1498,7 @@ int main(int argc, char *argv[]) {
     // if we're only overfitting a single batch for debugging, let's overfit the first batch
     // from val instead of train split, because val is smaller and faster. (train_gpt2.py does the same)
     if (overfit_single_batch == 1) { train_data_pattern = val_data_pattern; }
-    assert((lr_schedule==0 | lr_schedule==1) && "lr_schedule have to be 0 (cosine) or 1 (wsd)");
+    assert((lr_schedule_type==0 | lr_schedule_type==1) && "lr_schedule_type have to be 0 (cosine) or 1 (wsd)");
     printf0("+-----------------------+----------------------------------------------------+\n");
     printf0("| Parameter             | Value                                              |\n");
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -1508,10 +1511,10 @@ int main(int argc, char *argv[]) {
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
     printf0("| learning rate (LR)    | %-50e |\n", learning_rate);
-    if (lr_schedule == 1) {
+    if (lr_schedule_type == 1) {
         printf0("| LR schedule           | %-50s |\n", "wsd");
         printf0("| decay iterations      | %-50d |\n", decay_iterations);
-    } else if (lr_schedule == 0) {
+    } else if (lr_schedule_type == 0) {
         printf0("| LR schedule           | %-50s |\n", "cosine");
     }
     printf0("| warmup iterations     | %-50d |\n", warmup_iterations);
@@ -1643,6 +1646,10 @@ int main(int argc, char *argv[]) {
     // set up the Tokenizer
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+
+    // set up learning rate schedule
+    LRSchedule lr_schedule;
+    lr_schedule_init(&lr_schedule, learning_rate, lr_schedule_type, train_num_batches, warmup_iterations, final_learning_rate_frac, decay_iterations);
 
     // some memory for generating samples from the model
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
@@ -1802,40 +1809,10 @@ int main(int argc, char *argv[]) {
         model.mean_loss = lossf;
         // update the parameters
         gpt2_multi_gpu_grad_reduce(&model, &multi_gpu_config);
-        // learning rate schedule: warmup linearly to max LR, then cosine decay to LR * final_learning_rate_frac
-        float step_learning_rate = learning_rate;
+        // learning rate schedule step:
+        lr_step(&lr_schedule, step);
 
-        if (lr_schedule == 0) {
-            // cosine learning rate schedule: warmup linearly to max LR, then cosine decay to LR * final_learning_rate_frac
-            if (step < warmup_iterations) {
-                step_learning_rate = learning_rate * ((float)(step + 1)) / warmup_iterations;
-            } else {
-                float decay_ratio = ((float)(step - warmup_iterations)) / (train_num_batches - warmup_iterations);
-                assert(0.0f <= decay_ratio && decay_ratio <= 1.0f);
-                float coeff = 0.5f * (1.0f + cosf(M_PI * decay_ratio)); // coeff starts at 1 and goes to 0
-                assert(0.0f <= coeff && coeff <= 1.0f);
-                float min_lr = learning_rate * final_learning_rate_frac;
-                step_learning_rate = min_lr + coeff * (learning_rate - min_lr);
-            }
-        } else if (lr_schedule == 1) {
-            assert(decay_iterations != -1 && "decay_iterations must be defined.");
-            // wsd learning rate schedule: warmup linearly, then constant learning rate, then "1-sqrt" shape decay to LR * final_learning_rate_frac (should be 0 for optimal perf)
-            if (step < warmup_iterations) {
-                // warmup phase: linearly increase learning rate
-                step_learning_rate = learning_rate * ((float)(step + 1)) / warmup_iterations;
-            } else if (step < train_num_batches - decay_iterations) {
-                // constant learning rate phase
-                step_learning_rate = learning_rate;
-            } else {
-                // decay phase: 1 - square root decay
-                float decay_ratio = ((float)(step - train_num_batches + decay_iterations)) / decay_iterations;
-                assert(0.0f <= decay_ratio && decay_ratio <= 1.0f);
-                float min_lr = learning_rate * final_learning_rate_frac;
-                step_learning_rate = min_lr + (1.0f - sqrtf(decay_ratio)) * (learning_rate - min_lr);
-            }
-        }
-
-        float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
+        float grad_norm = gpt2_update(&model, lr_schedule.learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
         gpt2_multi_gpu_param_gather(&model, &multi_gpu_config);
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
@@ -1859,7 +1836,7 @@ int main(int argc, char *argv[]) {
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
         float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
         printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
-                step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
+                step + 1, train_num_batches, accumulated_loss, grad_norm, lr_schedule.learning_rate,
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
 
