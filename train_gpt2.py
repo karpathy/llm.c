@@ -346,12 +346,16 @@ class DistributedDataLoader:
         print0(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
 
         # kick things off
+        self.current_shard = None
         self.reset()
 
     def reset(self):
-        self.current_shard = 0
+        # we're being a bit clever here: if we already had shard 0 loaded,
+        # then don't do the work to reload it, just reset the pointer
+        if self.current_shard != 0:
+            self.current_shard = 0
+            self.tokens = _load_data_shard(self.files[self.current_shard])
         self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
 
     def advance(self): # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
@@ -672,14 +676,14 @@ if __name__ == "__main__":
     val_loader = None
     if args.input_val_bin:
         val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
 
     # -------------------------------------------------------------------------
-    # STAGE 1: weights / state logging for C to load later
+    # PyTorch -> C bridge: save some weights and state for C to load later as reference
 
     # do one forward pass to generate ground truth for our C tests
     if master_process and args.write_tensors and (not args.inference_only):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
         logits, loss = model(x, y)
         loss.backward()
         # save model params, in both float32 and bfloat16
@@ -691,9 +695,11 @@ if __name__ == "__main__":
         # save x, y, logits, loss, and parameter gradients, for debugging C
         # always store these in fp32 to have an accurate reference (?)
         write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
+        # reset the train_loader for the optimization below
+        train_loader.reset()
 
     # -------------------------------------------------------------------------
-    # STAGE 2: training loop
+    # main training loop
 
     # here we wrap model into DDP container
     if ddp:
@@ -789,6 +795,11 @@ if __name__ == "__main__":
         # micro-batch loop where we do gradient accumulation to reach desired total batch size
         lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
         for micro_step in range(grad_accum_steps):
+            # fetch a batch
+            if not args.overfit_single_batch \
+                or (args.overfit_single_batch and step == 0 and micro_step == 0):
+                x, y = train_loader.next_batch()
+                x, y = x.to(device), y.to(device)
             # forward pass
             with ctx:
                 _, loss = model(x, y, return_logits=False)
@@ -798,10 +809,6 @@ if __name__ == "__main__":
                 # instead of a SUM we want MEAN, so we scale the loss here
                 loss = loss / grad_accum_steps
                 lossf += loss.item() # keep track of the mean loss
-            # advance the dataset for the next batch
-            if not args.overfit_single_batch:
-                x, y = train_loader.next_batch()
-                x, y = x.to(device), y.to(device)
             # backward pass
             if ddp:
                 # we want only the last micro-step to sync grads in a DDP model

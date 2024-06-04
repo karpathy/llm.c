@@ -7,7 +7,7 @@ See the top of each file for how to compile and run the kernel. Alternatively, t
 For example, we can look at the top of `layernorm_forward.cu` to build the forward pass kernels for the LayerNorm:
 
 ```bash
-nvcc -O3 --use_fast_math layernorm_forward.cu -o layernorm_forward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt layernorm_forward.cu -o layernorm_forward
 ```
 
 or simply
