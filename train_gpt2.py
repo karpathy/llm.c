@@ -697,6 +697,10 @@ if __name__ == "__main__":
         write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
         # reset the train_loader for the optimization below
         train_loader.reset()
+        # clear the grads here explicitly because otherwise we'd have a duplicate grad accumulation
+        # since in the training loop we do a backward() and then zero_grad() at the end of the loop
+        # this would cause an incorrect first training step
+        model.zero_grad()
 
     # -------------------------------------------------------------------------
     # main training loop

@@ -6,6 +6,7 @@ The Logger object is stateless and uses append mode to write to log files.
 #define LOGGER_H
 
 #include <assert.h>
+#include <stdio.h>
 #include <string.h>
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 #include "utils.h"
