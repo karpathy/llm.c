@@ -813,9 +813,7 @@ if __name__ == "__main__":
                 # addition of gradients corresponds to a SUM in the objective, but
                 # instead of a SUM we want MEAN, so we scale the loss here
                 loss = loss / grad_accum_steps
-                dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-                loss /= dist.get_world_size()
-                lossf += loss.item() # keep track of the mean loss
+                lossf += loss.detach() # keep track of the mean loss
             # backward pass
             if ddp:
                 # we want only the last micro-step to sync grads in a DDP model
@@ -824,6 +822,9 @@ if __name__ == "__main__":
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             if not args.inference_only:
                 loss.backward()
+        if ddp:
+            dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
+        lossf = lossf.item()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
