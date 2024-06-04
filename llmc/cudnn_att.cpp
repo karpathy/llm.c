@@ -2,50 +2,21 @@
 // we change some unrelated piece of the code.
 // TODO this currently duplicates some of the utilities from the main file
 
+#define NOMINMAX
+#include "cudnn_att.h"
 #include <cudnn_frontend.h>
-#include <cuda_bf16.h>
-#include <nvtx3/nvToolsExt.h>
+
 namespace fe = cudnn_frontend;
 
 // Specific configurations based on the enabled precision
 #if defined(ENABLE_FP32)
-typedef float floatX;
 static_assert(false, "cuDNN is not supported in FP32 mode.")
-
 // use fp16 (note: this may require gradient scaler, currently not implemented!)
 #elif defined(ENABLE_FP16)
-typedef half floatX;
-#define CUBLAS_LOWP CUDA_R_16F
 #define CUDNN_16BIT fe::DataType_t::HALF
-
 #else // Default to bfloat16
-typedef __nv_bfloat16 floatX;
 #define CUDNN_16BIT fe::DataType_t::BFLOAT16
 #endif
-
-// CUDA error checking
-static void cudaCheck(cudaError_t error, const char *file, int line) {
-    if (error != cudaSuccess) {
-        printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
-               cudaGetErrorString(error));
-        exit(EXIT_FAILURE);
-    }
-};
-#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
-
-// Profiler utils
-namespace {
-    class NvtxRange {
-    public:
-        NvtxRange(const char* s) { nvtxRangePush(s); }
-        NvtxRange(const std::string& base_str, int number) {
-            std::string range_string = base_str + " " + std::to_string(number);
-            nvtxRangePush(range_string.c_str());
-        }
-        ~NvtxRange() { nvtxRangePop(); }
-    };
-}
-#define NVTX_RANGE_FN() NvtxRange nvtx_range(__FUNCTION__)
 
 static cudnnHandle_t cudnn_handle;
 static size_t cudnn_workspace_size = 0; // dynamically allocated as needed (up to 256MiB!)
@@ -88,7 +59,7 @@ auto lookup_cache_or_build_graph_fwd(int B,int H,int T,int HS, int is_inference_
     if (it != user_maintained_cache_fwd.end()) {
         return it->second;
     }
-    
+
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(CUDNN_16BIT)
           .set_intermediate_data_type(fe::DataType_t::FLOAT)
