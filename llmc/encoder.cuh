@@ -4,9 +4,10 @@ In the forward pass, both encodings are added together
 In the backward pass, the gradients flow to both, handled by different kernels
 */
 #include <assert.h>
+#include <stdint.h>
+#include <utility>              // std::pair
 #include <vector>
 #include <algorithm>
-#include <functional>
 #include <unordered_map>
 // llmc internal imports
 #include "cuda_common.h"
