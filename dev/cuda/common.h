@@ -323,6 +323,43 @@ void validate_result(D* device_result, const T* cpu_reference, const char* name,
     free(out_gpu);
 }
 
+template<class T>
+void validate_result_nomemcpy(T* result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance=1e-4) {
+    int nfaults = 0;
+#ifndef ENABLE_BF16
+    float epsilon = FLT_EPSILON;
+#else
+    float epsilon = 0.079;
+#endif
+    for (int i = 0; i < num_elements; i++) {
+        // Skip masked elements
+        if(!isfinite(cpu_reference[i]))
+            continue;
+
+        // print the first few comparisons
+        if (i < 5) {
+            printf("%f %f\n", cpu_reference[i], result[i]);
+        }
+        // effective tolerance is based on expected rounding error (epsilon),
+        // plus any specified additional tolerance
+        float t_eff = tolerance + fabs(cpu_reference[i]) * epsilon;
+        // ensure correctness for all elements.
+        if (fabs(cpu_reference[i] - result[i]) > t_eff) {
+            printf("Mismatch of %s at %d: CPU_ref: %f vs GPU: %f\n", name, i, cpu_reference[i], result[i]);
+            nfaults ++;
+            if (nfaults >= 10) {
+                exit(EXIT_FAILURE);
+            }
+        }
+    }
+
+    if (nfaults > 0) {
+        exit(EXIT_FAILURE);
+    }
+}
+
+
+
 template<class Kernel, class... KernelArgs>
 float benchmark_kernel(int repeats, Kernel kernel, KernelArgs&&... kernel_args) {
     cudaEvent_t start, stop;
