@@ -80,10 +80,12 @@ void layernorm_forward_cpu(float *out, float *mean, float *rstd,
 // allocate & set host & device memory, pinned memory allocation if necessary
 // pinned memcpy is interleaved with kernel invocation (cudaMemcpyAsync)
 // in order to achieve copy compute overlap
-void prepareMemory(bool pinned, float **out, float **mean, float **rstd,
-                   float **inp, float **weight, float **bias, float **d_out,
-                   float **d_mean, float **d_rstd, float **d_inp,
-                   float **d_weight, float **d_bias, int B, int T, int C) {
+void prepareMemory(float **out, float **mean, float **rstd, float **inp,
+                   float **weight, float **bias, float **d_out, float **d_mean,
+                   float **d_rstd, float **d_inp, float **d_weight,
+                   float **d_bias, int B, int T, int C, bool pinned = false) {
+
+  srand(0);
 
   cudaCheck(cudaMalloc(d_out, B * T * C * sizeof(float)));
   cudaCheck(cudaMalloc(d_mean, B * T * sizeof(float)));
@@ -119,11 +121,25 @@ void prepareMemory(bool pinned, float **out, float **mean, float **rstd,
   }
 }
 
+void prepareCPUMemory(float **out, float **mean, float **rstd, float **inp,
+                      float **weight, float **bias, int B, int T, int C) {
+
+  srand(0);
+
+  *out = (float *)malloc(B * T * C * sizeof(float));
+  *mean = (float *)malloc(B * T * sizeof(float));
+  *rstd = (float *)malloc(B * T * sizeof(float));
+  *inp = make_random_float(B * T * C);
+  *weight = make_random_float(C);
+  *bias = make_random_float(C);
+}
+
 // free memory, pinned memory requires cudaFreeHost
-void resetMemory(bool pinned, float **out, float **mean, float **rstd,
-                 float **inp, float **weight, float **bias, float **d_out,
-                 float **d_mean, float **d_rstd, float **d_inp,
-                 float **d_weight, float **d_bias) {
+void resetMemory(float **out, float **mean, float **rstd, float **inp,
+                 float **weight, float **bias, float **d_out, float **d_mean,
+                 float **d_rstd, float **d_inp, float **d_weight,
+                 float **d_bias, bool pinned = false) {
+
   cudaCheck(cudaFree(*d_out));
   cudaCheck(cudaFree(*d_mean));
   cudaCheck(cudaFree(*d_rstd));
@@ -147,15 +163,24 @@ void resetMemory(bool pinned, float **out, float **mean, float **rstd,
   }
 }
 
+void resetCPUMemory(float **out, float **mean, float **rstd, float **inp,
+                    float **weight, float **bias) {
+  free(*out);
+  free(*mean);
+  free(*rstd);
+  free(*inp);
+  free(*weight);
+  free(*bias);
+}
+
 bool isPinnedMemory(int pinnedMemoryKernels[], int kernelNum, size_t N) {
   for (int i = 0; i < N; i++) {
     if (kernelNum == pinnedMemoryKernels[i])
       return true;
   }
-
   return false;
 }
-// ----------------------------------------------------------------------------
+
 // GPU kernels
 
 // naive drag and drop implementation into kernel, parallelize over B,T, loop
@@ -449,49 +474,6 @@ void layernorm_forward1(float *out, float *mean, float *rstd, const float *inp,
   cudaCheck(cudaGetLastError());
 }
 
-void layernorm_forward6(float *d_out, float *d_mean, float *d_rstd,
-                        const float *d_inp, const float *d_weight,
-                        const float *d_bias, const float *inp,
-                        const float *weight, const float *bias, int B, int T,
-                        int C, const int block_size) {
-  const int nStreams = 8;
-  const int nChunk = 64;
-  const int N = nChunk * T;
-  size_t sData = T * C * sizeof(float);
-  size_t sChunk = nChunk * sData;
-  const int grid_size = ceil_div(N, block_size);
-
-  cudaStream_t streams[nStreams];
-  for (int i = 0; i < nStreams; i++) {
-    cudaStreamCreate(&streams[i]);
-  }
-  cudaCheck(cudaGetLastError());
-
-  for (int b = 0, sNum = 0; b < B; b += nChunk, sNum = (sNum + 1) % nStreams) {
-    cudaCheck(cudaMemcpyAsync((void *)d_inp, (void *)inp, sChunk,
-                              cudaMemcpyHostToDevice, streams[sNum]));
-    cudaCheck(cudaMemcpyAsync((void *)d_weight, (void *)weight, sData,
-                              cudaMemcpyHostToDevice, streams[sNum]));
-    cudaCheck(cudaMemcpyAsync((void *)d_bias, (void *)bias, sData,
-                              cudaMemcpyHostToDevice, streams[sNum]));
-
-    layernorm_forward_kernel1<<<grid_size, block_size, 0, streams[sNum]>>>(
-        d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, N, C);
-
-    d_out = d_out + nChunk * T * C;
-    d_mean = d_mean + nChunk * T;
-    d_rstd = d_rstd + nChunk * T;
-    d_inp = d_inp + nChunk * T * C;
-  }
-
-  cudaDeviceSynchronize();
-  cudaCheck(cudaGetLastError());
-
-  for (int i = 0; i < nStreams; i++) {
-    cudaStreamDestroy(streams[i]);
-  }
-}
-
 void layernorm_forward2(float *out, float *mean, float *rstd, const float *inp,
                         const float *weight, const float *bias, int B, int T,
                         int C, const int block_size) {
@@ -544,60 +526,72 @@ void layernorm_forward5(float *out, float *mean, float *rstd, const float *inp,
   cudaCheck(cudaGetLastError());
 }
 
+void layernorm_forward6(float *d_out, float *d_mean, float *d_rstd,
+                        float *d_inp, float *d_weight, float *d_bias,
+                        float *inp, float *weight, float *bias, int B, int T,
+                        int C, const int block_size, cudaStream_t *streams,
+                        int nStreams) {
+  const int nChunk = 64;
+  const int N = nChunk * T;
+  size_t sToken = C * sizeof(float);
+  const int grid_size = ceil_div(N, block_size);
+
+  cudaCheck(cudaGetLastError());
+
+  cudaCheck(cudaMemcpyAsync(d_weight, weight, sToken, cudaMemcpyHostToDevice,
+                            streams[nStreams - 1]));
+  cudaCheck(cudaMemcpyAsync(d_bias, bias, sToken, cudaMemcpyHostToDevice,
+                            streams[nStreams - 1]));
+
+  for (int b = 0, sNum = 0; b < B; b += nChunk, sNum = (sNum + 1) % nStreams) {
+    cudaCheck(cudaMemcpyAsync(d_inp, inp, N * sToken, cudaMemcpyHostToDevice,
+                              streams[sNum]));
+    layernorm_forward_kernel1<<<grid_size, block_size, 0, streams[sNum]>>>(
+        d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, N, C);
+
+    d_out = d_out + N * C;
+    d_mean = d_mean + N;
+    d_rstd = d_rstd + N;
+    d_inp = d_inp + N * C;
+    inp = inp + N * C;
+  }
+
+  cudaDeviceSynchronize();
+  cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
-void layernorm_forward(int kernel_num, float **d_out, float **d_mean,
-                       float **d_rstd, float **d_inp, float **d_weight,
-                       float **d_bias, float **out, float **mean, float **rstd,
-                       float **inp, float **weight, float **bias, int B, int T,
-                       int C, const int block_size) {
+void layernorm_forward(int kernel_num, float *d_out, float *d_mean,
+                       float *d_rstd, float *d_inp, float *d_weight,
+                       float *d_bias, float *out, float *mean, float *rstd,
+                       float *inp, float *weight, float *bias, int B, int T,
+                       int C, const int block_size, int nStreams,
+                       cudaStream_t *streams = nullptr) {
+
   switch (kernel_num) {
   case 1:
-    prepareMemory(false, out, mean, rstd, inp, weight, bias, d_out, d_mean,
-                  d_rstd, d_inp, d_weight, d_bias, B, T, C);
-    layernorm_forward1(*d_out, *d_mean, *d_rstd, *d_inp, *weight, *bias, B, T,
-                       C, block_size);
-    resetMemory(false, out, mean, rstd, inp, weight, bias, d_out, d_mean,
-                d_rstd, d_inp, d_weight, d_bias);
+    layernorm_forward1(d_out, d_mean, d_rstd, d_inp, weight, bias, B, T, C,
+                       block_size);
     break;
   case 2:
-    prepareMemory(false, out, mean, rstd, inp, weight, bias, d_out, d_mean,
-                  d_rstd, d_inp, d_weight, d_bias, B, T, C);
-    layernorm_forward2(*d_out, *d_mean, *d_rstd, *d_inp, *weight, *bias, B, T,
-                       C, block_size);
-    resetMemory(false, out, mean, rstd, inp, weight, bias, d_out, d_mean,
-                d_rstd, d_inp, d_weight, d_bias);
+    layernorm_forward2(d_out, d_mean, d_rstd, d_inp, weight, bias, B, T, C,
+                       block_size);
     break;
   case 3:
-    prepareMemory(false, out, mean, rstd, inp, weight, bias, d_out, d_mean,
-                  d_rstd, d_inp, d_weight, d_bias, B, T, C);
-    layernorm_forward3(*d_out, *d_mean, *d_rstd, *d_inp, *weight, *bias, B, T,
-                       C, block_size);
-    resetMemory(false, out, mean, rstd, inp, weight, bias, d_out, d_mean,
-                d_rstd, d_inp, d_weight, d_bias);
+    layernorm_forward3(d_out, d_mean, d_rstd, d_inp, weight, bias, B, T, C,
+                       block_size);
     break;
   case 4:
-    prepareMemory(false, out, mean, rstd, inp, weight, bias, d_out, d_mean,
-                  d_rstd, d_inp, d_weight, d_bias, B, T, C);
-    layernorm_forward4(*d_out, *d_mean, *d_rstd, *d_inp, *weight, *bias, B, T,
-                       C, block_size);
-    resetMemory(false, out, mean, rstd, inp, weight, bias, d_out, d_mean,
-                d_rstd, d_inp, d_weight, d_bias);
+    layernorm_forward4(d_out, d_mean, d_rstd, d_inp, weight, bias, B, T, C,
+                       block_size);
     break;
   case 5:
-    prepareMemory(false, out, mean, rstd, inp, weight, bias, d_out, d_mean,
-                  d_rstd, d_inp, d_weight, d_bias, B, T, C);
-    layernorm_forward5(*d_out, *d_mean, *d_rstd, *d_inp, *weight, *bias, B, T,
-                       C, block_size);
-    resetMemory(false, out, mean, rstd, inp, weight, bias, d_out, d_mean,
-                d_rstd, d_inp, d_weight, d_bias);
+    layernorm_forward5(d_out, d_mean, d_rstd, d_inp, weight, bias, B, T, C,
+                       block_size);
     break;
   case 6:
-    prepareMemory(true, out, mean, rstd, inp, weight, bias, d_out, d_mean,
-                  d_rstd, d_inp, d_weight, d_bias, B, T, C);
-    layernorm_forward6(*d_out, *d_mean, *d_rstd, *d_inp, *d_weight, *d_bias,
-                       *inp, *weight, *bias, B, T, C, block_size);
-    resetMemory(true, out, mean, rstd, inp, weight, bias, d_out, d_mean, d_rstd,
-                d_inp, d_weight, d_bias);
+    layernorm_forward6(d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, inp,
+                       weight, bias, B, T, C, block_size, streams, nStreams);
     break;
   default:
     printf("Invalid kernel number\n");
@@ -616,20 +610,28 @@ int main(int argc, char **argv) {
   cudaCheck(cudaSetDevice(deviceIdx));
 
   // host pointers
-  float *out = NULL;
-  float *mean = NULL;
-  float *rstd = NULL;
-  float *inp = NULL;
-  float *weight = NULL;
-  float *bias = NULL;
+  float *out = nullptr;
+  float *mean = nullptr;
+  float *rstd = nullptr;
+  float *inp = nullptr;
+  float *weight = nullptr;
+  float *bias = nullptr;
+
+  // reference implementation pointers
+  float *rOut = nullptr;
+  float *rMean = nullptr;
+  float *rRstd = nullptr;
+  float *rInp = nullptr;
+  float *rWeight = nullptr;
+  float *rBias = nullptr;
 
   // device pointers
-  float *d_out = NULL;
-  float *d_mean = NULL;
-  float *d_rstd = NULL;
-  float *d_inp = NULL;
-  float *d_weight = NULL;
-  float *d_bias = NULL;
+  float *d_out = nullptr;
+  float *d_mean = nullptr;
+  float *d_rstd = nullptr;
+  float *d_inp = nullptr;
+  float *d_weight = nullptr;
+  float *d_bias = nullptr;
 
   // read kernel_num from command line
   int kernel_num = 2;
@@ -638,29 +640,34 @@ int main(int argc, char **argv) {
   }
   printf("Using kernel %d\n", kernel_num);
 
-  // int block_sizes[] = {32, 64, 128, 256, 512, 1024};
-  int block_sizes[] = {256};
+  prepareCPUMemory(&rOut, &rMean, &rRstd, &rInp, &rWeight, &rBias, B, T, C);
+  layernorm_forward_cpu(rOut, rMean, rRstd, rInp, rWeight, rBias, B, T, C);
+
+  int block_sizes[] = {32, 64, 128, 256, 512, 1024};
   int pinned_memory_kernels[1] = {6};
-  bool pinned;
-  layernorm_forward_cpu(out, mean, rstd, inp, weight, bias, B, T, C);
+  bool pinned = isPinnedMemory(pinned_memory_kernels, kernel_num,
+                               sizeof(pinned_memory_kernels) / sizeof(int));
+
+  const int nStreams = 8;
+  cudaStream_t streams[nStreams];
+  for (int i = 0; i < nStreams; i++) {
+    cudaStreamCreate(&streams[i]);
+  }
 
   // check the correctness of the kernel at all block sizes
+  prepareMemory(&out, &mean, &rstd, &inp, &weight, &bias, &d_out, &d_mean,
+                &d_rstd, &d_inp, &d_weight, &d_bias, B, T, C, pinned);
   for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
     int block_size = block_sizes[j];
     printf("Checking block size %d.\n", block_size);
 
-    layernorm_forward(kernel_num, &d_out, &d_mean, &d_rstd, &d_inp, &d_weight,
-                      &d_bias, &out, &mean, &rstd, &inp, &weight, &bias, B, T,
-                      C, block_size);
+    layernorm_forward(kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight,
+                      d_bias, out, mean, rstd, inp, weight, bias, B, T, C,
+                      block_size, nStreams, streams);
 
-    pinned = isPinnedMemory(pinned_memory_kernels, kernel_num,
-                            sizeof(pinned_memory_kernels));
-    resetMemory(pinned, &out, &mean, &rstd, &inp, &weight, &bias, &d_out,
-                &d_mean, &d_rstd, &d_inp, &d_weight, &d_bias);
-
-    validate_result(d_out, out, "out", B * T * C, 1e-5f);
-    validate_result(d_mean, mean, "mean", B * T, 1e-5f);
-    validate_result(d_rstd, rstd, "rstd", B * T, 1e-5f);
+    validate_result(d_out, rOut, "out", B * T * C, 1e-5f);
+    validate_result(d_mean, rMean, "mean", B * T, 1e-5f);
+    validate_result(d_rstd, rRstd, "rstd", B * T, 1e-5f);
   }
 
   printf("All results match. Starting benchmarks.\n\n");
@@ -669,16 +676,11 @@ int main(int argc, char **argv) {
   for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
     int block_size = block_sizes[j];
 
-    int repeat_times = 2000;
+    int repeat_times = 2;
     float elapsed_time = benchmark_kernel(
-        repeat_times, layernorm_forward, kernel_num, &d_out, &d_mean, &d_rstd,
-        &d_inp, &d_weight, &d_bias, &out, &mean, &rstd, &inp, &weight, &bias, B,
-        T, C, block_size);
-
-    pinned = isPinnedMemory(pinned_memory_kernels, kernel_num,
-                            sizeof(pinned_memory_kernels));
-    resetMemory(pinned, &out, &mean, &rstd, &inp, &weight, &bias, &d_out,
-                &d_mean, &d_rstd, &d_inp, &d_weight, &d_bias);
+        repeat_times, layernorm_forward, kernel_num, d_out, d_mean, d_rstd,
+        d_inp, d_weight, d_bias, out, mean, rstd, inp, weight, bias, B, T, C,
+        block_size, nStreams, streams);
 
     // napkin math: estimate the memory bandwidth achieved
     // e.g. A100 40GB PCIe is advertised at 1,555GB/s
@@ -688,6 +690,13 @@ int main(int argc, char **argv) {
     printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size,
            elapsed_time, memory_bandwidth);
   }
+
+  for (int i = 0; i < nStreams; i++) {
+    cudaStreamDestroy(streams[i]);
+  }
+  resetMemory(&out, &mean, &rstd, &inp, &weight, &bias, &d_out, &d_mean,
+              &d_rstd, &d_inp, &d_weight, &d_bias, pinned);
+  resetCPUMemory(&rOut, &rMean, &rRstd, &rInp, &rWeight, &rBias);
 
   return 0;
 }
