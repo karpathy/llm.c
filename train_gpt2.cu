@@ -1230,15 +1230,23 @@ void gpt2_multi_gpu_param_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
 }
 
 float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
-    // estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS
-    // see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-    // TODO this calculation is only valid for an A100: generalize it?
-    int N = model->num_parameters;
+    /*
+    Estimate model flops utilization (MFU)
+    ref: Section 2.1 of https://arxiv.org/pdf/2001.08361
+    Note: Ideally, the N here would be only the parameters that actually
+    participate in matrix multiplications. In this N, we are over-estimating by
+    including LayerNorm params, biases, and the position embedding weights,
+    but these are very small terms. Also keep in mind that we would want to exclude
+    the token embedding weights, but in GPT-2 these are weight shared, so they
+    participate in the classifier matmul, so they are correct to be included in N.
+    Note 2: The first term (6 * N) in flops_per_token is all weight matmuls, the
+    second is the attention matmul, which is also usually a small contribution.
+    */
+    size_t N = model->num_parameters;
     int L = model->config.num_layers;
-    int H = model->config.num_heads;
-    int Q = model->config.channels / model->config.num_heads;
+    int C = model->config.channels;
     int T = model->seq_len;
-    size_t flops_per_token = (size_t)6 * N + (size_t)12 * L * H * Q * T;
+    size_t flops_per_token = 6 * N + (size_t)6 * L * C * T;
     size_t flops_per_step = flops_per_token * num_tokens;
     // express our flops throughput as ratio of A100 bfloat16 peak flops
     float flops_achieved = (float)flops_per_step * (1.0f / dt); // per second
