@@ -542,16 +542,16 @@ void layernorm_forward6(float *d_out, float *d_mean, float *d_rstd,
   cudaMemcpy(d_bias, bias, sToken, cudaMemcpyHostToDevice);
 
   for (int b = 0, sNum = 0; b < B; b += nChunk, sNum = (sNum + 1) % nStreams) {
-    cudaMemcpyAsync(d_inp, inp, N * sToken, cudaMemcpyHostToDevice,
-                    streams[sNum]);
+    cudaCheck(cudaMemcpyAsync(d_inp, inp, N * sToken, cudaMemcpyHostToDevice,
+                              streams[sNum]));
     layernorm_forward_kernel1<<<grid_size, block_size, 0, streams[sNum]>>>(
         d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, N, C);
-    cudaMemcpyAsync(out, d_out, N * sToken, cudaMemcpyDeviceToHost,
-                    streams[sNum]);
-    cudaMemcpyAsync(mean, d_mean, N * sizeof(float), cudaMemcpyDeviceToHost,
-                    streams[sNum]);
-    cudaMemcpyAsync(rstd, d_rstd, N * sizeof(float), cudaMemcpyDeviceToHost,
-                    streams[sNum]);
+    cudaCheck(cudaMemcpyAsync(out, d_out, N * sToken, cudaMemcpyDeviceToHost,
+                              streams[sNum]));
+    cudaCheck(cudaMemcpyAsync(mean, d_mean, N * sizeof(float),
+                              cudaMemcpyDeviceToHost, streams[sNum]));
+    cudaCheck(cudaMemcpyAsync(rstd, d_rstd, N * sizeof(float),
+                              cudaMemcpyDeviceToHost, streams[sNum]));
 
     d_out = d_out + N * C;
     out = out + N * C;
