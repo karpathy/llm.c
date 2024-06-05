@@ -153,11 +153,35 @@ void trimul_cublas(float* preatt,
     // batched matrix multiply with cuBLAS
     const float alpha = 1.0f / sqrtf(HS);
     const float beta = 0.0f;
-    // currently computes: K^T @ Q, todo: change to natural Q @ K^T order.
-    // where after the permute kernel above we have the following shapes:
-    // Q : (B, NH, T, HS)
-    // K : (B, NH, T, HS) -> K^T shape: (B, NH, HS, T)
-    // This schedules in parallel for each head and batch B*NH matmuls of shape (T, HS) x (HS, T)
+    // This schedules in parallel B*NH matmuls of shape q@k^t = (T, HS) @ (HS, T) = (T, T).
+    // IMPORTANT NOTE: Cublas uses a column-major (and we use row-major in our codebase) representation,
+    // so this call might look confusing to you if you look at the `cublasSgemmStridedBatched` signature.
+    //
+    // In order to avoid having to do an additional transpose operation after this func call,
+    // we need to pass in K as the first argument and Q as the second argument, which might make you think we're computing K^T @ Q.
+    // That combined with the shapes we got after the permute kernel - (B, NH, T, HS) (I'll omit B, NH for brevity going forward)
+    // and you might think we end up with (HS, T) @ (T, HS) = (HS, HS).
+    // This is not the case. :)
+    //
+    // Cublas sees our row-major matrix (T, HS) as (HS, T), hence we set the lead dimensions to HS (see function signature).
+    // We transpose K and end up computing K^T @ Q = (T, HS) @ (HS, T) = (T, T).
+    // If you were to interpret the above formula K^T @ Q you might think we end up with:
+    // -----------------------------------
+    // k1.dot(q1) k1.dot(q2) ... k1.dot(qT)
+    // k2.dot(q1) k2.dot(q2) ... k2.dot(qT)
+    // ...
+    // kT.dot(q1) kT.dot(q2) ... kT.dot(qT)
+    // -----------------------------------
+    // But as I mentioned, Cublas is column-major!
+    // So given that the dot product is symmetric we can write k1.dot(q1) as q1.dot(k1) and transposing the above
+    // representation we can see what we actually end up with in the row-major format:
+    // -----------------------------------
+    // q1.dot(k1) q1.dot(k2) ... q1.dot(kT)
+    // q2.dot(k1) q2.dot(k2) ... q2.dot(kT)
+    // ...
+    // qT.dot(k1) qT.dot(k2) ... qT.dot(kT)
+    // -----------------------------------
+    // which is exactly what we wanted! :)
     cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                                           CUBLAS_OP_T, CUBLAS_OP_N,
                                           T, T, HS,
@@ -210,7 +234,7 @@ __global__ void __launch_bounds__(256, 2) trimul_global(float* out, const float*
     float* r = out + (b*NH + nh)*T*T;  // out[b][nh][:][:]
 
     // start the multiplication
-    matmul_tri(r, T, q, C3, k, C3, T, HS, scale);
+    matmul_tri(r, T, k, C3, q, C3, T, HS, scale);
 }
 
 template<matmul_fn_ptr matmul_tri>
@@ -279,7 +303,7 @@ __device__ void matmul_tri_naive(float* p, int PS, const float* k, int KS, const
             int j = j_base + jo;
             float val = 0;
             for (int s = 0; s < HS; ++s) {
-                val += k[i * QS + s] * q[j * KS + s];
+                val += q[i * QS + s] * k[j * KS + s];
             }
             p[i * PS + j] = val * alpha;
         }
@@ -324,8 +348,8 @@ __device__ void matmul_tri_registers(float* p, int PS, const float* k, int KS, c
         return;
 
     // shift our pointers to the sub-block this thread is responsible for
-    k += i_base * KS;
-    q += j_base * QS;
+    q += i_base * QS;
+    k += j_base * KS;
     p += i_base * PS + j_base;
 
     float vals[8][8] = {};
@@ -333,8 +357,8 @@ __device__ void matmul_tri_registers(float* p, int PS, const float* k, int KS, c
         float lhs[8];
         float rhs[8];
         for (int u = 0; u < 8; ++u) {
-            lhs[u] = k[u * KS + hs];
-            rhs[u] = q[u * QS + hs];
+            lhs[u] = q[u * QS + hs];
+            rhs[u] = k[u * KS + hs];
         }
 
         for (int i = 0; i < 8; ++i) {
@@ -397,8 +421,8 @@ __device__ void matmul_tri3(float* p, int PS, const float* k, int KS, const floa
         return;
 
     // shift our pointers to the sub-block this thread is responsible for
-    k += i_base * KS;
-    q += j_base * QS;
+    q += i_base * QS;
+    k += j_base * KS;
     p += i_base * PS + j_base;
 
     float vals[8][8] = {};
@@ -406,12 +430,12 @@ __device__ void matmul_tri3(float* p, int PS, const float* k, int KS, const floa
         // load in float4 to improve coalescing
         float4 rhs[8];
         for (int u = 0; u < 8; ++u) {
-            rhs[u] = ld_vec(q + u * QS + hs);
+            rhs[u] = ld_vec(k + u * KS + hs);
         }
 
         for (int i = 0; i < 8; ++i) {
             // no need to keep lhs around for the i loop, its only reused in the j loop anyway.
-            float4 lhs = ld_vec(k + i * KS + hs);
+            float4 lhs = ld_vec(q + i * QS + hs);
             for (int j = 0; j < 8; ++j) {
                 vals[i][j] += lhs.x * rhs[j].x;
                 vals[i][j] += lhs.y * rhs[j].y;
@@ -458,8 +482,8 @@ __device__ void matmul_tri4(float* p, int PS, const float* k, int KS, const floa
     if (blockIdx.y > blockIdx.x)
         return;
 
-    k += 128 * blockIdx.x * KS;
-    q += 128 * blockIdx.y * QS;
+    q += 128 * blockIdx.x * QS;
+    k += 128 * blockIdx.y * KS;
 
     __shared__ float lhs_s[128][32];
     __shared__ float rhs_s[128][32];
@@ -478,15 +502,15 @@ __device__ void matmul_tri4(float* p, int PS, const float* k, int KS, const floa
         __syncthreads();
         for(int y = threadIdx.y / 2; y < 128; y += 8) {
             int xo = (threadIdx.y % 2) * 16;
-            lhs_s[y][threadIdx.x + xo] = k[y * KS + so + threadIdx.x + xo];
-            rhs_s[y][threadIdx.x + xo] = q[y * QS + so + threadIdx.x + xo];
+            lhs_s[y][threadIdx.x + xo] = q[y * QS + so + threadIdx.x + xo];
+            rhs_s[y][threadIdx.x + xo] = k[y * KS + so + threadIdx.x + xo];
         }
         __syncthreads();
 
         // Now we compute a partial dot product (only 32 dims) for all combinations of keys and queries (128x128).
         // Each thread does 8x8 of these partial dot products.
-        // E.g. thread (0,0) covers keys 0-7 and queries 0-7. More generally first row of threads
-        // (0,:) covers keys 0-7 with queries 0-127 and so on.
+        // E.g. thread (0,0) covers queries 0-7 and keys 0-7. More generally first row of threads
+        // (0,:) covers queries 0-7 with keys 0-127 and so on.
         // In the next iterations of the outer (`so`) loop we'll be accumulating values to `vals` until we
         // get the full dot product. We then later deposit it into the output matrix for all 8x8 blocks
         // that are below the diagonal.
