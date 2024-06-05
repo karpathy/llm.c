@@ -24,8 +24,6 @@ otherwise
 ./layernorm_forward 5
 */
 
-#define __USE_TIME_BITS64
-
 #include "common.h"
 #include <assert.h>
 #include <cooperative_groups.h>
@@ -535,25 +533,25 @@ void layernorm_forward6(float *d_out, float *d_mean, float *d_rstd,
                         float *weight, float *bias, int B, int T, int C,
                         const int block_size, cudaStream_t *streams,
                         int nStreams) {
-  const int nChunk = 16;
+  const int nChunk = 1;
   const int N = nChunk * T;
   size_t sToken = C * sizeof(float);
   const int grid_size = ceil_div(N, block_size);
 
-  cudaCheck(cudaMemcpy(d_weight, weight, sToken, cudaMemcpyHostToDevice));
-  cudaCheck(cudaMemcpy(d_bias, bias, sToken, cudaMemcpyHostToDevice));
+  cudaMemcpy(d_weight, weight, sToken, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_bias, bias, sToken, cudaMemcpyHostToDevice);
 
   for (int b = 0, sNum = 0; b < B; b += nChunk, sNum = (sNum + 1) % nStreams) {
-    cudaCheck(cudaMemcpyAsync(d_inp, inp, N * sToken, cudaMemcpyHostToDevice,
-                              streams[sNum]));
+    cudaMemcpyAsync(d_inp, inp, N * sToken, cudaMemcpyHostToDevice,
+                    streams[sNum]);
     layernorm_forward_kernel1<<<grid_size, block_size, 0, streams[sNum]>>>(
         d_out, d_mean, d_rstd, d_inp, d_weight, d_bias, N, C);
-    cudaCheck(cudaMemcpyAsync(out, d_out, N * sToken, cudaMemcpyDeviceToHost,
-                              streams[sNum]));
-    cudaCheck(cudaMemcpyAsync(mean, d_mean, N * sizeof(float),
-                              cudaMemcpyDeviceToHost, streams[sNum]));
-    cudaCheck(cudaMemcpyAsync(rstd, d_rstd, N * sizeof(float),
-                              cudaMemcpyDeviceToHost, streams[sNum]));
+    cudaMemcpyAsync(out, d_out, N * sToken, cudaMemcpyDeviceToHost,
+                    streams[sNum]);
+    cudaMemcpyAsync(mean, d_mean, N * sizeof(float), cudaMemcpyDeviceToHost,
+                    streams[sNum]);
+    cudaMemcpyAsync(rstd, d_rstd, N * sizeof(float), cudaMemcpyDeviceToHost,
+                    streams[sNum]);
 
     d_out = d_out + N * C;
     out = out + N * C;
@@ -624,8 +622,8 @@ void layernorm_forward(int kernel_num, float *d_out, float *d_mean,
 int main(int argc, char **argv) {
   srand(0);
 
-  int B = 64;
-  int T = 16384;
+  int B = 128;
+  int T = 1024;
   int C = 768;
 
   int deviceIdx = 0;
@@ -665,8 +663,7 @@ int main(int argc, char **argv) {
   prepareCPUMemory(&rOut, &rMean, &rRstd, &rInp, &rWeight, &rBias, B, T, C);
   layernorm_forward_cpu(rOut, rMean, rRstd, rInp, rWeight, rBias, B, T, C);
 
-  // int block_sizes[] = {32, 64, 128, 256, 512, 1024};
-  int block_sizes[] = {32};
+  int block_sizes[] = {32, 64, 128, 256, 512, 1024};
   int pinned_memory_kernels[1] = {6};
   bool pinned = isPinnedMemory(pinned_memory_kernels, kernel_num,
                                sizeof(pinned_memory_kernels) / sizeof(int));
@@ -686,31 +683,29 @@ int main(int argc, char **argv) {
       ((end.tv_sec - start.tv_sec) * 1e9 + (end.tv_nsec - start.tv_nsec)) / 1e6;
 
   // check the correctness of the kernel at all block sizes
-  // for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
-  //   int block_size = block_sizes[j];
-  //   printf("Checking block size %d.\n", block_size);
-  //
-  //   layernorm_forward(kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight,
-  //                     d_bias, out, mean, rstd, inp, weight, bias, B, T, C,
-  //                     block_size, nStreams, streams);
-  //
-  //   validate_result_nomemcpy(out, rOut, "out", B * T * C, 1e-5f);
-  //   validate_result_nomemcpy(mean, rMean, "mean", B * T, 1e-5f);
-  //   validate_result_nomemcpy(rstd, rRstd, "rstd", B * T, 1e-5f);
-  // }
-  //
-  // printf("All results match. Starting benchmarks.\n\n");
+  for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+    int block_size = block_sizes[j];
+    printf("Checking block size %d.\n", block_size);
+
+    layernorm_forward(kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight,
+                      d_bias, out, mean, rstd, inp, weight, bias, B, T, C,
+                      block_size, nStreams, streams);
+
+    validate_result_nomemcpy(out, rOut, "out", B * T * C, 1e-5f);
+    validate_result_nomemcpy(mean, rMean, "mean", B * T, 1e-5f);
+    validate_result_nomemcpy(rstd, rRstd, "rstd", B * T, 1e-5f);
+  }
+
+  printf("All results match. Starting benchmarks.\n\n");
 
   // time the kernel at different block sizes
   double memory_bandwidth = 0.f;
   double totalDeviceTime = 0.f;
-  long long memory_ops =
-      B * T * C; // *4 for floats (*2 & *4 applied later for numerics)
   int nBlockSizes = sizeof(block_sizes) / sizeof(int);
   for (int j = 0; j < nBlockSizes; j++) {
     int block_size = block_sizes[j];
 
-    int repeat_times = 20;
+    int repeat_times = 10;
     float elapsed_time = benchmark_kernel(
         repeat_times, layernorm_forward, kernel_num, d_out, d_mean, d_rstd,
         d_inp, d_weight, d_bias, out, mean, rstd, inp, weight, bias, B, T, C,
@@ -719,7 +714,9 @@ int main(int argc, char **argv) {
 
     // napkin math: estimate the memory bandwidth achieved
     // e.g. A100 40GB PCIe is advertised at 1,555GB/s
-    memory_bandwidth = (memory_ops / elapsed_time / 1e6) * 2 * 4;
+    // breaking the calculation into more steps overcomes overflow issues
+    // * 2 (cpy to & from device) & * 4 (bytes for floats)
+    memory_bandwidth = (B * T * C / elapsed_time / 1e6) * 2 * 4;
 
     printf("block_size %4d | time %.4lf ms | bandwidth %.2lf GB/s\n",
            block_size, elapsed_time, memory_bandwidth);
