@@ -13,7 +13,7 @@ def run_model_test(model, dtype):
         tmp_file_name = tmp_file.name
         write_model(model, tmp_file_name, dtype=dtype)
         
-        loaded_state_dict = get_state(tmp_file_name, dtype=dtype)
+        loaded_state_dict = get_state(tmp_file_name)
 
         for key in model.state_dict().keys():
             model_tensors = model.state_dict()[key]
