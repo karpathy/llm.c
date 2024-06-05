@@ -409,7 +409,7 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     size_t rounded_C = CEIL_DIV(C, (32 * x128::size)) * (32 * x128::size);
     size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - 32) * f128::size) * sizeof(float);
 
-    cudaCheck(cudaMemset(scratch, 0, 1 * sizeof(float))); // only need to reset the flag to 0
+    cudaCheck(cudaMemsetAsync(scratch, 0, 1 * sizeof(float), stream)); // only need to reset the flag to 0
     layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
