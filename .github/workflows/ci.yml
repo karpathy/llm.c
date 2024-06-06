@@ -142,8 +142,7 @@ jobs:
   build-ubuntu20-04:
     runs-on: ubuntu-20.04
     container:
-      image: 11.8.0-devel-ubuntu20.04
-
+      image: nvidia/cuda:11.8.0-devel-ubuntu20.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
