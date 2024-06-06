@@ -142,16 +142,27 @@ jobs:
   build-ubuntu20-04:
     runs-on: ubuntu-20.04
     container:
-      image: nvidia/cuda:11.8.0-devel-ubuntu20.04
+      image: nvidia/cuda:11.8.0-cudnn8-devel-ubuntu20.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: System Info
+        run: |
+          nvcc --version
+          g++ --version
+
+      - name: Get CUDNN
+        run: git clone https://github.com/NVIDIA/cudnn-frontend.git
 
       - name: Build FP32 checkpoint
         run: make train_gpt2fp32cu test_gpt2fp32cu
 
       - name: Build FP32 precision
         run: PRECISION=FP32 make train_gpt2cu test_gpt2cu profile_gpt2cu
+
+      - name: Build with CUDNN
+        run: PRECISION=BF16 USE_CUDNN=1 make train_gpt2cu test_gpt2cu profile_gpt2cu
 
   build-cuda-fp32:
     runs-on: ubuntu-latest
