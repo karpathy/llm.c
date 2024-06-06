@@ -272,9 +272,19 @@ __global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, i
 // threads to fetch a cacheline, which means that we can already operate on a "depth" of four within a single warp.
 // => blockDim.x == 4, blockDim.y == 32/4 = 8
 //
+template<typename OutFloat>
+__device__ void update_dbias8(OutFloat* dbias, float a, int global_oc, int k, std::true_type) {
+    atomicAdd(dbias + global_oc + k, a);
+}
+
+template<typename OutFloat>
+__device__ void update_dbias8(OutFloat* dbias, float a, int global_oc, int k, std::false_type) {
+    dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
+}
+
 template<typename OutFloat, bool Atomic>
 __global__ void matmul_backward_bias_kernel8(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
-                                             std::bool_constant<Atomic>) {
+                                             std::integral_constant<bool, Atomic>) {
     constexpr const int bdx = 4;
     constexpr const int bdy = 32 / bdx;
     assert(blockDim.x == bdx);
@@ -331,11 +341,7 @@ __global__ void matmul_backward_bias_kernel8(OutFloat* dbias, const floatX* dout
         }
         if(warp_d == 0 && global_oc < OC) {
             // coalesced, but not cacheline-sized
-            if constexpr (!Atomic) {
-                dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
-            } else {
-                atomicAdd(dbias + global_oc + k, a);
-            }
+            update_dbias8(dbias, a, global_oc, k, std::integral_constant<bool, Atomic>());
         }
     }
 }
@@ -344,9 +350,19 @@ __global__ void matmul_backward_bias_kernel8(OutFloat* dbias, const floatX* dout
 // multiple values that need to be summed up in a separate kernel call.
 // If UseAuxBuffer is false, gridDim.y has to be one, and results are added directly
 // to dbias.
+template<typename OutFloat>
+__device__ void update_dbias9(OutFloat* dbias, float a, int global_oc, int k, int OC, std::true_type) {
+    dbias[global_oc + k + blockIdx.y * OC] = a;
+}
+
+template<typename OutFloat>
+__device__ void update_dbias9(OutFloat* dbias, float a, int global_oc, int k, int OC, std::false_type) {
+    dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
+}
+
 template<typename OutFloat, bool UseAuxBuffer>
 __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
-                                             std::bool_constant<UseAuxBuffer>) {
+                                             std::integral_constant<bool, UseAuxBuffer>) {
     constexpr const int bdx = 4;
     constexpr const int bdy = 32 / bdx;
     assert(blockDim.x == bdx);
@@ -403,11 +419,7 @@ __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout
         }
         if(warp_d == 0 && global_oc < OC) {
             // coalesced, but not cacheline-sized
-            if constexpr (!UseAuxBuffer) {
-                dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
-            } else {
-                dbias[global_oc + k + blockIdx.y * OC] = a;
-            }
+            update_dbias9(dbias, a, global_oc, k, OC, std::integral_constant<bool, UseAuxBuffer>());
         }
     }
 }
@@ -521,11 +533,11 @@ void matmul_backward_bias8(floatX* dbias, const floatX* dout,
     // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
     // and write results directly to the output.
     if(grid_size_y == 1) {
-        matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
+        matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC, std::integral_constant<bool, false>());
         cudaCheck(cudaGetLastError());
     } else {
         cudaCheck(cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float)));
-        matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
+        matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC, std::integral_constant<bool, true>());
         cudaCheck(cudaGetLastError());
         cast_and_add_kernel<<<ceil_div(OC, 256), 256, 0>>>(dbias, dbias_buffer, OC);
         cudaCheck(cudaGetLastError());
@@ -543,11 +555,11 @@ void matmul_backward_bias9(floatX* dbias, const floatX* dout,
     // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
     // and write results directly to the output.
     if(grid_size_y == 1) {
-        matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
+        matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC, std::integral_constant<bool, false>());
         cudaCheck(cudaGetLastError());
     } else {
         // kernel 9 overwrites temp buffer, so no need to memset
-        matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
+        matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC, std::integral_constant<bool, true>());
         cudaCheck(cudaGetLastError());
         reduce_add_sum_kernel<<<ceil_div(OC, 256 * f128::size), 256, 0>>>(dbias, dbias_buffer, OC, grid_size_y);
         cudaCheck(cudaGetLastError());
@@ -644,7 +656,7 @@ int main(int argc, char **argv) {
         matmul_backward_bias(kernel_num, d_dbias, d_dout, B, T, OC, block_size);
         // compare
         printf("Checking correctness...\n");
-        float tol = std::is_same_v<floatX, float> ? 5e-3f : 1.0f;
+        float tol = std::is_same<floatX, float>::value ? 5e-3f : 1.0f;
         validate_result(d_dbias, dbias, "dbias", OC, tol);
         printf("All results match for block_size=%d.\n\n", block_size);
     }
