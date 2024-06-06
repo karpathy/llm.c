@@ -152,8 +152,10 @@ jobs:
           nvcc --version
           g++ --version
 
-      - name: Get CUDNN
-        run: git clone https://github.com/NVIDIA/cudnn-frontend.git
+      - name: Install cudnn frontend
+        run: |
+          apt-get update && apt-get install -y git
+          git clone https://github.com/NVIDIA/cudnn-frontend.git
 
       - name: Build FP32 checkpoint
         run: make train_gpt2fp32cu test_gpt2fp32cu
