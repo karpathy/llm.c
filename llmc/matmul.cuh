@@ -11,9 +11,19 @@ Matrix Multiplication, with help from cuBLASLt
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
+template<typename OutFloat>
+__device__ void update_dbias9(OutFloat* dbias, float a, int global_oc, int k, int OC, std::true_type) {
+    dbias[global_oc + k + blockIdx.y * OC] = a;
+}
+
+template<typename OutFloat>
+__device__ void update_dbias9(OutFloat* dbias, float a, int global_oc, int k, int OC, std::false_type) {
+    dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
+}
+
 template<typename OutFloat, bool UseAuxBuffer>
 __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
-                                             std::bool_constant<UseAuxBuffer>) {
+                                             std::integral_constant<bool, UseAuxBuffer>) {
     constexpr const int bdx = 4;
     constexpr const int bdy = WARP_SIZE / bdx;
     assert(blockDim.x == bdx);
@@ -69,14 +79,11 @@ __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout
             a += v;
         }
         if(warp_d == 0 && global_oc < OC) {
-            if constexpr (!UseAuxBuffer) {
-                dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
-            } else {
-                dbias[global_oc + k + blockIdx.y * OC] = a;
-            }
+            update_dbias9(dbias, a, global_oc, k, OC, std::integral_constant<bool, UseAuxBuffer>());
         }
     }
 }
+
 
 __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, size_t m) {
     const size_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * f128::size;
@@ -195,11 +202,11 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
         // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
         // and write results directly to the output.
         if(grid_size_y == 1) {
-            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
+            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC, std::integral_constant<bool, false>());
             cudaCheck(cudaGetLastError());
         } else {
             // kernel 9 overwrites temp buffer, so no need to memset
-            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
+            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC, std::integral_constant<bool, true>());
             cudaCheck(cudaGetLastError());
             reduce_add_sum_kernel<<<CEIL_DIV(OC, 256 * f128::size), 256>>>(dbias, dbias_buffer, OC, grid_size_y);
             cudaCheck(cudaGetLastError());
