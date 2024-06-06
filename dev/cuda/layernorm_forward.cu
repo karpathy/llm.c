@@ -79,22 +79,27 @@ void layernorm_forward_cpu(float *out, float *mean, float *rstd,
 // --------------------------------------------------------------------------
 // Memory Management
 
-// allocate & set host & device memory, pinned memory allocation if necessary
-// pinned memcpy is interleaved with kernel invocation (cudaMemcpyAsync)
-// in order to achieve copy compute overlap
-void prepareMemory(float **out, float **mean, float **rstd, float **inp,
-                   float **weight, float **bias, float **d_out, float **d_mean,
-                   float **d_rstd, float **d_inp, float **d_weight,
-                   float **d_bias, int B, int T, int C, bool pinned = false) {
+// allocate host & device memory, set host memory (no memcpy), pinned memory
+// allocation if necessary, pinned memcpy is interleaved with kernel invocation
+// (cudaMemcpyAsync) in order to achieve copy compute overlap, so to make an
+// accurate comparison of performance, memcpy needs is in the measurement loop
+void allocateMemory(float **out, float **mean, float **rstd, float **inp,
+                    float **weight, float **bias, float **d_out, float **d_mean,
+                    float **d_rstd, float **d_inp, float **d_weight,
+                    float **d_bias, int B, int T, int C, bool pinned = false) {
 
   srand(0);
+  // random# generator -> weights bias inp must generate rand#s in that exact
+  // sequence in prepareMemory & prepareCPUMemory
 
-  cudaCheck(cudaMalloc(d_out, B * T * C * sizeof(float)));
-  cudaCheck(cudaMalloc(d_mean, B * T * sizeof(float)));
-  cudaCheck(cudaMalloc(d_rstd, B * T * sizeof(float)));
   cudaCheck(cudaMalloc(d_inp, B * T * C * sizeof(float)));
   cudaCheck(cudaMalloc(d_weight, C * sizeof(float)));
   cudaCheck(cudaMalloc(d_bias, C * sizeof(float)));
+  cudaCheck(cudaMalloc(d_out, B * T * C * sizeof(float)));
+  cudaCheck(cudaMalloc(d_mean, B * T * sizeof(float)));
+  cudaCheck(cudaMalloc(d_rstd, B * T * sizeof(float)));
+  *weight = make_random_float(C);
+  *bias = make_random_float(C);
 
   if (pinned) {
     cudaCheck(
@@ -103,37 +108,27 @@ void prepareMemory(float **out, float **mean, float **rstd, float **inp,
     cudaCheck(cudaHostAlloc(rstd, B * T * sizeof(float), cudaHostAllocDefault));
 
     *inp = make_random_float_pinned(B * T * C);
-    *weight = make_random_float(C);
-    *bias = make_random_float(C);
   } else {
     *out = (float *)malloc(B * T * C * sizeof(float));
     *mean = (float *)malloc(B * T * sizeof(float));
     *rstd = (float *)malloc(B * T * sizeof(float));
 
     *inp = make_random_float(B * T * C);
-    *weight = make_random_float(C);
-    *bias = make_random_float(C);
-
-    cudaCheck(cudaMemcpy(*d_inp, *inp, B * T * C * sizeof(float),
-                         cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(*d_weight, *weight, C * sizeof(float),
-                         cudaMemcpyHostToDevice));
-    cudaCheck(
-        cudaMemcpy(*d_bias, *bias, C * sizeof(float), cudaMemcpyHostToDevice));
   }
 }
 
-void prepareCPUMemory(float **out, float **mean, float **rstd, float **inp,
-                      float **weight, float **bias, int B, int T, int C) {
-
+void allocateCPUMemory(float **out, float **mean, float **rstd, float **inp,
+                       float **weight, float **bias, int B, int T, int C) {
   srand(0);
+  // random# generator -> weights bias inp must generate rand#s in that exact
+  // sequence in prepareMemory & prepareCPUMemory
 
   *out = (float *)malloc(B * T * C * sizeof(float));
   *mean = (float *)malloc(B * T * sizeof(float));
   *rstd = (float *)malloc(B * T * sizeof(float));
-  *inp = make_random_float(B * T * C);
   *weight = make_random_float(C);
   *bias = make_random_float(C);
+  *inp = make_random_float(B * T * C);
 }
 
 // free memory, pinned memory requires cudaFreeHost
@@ -538,8 +533,11 @@ void layernorm_forward6(float *d_out, float *d_mean, float *d_rstd,
   size_t sToken = C * sizeof(float);
   const int grid_size = ceil_div(N, block_size);
 
-  cudaMemcpy(d_weight, weight, sToken, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_bias, bias, sToken, cudaMemcpyHostToDevice);
+  cudaCheck(cudaMemcpyAsync(d_weight, weight, sToken, cudaMemcpyHostToDevice,
+                            streams[0 % nStreams]));
+  cudaCheck(cudaMemcpyAsync(d_bias, bias, sToken, cudaMemcpyHostToDevice,
+                            streams[1 % nStreams]));
+  cudaDeviceSynchronize();
 
   for (int b = 0, sNum = 0; b < B; b += nChunk, sNum = (sNum + 1) % nStreams) {
     cudaCheck(cudaMemcpyAsync(d_inp, inp, N * sToken, cudaMemcpyHostToDevice,
@@ -573,7 +571,15 @@ void layernorm_forward(int kernel_num, float *d_out, float *d_mean,
                        float *d_bias, float *out, float *mean, float *rstd,
                        float *inp, float *weight, float *bias, int B, int T,
                        int C, const int block_size, int nStreams,
-                       cudaStream_t *streams = nullptr) {
+                       cudaStream_t *streams = nullptr, bool pinned = false) {
+  if (!pinned) {
+    cudaCheck(cudaMemcpy(d_inp, inp, B * T * C * sizeof(float),
+                         cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(d_weight, weight, C * sizeof(float),
+                         cudaMemcpyHostToDevice));
+    cudaCheck(
+        cudaMemcpy(d_bias, bias, C * sizeof(float), cudaMemcpyHostToDevice));
+  }
 
   switch (kernel_num) {
   case 1:
@@ -606,10 +612,7 @@ void layernorm_forward(int kernel_num, float *d_out, float *d_mean,
     exit(1);
   }
 
-  switch (kernel_num) {
-  case 6: // copy compute overlap (no memcpy to host needed)
-    break;
-  default:
+  if (!pinned) {
     cudaCheck(cudaMemcpy(out, d_out, B * T * C * sizeof(float),
                          cudaMemcpyDeviceToHost));
     cudaCheck(cudaMemcpy(mean, d_mean, B * T * sizeof(float),
@@ -622,7 +625,7 @@ void layernorm_forward(int kernel_num, float *d_out, float *d_mean,
 int main(int argc, char **argv) {
   srand(0);
 
-  int B = 128;
+  int B = 8;
   int T = 1024;
   int C = 768;
 
@@ -658,9 +661,15 @@ int main(int argc, char **argv) {
   if (argc > 1) {
     kernel_num = atoi(argv[1]);
   }
-  printf("Using kernel %d\n", kernel_num);
 
-  prepareCPUMemory(&rOut, &rMean, &rRstd, &rInp, &rWeight, &rBias, B, T, C);
+  if (argc > 2) {
+    B = atoi(argv[2]);
+  }
+
+  printf("\nUsing kernel %d\n", kernel_num);
+  printf("Batch size %d\n", B);
+
+  allocateCPUMemory(&rOut, &rMean, &rRstd, &rInp, &rWeight, &rBias, B, T, C);
   layernorm_forward_cpu(rOut, rMean, rRstd, rInp, rWeight, rBias, B, T, C);
 
   int block_sizes[] = {32, 64, 128, 256, 512, 1024};
@@ -674,13 +683,8 @@ int main(int argc, char **argv) {
     cudaStreamCreate(&streams[i]);
   }
 
-  struct timespec start, end;
-  clock_gettime(CLOCK_MONOTONIC, &start);
-  prepareMemory(&out, &mean, &rstd, &inp, &weight, &bias, &d_out, &d_mean,
-                &d_rstd, &d_inp, &d_weight, &d_bias, B, T, C, pinned);
-  clock_gettime(CLOCK_MONOTONIC, &end);
-  double memoryCopyTime =
-      ((end.tv_sec - start.tv_sec) * 1e9 + (end.tv_nsec - start.tv_nsec)) / 1e6;
+  allocateMemory(&out, &mean, &rstd, &inp, &weight, &bias, &d_out, &d_mean,
+                 &d_rstd, &d_inp, &d_weight, &d_bias, B, T, C, pinned);
 
   // check the correctness of the kernel at all block sizes
   for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
@@ -689,7 +693,7 @@ int main(int argc, char **argv) {
 
     layernorm_forward(kernel_num, d_out, d_mean, d_rstd, d_inp, d_weight,
                       d_bias, out, mean, rstd, inp, weight, bias, B, T, C,
-                      block_size, nStreams, streams);
+                      block_size, nStreams, streams, pinned);
 
     validate_result_nomemcpy(out, rOut, "out", B * T * C, 1e-5f);
     validate_result_nomemcpy(mean, rMean, "mean", B * T, 1e-5f);
@@ -699,33 +703,26 @@ int main(int argc, char **argv) {
   printf("All results match. Starting benchmarks.\n\n");
 
   // time the kernel at different block sizes
-  double memory_bandwidth = 0.f;
-  double totalDeviceTime = 0.f;
+  double memory_bandwidth;
   int nBlockSizes = sizeof(block_sizes) / sizeof(int);
   for (int j = 0; j < nBlockSizes; j++) {
     int block_size = block_sizes[j];
 
-    int repeat_times = 10;
+    int repeat_times = 20;
     float elapsed_time = benchmark_kernel(
         repeat_times, layernorm_forward, kernel_num, d_out, d_mean, d_rstd,
         d_inp, d_weight, d_bias, out, mean, rstd, inp, weight, bias, B, T, C,
-        block_size, nStreams, streams);
-    totalDeviceTime += elapsed_time;
+        block_size, nStreams, streams, pinned);
 
     // napkin math: estimate the memory bandwidth achieved
     // e.g. A100 40GB PCIe is advertised at 1,555GB/s
     // breaking the calculation into more steps overcomes overflow issues
     // * 2 (cpy to & from device) & * 4 (bytes for floats)
-    memory_bandwidth = (B * T * C / elapsed_time / 1e6) * 2 * 4;
+    memory_bandwidth = (B * T * C / 1e6 / elapsed_time) * 2 * 4;
 
     printf("block_size %4d | time %.4lf ms | bandwidth %.2lf GB/s\n",
            block_size, elapsed_time, memory_bandwidth);
   }
-
-  // Provide data for copy compute overlap comparison.
-  printf("\nMemory preparation time: %.4lf ms", memoryCopyTime);
-  printf("\nAverage total computation time: %.4lf ms",
-         (totalDeviceTime / nBlockSizes) + memoryCopyTime);
 
   for (int i = 0; i < nStreams; i++) {
     cudaStreamDestroy(streams[i]);
