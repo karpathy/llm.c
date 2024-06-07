@@ -406,29 +406,17 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
 // Backward pass is conceptually quite different from forward, because we can discard
 // the activations of a layer as soon as we're done with it. This lets us aggressively
 // reuse memory, so that we need far fewer tensors for backward state.
-#ifdef ENABLE_CUDNN
 #define NUM_BACKWARD_TENSORS 2
-#else
-#define NUM_BACKWARD_TENSORS 3
-#endif
 
 typedef struct {
     floatX* bt4c; // (B, T, 4*C)
     floatX* residual3; // (B, T, C)
-    #ifndef ENABLE_CUDNN
-    floatX* preatt; // (B, NH, T, T)
-    #endif
 } GradActTensors;
 
 void fill_in_grad_act_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config) {
     size_t C = config.channels;
     act_sizes[0] = B * T * 4 * C; // bt4c
     act_sizes[1] = B * T * C; // residual3
-
-    #ifndef ENABLE_CUDNN
-    size_t NH = config.num_heads;
-    act_sizes[2] = B * NH * T * T; // preatt
-    #endif
 }
 
 void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n) {
@@ -464,9 +452,6 @@ void* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_si
 void* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) {
     floatX** ptrs[] = {
         &acts->bt4c, &acts->residual3,
-        #ifndef ENABLE_CUDNN
-        &acts->preatt,
-        #endif
     };
     return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
@@ -1034,8 +1019,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
-        floatX* dl_preatt = (floatX*)grads_acts.preatt; // dedicated scratchpad allocation
-        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
+        attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
         #endif
         if(model->recompute >= 2) {
             layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
