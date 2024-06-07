@@ -1188,6 +1188,8 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     cudaCheck(cudaMemcpy(cpu_buffer, model->v_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    cudaCheck(cudaMemcpy(cpu_buffer, model->master_weights, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
+    fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     free(cpu_buffer);
     fclose(state_file);
 }
@@ -1219,6 +1221,8 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     cudaCheck(cudaMemcpy(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     cudaCheck(cudaMemcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+    freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    cudaCheck(cudaMemcpy(model->master_weights, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     free(cpu_buffer);
     fclose(state_file);
 }
