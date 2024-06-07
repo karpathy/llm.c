@@ -20,7 +20,7 @@ Export to a local HF model and also push to your account on Hugging Face:
 import numpy as np
 import torch
 import argparse, sys
-from transformers import GPT2Config, GPT2Tokenizer, GPT2Model
+from transformers import GPT2Config, GPT2Tokenizer, GPT2LMHeadModel
 
 # -----------------------------------------------------------------------------
 # Tensor functions for both bfloat16 (from int16) and normal float32
@@ -102,25 +102,26 @@ def convert(filepath, output, push_to_hub=False):
 
     # Map to our model dict
     model_dict = {}
-    model_dict['wte.weight'] = mk_tensor(w['wte'])
-    model_dict['wpe.weight'] = mk_tensor(w['wpe'])
+    model_dict['transformer.wte.weight'] = mk_tensor(w['wte'])
+    model_dict['transformer.wpe.weight'] = mk_tensor(w['wpe'])
+    model_dict['lm_head.weight'] = model_dict['transformer.wte.weight'] # Tie weights
 
     for i in range(L):
-        model_dict[f'h.{i}.ln_1.weight'] = mk_tensor(w['ln1w'][i])
-        model_dict[f'h.{i}.ln_1.bias'] = mk_tensor(w['ln1b'][i])
-        model_dict[f'h.{i}.attn.c_attn.weight'] = mk_tensor(w['qkvw'][i], True)
-        model_dict[f'h.{i}.attn.c_attn.bias'] = mk_tensor(w['qkvb'][i])
-        model_dict[f'h.{i}.attn.c_proj.weight'] = mk_tensor(w['attprojw'][i], True)
-        model_dict[f'h.{i}.attn.c_proj.bias'] = mk_tensor(w['attprojb'][i])
-        model_dict[f'h.{i}.ln_2.weight'] = mk_tensor(w['ln2w'][i])
-        model_dict[f'h.{i}.ln_2.bias'] = mk_tensor(w['ln2b'][i])
-        model_dict[f'h.{i}.mlp.c_fc.weight'] = mk_tensor(w['fcw'][i], True)
-        model_dict[f'h.{i}.mlp.c_fc.bias'] = mk_tensor(w['fcb'][i])
-        model_dict[f'h.{i}.mlp.c_proj.weight'] = mk_tensor(w['fcprojw'][i], True)
-        model_dict[f'h.{i}.mlp.c_proj.bias'] = mk_tensor(w['fcprojb'][i])
+        model_dict[f'transformer.h.{i}.ln_1.weight'] = mk_tensor(w['ln1w'][i])
+        model_dict[f'transformer.h.{i}.ln_1.bias'] = mk_tensor(w['ln1b'][i])
+        model_dict[f'transformer.h.{i}.attn.c_attn.weight'] = mk_tensor(w['qkvw'][i], True)
+        model_dict[f'transformer.h.{i}.attn.c_attn.bias'] = mk_tensor(w['qkvb'][i])
+        model_dict[f'transformer.h.{i}.attn.c_proj.weight'] = mk_tensor(w['attprojw'][i], True)
+        model_dict[f'transformer.h.{i}.attn.c_proj.bias'] = mk_tensor(w['attprojb'][i])
+        model_dict[f'transformer.h.{i}.ln_2.weight'] = mk_tensor(w['ln2w'][i])
+        model_dict[f'transformer.h.{i}.ln_2.bias'] = mk_tensor(w['ln2b'][i])
+        model_dict[f'transformer.h.{i}.mlp.c_fc.weight'] = mk_tensor(w['fcw'][i], True)
+        model_dict[f'transformer.h.{i}.mlp.c_fc.bias'] = mk_tensor(w['fcb'][i])
+        model_dict[f'transformer.h.{i}.mlp.c_proj.weight'] = mk_tensor(w['fcprojw'][i], True)
+        model_dict[f'transformer.h.{i}.mlp.c_proj.bias'] = mk_tensor(w['fcprojb'][i])
 
-    model_dict['ln_f.weight'] = mk_tensor(w['lnfw'])
-    model_dict['ln_f.bias'] = mk_tensor(w['lnfb'])
+    model_dict['transformer.ln_f.weight'] = mk_tensor(w['lnfw'])
+    model_dict['transformer.ln_f.bias'] = mk_tensor(w['lnfb'])
 
     # Create a GPT-2 model instance
     config = GPT2Config(vocab_size = V,
@@ -129,7 +130,7 @@ def convert(filepath, output, push_to_hub=False):
                         n_embd = C,
                         n_layer = L,
                         n_head = H)
-    model = GPT2Model(config)
+    model = GPT2LMHeadModel(config)
     if version==5:
         model = model.to(torch.bfloat16)
 
@@ -153,8 +154,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained("{output}")
 model = AutoModelForCausalLM.from_pretrained("{output}")
-input = tokenizer.encode("During photosynthesis in green plants", return_tensors="pt")
-output = model.generate(input, max_new_tokens=100, repetition_penalty=1.3)
+tokens = tokenizer.encode("During photosynthesis in green plants", return_tensors="pt")
+output = model.generate(tokens, max_new_tokens=100, repetition_penalty=1.3)
 print(tokenizer.batch_decode(output))""")
     
 # -----------------------------------------------------------------------------
