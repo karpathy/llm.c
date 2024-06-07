@@ -146,6 +146,17 @@ def convert(filepath, output, push_to_hub=False):
         model.push_to_hub(output)
         tokenizer.push_to_hub(output)
 
+    print("Model exported.\nYou can use the model with the transformers library in Python, for example:")
+    print("-"*80)
+    print(f"""\
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("{output}")
+model = AutoModelForCausalLM.from_pretrained("{output}")
+input = tokenizer.encode("During photosynthesis in green plants", return_tensors="pt")
+output = model.generate(input, max_new_tokens=100, repetition_penalty=1.3)
+print(tokenizer.batch_decode(output))""")
+    
 # -----------------------------------------------------------------------------
 # When used as a script
 if __name__== '__main__':
