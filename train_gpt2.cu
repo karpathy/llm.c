@@ -336,7 +336,7 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     return params_memory;
 }
 
-#define NUM_ACTIVATION_TENSORS 21
+constexpr int NUM_ACTIVATION_TENSORS = 23;
 typedef struct {
     floatX* encoded; // (B, T, C)
     floatX* ln1; // (L, B, T, C)
@@ -365,6 +365,10 @@ typedef struct {
     // general scratchpad buffer. Allocation is made large enough to hold (B, T, 3C),
     // (B, NH, T, T), and (B, T, V) shaped tensors.
     floatX* output;
+
+    // some additional scratch buffers
+    floatX* scratch_bt4c;   // (B, T, 4*C)
+    floatX* scratch_btc;    // (B, T, C)
 } ActivationTensors;
 
 void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config, int recompute) {
@@ -401,22 +405,9 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     act_sizes[18] = B * T; // losses
     act_sizes[19] = L * B * T * 3*C; // qkvr
     act_sizes[20] = B * T * max(3*C, max(NH*T, Vp)); // output / scratch
-}
 
-// Backward pass is conceptually quite different from forward, because we can discard
-// the activations of a layer as soon as we're done with it. This lets us aggressively
-// reuse memory, so that we need far fewer tensors for backward state.
-#define NUM_BACKWARD_TENSORS 2
-
-typedef struct {
-    floatX* bt4c; // (B, T, 4*C)
-    floatX* residual3; // (B, T, C)
-} GradActTensors;
-
-void fill_in_grad_act_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config) {
-    size_t C = config.channels;
-    act_sizes[0] = B * T * 4 * C; // bt4c
-    act_sizes[1] = B * T * C; // residual3
+    act_sizes[21] = B * T * 4 * C;  // scratch_bt4c
+    act_sizes[22] = B * T * C;      // scratch_btc
 }
 
 void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n) {
@@ -444,16 +435,10 @@ void* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_si
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->atty,
         &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
-        &acts->lnf_mean, &acts->lnf_rstd, &acts->losses, &acts->qkvr, &acts->output
+        &acts->lnf_mean, &acts->lnf_rstd, &acts->losses, &acts->qkvr, &acts->output,
+        &acts->scratch_bt4c, &acts->scratch_btc
     };
     return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
-}
-
-void* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) {
-    floatX** ptrs[] = {
-        &acts->bt4c, &acts->residual3,
-    };
-    return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
 
 typedef struct {
@@ -477,10 +462,6 @@ typedef struct {
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
     void* acts_memory;
     size_t num_activations;
-    // gradients of the activations
-    GradActTensors grads_acts;
-    size_t num_grad_acts;
-    void* grads_acts_memory;
     // other run state configuration
     int batch_size; // the batch size (B) of current forward pass
     int seq_len; // the sequence length (T) of current forward pass
@@ -515,7 +496,6 @@ void gpt2_init_common(GPT2 *model) {
     model->mean_loss = -1.0f; // -1.0f designates no loss, set at end of forward()
     // memory lazily initialized in backward()
     model->grads_memory = NULL;
-    model->grads_acts_memory = NULL;
     model->workload_indices = NULL; // on cpu, for encoder_backward
     model->bucket_info = NULL; // on cpu, for encoder_backward
     // memory lazily initialized in update()
@@ -892,17 +872,6 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         // allocate buffers for weight gradients
         printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
-        // we're going to be clever for the activations backward pass. we don't need to exactly
-        // mirror the forward pass activations and we will save memory.
-        size_t bw_act_sizes[NUM_BACKWARD_TENSORS];
-        fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, model->config);
-        // count up and allocate the space
-        model->num_grad_acts = 0;
-        for (size_t i = 0; i < NUM_BACKWARD_TENSORS; i++) {
-            model->num_grad_acts += bw_act_sizes[i];
-        }
-        printf0("allocating %d MiB for activation gradients\n", (int)round(model->num_grad_acts * sizeof(floatX) / (1024 * 1024)));
-        model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
         // init gradients of parameters and activations to zero
         gpt2_zero_grad(model);
         // initialise cpu scratch buffers for encoder backward
@@ -924,10 +893,10 @@ void gpt2_backward(GPT2 *model, int* inputs) {
     ParameterTensors params = model->params; // for brevity
     ParameterTensors grads = model->grads;
     ActivationTensors acts = model->acts;
-    GradActTensors grads_acts = model->grads_acts;
 
     // reset residual stream gradients (put here to work with gradient accumulation)
-    cudaCheck(cudaMemset(model->grads_acts.residual3, 0, B * T * C * sizeof(floatX)));
+    floatX* dresidual = (floatX*)model->acts.scratch_btc; // the main buffer holding the gradient in the backward pass
+    cudaCheck(cudaMemset(dresidual, 0, B * T * C * sizeof(floatX)));
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
     float*  scratchF = (float*)acts.output;
@@ -938,11 +907,10 @@ void gpt2_backward(GPT2 *model, int* inputs) {
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    floatX* dresidual = (floatX*)grads_acts.residual3; // the main buffer holding the gradient in the backward pass
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
 
     // from this point on, we no longer need the values stored in the last residual, so we can reuse that memory as generic
     // scratch for backward computations
@@ -992,7 +960,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
 
-        floatX* dl_bt4c = (floatX*)grads_acts.bt4c;
+        floatX* dl_bt4c = (floatX*)model->acts.scratch_bt4c;
 
         // start the backward pass for this layer
         if(model->recompute >= 1) {
@@ -1249,7 +1217,6 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->v_memory));
     cudaCheck(cudaFree(model->master_weights));
     cudaCheck(cudaFree(model->acts_memory));
-    cudaCheck(cudaFree(model->grads_acts_memory));
     cudaCheck(cudaFree(model->inputs));
     cudaCheck(cudaFree(model->targets));
     cudaCheck(cudaFreeHost(model->cpu_losses));
