@@ -88,7 +88,7 @@ void dataloader_resume(DataLoader *loader, int current_shard, int64_t current_po
     dataloader_load_shard_(loader, loader->current_shard);
 }
 
-void dataloader_reset(DataLoader *loader, unsigned long long *state = NULL) {
+void dataloader_reset(DataLoader *loader, unsigned long long *state) {
     // fully resets the DataLoader object to init configuration
     // each process starts at a different offset in the file
     int64_t header_bytes = HEADER_SIZE * sizeof(int);
@@ -129,7 +129,7 @@ void dataloader_init(DataLoader *loader,
                      size_t T,
                      int process_rank,
                      int num_processes,
-                     unsigned long long *state = NULL) {
+                     unsigned long long *state) {
     loader->process_rank = process_rank;
     loader->num_processes = num_processes;
     loader->B = B;

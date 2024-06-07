@@ -1598,7 +1598,7 @@ int main(int argc, char *argv[]) {
     // build DataLoaders for both train and val
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, &model.rng_state);
-    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, NULL);
     // figure out the number of training steps we will run for
     int train_num_batches = max_steps; // passed in from command line
     if (train_num_batches == -1) {
@@ -1686,7 +1686,7 @@ int main(int argc, char *argv[]) {
         if (step % val_loss_every == 0 || last_step) {
             NvtxRange validation_range("validation");
             float val_loss = 0.0f;
-            dataloader_reset(&val_loader);
+            dataloader_reset(&val_loader, NULL);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
                 gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
