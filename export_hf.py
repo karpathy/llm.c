@@ -20,7 +20,7 @@ Export to a local HF model and also push to your account on Hugging Face:
 import numpy as np
 import torch
 import argparse, sys
-from transformers import GPT2LMHeadModel, GPT2Config, GPT2Tokenizer
+from transformers import GPT2Config, GPT2Tokenizer, GPT2Model
 
 # -----------------------------------------------------------------------------
 # Tensor functions for both bfloat16 (from int16) and normal float32
@@ -33,7 +33,7 @@ def tensor_bf16(data_int16, transpose=False):
 def tensor_f32(data_float32, transpose=False):
     if transpose:
         data_float32 = data_float32.transpose(1,0)
-    return torch.tensor(data_float32)
+    return torch.tensor(data_float32).view(torch.float32)
 
 # -----------------------------------------------------------------------------
 # Main conversion function
@@ -61,6 +61,8 @@ def convert(filepath, output, push_to_hub=False):
     C = model_header[6].item() # channels
     Vp = model_header[7].item() # padded vocab size
 
+    print(f"{version=}, {maxT=}, {V=}, {Vp=}, {L=}, {H=}, {C=}")
+    
     # Define the shapes of our parameters
     shapes = {
         'wte': (Vp, C),
@@ -77,8 +79,8 @@ def convert(filepath, output, push_to_hub=False):
         'fcb': (L, 4 * C),
         'fcprojw': (L, C, 4 * C),
         'fcprojb': (L, C),
-        'lnfw': (C),
-        'lnfb': (C),
+        'lnfw': (C,),
+        'lnfb': (C,),
     }
 
     # Map to float32 or bfloat16 depending on version
@@ -89,10 +91,10 @@ def convert(filepath, output, push_to_hub=False):
     w={}
     for key, shape in shapes.items():
         num_elements = np.prod(shape)
-        data = np.frombuffer(f.read(num_elements*np.dtype(dtype).itemsize), dtype=dtype)
+        data = np.frombuffer(f.read(num_elements * np.dtype(dtype).itemsize), dtype=dtype)
         w[key] = data.reshape(shape)
         # The binary file saves the padded vocab - drop the padding back to GPT2 size
-        if type(shape) is tuple and shape[0]==Vp:
+        if shape[0]==Vp:
             w[key] = w[key].reshape(shape)[:(V-Vp), :]
     # Ensure the file is fully read and then close
     assert f.read() == b''
@@ -100,26 +102,25 @@ def convert(filepath, output, push_to_hub=False):
 
     # Map to our model dict
     model_dict = {}
-    model_dict['transformer.wte.weight'] = mk_tensor(w['wte'])
-    model_dict['transformer.wpe.weight'] = mk_tensor(w['wpe'])
-    model_dict['lm_head.weight'] = model_dict['transformer.wte.weight'] # Tie w
+    model_dict['wte.weight'] = mk_tensor(w['wte'])
+    model_dict['wpe.weight'] = mk_tensor(w['wpe'])
 
     for i in range(L):
-        model_dict[f'transformer.h.{i}.ln_1.weight'] = mk_tensor(w['ln1w'][i])
-        model_dict[f'transformer.h.{i}.ln_1.bias'] = mk_tensor(w['ln1b'][i])
-        model_dict[f'transformer.h.{i}.attn.c_attn.weight'] = mk_tensor(w['qkvw'][i], True)
-        model_dict[f'transformer.h.{i}.attn.c_attn.bias'] = mk_tensor(w['qkvb'][i])
-        model_dict[f'transformer.h.{i}.attn.c_proj.weight'] = mk_tensor(w['attprojw'][i], True)
-        model_dict[f'transformer.h.{i}.attn.c_proj.bias'] = mk_tensor(w['attprojb'][i])
-        model_dict[f'transformer.h.{i}.ln_2.weight'] = mk_tensor(w['ln2w'][i])
-        model_dict[f'transformer.h.{i}.ln_2.bias'] = mk_tensor(w['ln2b'][i])
-        model_dict[f'transformer.h.{i}.mlp.c_fc.weight'] = mk_tensor(w['fcw'][i], True)
-        model_dict[f'transformer.h.{i}.mlp.c_fc.bias'] = mk_tensor(w['fcb'][i])
-        model_dict[f'transformer.h.{i}.mlp.c_proj.weight'] = mk_tensor(w['fcprojw'][i], True)
-        model_dict[f'transformer.h.{i}.mlp.c_proj.bias'] = mk_tensor(w['fcprojb'][i])
+        model_dict[f'h.{i}.ln_1.weight'] = mk_tensor(w['ln1w'][i])
+        model_dict[f'h.{i}.ln_1.bias'] = mk_tensor(w['ln1b'][i])
+        model_dict[f'h.{i}.attn.c_attn.weight'] = mk_tensor(w['qkvw'][i], True)
+        model_dict[f'h.{i}.attn.c_attn.bias'] = mk_tensor(w['qkvb'][i])
+        model_dict[f'h.{i}.attn.c_proj.weight'] = mk_tensor(w['attprojw'][i], True)
+        model_dict[f'h.{i}.attn.c_proj.bias'] = mk_tensor(w['attprojb'][i])
+        model_dict[f'h.{i}.ln_2.weight'] = mk_tensor(w['ln2w'][i])
+        model_dict[f'h.{i}.ln_2.bias'] = mk_tensor(w['ln2b'][i])
+        model_dict[f'h.{i}.mlp.c_fc.weight'] = mk_tensor(w['fcw'][i], True)
+        model_dict[f'h.{i}.mlp.c_fc.bias'] = mk_tensor(w['fcb'][i])
+        model_dict[f'h.{i}.mlp.c_proj.weight'] = mk_tensor(w['fcprojw'][i], True)
+        model_dict[f'h.{i}.mlp.c_proj.bias'] = mk_tensor(w['fcprojb'][i])
 
-    model_dict['transformer.ln_f.weight'] = mk_tensor(w['lnfw'])
-    model_dict['transformer.ln_f.bias'] = mk_tensor(w['lnfb'])
+    model_dict['ln_f.weight'] = mk_tensor(w['lnfw'])
+    model_dict['ln_f.bias'] = mk_tensor(w['lnfb'])
 
     # Create a GPT-2 model instance
     config = GPT2Config(vocab_size = V,
@@ -127,10 +128,10 @@ def convert(filepath, output, push_to_hub=False):
                         n_ctx = maxT,
                         n_embd = C,
                         n_layer = L,
-                        n_head = L)
-    model = GPT2LMHeadModel(config)
+                        n_head = H)
+    model = GPT2Model(config)
     if version==5:
-        model=model.to(torch.bfloat16)
+        model = model.to(torch.bfloat16)
 
     # Set the model dict and save
     model.load_state_dict(model_dict)
