@@ -1063,20 +1063,22 @@ float multi_gpu_cpu_float_sum(float value) {
 
 // Averages out the loss and gradients across all GPUs. No-op when multi-GPU is disabled.
 // todo - this version only works if all the parameters are the same size (floatX)
-void gpt2_multi_gpu_grad_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
+void gpt2_multi_gpu_loss_and_grad_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
     NVTX_RANGE_FN();
+    // If there's only one process, there is nothing to do
     if (multi_gpu_config->num_processes == 1) { return; }
     // Average all losses.
     model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss) / multi_gpu_config->num_processes;
+    // Now average the gradients
     if(multi_gpu_config->zero_stage == 0) {
-        //  no ZERO == standard DDP: Average all gradients.
+        // no ZERO == standard DDP: Average all gradients.
         ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
                                 model->num_parameters,
                                 ncclFloatX, ncclAvg,
                                 multi_gpu_config->nccl_comm, 0));
     } else if (multi_gpu_config->zero_stage == 1) {
-        // ZERO-1: Get average gradient for local shard
+        // ZERO-1: Get the average gradient only for local shard
         floatX* local_grads_memory = (floatX*) model->grads_memory + multi_gpu_config->shard_offset;
         ncclCheck(ncclReduceScatter(model->grads_memory, local_grads_memory,
                                     multi_gpu_config->shard_num_parameters,
@@ -1120,12 +1122,12 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     // repurposing this buffer (which isn't needed now) to write grad norm into it
     float* grad_norm_squared = (float*)model->acts.output;
     if (multi_gpu_config->zero_stage == 1) {
-        // ^1 because of the ncclReduceScatter() in gpt2_multi_gpu_grad_reduce,
+        // ^1 because of the ncclReduceScatter() in gpt2_multi_gpu_loss_and_grad_reduce,
         // grads_memory only contains the averaged gradients at the local shard
         // so we only calculate the grad norm at the grads_memory belonging to the local shard
         global_norm_squared(grad_norm_squared, grads_memory + shard_offset, shard_num_parameters);
     } else {
-        // the ncclAllReduce() in gpt2_multi_gpu_grad_reduce has averaged the gradients across all GPUs
+        // the ncclAllReduce() in gpt2_multi_gpu_loss_and_grad_reduce has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
         global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters);
     }
@@ -1228,15 +1230,23 @@ void gpt2_multi_gpu_param_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
 }
 
 float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
-    // estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS
-    // see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-    // TODO this calculation is only valid for an A100: generalize it?
-    int N = model->num_parameters;
+    /*
+    Estimate model flops utilization (MFU)
+    ref: Section 2.1 of https://arxiv.org/pdf/2001.08361
+    Note: Ideally, the N here would be only the parameters that actually
+    participate in matrix multiplications. In this N, we are over-estimating by
+    including LayerNorm params, biases, and the position embedding weights,
+    but these are very small terms. Also keep in mind that we would want to exclude
+    the token embedding weights, but in GPT-2 these are weight shared, so they
+    participate in the classifier matmul, so they are correct to be included in N.
+    Note 2: The first term (6 * N) in flops_per_token is all weight matmuls, the
+    second is the attention matmul, which is also usually a small contribution.
+    */
+    size_t N = model->num_parameters;
     int L = model->config.num_layers;
-    int H = model->config.num_heads;
-    int Q = model->config.channels / model->config.num_heads;
+    int C = model->config.channels;
     int T = model->seq_len;
-    size_t flops_per_token = (size_t)6 * N + (size_t)12 * L * H * Q * T;
+    size_t flops_per_token = 6 * N + (size_t)6 * L * C * T;
     size_t flops_per_step = flops_per_token * num_tokens;
     // express our flops throughput as ratio of A100 bfloat16 peak flops
     float flops_achieved = (float)flops_per_step * (1.0f / dt); // per second
@@ -1789,8 +1799,8 @@ int main(int argc, char *argv[]) {
         // override the mean loss, accounting for the gradient accumulation loop
         // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
         model.mean_loss = lossf;
-        // update the parameters
-        gpt2_multi_gpu_grad_reduce(&model, &multi_gpu_config);
+        // average the loss and the gradients between all processes
+        gpt2_multi_gpu_loss_and_grad_reduce(&model, &multi_gpu_config);
         // learning rate schedule: warmup linearly to max LR, then cosine decay to LR * final_learning_rate_frac
         float step_learning_rate = learning_rate;
         if (step < warmup_iterations) {

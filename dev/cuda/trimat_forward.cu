@@ -65,30 +65,38 @@ static float* d_qkvr;   // scratch for the cublas kernel
 // taken from then attention forward pass
 void trimul_cpu(float* out, const float* inp,
                 int B, int T, int C, int NH) {
+    // inp shape: (B, T, 3, NH, HS)
+    // out shape: (B, NH, T, T)
     int C3 = C*3;
-    int hs = C / NH; // head size
-    float scale = 1.0 / sqrtf(hs);
+    int HS = C / NH; // head size
+    float scale = 1.0 / sqrtf(HS);
 
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            for (int h = 0; h < NH; h++) {
-                const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-                float* out_bth = out + b * NH * T * T + h * T * T + t * T;
+            for (int nh = 0; nh < NH; nh++) {
+                // Q[b][nh][t][:] = inp[b][t][0][nh][:] (where : is the slice operator for hs)
+                const float* query_t = inp + b * T * C3 + t * C3 + nh * HS;
+                // out[b][nh][t][:]
+                float* out_bth = out + b * NH * T * T + nh * T * T + t * T;
 
                 // pass 1: calculate query dot key and maxval
                 for (int t2 = 0; t2 <= t; t2++) {
-                    const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                    // K[b][nh][t2][:] = inp[b][t2][1][nh][:]
+                    const float* key_t2 = inp + b * T * C3 + t2 * C3 + nh * HS + C; // +C because it's key
 
-                    // (query_t) dot (key_t2)
+                    // Q[b][nh][t][:] dot K[b][nh][t2][:]
                     float val = 0.0f;
-                    for (int i = 0; i < hs; i++) {
+                    for (int i = 0; i < HS; i++) {
                         val += query_t[i] * key_t2[i];
                     }
                     val *= scale;
 
+                     // out[b][nh][t][t2] = val
                     out_bth[t2] = val;
                 }
                 for(int t2 = t + 1; t2 < T; ++t2) {
+                    // causal mask, using NAN to supress warnings -> it could be -inf
+                    // but it doesn't matter because in validate_result we ignore infinities/NANs
                     out_bth[t2] = NAN;
                 }
             }
@@ -98,31 +106,31 @@ void trimul_cpu(float* out, const float* inp,
 
 __global__ void permute_kernel(float* q, float* k, float* v,
                                const float* inp,
-                               int B, int N, int NH, int d) {
-    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
-    // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
+                               int B, int T, int NH, int HS) {
+    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, T, HS)
+    // but instead, we have a single tensor QKV (inp) of shape (B, T, 3, NH, HS)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
+    // Q[b][nh][t][hs] = inp[b][t][0][nh][hs]
 
-    if (idx < B * NH * N * d) {
-        int b = idx / (NH * N * d);
-        int rest = idx % (NH * N * d);
-        int nh_ = rest / (N * d);
-        rest = rest % (N * d);
-        int n = rest / d;
-        int d_ = rest % d;
+    if (idx < B * NH * T * HS) {
+        int b = idx / (NH * T * HS);
+        int rest = idx % (NH * T * HS);
+        int nh = rest / (T * HS);
+        rest = rest % (T * HS);
+        int t = rest / HS;
+        int hs = rest % HS;
 
         int inp_idx = \
-            (b * N * 3 * NH * d)
-            +   (n * 3 * NH * d)
-            +       (0 * NH * d)
-            +          (nh_ * d)
-            +                d_;
+            (b * T * 3 * NH * HS)
+            +   (t * 3 * NH * HS)
+            +       (0 * NH * HS)
+            +          (nh * HS)
+            +                hs;
 
         q[idx] = inp[inp_idx];
-        k[idx] = inp[inp_idx + NH * d];
-        v[idx] = inp[inp_idx + 2 * (NH * d)];
+        k[idx] = inp[inp_idx + NH * HS];
+        v[idx] = inp[inp_idx + 2 * (NH * HS)];
     }
 }
 
@@ -145,6 +153,35 @@ void trimul_cublas(float* preatt,
     // batched matrix multiply with cuBLAS
     const float alpha = 1.0f / sqrtf(HS);
     const float beta = 0.0f;
+    // This schedules in parallel B*NH matmuls of shape q@k^t = (T, HS) @ (HS, T) = (T, T).
+    // IMPORTANT NOTE: Cublas uses a column-major (and we use row-major in our codebase) representation,
+    // so this call might look confusing to you if you look at the `cublasSgemmStridedBatched` signature.
+    //
+    // In order to avoid having to do an additional transpose operation after this func call,
+    // we need to pass in K as the first argument and Q as the second argument, which might make you think we're computing K^T @ Q.
+    // That combined with the shapes we got after the permute kernel - (B, NH, T, HS) (I'll omit B, NH for brevity going forward)
+    // and you might think we end up with (HS, T) @ (T, HS) = (HS, HS).
+    // This is not the case. :)
+    //
+    // Cublas sees our row-major matrix (T, HS) as (HS, T), hence we set the lead dimensions to HS (see function signature).
+    // We transpose K and end up computing K^T @ Q = (T, HS) @ (HS, T) = (T, T).
+    // If you were to interpret the above formula K^T @ Q you might think we end up with:
+    // -----------------------------------
+    // k1.dot(q1) k1.dot(q2) ... k1.dot(qT)
+    // k2.dot(q1) k2.dot(q2) ... k2.dot(qT)
+    // ...
+    // kT.dot(q1) kT.dot(q2) ... kT.dot(qT)
+    // -----------------------------------
+    // But as I mentioned, Cublas is column-major!
+    // So given that the dot product is symmetric we can write k1.dot(q1) as q1.dot(k1) and transposing the above
+    // representation we can see what we actually end up with in the row-major format:
+    // -----------------------------------
+    // q1.dot(k1) q1.dot(k2) ... q1.dot(kT)
+    // q2.dot(k1) q2.dot(k2) ... q2.dot(kT)
+    // ...
+    // qT.dot(k1) qT.dot(k2) ... qT.dot(kT)
+    // -----------------------------------
+    // which is exactly what we wanted! :)
     cublasCheck(cublasSgemmStridedBatched(cublas_handle,
                                           CUBLAS_OP_T, CUBLAS_OP_N,
                                           T, T, HS,
@@ -173,7 +210,7 @@ void trimul_cublas(float* preatt,
  */
 
 // using creates an alias for a function pointer
-using matmul_fn_ptr = void(*)(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha);
+using matmul_fn_ptr = void(*)(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha);
 
 template<matmul_fn_ptr matmul_tri>
 __global__ void __launch_bounds__(256, 2) trimul_global(float* out, const float* inp, int T, int C, int NH) {
@@ -183,20 +220,21 @@ __global__ void __launch_bounds__(256, 2) trimul_global(float* out, const float*
 
     // set up indices
     int C3 = C*3;
-    int hs = C / NH; // head size
-    float scale = 1.0 / sqrtf(hs);
+    int HS = C / NH; // head size
+    float scale = 1.0 / sqrtf(HS);
 
     // we put the "batch x head" dimension into the z block index.
-    int h = blockIdx.z % NH;
     int b = blockIdx.z / NH;
+    int nh = blockIdx.z % NH;
 
     // Get the base address for the current batch and head
-    const float* q = inp + b * T * C3 + h * hs;
-    const float* k = inp + b * T * C3 + h * hs + C;
-    float* r = out + (b*NH + h)*T*T;
+    // shapes -> inp (B, T, 3, NH, HS), Q (B, NH, T, HS), K (B, NH, T, HS)
+    const float* q = inp + b * T * C3 + nh * HS;  // Q[b][nh][:][:] = inp[b][:][0][nh][:]
+    const float* k = inp + b * T * C3 + nh * HS + C;  // K[b][nh][:][:] = inp[b][:][1][nh][:]
+    float* r = out + (b*NH + nh)*T*T;  // out[b][nh][:][:]
 
     // start the multiplication
-    matmul_tri(r, T, q, C3, k, C3, T, hs, scale);
+    matmul_tri(r, T, k, C3, q, C3, T, HS, scale);
 }
 
 template<matmul_fn_ptr matmul_tri>
@@ -239,12 +277,22 @@ void trimul_launcher(float* out, const float* inp, int B, int T, int C, int NH) 
  */
 
 // baseline implementation: 20 ms
-__device__ void matmul_tri_naive(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
-    // get coordinates of our block
+__device__ void matmul_tri_naive(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
+    // coordinate system:
+    // | - - - - - > j
+    // |
+    // |
+    // v
+    // i
+    // get coordinates of our block - each thread is responsible for a single 8x8 block.
     int i_base = 128 * blockIdx.x + 8 * threadIdx.x;
     int j_base = 128 * blockIdx.y + 8 * threadIdx.y;
 
-    // one more check to skip the upper diagonal in blocks that are on the diagonal.
+    // One more check to skip the upper diagonal in blocks that are on the diagonal.
+    // Note: we deliberately waste some compute on the jagged diagonal i.e. elements that belong
+    // to the upper triangle that should be masked out. This will be ignored due to the causal mask
+    // in the reference CPU implementation when used in the `validate_result` function.
+    // Alternatively this check should be done in the nested for loop below -> if (i > j) return.
     if(j_base > i_base)
         return;
 
@@ -254,17 +302,17 @@ __device__ void matmul_tri_naive(float* p, int ps, const float* k, int ks, const
         for(int jo = 0; jo < 8; ++jo) {
             int j = j_base + jo;
             float val = 0;
-            for (int s = 0; s < hs; ++s) {
-                val += k[i * ks + s] * q[j * qs + s];
+            for (int s = 0; s < HS; ++s) {
+                val += q[i * QS + s] * k[j * KS + s];
             }
-            p[i * ps + j] = val * alpha;
+            p[i * PS + j] = val * alpha;
         }
     }
 }
 
 /*                     ** Chapter IV - ... **
  *
- *  Each worker is producing 64 combined cookies from 8 animals and 8 landscapes. They send there runners of 64 times
+ *  Each worker is producing 64 combined cookies from 8 animals and 8 landscapes. They send their runners 64 times
  *  to fetch the corresponding shapes. This is terribly inefficient; The runners need a minute or so for each trip,
  *  but making a cookie can be done in just a second.
  *
@@ -292,7 +340,7 @@ __device__ void matmul_tri_naive(float* p, int ps, const float* k, int ks, const
  */
 
 // reorganize loops to enable data reuse: 3.5 ms
-__device__ void matmul_tri_registers(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
+__device__ void matmul_tri_registers(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
     int i_base = 128 * blockIdx.x + 8 * threadIdx.x;
     int j_base = 128 * blockIdx.y + 8 * threadIdx.y;
 
@@ -300,17 +348,17 @@ __device__ void matmul_tri_registers(float* p, int ps, const float* k, int ks, c
         return;
 
     // shift our pointers to the sub-block this thread is responsible for
-    k += i_base * ks;
-    q += j_base * qs;
-    p += i_base * ps + j_base;
+    q += i_base * QS;
+    k += j_base * KS;
+    p += i_base * PS + j_base;
 
     float vals[8][8] = {};
-    for (int s = 0; s < hs; ++s) {
+    for (int hs = 0; hs < HS; ++hs) {
         float lhs[8];
         float rhs[8];
         for (int u = 0; u < 8; ++u) {
-            lhs[u] = k[u * ks + s];
-            rhs[u] = q[u * qs + s];
+            lhs[u] = q[u * QS + hs];
+            rhs[u] = k[u * KS + hs];
         }
 
         for (int i = 0; i < 8; ++i) {
@@ -322,7 +370,7 @@ __device__ void matmul_tri_registers(float* p, int ps, const float* k, int ks, c
 
     for (int i = 0; i < 8; ++i) {
         for (int j = 0; j < 8; ++j) {
-            p[i * ps + j] = vals[i][j] * alpha;
+            p[i * PS + j] = vals[i][j] * alpha;
         }
     }
 }
@@ -334,7 +382,7 @@ __device__ void matmul_tri_registers(float* p, int ps, const float* k, int ks, c
  *  "Of course", the runner answers, "but they've asked me for an elephant, a lion, a zebra, and a goldfish. These
  *  are all over the place, I can't just pick them up at one spot (_strided acccess_).
  *  "But the lion is right next to the palm tree. You could bring those two together?", you confirm.
- *  "Yes", he says, "if the just asked for the different categories at the same time, that would make things
+ *  "Yes", he says, "if they just asked for the different categories at the same time, that would make things
  *  so much easier. See, I have this bucket, I could carry lots of things in one go if I could just scoop them up
  *  from the same place (_coalesced access_).
  *
@@ -364,7 +412,8 @@ __device__ void st_vec(float* address, float4 val) {
 }
 
 // vector instructions for coalesced memory access: 1.7 ms
-__device__ void matmul_tri3(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
+__device__ void matmul_tri3(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
+    // Same logic as previous kernel we just load in float4 to improve coalescing
     int i_base = 128 * blockIdx.x + 8 * threadIdx.x;
     int j_base = 128 * blockIdx.y + 8 * threadIdx.y;
 
@@ -372,21 +421,21 @@ __device__ void matmul_tri3(float* p, int ps, const float* k, int ks, const floa
         return;
 
     // shift our pointers to the sub-block this thread is responsible for
-    k += i_base * ks;
-    q += j_base * qs;
-    p += i_base * ps + j_base;
+    q += i_base * QS;
+    k += j_base * KS;
+    p += i_base * PS + j_base;
 
     float vals[8][8] = {};
-    for (int s = 0; s < hs; s += 4) {
+    for (int hs = 0; hs < HS; hs += 4) {
         // load in float4 to improve coalescing
         float4 rhs[8];
         for (int u = 0; u < 8; ++u) {
-            rhs[u] = ld_vec(q + u * qs + s);
+            rhs[u] = ld_vec(k + u * KS + hs);
         }
 
         for (int i = 0; i < 8; ++i) {
             // no need to keep lhs around for the i loop, its only reused in the j loop anyway.
-            float4 lhs = ld_vec(k + i * ks + s);
+            float4 lhs = ld_vec(q + i * QS + hs);
             for (int j = 0; j < 8; ++j) {
                 vals[i][j] += lhs.x * rhs[j].x;
                 vals[i][j] += lhs.y * rhs[j].y;
@@ -403,7 +452,7 @@ __device__ void matmul_tri3(float* p, int ps, const float* k, int ks, const floa
             result.y = vals[i][j + 1] * alpha;
             result.z = vals[i][j + 2] * alpha;
             result.w = vals[i][j + 3] * alpha;
-            st_vec(p + i * ps + j, result);
+            st_vec(p + i * PS + j, result);
         }
     }
 }
@@ -424,7 +473,7 @@ __device__ void matmul_tri3(float* p, int ps, const float* k, int ks, const floa
  *  details.]
  *
  */
-__device__ void matmul_tri4(float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
+__device__ void matmul_tri4(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
     int i_base = 128 * blockIdx.x + 8 * threadIdx.x;
     int j_base = 128 * blockIdx.y + 8 * threadIdx.y;
 
@@ -433,14 +482,14 @@ __device__ void matmul_tri4(float* p, int ps, const float* k, int ks, const floa
     if (blockIdx.y > blockIdx.x)
         return;
 
-    k += 128 * blockIdx.x * ks;
-    q += 128 * blockIdx.y * qs;
+    q += 128 * blockIdx.x * QS;
+    k += 128 * blockIdx.y * KS;
 
     __shared__ float lhs_s[128][32];
     __shared__ float rhs_s[128][32];
 
     float vals[8][8] = {};
-    for (int so = 0; so < hs; so += 32) {
+    for (int so = 0; so < HS; so += 32) {
         // Read a large slice of the input, worked on together by all threads.
         // They are organized differently for this part. We want to ensure
         // fully coalesced loads, so we let a single warp handle consecutive
@@ -448,14 +497,23 @@ __device__ void matmul_tri4(float* p, int ps, const float* k, int ks, const floa
         // in one read operation.
         // note: threads may read data here that they don't need themselves.
         //       this really is a block-level operation.
+        // note2: 16x16 threads (i.e. the block) will, through this for loop, fetch 32 dims from 128 keys and 128 queries
+        // i.e. from Q/K, of shape (T, HS) take q[:128, so*32:(so+1)*32] and k[:128, so*32:(so+1)*32]
         __syncthreads();
         for(int y = threadIdx.y / 2; y < 128; y += 8) {
             int xo = (threadIdx.y % 2) * 16;
-            lhs_s[y][threadIdx.x + xo] = k[y * ks + so + threadIdx.x + xo];
-            rhs_s[y][threadIdx.x + xo] = q[y * qs + so + threadIdx.x + xo];
+            lhs_s[y][threadIdx.x + xo] = q[y * QS + so + threadIdx.x + xo];
+            rhs_s[y][threadIdx.x + xo] = k[y * KS + so + threadIdx.x + xo];
         }
         __syncthreads();
 
+        // Now we compute a partial dot product (only 32 dims) for all combinations of keys and queries (128x128).
+        // Each thread does 8x8 of these partial dot products.
+        // E.g. thread (0,0) covers queries 0-7 and keys 0-7. More generally first row of threads
+        // (0,:) covers queries 0-7 with keys 0-127 and so on.
+        // In the next iterations of the outer (`so`) loop we'll be accumulating values to `vals` until we
+        // get the full dot product. We then later deposit it into the output matrix for all 8x8 blocks
+        // that are below the diagonal.
         for (int si = 0; si < 32; ++si) {
             float rhs[8];
             for (int u = 0; u < 8; ++u) {
@@ -484,7 +542,7 @@ __device__ void matmul_tri4(float* p, int ps, const float* k, int ks, const floa
             result.y = vals[ii][ji + 1] * alpha;
             result.z = vals[ii][ji + 2] * alpha;
             result.w = vals[ii][ji + 3] * alpha;
-            st_vec(p + i * ps + j, result);
+            st_vec(p + i * PS + j, result);
         }
     }
 }
