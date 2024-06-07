@@ -1487,9 +1487,9 @@ int main(int argc, char *argv[]) {
         assert(strlen(output_log_dir) < 400); // careful bunch of hardcoded snprintf around this
     }
     // check if output_log_dir does not exist or is a file
-    struct stat st = {0};
-    if (output_log_dir != NULL && (stat(output_log_dir, &st) == -1 || !S_ISDIR(st.st_mode))) {
-        fprintf(stderr, "-o (%s) does not exist or is a file - are you specifying a file instead of dir?\n", output_log_dir);
+    struct stat info;
+    if (output_log_dir != NULL && (stat(output_log_dir, &info ) != 0 || !(info.st_mode & S_IFDIR))) {
+        fprintf(stderr, "-o \"%s\" does not exist or is a file - are you specifying a file instead of dir?\n", output_log_dir);
         exit(EXIT_FAILURE);
     }
     int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
