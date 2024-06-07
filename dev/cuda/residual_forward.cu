@@ -99,7 +99,7 @@ int main(int argc, char **argv) {
     float* out = (float*)malloc(B * T * C * sizeof(float));
     float* inp1 = make_random_float(B * T * C);
     float* inp2 = make_random_float(B * T * C);
-    
+
     // move to GPU
     floatX* d_out;
     floatX* d_inp1;
