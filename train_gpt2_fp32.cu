@@ -1634,8 +1634,8 @@ int main(int argc, char *argv[]) {
 
     // build DataLoaders for both train and val
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1);
-    dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1);
+    dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, NULL);
+    dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, NULL);
     int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
     int val_num_batches = val_loader.num_tokens / (B*T);
     if (val_num_batches > val_max_steps) { val_num_batches = val_max_steps; }
@@ -1668,7 +1668,7 @@ int main(int argc, char *argv[]) {
         // once in a while estimate the validation loss
         if (step % val_loss_every == 0 || last_step) {
             float val_loss = 0.0f;
-            dataloader_reset(&val_loader);
+            dataloader_reset(&val_loader, NULL);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
                 gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
