@@ -1486,10 +1486,10 @@ int main(int argc, char *argv[]) {
     if (output_log_dir != NULL) {
         assert(strlen(output_log_dir) < 400); // careful bunch of hardcoded snprintf around this
     }
-    // check if output_log_dir has a "." in it, because this behavior changed May 24, 2024. take out later
-    if (output_log_dir != NULL && strstr(output_log_dir, ".") != NULL) {
-        fprintf(stderr, "-o (output_log_dir) has a '.', are you specifying a file instead of dir?\n");
-        fprintf(stderr, "(note that this option changed recently, -o used to be file, became dir.)\n");
+    // check if output_log_dir does not exist or is a file
+    struct stat st = {0};
+    if (output_log_dir != NULL && (stat(output_log_dir, &st) == -1 || !S_ISDIR(st.st_mode))) {
+        fprintf(stderr, "-o (%s) does not exist or is a file - are you specifying a file instead of dir?\n", output_log_dir);
         exit(EXIT_FAILURE);
     }
     int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
