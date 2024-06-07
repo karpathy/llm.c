@@ -15,6 +15,8 @@ Implements:
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck
 // defines: mallocCheck
 #include "utils.h"
+// defines: random_u32
+#include "sampler.h"
 
 // ----------------------------------------------------------------------------
 // implementation of glob for Windows is in dev/unistd.h
@@ -86,13 +88,26 @@ void dataloader_resume(DataLoader *loader, int current_shard, int64_t current_po
     dataloader_load_shard_(loader, loader->current_shard);
 }
 
-void dataloader_reset(DataLoader *loader) {
+void dataloader_reset(DataLoader *loader, unsigned long long *state) {
     // fully resets the DataLoader object to init configuration
     // each process starts at a different offset in the file
     int64_t header_bytes = HEADER_SIZE * sizeof(int);
     int64_t token_bytes_offset = loader->process_rank * loader->B * loader->T * sizeof(uint16_t);
-    loader->current_shard = 0;
-    loader->current_position = header_bytes + token_bytes_offset;
+    if (state != NULL) {
+        // pick a random shard to start from
+        loader->current_shard = random_u32(state) % loader->glob_result.gl_pathc;
+        // pick a random example inside the shard to start from
+        size_t total_batch_size_bytes = ((loader->num_processes * (loader->B * loader->T)) * sizeof(uint16_t));
+        // -1 due to us taking B*T+1 tokens but moving by B*T tokens
+        size_t num_batches = (loader->file_size - sizeof(uint16_t)) / total_batch_size_bytes;
+        size_t rand_batch_idx = random_u32(state) % num_batches;
+        size_t global_token_bytes_offset = rand_batch_idx * total_batch_size_bytes;
+        loader->current_position = header_bytes + global_token_bytes_offset + token_bytes_offset;
+    } else {
+        // start from the beginning of the file
+        loader->current_shard = 0;
+        loader->current_position = header_bytes + token_bytes_offset;
+    }
     dataloader_load_shard_(loader, loader->current_shard);
 }
 
@@ -113,7 +128,8 @@ void dataloader_init(DataLoader *loader,
                      size_t B,
                      size_t T,
                      int process_rank,
-                     int num_processes) {
+                     int num_processes,
+                     unsigned long long *state = NULL) {
     loader->process_rank = process_rank;
     loader->num_processes = num_processes;
     loader->B = B;
@@ -152,7 +168,7 @@ void dataloader_init(DataLoader *loader,
     loader->num_tokens = ntok_total;
 
     // reset the loader, to initialize it
-    dataloader_reset(loader);
+    dataloader_reset(loader, state);
 }
 
 void dataloader_next_batch(DataLoader *loader) {
