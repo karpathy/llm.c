@@ -17,7 +17,7 @@ GPU_MEM=80 modal run dev/cuda/benchmark_on_modal.py \
 For profiling using nsight system:
 GPU_MEM=80 modal run dev/cuda/benchmark_on_modal.py \
     --compile-command "make train_gpt2cu USE_CUDNN=1" \
-    --run-command "--cuda-graph-trace=graph --python-backtrace=cuda --cuda-memory-usage=true \
+    --run-command "nsys profile --cuda-graph-trace=graph --python-backtrace=cuda --cuda-memory-usage=true \
     ./train_gpt2cu -i dev/data/tinyshakespeare/tiny_shakespeare_train.bin \
     -j dev/data/tinyshakespeare/tiny_shakespeare_val.bin -v 250 -s 250 -g 144 -f shakespeare.log -b 4"
 
