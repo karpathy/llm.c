@@ -226,15 +226,13 @@ struct ShardInfo {
     size_t size;
 };
 ShardInfo multi_gpu_get_shard_offset(size_t elements, const MultiGpuConfig* multi_gpu_config, int shard_at_stage) {
+    int nproc = multi_gpu_config->num_processes;
     if(multi_gpu_config->zero_stage >= shard_at_stage) {
-        if (elements % multi_gpu_config->num_processes != 0) {
-            fprintf(stderr, "Number of elements %zu must be a multiple of the number of processes %d\n", elements,
-                    multi_gpu_config->num_processes);
+        if (elements % nproc != 0) {
+            fprintf(stderr, "Number of elements %zu must be a multiple of the number of processes %d\n", elements, nproc);
             exit(EXIT_FAILURE);
         }
-        return {(ptrdiff_t) (multi_gpu_config->process_rank * (elements / multi_gpu_config->num_processes)),
-                elements / multi_gpu_config->num_processes
-        };
+        return {(ptrdiff_t) (multi_gpu_config->process_rank * (elements / nproc)), elements / nproc};
     } else {
         return {0, elements};
     }
@@ -1159,25 +1157,13 @@ float multi_gpu_cpu_float_sum(float value) {
 
 // Averages out the loss and gradients across all GPUs. No-op when multi-GPU is disabled.
 // todo - this version only works if all the parameters are the same size (floatX)
-void gpt2_multi_gpu_loss_and_grad_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
+void gpt2_multi_gpu_loss_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
     NVTX_RANGE_FN();
     // If there's only one process, there is nothing to do
     if (multi_gpu_config->num_processes == 1) { return; }
     // Average all losses.
     model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss) / multi_gpu_config->num_processes;
-    // Now average the gradients
-    if(multi_gpu_config->zero_stage == 0) {
-        // gradients get averaged during backward
-    } else if (multi_gpu_config->zero_stage == 1) {
-        assert(false && "This code is WIP; ZeRO-1 is currently broken");
-        // ZERO-1: Get the average gradient only for local shard
-        floatX* local_grads_memory = (floatX*) model->grads_memory + multi_gpu_config->shard_offset;
-        ncclCheck(ncclReduceScatter(model->grads_memory, local_grads_memory,
-                                    multi_gpu_config->shard_num_parameters,
-                                    ncclFloatX, ncclAvg,
-                                    multi_gpu_config->nccl_comm, main_stream));
-    }
 #endif
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -1248,23 +1234,32 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
 
     // handle adamw for all the transformer blocks
     for(int l = 0; l < model->config.num_layers; ++l) {
-        ptrdiff_t tensor_offset = 0;
+        ptrdiff_t full_tensor_offset = 0;
+        ptrdiff_t partial_tensor_offset = 0;
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
             // skip over preceding layers
             if(i > 0) {
-                tensor_offset += model->param_elements[i - 1];
+                full_tensor_offset += model->param_elements[i - 1];
+                partial_tensor_offset += model->param_elements[i - 1] / multi_gpu_config->num_processes;
             }
-            ptrdiff_t local_offset;
+
+            ptrdiff_t global_offset;
+            ptrdiff_t local_offset_full;
+            ptrdiff_t local_offset_partial;
             size_t num_parameters;
-            if(2 <= i && i <= 12) {
+            if(2 <= i && i <= 13) {
                 size_t tensor_nelem = model->param_elements[i] / model->config.num_layers;
                 ShardInfo shard = multi_gpu_get_shard_offset(tensor_nelem, multi_gpu_config, 1);
-                local_offset = tensor_offset + l * tensor_nelem + shard.offset;
+                global_offset = full_tensor_offset + l * tensor_nelem;
+                local_offset_full = full_tensor_offset + l * tensor_nelem + shard.offset;
+                local_offset_partial = partial_tensor_offset + l * shard.size;
                 num_parameters = shard.size;
             } else {
                 if(l != 0) continue;
                 ShardInfo shard = multi_gpu_get_shard_offset(model->param_elements[i], multi_gpu_config, 1);
-                local_offset = tensor_offset + shard.offset;
+                global_offset = full_tensor_offset;
+                local_offset_full = full_tensor_offset + shard.offset;
+                local_offset_partial = partial_tensor_offset;
                 num_parameters = shard.size;
             }
 
@@ -1273,18 +1268,28 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
             // - the token embeddings are weight shared and participate in the final projection to logits
             // - the position embeddings actively participate at every forward/backward pass
             float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
-            floatX* param_ptr = (floatX*)model->params_memory + local_offset;
-            floatX* grad_ptr = (floatX*)model->grads_memory + local_offset;
-            float* m_ptr = model->m_memory + local_offset;
-            float* v_ptr = model->v_memory + local_offset;
+            floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
+            floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
+
+            ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ?  local_offset_full : local_offset_partial;
+            float* m_ptr = model->m_memory + opt_state_offset;
+            float* v_ptr = model->v_memory + opt_state_offset;
             float* master_ptr = NULL;
-            if (model->master_weights != NULL) { master_ptr = model->master_weights + local_offset; }
+            if (model->master_weights != NULL) { master_ptr = model->master_weights + opt_state_offset; }
 
             // ok finally call the kernel
             adamw_update(param_ptr, master_ptr, grad_ptr,
                          m_ptr, v_ptr,
                          num_parameters, learning_rate,
                          beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+            cudaCheck(cudaGetLastError());
+
+            if (multi_gpu_config->zero_stage == 1) {
+                // gather updated shards of model->params_memory from each process
+                ncclCheck(ncclAllGather(param_ptr, (floatX*)model->params_memory + global_offset,
+                                        num_parameters, ncclFloatX,
+                                        multi_gpu_config->nccl_comm, main_stream));
+            }
             cudaCheck(cudaGetLastError());
         }
     }
@@ -1884,7 +1889,7 @@ int main(int argc, char *argv[]) {
         // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
         model.mean_loss = lossf;
         // average the loss and the gradients between all processes
-        gpt2_multi_gpu_loss_and_grad_reduce(&model, &multi_gpu_config);
+        gpt2_multi_gpu_loss_reduce(&model, &multi_gpu_config);
         // learning rate schedule: warmup linearly to max LR, then cosine decay to LR * final_learning_rate_frac
         float step_learning_rate = learning_rate;
         if (step < warmup_iterations) {
@@ -1899,7 +1904,7 @@ int main(int argc, char *argv[]) {
         }
         // update the model parameters
         float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
-        gpt2_multi_gpu_param_gather(&model, &multi_gpu_config);
+        //gpt2_multi_gpu_param_gather(&model, &multi_gpu_config);
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
         cudaCheck(cudaEventRecord(end));
