@@ -221,6 +221,25 @@ void multi_gpu_barrier(const MultiGpuConfig* multi_gpu_config) {
 #endif
 }
 
+struct ShardInfo {
+    ptrdiff_t offset;
+    size_t size;
+};
+ShardInfo multi_gpu_get_shard_offset(size_t elements, const MultiGpuConfig* multi_gpu_config, int shard_at_stage) {
+    if(multi_gpu_config->zero_stage >= shard_at_stage) {
+        if (elements % multi_gpu_config->num_processes != 0) {
+            fprintf(stderr, "Number of elements %zu must be a multiple of the number of processes %d\n", elements,
+                    multi_gpu_config->num_processes);
+            exit(EXIT_FAILURE);
+        }
+        return {(ptrdiff_t) (multi_gpu_config->process_rank * (elements / multi_gpu_config->num_processes)),
+                elements / multi_gpu_config->num_processes
+        };
+    } else {
+        return {0, elements};
+    }
+}
+
 // convenience function that only prints if the rank of process is zero
 void printf0(const char *format, ...) {
     if (multi_gpu_config.process_rank == 0) {
@@ -1226,63 +1245,49 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
 
     // AdamW update
     unsigned int seed = random_u32(&model->rng_state);
-    // individually call the adamw_kernel3 on all parameter tensors separately
-    size_t offset = 0;
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        size_t num_parameters = model->param_elements[i];
-        // the scope of this GPU's work is the range: [shard_offset, shard_offset + shard_num_parameters)
-        // this parameter's values are in the range:  [offset, offset + num_parameters)
-        // so we are responsible for some of its parameters if:
-        // 1) this parameter ends after we begin (i.e. offset + num_parameters > shard_offset)
-        // 2) this parameter begins before we end (i.e. offset < shard_offset + shard_num_parameters)
-        if(offset + num_parameters > shard_offset && offset < shard_offset + shard_num_parameters) {
 
-            // ok this tensor has at least one element inside the range of responsibility of this GPU
-            // let's figure out the exact span we wish to call the AdamW kernel on
-            floatX* params_ptr = NULL;
-            floatX* grad_ptr = NULL;
-            float* m_ptr = NULL;
-            float* v_ptr = NULL;
-            float* master_ptr = NULL;
-            size_t local_params = 0;
-            // does the tensor begin before our responsibility?
-            if(offset <= shard_offset) {
-                // if so, our start point is exactly that of our responsibility, i.e. shard_offset
-                params_ptr = params_memory + shard_offset;
-                grad_ptr = grads_memory + shard_offset;
-                // note that (master_weights, m, v) are already only the "local slice" for this GPU,
-                // and are of size shard_num_parameters, instead of the total number of parameters
-                // so they do not get offset, i.e. we just start at their index 0
-                if (model->master_weights != NULL) { master_ptr = model->master_weights; }
-                m_ptr = model->m_memory;
-                v_ptr = model->v_memory;
-                // the number of parameters we have to update is the minimum of two ranges
-                local_params = min(shard_num_parameters, (offset + num_parameters) - shard_offset);
-            } else {
-                // our start point is the location of this tensor, i.e. offset
-                params_ptr = params_memory + offset;
-                grad_ptr = grads_memory + offset;
-                // this arithmetic gave me a headache but my little doodle example says it's right
-                size_t delta = offset - shard_offset;
-                if (model->master_weights != NULL) { master_ptr = model->master_weights + delta; }
-                m_ptr = model->m_memory + delta;
-                v_ptr = model->v_memory + delta;
-                local_params = min(num_parameters, shard_num_parameters - delta);
+    // handle adamw for all the transformer blocks
+    for(int l = 0; l < model->config.num_layers; ++l) {
+        ptrdiff_t tensor_offset = 0;
+        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            // skip over preceding layers
+            if(i > 0) {
+                tensor_offset += model->param_elements[i - 1];
             }
+            ptrdiff_t local_offset;
+            size_t num_parameters;
+            if(2 <= i && i <= 12) {
+                size_t tensor_nelem = model->param_elements[i] / model->config.num_layers;
+                ShardInfo shard = multi_gpu_get_shard_offset(tensor_nelem, multi_gpu_config, 1);
+                local_offset = tensor_offset + l * tensor_nelem + shard.offset;
+                num_parameters = shard.size;
+            } else {
+                if(l != 0) continue;
+                ShardInfo shard = multi_gpu_get_shard_offset(model->param_elements[i], multi_gpu_config, 1);
+                local_offset = tensor_offset + shard.offset;
+                num_parameters = shard.size;
+            }
+
             // we only want to weight decay the 2D tensors and leave all 1D tensors alone
             // in particular this also decays the embedding weights, but this is ok:
             // - the token embeddings are weight shared and participate in the final projection to logits
             // - the position embeddings actively participate at every forward/backward pass
             float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
+            floatX* param_ptr = (floatX*)model->params_memory + local_offset;
+            floatX* grad_ptr = (floatX*)model->grads_memory + local_offset;
+            float* m_ptr = model->m_memory + local_offset;
+            float* v_ptr = model->v_memory + local_offset;
+            float* master_ptr = NULL;
+            if (model->master_weights != NULL) { master_ptr = model->master_weights + local_offset; }
+
             // ok finally call the kernel
-            adamw_update(params_ptr, master_ptr, grad_ptr,
-                         m_ptr, v_ptr, local_params, learning_rate,
+            adamw_update(param_ptr, master_ptr, grad_ptr,
+                         m_ptr, v_ptr,
+                         num_parameters, learning_rate,
                          beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+            cudaCheck(cudaGetLastError());
         }
-        // advance the offset pointer to the next parameter tensor
-        offset += num_parameters;
     }
-    cudaCheck(cudaGetLastError());
 
     cudaCheck(cudaDeviceSynchronize());
     return grad_norm_cpu;
