@@ -158,7 +158,7 @@ int main(int argc, char *argv[]) {
     // copy logits to CPU so we can compare them
     floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
     float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
-    cudaMemcpyAsync(logits_cpu_raw, model.acts.output, B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost, main_stream);
+    cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost);
     for (int i = 0; i < B * T * Vp; i++) {
         logits_cpu[i] = (float)logits_cpu_raw[i];
     }
@@ -219,7 +219,7 @@ int main(int argc, char *argv[]) {
             }
 
             // move the (mixed precision) grads from GPU to CPU
-            cudaMemcpyAsync(grads_memory_cpu, model.grads_memory, model.num_parameters_bytes, cudaMemcpyDeviceToHost, main_stream);
+            cudaMemcpy(grads_memory_cpu, model.grads_memory, model.num_parameters_bytes, cudaMemcpyDeviceToHost);
 
             // convert all gradients to float on the CPU
             char* src_iterator = (char*)grads_memory_cpu; // can be lower precision, so we use char*

@@ -563,7 +563,7 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     fwrite(model_header, sizeof(int), 256, model_file);
     // write the parameters
     void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
-    cudaCheck(cudaMemcpyAsync(params_memory_cpu, model->params_memory, model->num_parameters_bytes, cudaMemcpyDeviceToHost, main_stream));
+    cudaCheck(cudaMemcpy(params_memory_cpu, model->params_memory, model->num_parameters_bytes, cudaMemcpyDeviceToHost));
     fwrite(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
     free(params_memory_cpu);
     // close file, we're done
@@ -629,7 +629,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     // read in all the parameters from file and copy them to device
     void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
     freadCheck(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
-    cudaCheck(cudaMemcpyAsync(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice, main_stream));
+    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     free(params_memory_cpu);
     fcloseCheck(model_file);
 
@@ -721,7 +721,7 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     }
 
     // copy them to GPU
-    cudaCheck(cudaMemcpyAsync(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice, main_stream));
+    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     free(params_memory_cpu);
 
     gpt2_init_common(model);
@@ -777,9 +777,9 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
     }
 
     // copy inputs/targets to the model
-    cudaCheck(cudaMemcpyAsync(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice, main_stream));
+    cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
     if (targets != NULL) {
-        cudaCheck(cudaMemcpyAsync(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice, main_stream));
+        cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     }
 
     // validate inputs, all indices must be in the range [0, V)
@@ -877,8 +877,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
         const float dloss = 1.0f / (B * T * grad_accum_steps); // results in the uniform average loss over all elements
         fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, main_stream);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
-        cudaCheck(cudaMemcpyAsync(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost, main_stream));
-        cudaCheck(cudaDeviceSynchronize());     // wait for the loss to be available
+        cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost));
         float mean_loss = 0.0f;
         for (int i = 0; i < B*T; i++) {
             float loss = (float)(model->cpu_losses[i]);
@@ -897,7 +896,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
 void gpt2_zero_grad(GPT2 *model) {
     NVTX_RANGE_FN();
     if (model->grads_memory != NULL) {
-        cudaCheck(cudaMemsetAsync(model->grads_memory, 0, model->num_parameters * sizeof(floatX), main_stream));
+        cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(floatX)));
     }
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -951,7 +950,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
     GradActTensors grads_acts = model->grads_acts;
 
     // reset residual stream gradients (put here to work with gradient accumulation)
-    cudaCheck(cudaMemsetAsync(model->grads_acts.residual3, 0, B * T * C * sizeof(floatX), main_stream));
+    cudaCheck(cudaMemset(model->grads_acts.residual3, 0, B * T * C * sizeof(floatX)));
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
     float*  scratchF = (float*)acts.output;
@@ -1120,8 +1119,8 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
         cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
         cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
-        cudaCheck(cudaMemsetAsync(model->m_memory, 0, shard_num_parameters * sizeof(float), main_stream));
-        cudaCheck(cudaMemsetAsync(model->v_memory, 0, shard_num_parameters * sizeof(float), main_stream));
+        cudaCheck(cudaMemset(model->m_memory, 0, shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->v_memory, 0, shard_num_parameters * sizeof(float)));
     }
     if (model->use_master_weights == 1 && model->master_weights == NULL) {
         printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
@@ -1146,8 +1145,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     }
     // transfer the gradient norm to CPU
     float grad_norm_squared_cpu = 0.0f;
-    cudaCheck(cudaMemcpyAsync(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
-    cudaCheck(cudaDeviceSynchronize());     // wait for the norm to be available
+    cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
     if (multi_gpu_config->zero_stage == 1) {
         // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
         grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
@@ -1348,9 +1346,9 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     // write AdamW m, v, and master_weights here (they are all float)
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
     float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
-    cudaCheck(cudaMemcpyAsync(cpu_buffer, model->m_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost, main_stream));
+    cudaCheck(cudaMemcpy(cpu_buffer, model->m_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    cudaCheck(cudaMemcpyAsync(cpu_buffer, model->v_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost, main_stream));
+    cudaCheck(cudaMemcpy(cpu_buffer, model->v_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     free(cpu_buffer);
     fclose(state_file);
@@ -1380,9 +1378,9 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     }
     float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    cudaCheck(cudaMemcpyAsync(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice, main_stream));
+    cudaCheck(cudaMemcpy(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    cudaCheck(cudaMemcpyAsync(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice, main_stream));
+    cudaCheck(cudaMemcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     free(cpu_buffer);
     fclose(state_file);
 }
@@ -1736,8 +1734,7 @@ int main(int argc, char *argv[]) {
                 // get the V-dimensional vector probs[0, t-1, :]
                 floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
                 // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
-                cudaCheck(cudaMemcpyAsync(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost, main_stream));
-                cudaCheck(cudaDeviceSynchronize());     // wait for the logits to become available
+                cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost));
                 // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
                 for (int i = 0; i < model.config.vocab_size; i++) {
                     cpu_logits[i] = (float)cpu_logits_raw[i];
