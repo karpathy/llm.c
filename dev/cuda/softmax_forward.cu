@@ -135,7 +135,6 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
         maxval = fmaxf(maxval, x[i]);
     }
     shared[tid] = maxval;
-    __syncthreads();
     // reductions
     for (int stride = block_size / 2; stride >= 1; stride /= 2) {
         __syncthreads();
@@ -157,7 +156,6 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
         sumval += x[i];
     }
     shared[tid] = sumval;
-    __syncthreads();
     // reductions
     for (int stride = block_size / 2; stride >= 1; stride /= 2) {
         __syncthreads();
@@ -210,14 +208,13 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
     for (int i = tid; i < C; i += blockDim.x) {
         sumval += x[i];
     }
+    // No need to broadcast sumval since all threads in the warp will have the same value
+    // (due to the fact that we're using __shfl_xor_sync)
     sumval = warpReduceSum(sumval);
-
-    // Broadcast sumval within the warp
-    float sum = __shfl_sync(0xFFFFFFFF, sumval, 0);
 
     // Divide the input values by the sum
     for (int i = tid; i < C; i += blockDim.x) {
-        out[idx * C + i] = x[i] / sum;
+        out[idx * C + i] = x[i] / sumval;
     }
 }
 
@@ -238,10 +235,9 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     // the number of warps per block. recall that blockDim.x is block_size
     int warpsPerBlock = blockDim.x / 32;
 
-    // shared[] must be allocated to have 2 * warpsPerBlock elements
-    // first half for max values, the second half for sum values
-    float* maxvals = shared;
-    float* sumvals = &shared[warpsPerBlock];
+    // shared[] must be allocated to have warpsPerBlock elements
+    // those will be used for max and sum values
+    float* max_or_sum_storage = shared;
 
     // one row of inp, i.e. inp[idx, :] of shape (C,)
     const float* x = inp + idx * C;
@@ -255,21 +251,21 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     maxval = warpReduceMax(maxval);
 
     // the 0th thread of each warp writes the maxval of that warp to shared memory
-    if (laneId == 0) maxvals[warpId] = maxval;
+    if (laneId == 0) max_or_sum_storage[warpId] = maxval;
     __syncthreads();
 
-    // now the 0th thread reduces the maxvals in shared memory, i.e. across warps
+    // now the 0th thread of the block reduces the max values in shared memory, i.e. across warps
     if (tid == 0) {
-        float val = maxvals[tid];
+        float val = max_or_sum_storage[tid];
         for (int i = 1; i < warpsPerBlock; i++) {
-            val = fmaxf(val, maxvals[i]);
+            val = fmaxf(val, max_or_sum_storage[i]);
         }
         // store the final max in the first position
-        maxvals[0] = val;
+        max_or_sum_storage[0] = val;
     }
     __syncthreads();
     // broadcast the max to all threads
-    float offset = maxvals[0];
+    float offset = max_or_sum_storage[0];
 
     // compute expf and write the result to global memory
     for (int i = tid; i < C; i += blockDim.x) {
@@ -289,20 +285,20 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     sumval = warpReduceSum(sumval);
 
     // write sumval to shared memory
-    if (laneId == 0) sumvals[warpId] = sumval;
+    if (laneId == 0) max_or_sum_storage[warpId] = sumval;
     __syncthreads();
 
     // inter-thread reduction of sum
     if (tid == 0) {
-        float val = sumvals[tid];
+        float val = max_or_sum_storage[tid];
         for (int i = 1; i < warpsPerBlock; ++i) {
-            val += sumvals[i];
+            val += max_or_sum_storage[i];
         }
-        sumvals[0] = val;
+        max_or_sum_storage[0] = val;
     }
     __syncthreads();
     // broadcast the sum to all threads
-    float sum = sumvals[0];
+    float sum = max_or_sum_storage[0];
 
     // divide the whole row by the sum
     for (int i = tid; i < C; i += blockDim.x) {
@@ -322,12 +318,13 @@ __global__ void softmax_forward_online_kernel1(float* out, const float* inp, int
         double sum = 0.0;
         for (int j = 0; j < C; j++) {
             float maxval_prev = maxval;
-			if (inp_row[j] > maxval) {
-				maxval = inp_row[j];
-				sum = sum * expf(maxval_prev - maxval) + expf(inp_row[j] - maxval);
+            float current_val = inp_row[j];
+			if (current_val > maxval) {
+				maxval = current_val;
+				sum = sum * expf(maxval_prev - maxval) + expf(current_val - maxval);
 			}
 			else {
-				sum += expf(inp_row[j] - maxval);
+				sum += expf(current_val - maxval);
 			}
 		}
 
@@ -590,7 +587,8 @@ void softmax_forward3(float* out, const float* inp, int N, int C, int block_size
 
 void softmax_forward4(float* out, const float* inp, int N, int C, int block_size) {
     int grid_size = N;
-    size_t shared_mem_size = 2 * block_size / 32 * sizeof(float);
+    // for each warp in the block we need a float that will be used for both maxval and sumval
+    size_t shared_mem_size = block_size / 32 * sizeof(float);
     softmax_forward_kernel4<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, C);
 }
 
@@ -672,10 +670,9 @@ int main(int argc, char **argv) {
     const int* outliers = make_random_int(B * T * 3, V);
     for(int k = 0; k < 3; ++k) {
         for(int j = 0; j < B * T; ++j) {
-            inp[j * V +  outliers[j*3 + k]] *= 20;
+            inp[j * V + outliers[j*3 + k]] *= 20;
         }
     }
-
 
     // move to GPU
     float* d_out;
@@ -728,6 +725,7 @@ int main(int argc, char **argv) {
     // free memory
     free(out);
     free(inp);
+    free((void*)outliers);
     cudaCheck(cudaFree(d_out));
     cudaCheck(cudaFree(d_inp));
 

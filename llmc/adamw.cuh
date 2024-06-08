@@ -47,3 +47,19 @@ __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg
     // this will be used in the next update
     if (master_params_memory != NULL) { master_params_memory[idx] = param; }
 }
+
+template <typename Tp, typename Tg>
+void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+                  float learning_rate, float beta1, float beta2, int t, float eps, float weight_decay,
+                  float grad_scale, unsigned int seed, cudaStream_t stream) {
+    // AdamW update
+    int block_size = 512;
+    int num_blocks = CEIL_DIV(num_parameters, block_size);
+    float beta1_correction = 1.0f - powf(beta1, t);
+    float beta2_correction = 1.0f - powf(beta2, t);
+    adamw_kernel3<<<num_blocks, block_size, 0, stream>>>(params_memory, master_params_memory, grads_memory,
+                                                         m_memory, v_memory, num_parameters,
+                                                         learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
+                                                         grad_scale, seed);
+    cudaCheck(cudaGetLastError());
+}

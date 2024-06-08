@@ -10,7 +10,7 @@ endif
 
 # Compiler flags
 CFLAGS = -O3 --use_fast_math
-NVCCFLAGS = -lcublas -lcublasLt
+NVCCFLAGS = -lcublas -lcublasLt -std=c++17
 MPI_PATHS = -I/usr/lib/x86_64-linux-gnu/openmpi/include -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
 
 # Default rule for our CUDA files
