@@ -13,7 +13,7 @@ CUDA_OUTPUT_FILE = -o $@
 
 # NVCC flags
 # -t=0 is short for --threads, 0 = number of CPUs on the machine
-NVCC_FLAGS = -O3 -t=0 --use_fast_math
+NVCC_FLAGS = -O3 -t=0 --use_fast_math -std=c++17
 NVCC_LDFLAGS = -lcublas -lcublasLt
 NVCC_INCLUDES =
 NVCC_LDLIBS =

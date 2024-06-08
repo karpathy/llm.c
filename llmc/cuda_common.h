@@ -10,6 +10,7 @@ Common utilities for CUDA code.
 #include <string>
 #include <cuda_runtime.h>
 #include <nvtx3/nvToolsExt.h>
+#include <nvtx3/nvToolsExtCudaRt.h>
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

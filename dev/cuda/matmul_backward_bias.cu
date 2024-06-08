@@ -92,7 +92,7 @@ __global__ void matmul_backward_bias_kernel1(floatX* dbias, const floatX* dout, 
     }
     // write the final result (at thread 0) to global memory
     if (tid == 0) {
-        dbias[o] = (float)dbias[o] + shared[0];
+        dbias[o] = (floatX)((float)dbias[o] + shared[0]);
     }
 }
 
@@ -116,7 +116,7 @@ __global__ void matmul_backward_bias_kernel2(floatX* dbias, const floatX* dout, 
     sum = cg::reduce(warp, sum, cg::plus<float>{});
     // write the result to output (global memory)
     if(warp.thread_rank() == 0) {
-        dbias[idx] += sum;
+        dbias[idx] += (floatX)sum;
     }
 }
 
@@ -132,12 +132,13 @@ __global__ void matmul_backward_bias_kernel3(floatX* dbias, const floatX* dout, 
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
     int idx = blockIdx.x; // simply one block per row
-    // round 1: thread coarsening to reduce the problem size from B*T to 32
+    // round 1: thread coarsening to reduce the problem size from B*T to block_size
     float thread_sum = 0.0f;
     for(int i = threadIdx.x; i < BT; i += blockDim.x) {
         thread_sum += (float)dout[i * OC + idx];
     }
     // now do a warp-level reduce to get the sum across the 32 threads in each warp
+    // reduce the problem size from block_size to block_size/32 i.e. `num_warps`
     float warp_sum = cg::reduce(warp, thread_sum, cg::plus<float>{});
     // store the warp sum in shared memory (we could have lane_id == 0 guard but not needed)
     shared_sum[warp_id] = warp_sum;
@@ -167,7 +168,7 @@ __global__ void matmul_backward_bias_kernel4(floatX* dbias, const floatX* dout, 
     const int vstep = blockDim.x / warpSize; // number of warps in a block, e.g. 4
 
     // pointer to the start of the column for one lane of threads
-    // so e.g. 4 threads (of the same lane_id) will reduce this one column
+    // so e.g. 4 (`vstep`) threads (of the same lane_id) will reduce this one column
     const floatX* dout_col = dout + tl + lane_id;
 
     // column reductions by looping through the rows
@@ -503,7 +504,7 @@ void matmul_backward_bias7(floatX* dbias, const floatX* dout,
 
     assert(block_size_y >= x128::size); // part of the kernel assumes this is large enough to avoid loops
 
-    cudaCheck(cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float)));
+    cudaCheck(cudaMemset(dbias_buffer, 0, OC * sizeof(float)));
     matmul_backward_bias_kernel7<<<dim3(grid_size_x, grid_size_y),
         dim3(block_size_x, block_size_y), OC_per_warp * sizeof(float)>>>(dbias_buffer, dout, B, T, OC, block_size);
     cudaCheck(cudaGetLastError());
@@ -524,7 +525,7 @@ void matmul_backward_bias8(floatX* dbias, const floatX* dout,
         matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
         cudaCheck(cudaGetLastError());
     } else {
-        cudaCheck(cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float)));
+        cudaCheck(cudaMemset(dbias_buffer, 0, OC * sizeof(float)));
         matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
         cudaCheck(cudaGetLastError());
         cast_and_add_kernel<<<ceil_div(OC, 256), 256, 0>>>(dbias, dbias_buffer, OC);
@@ -661,6 +662,7 @@ int main(int argc, char **argv) {
     // cleanups
     free(dbias);
     free(dout);
+    cudaCheck(cudaFree(dbias_buffer));
     cudaCheck(cudaFree(d_dbias));
     cudaCheck(cudaFree(d_dout));
 
