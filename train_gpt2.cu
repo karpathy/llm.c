@@ -1834,7 +1834,7 @@ int main(int argc, char *argv[]) {
         model.mean_loss = lossf;
 
         // average the loss and the gradients between all processes
-        gpt2_multi_gpu_grad_reduce(&model, &multi_gpu_config);
+        gpt2_multi_gpu_loss_and_grad_reduce(&model, &multi_gpu_config);
         // learning rate schedule step:
         lr_step(&lr_schedule, step);
         // update the model parameters
