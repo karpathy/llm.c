@@ -123,7 +123,9 @@ typedef struct {
     size_t shard_num_parameters;
     size_t shard_offset;
 #ifdef MULTI_GPU
-    ncclComm_t nccl_comm;  // NCCL communication primitive, used for collective multi-GPU work.
+    ncclComm_t nccl_comm;       // NCCL communication primitive, used for collective multi-GPU work.
+    cudaStream_t nccl_stream;   // CUDA Stream to perform NCCL operations.
+    cudaEvent_t compute_nccl_sync; // Event used to synchronize NCCL with the compute
 #endif
 } MultiGpuConfig;
 
@@ -186,6 +188,10 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
     }
     mpiCheck(MPI_Bcast((void *)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD));
     ncclCheck(ncclCommInitRank(&result.nccl_comm, result.num_processes, nccl_id, result.process_rank));
+    cudaCheck(cudaStreamCreate(&result.nccl_stream));
+    cudaCheck(cudaEventCreate(&result.compute_nccl_sync));
+    nvtxNameCudaStreamA(result.nccl_stream, "nccl stream");
+    nvtxNameCudaEventA(result.compute_nccl_sync, "nccl compute sync");
     return result;
 #else
     printf("Multi-GPU support is disabled. Using a single GPU.\n");
@@ -201,6 +207,8 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
 void multi_gpu_config_free(const MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
     ncclCheck(ncclCommDestroy(multi_gpu_config->nccl_comm));
+    cudaCheck(cudaStreamDestroy(multi_gpu_config->nccl_stream));
+    cudaCheck(cudaEventDestroy(multi_gpu_config->compute_nccl_sync));
     mpiCheck(MPI_Finalize());
 #endif
 }
@@ -901,7 +909,37 @@ void gpt2_zero_grad(GPT2 *model) {
     cudaCheck(cudaDeviceSynchronize());
 }
 
-void gpt2_backward(GPT2 *model, int* inputs) {
+// Block NCCL stream until computations on compute_stream are done, then aggregate multiple pointers in an NCCL group.
+template<int N>
+void multi_gpu_async_all_reduce_pointers_group(
+    floatX* const (&pointers)[N], const size_t (&pointers_sizes)[N],
+    MultiGpuConfig* multi_gpu_config, cudaStream_t compute_stream) {
+#ifdef MULTI_GPU
+    NVTX_RANGE_FN();
+    if (multi_gpu_config->num_processes == 1) {
+        return; // no multi-GPU, just exit.
+    }
+    // mark an event on the compute stream, and immediately wait on this in the nccl stream
+    // this means that the nccl stream won't start executing before all compute kernels that
+    // have been submitted before this point have finished.
+    // by using an event instead of cudaSyncStream, we avoid having to synchronize the host, and
+    // can enqueue new work to the GPU right away.
+    cudaCheck(cudaEventRecord(multi_gpu_config->compute_nccl_sync, compute_stream));
+    cudaCheck(cudaStreamWaitEvent(multi_gpu_config->nccl_stream, multi_gpu_config->compute_nccl_sync));
+    ncclCheck(ncclGroupStart()); // NCCL group: aggregate all pointers in a single NCCL GPU kernel.
+    for (int i = 0; i < N; ++i) {
+        ncclCheck(ncclAllReduce(
+            pointers[i], pointers[i],
+            pointers_sizes[i],
+            ncclFloatX, ncclAvg,
+            multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream
+        ));
+    }
+    ncclCheck(ncclGroupEnd());
+#endif
+}
+
+void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
     NVTX_RANGE_FN();
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
@@ -1052,9 +1090,38 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
+
+        // Accumulate gradients from this layer in a background stream.
+        if(last_step) {
+            floatX* pointers[] = {
+                dl_ln1w, dl_ln1b,
+                dl_qkvw, dl_qkvb,
+                dl_attprojw, dl_attprojb,
+                dl_ln2w, dl_ln2b,
+                dl_fcw, dl_fcb,
+                dl_fcprojw, dl_fcprojb
+            };
+            size_t nelem[] = {
+                C, C,
+                3 * C * C, 3 * C,
+                C * C, C,
+                C, C,
+                4 * C * C, 4 * C,
+                C * 4 * C, C
+            };
+            multi_gpu_async_all_reduce_pointers_group(pointers, nelem,
+                                                      &multi_gpu_config, main_stream);
+        }
     }
     encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
                      dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
+
+    // Aggregate all gradients that are not part of the transformer blocks
+    if(last_step) {
+        floatX* pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
+        size_t nelem[] = {Vp * C, T * C, C, C};
+        multi_gpu_async_all_reduce_pointers_group(pointers, nelem, &multi_gpu_config, main_stream);
+    }
 
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -1082,12 +1149,9 @@ void gpt2_multi_gpu_loss_and_grad_reduce(GPT2* model, MultiGpuConfig* multi_gpu_
     model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss) / multi_gpu_config->num_processes;
     // Now average the gradients
     if(multi_gpu_config->zero_stage == 0) {
-        // no ZERO == standard DDP: Average all gradients.
-        ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
-                                model->num_parameters,
-                                ncclFloatX, ncclAvg,
-                                multi_gpu_config->nccl_comm, main_stream));
+        // gradients get averaged during backward
     } else if (multi_gpu_config->zero_stage == 1) {
+        assert(false && "This code is WIP; ZeRO-1 is currently broken");
         // ZERO-1: Get the average gradient only for local shard
         floatX* local_grads_memory = (floatX*) model->grads_memory + multi_gpu_config->shard_offset;
         ncclCheck(ncclReduceScatter(model->grads_memory, local_grads_memory,
@@ -1809,7 +1873,7 @@ int main(int argc, char *argv[]) {
             gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, grad_accum_steps);
             lossf += model.mean_loss; // the mean_loss was normalized by grad_accum_steps inside gpt2_forward
             // backward pass. all model params accumulate gradients with += inside this inner loop
-            gpt2_backward(&model, train_loader.inputs);
+            gpt2_backward(&model, train_loader.inputs, micro_step != grad_accum_steps - 1);
         }
         // override the mean loss, accounting for the gradient accumulation loop
         // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
