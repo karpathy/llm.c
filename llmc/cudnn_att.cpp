@@ -21,9 +21,16 @@ static_assert(false, "cuDNN is not supported in FP32 mode.")
 static cudnnHandle_t cudnn_handle;
 static size_t cudnn_workspace_size = 0; // dynamically allocated as needed (up to 256MiB!)
 static void* cudnn_workspace = NULL;
-#define checkCudnnErr(err) assert((int)err == 0);
 
-static void checkCudnnFE(fe::error_object e, const char *file, int line) {
+static void cuDNNCheck(cudnnStatus_t error, const char *file, int line) {
+    if (error != CUDNN_STATUS_SUCCESS) {
+        printf("[CUDNN ERROR] at file %s:%d:\n%s\n", file, line, cudnnGetErrorString(error));
+        exit(EXIT_FAILURE);
+    }
+};
+#define cuDNNCheck(err) (cuDNNCheck(err, __FILE__, __LINE__))
+
+static void checkCudnnFE(const fe::error_object& e, const char *file, int line) {
     if(!e.is_good()) {
         printf("[CUDNN ERROR] at file %s:%d:\n%s\n", file, line, e.err_msg.c_str());
         exit(EXIT_FAILURE);
@@ -211,10 +218,12 @@ auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
 void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
                              float* stats, // output for backward pass: (B, NH, T)
                              floatX* inp,  // input: (B, T, 3, NH, HS) QKV
-                             int B, int T, int NH, int C) {
+                             int B, int T, int NH, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     int HS = C / NH; // number of features per head
     bool is_inference_only = (stats == nullptr);
+
+    cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
 
     // Get graph and tensors from cache (or generate it on first use)
     auto graph = lookup_cache_or_build_graph_fwd(B, NH, T, HS, is_inference_only);
@@ -242,7 +251,7 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
 
 void attention_backward_cudnn(floatX* dqkvr,                                       // output
                               floatX* dout, floatX* qkvr, floatX* o, float* stats, // inputs
-                              int B, int T, int NH, int C) {
+                              int B, int T, int NH, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     int HS = C / NH; // number of features per head
 
@@ -269,15 +278,16 @@ void attention_backward_cudnn(floatX* dqkvr,                                    
         {Attn_scale_UID, &attn_scale_cpu}};
 
     // Execute graph
+    cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
     checkCudnnFE(graph->execute(cudnn_handle, variant_pack, cudnn_workspace));
     cudaCheck(cudaGetLastError());
 }
 
 void create_cudnn() {
-    checkCudnnErr(cudnnCreate(&cudnn_handle));
+    cuDNNCheck(cudnnCreate(&cudnn_handle));
 }
 
 void destroy_cudnn() {
     if (cudnn_workspace != NULL) { cudaCheck(cudaFree(cudnn_workspace)); }
-    checkCudnnErr(cudnnDestroy(cudnn_handle));
+    cuDNNCheck(cudnnDestroy(cudnn_handle));
 }

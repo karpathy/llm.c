@@ -504,7 +504,7 @@ void matmul_backward_bias7(floatX* dbias, const floatX* dout,
 
     assert(block_size_y >= x128::size); // part of the kernel assumes this is large enough to avoid loops
 
-    cudaCheck(cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float)));
+    cudaCheck(cudaMemset(dbias_buffer, 0, OC * sizeof(float)));
     matmul_backward_bias_kernel7<<<dim3(grid_size_x, grid_size_y),
         dim3(block_size_x, block_size_y), OC_per_warp * sizeof(float)>>>(dbias_buffer, dout, B, T, OC, block_size);
     cudaCheck(cudaGetLastError());
@@ -525,7 +525,7 @@ void matmul_backward_bias8(floatX* dbias, const floatX* dout,
         matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias, dout, B, T, OC, std::bool_constant<false>{});
         cudaCheck(cudaGetLastError());
     } else {
-        cudaCheck(cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float)));
+        cudaCheck(cudaMemset(dbias_buffer, 0, OC * sizeof(float)));
         matmul_backward_bias_kernel8<<<dim3(grid_size_x, grid_size_y), block_dim>>>(dbias_buffer, dout, B, T, OC, std::bool_constant<true>{});
         cudaCheck(cudaGetLastError());
         cast_and_add_kernel<<<ceil_div(OC, 256), 256, 0>>>(dbias, dbias_buffer, OC);
