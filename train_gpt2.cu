@@ -1832,7 +1832,8 @@ int main(int argc, char *argv[]) {
         // override the mean loss, accounting for the gradient accumulation loop
         // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
         model.mean_loss = lossf;
-        // update the parameters
+
+        // average the loss and the gradients between all processes
         gpt2_multi_gpu_grad_reduce(&model, &multi_gpu_config);
         // learning rate schedule step:
         lr_step(&lr_schedule, step);
