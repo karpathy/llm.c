@@ -62,198 +62,27 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines: global_norm_squared
 #include "llmc/global_norm.cuh"
 // ----------- Multi-GPU support -----------
-#ifdef MULTI_GPU
-#include <mpi.h>
-#include <nccl.h>
-#endif
+#include "llmc/zero.cuh"
+
 
 // ----------------------------------------------------------------------------
 // global vars containing information about the GPU this process is running on
 cudaDeviceProp deviceProp; // fills in common_start()
 cudaStream_t main_stream;
-
-// ----------------------------------------------------------------------------
-// Multi-GPU related
-#ifdef MULTI_GPU
-
-#if defined(ENABLE_FP32)
-const ncclDataType_t ncclFloatX = ncclFloat;
-#elif defined(ENABLE_FP16)
-const ncclDataType_t ncclFloatX = ncclHalf;
-#else // Default to bfloat16
-const ncclDataType_t ncclFloatX = ncclBfloat16;
-#endif
-
-void nccl_check(ncclResult_t status, const char *file, int line) {
-    if (status != ncclSuccess) {
-        printf("[NCCL ERROR] at file %s:%d:\n%s\n", file, line, ncclGetErrorString(status));
-        exit(EXIT_FAILURE);
-    }
-}
-#define ncclCheck(err) (nccl_check(err, __FILE__, __LINE__))
-
-void mpi_check(int status, const char *file, int line) {
-    if (status != MPI_SUCCESS) {
-        char mpi_error[4096];
-        int mpi_error_len = 0;
-        assert(MPI_Error_string(status, &mpi_error[0], &mpi_error_len) == MPI_SUCCESS);
-        printf("[MPI ERROR] at file %s:%d:\n%.*s\n", file, line, mpi_error_len, mpi_error);
-        exit(EXIT_FAILURE);
-    }
-}
-#define mpiCheck(err) (mpi_check(err, __FILE__, __LINE__))
-
-#endif // MULTI_GPU
-
-// ----------------------------------------------------------------------------
-// MPI / multi-processing setup
-
-// Parameters specific to training on multiple GPUs.
-typedef struct {
-    int process_rank;      // Rank of this process among all MPI processes. 0 if no multi-GPU.
-    int num_processes;     // Total number of processes. 1 if no multi-GPU.
-    int local_device_idx;  // This process GPU index on current machine. 0 if no multi-GPU.
-
-    // Zero Redundancy Optimizer stage - https://fairscale.readthedocs.io/en/stable/deep_dive/oss_sdp_fsdp.html
-    // 0-Disabled
-    // 1-Optimizer State Sharding (OSS)
-    // 2-Optimizer + Gradient State Sharding (SDP)
-    // 3-Optimizer + Gradient + Horizontal Model Sharding (FSDP)
-    int zero_stage;
-    size_t shard_num_parameters;
-    size_t shard_offset;
-#ifdef MULTI_GPU
-    ncclComm_t nccl_comm;       // NCCL communication primitive, used for collective multi-GPU work.
-    cudaStream_t nccl_stream;   // CUDA Stream to perform NCCL operations.
-    cudaEvent_t compute_nccl_sync; // Event used to synchronize NCCL with the compute
-#endif
-} MultiGpuConfig;
-
 // one global variable to hold the multi-GPU configuration for this process
 MultiGpuConfig multi_gpu_config;
 
-#ifdef MULTI_GPU
-// Determine which GPU this process should use.
-// Processes on the same machines use different GPU indicies. Processes on other machines don't.
-// Copied from NCCL examples: https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/examples.html#example-2-one-device-per-process-or-thread
-int multi_gpu_get_local_device_idx(int process_rank, int num_processes) {
-  char hostname[1024];
-  hostname[1023] = '\0';
-  // All processes on the same machine will share the same hostname.
-  gethostname(hostname, 1023);
-  for (int i=0; i < 1024; i++) {
-    if (hostname[i] == '.') {
-        hostname[i] = '\0';
-        break;
-    }
-  }
-  uint64_t hostname_hash = 5381;
-  for (int c = 0; hostname[c] != '\0'; c++){ hostname_hash = ((hostname_hash << 5) + hostname_hash) ^ hostname[c]; }
-
-  // Distribute all hostname hashes to all processes.
-  uint64_t* all_hostsname_hashes = (uint64_t*)malloc(num_processes * sizeof(uint64_t));
-  all_hostsname_hashes[process_rank] = hostname_hash;
-  mpiCheck(MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, all_hostsname_hashes, sizeof(uint64_t), MPI_BYTE, MPI_COMM_WORLD));
-
-  // Identify which GPU we need to use.
-  int local_device_idx = 0;
-  for (int current_process = 0; current_process < num_processes; ++current_process) {
-     if (current_process == process_rank) {
-      // Found my gpu, local_device_idx now has my target GPU index.
-      break;
-     }
-     if (all_hostsname_hashes[current_process] == all_hostsname_hashes[process_rank]) {
-      // This process ID runs on the same machine, but it's not me, skip this GPU
-      local_device_idx++;
-     }
-  }
-
-  free(all_hostsname_hashes);
-  return local_device_idx;
-}
-#endif
-
-MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
-#ifdef MULTI_GPU
-    // Initialize MPI.
-    MultiGpuConfig result;
-    mpiCheck(MPI_Init(argc, argv));
-    mpiCheck(MPI_Comm_rank(MPI_COMM_WORLD, &result.process_rank));
-    mpiCheck(MPI_Comm_size(MPI_COMM_WORLD, &result.num_processes));
-    result.local_device_idx = multi_gpu_get_local_device_idx(result.process_rank, result.num_processes);
-    cudaCheck(cudaSetDevice(result.local_device_idx));
-    ncclUniqueId nccl_id;
-    if (result.process_rank == 0) {
-        ncclCheck(ncclGetUniqueId(&nccl_id));
-    }
-    mpiCheck(MPI_Bcast((void *)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD));
-    ncclCheck(ncclCommInitRank(&result.nccl_comm, result.num_processes, nccl_id, result.process_rank));
-    cudaCheck(cudaStreamCreate(&result.nccl_stream));
-    cudaCheck(cudaEventCreate(&result.compute_nccl_sync));
-    nvtxNameCudaStreamA(result.nccl_stream, "nccl stream");
-    nvtxNameCudaEventA(result.compute_nccl_sync, "nccl compute sync");
-    return result;
-#else
-    printf("Multi-GPU support is disabled. Using a single GPU.\n");
-    cudaCheck(cudaSetDevice(0));
-    MultiGpuConfig result;
-    result.process_rank = 0;
-    result.num_processes = 1;
-    result.local_device_idx = 0;
-    return result;
-#endif
-}
-
-void multi_gpu_config_free(const MultiGpuConfig* multi_gpu_config) {
-#ifdef MULTI_GPU
-    ncclCheck(ncclCommDestroy(multi_gpu_config->nccl_comm));
-    cudaCheck(cudaStreamDestroy(multi_gpu_config->nccl_stream));
-    cudaCheck(cudaEventDestroy(multi_gpu_config->compute_nccl_sync));
-    mpiCheck(MPI_Finalize());
-#endif
-}
-
-void multi_gpu_barrier(const MultiGpuConfig* multi_gpu_config) {
-#ifdef MULTI_GPU
-    if (multi_gpu_config->num_processes > 1) {
-        mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
-    }
-#endif
-}
-
-struct ShardInfo {
-    ptrdiff_t offset;
-    size_t size;
-};
-ShardInfo multi_gpu_get_shard_offset(size_t elements, const MultiGpuConfig* multi_gpu_config, int shard_at_stage) {
-    int nproc = multi_gpu_config->num_processes;
-    if(multi_gpu_config->zero_stage >= shard_at_stage) {
-        if (elements % nproc != 0) {
-            fprintf(stderr, "Number of elements %zu must be a multiple of the number of processes %d\n", elements, nproc);
-            exit(EXIT_FAILURE);
-        }
-        return {(ptrdiff_t) (multi_gpu_config->process_rank * (elements / nproc)), elements / nproc};
-    } else {
-        return {0, elements};
-    }
-}
-
 // convenience function that only prints if the rank of process is zero
-void printf0(const char *format, ...) {
+template<class... Args>
+void printf0(const char *format, Args... args) {
     if (multi_gpu_config.process_rank == 0) {
-        va_list args;
-        va_start(args, format);
-        vprintf(format, args);
-        va_end(args);
+        printf(format, args...);
     }
 }
 
 void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t total_parameters) {
-
     multi_gpu_config->zero_stage = 0;
     multi_gpu_config->shard_num_parameters = total_parameters;
-    multi_gpu_config->shard_offset = 0;
-
     // Check the Zero Stage and define sharding parameters
     if (zero_stage == 0) {
         printf0("| Zero Optimization is disabled                                              |\n");
@@ -267,7 +96,6 @@ void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t t
             printf0("| Zero Stage1 is enabled                                                     |\n");
             multi_gpu_config->zero_stage = 1;
             multi_gpu_config->shard_num_parameters = total_parameters / multi_gpu_config->num_processes;
-            multi_gpu_config->shard_offset = multi_gpu_config->process_rank * multi_gpu_config->shard_num_parameters;
         }
     }
     else{
@@ -926,36 +754,6 @@ void gpt2_zero_grad(GPT2 *model) {
     cudaCheck(cudaDeviceSynchronize());
 }
 
-// Block NCCL stream until computations on compute_stream are done, then aggregate multiple pointers in an NCCL group.
-template<int N>
-void multi_gpu_async_all_reduce_pointers_group(
-    floatX* const (&pointers)[N], const size_t (&pointers_sizes)[N],
-    MultiGpuConfig* multi_gpu_config, cudaStream_t compute_stream) {
-#ifdef MULTI_GPU
-    NVTX_RANGE_FN();
-    if (multi_gpu_config->num_processes == 1) {
-        return; // no multi-GPU, just exit.
-    }
-    // mark an event on the compute stream, and immediately wait on this in the nccl stream
-    // this means that the nccl stream won't start executing before all compute kernels that
-    // have been submitted before this point have finished.
-    // by using an event instead of cudaSyncStream, we avoid having to synchronize the host, and
-    // can enqueue new work to the GPU right away.
-    cudaCheck(cudaEventRecord(multi_gpu_config->compute_nccl_sync, compute_stream));
-    cudaCheck(cudaStreamWaitEvent(multi_gpu_config->nccl_stream, multi_gpu_config->compute_nccl_sync));
-    ncclCheck(ncclGroupStart()); // NCCL group: aggregate all pointers in a single NCCL GPU kernel.
-    for (int i = 0; i < N; ++i) {
-        ncclCheck(ncclAllReduce(
-            pointers[i], pointers[i],
-            pointers_sizes[i],
-            ncclFloatX, ncclAvg,
-            multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream
-        ));
-    }
-    ncclCheck(ncclGroupEnd());
-#endif
-}
-
 void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
     NVTX_RANGE_FN();
     // double check we forwarded previously, with targets
@@ -1168,6 +966,24 @@ void gpt2_multi_gpu_loss_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
     cudaCheck(cudaDeviceSynchronize());
 }
 
+// Gets the offset of a specific tensor for a specific layer in the GPT2 model
+// layer_id is ignored for weights that are not part of a transformer block
+ShardInfo gtp2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_tensor_id) {
+    ptrdiff_t offset = 0;
+    for (int i = 0; i < param_tensor_id; i++) {
+        offset += (ptrdiff_t)model->param_elements[i];
+    }
+
+    size_t size = model->param_elements[param_tensor_id] ;
+
+    if(2 <= param_tensor_id && param_tensor_id <= 13) {
+        size /= model->config.num_layers;
+        offset += (ptrdiff_t)(layer_id * size);
+    }
+
+    return {offset, size};
+}
+
 float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_clip, int t, MultiGpuConfig* multi_gpu_config) {
     // update the model parameters using the AdamW optimizer
     // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
@@ -1177,8 +993,6 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     // TODO: revisit and probably refactor this entire function
     NVTX_RANGE_FN();
     size_t shard_num_parameters = multi_gpu_config->shard_num_parameters; // num parameters we are responsible for
-    size_t shard_offset = multi_gpu_config->shard_offset; // offset into the full parameter tensor
-    floatX* params_memory = (floatX*)model->params_memory;
     floatX* grads_memory = (floatX*)model->grads_memory;
 
     // lazily allocate m,v memory and master weights (usually on the first iteration)
@@ -1191,12 +1005,12 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         cudaCheck(cudaMemset(model->m_memory, 0, shard_num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->v_memory, 0, shard_num_parameters * sizeof(float)));
     }
+
+    bool init_master_weights = false;
     if (model->use_master_weights == 1 && model->master_weights == NULL) {
         printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
         cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
-        size_t grid_size = CEIL_DIV(shard_num_parameters, 512);
-        copy_and_cast_kernel<<<grid_size, 512, 0, main_stream>>>(model->master_weights, params_memory + shard_offset, shard_num_parameters);
-        cudaCheck(cudaGetLastError());
+        init_master_weights = true;
     }
 
     // gradient clipping
@@ -1206,11 +1020,24 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         // ^1 because of the ncclReduceScatter() in gpt2_multi_gpu_loss_and_grad_reduce,
         // grads_memory only contains the averaged gradients at the local shard
         // so we only calculate the grad norm at the grads_memory belonging to the local shard
-        global_norm_squared(grad_norm_squared, grads_memory + shard_offset, shard_num_parameters, main_stream);
+        cudaCheck(cudaMemsetAsync(grad_norm_squared, 0, sizeof(float), main_stream));
+        for(int l = 0; l < model->config.num_layers; ++l) {
+            for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+                if((i < 2 || i > 13) && l != 0) {
+                    continue;
+                }
+                // if(2 <= i && i <= 13)
+
+                ShardInfo tensor = gtp2_get_tensor_at_layer(model, l, i);
+                ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
+                ptrdiff_t local_offset_full = tensor.offset + shard.offset;
+                global_norm_squared(grad_norm_squared, grads_memory + local_offset_full, shard.size, false, main_stream);
+            }
+        }
     } else {
         // the ncclAllReduce() in gpt2_multi_gpu_loss_and_grad_reduce has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
-        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, main_stream);
+        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, true, main_stream);
     }
     // transfer the gradient norm to CPU
     float grad_norm_squared_cpu = 0.0f;
@@ -1234,34 +1061,15 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
 
     // handle adamw for all the transformer blocks
     for(int l = 0; l < model->config.num_layers; ++l) {
-        ptrdiff_t full_tensor_offset = 0;
-        ptrdiff_t partial_tensor_offset = 0;
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-            // skip over preceding layers
-            if(i > 0) {
-                full_tensor_offset += model->param_elements[i - 1];
-                partial_tensor_offset += model->param_elements[i - 1] / multi_gpu_config->num_processes;
+            if((i < 2 || i > 13) && l != 0) {
+                continue;
             }
 
-            ptrdiff_t global_offset;
-            ptrdiff_t local_offset_full;
-            ptrdiff_t local_offset_partial;
-            size_t num_parameters;
-            if(2 <= i && i <= 13) {
-                size_t tensor_nelem = model->param_elements[i] / model->config.num_layers;
-                ShardInfo shard = multi_gpu_get_shard_offset(tensor_nelem, multi_gpu_config, 1);
-                global_offset = full_tensor_offset + l * tensor_nelem;
-                local_offset_full = full_tensor_offset + l * tensor_nelem + shard.offset;
-                local_offset_partial = partial_tensor_offset + l * shard.size;
-                num_parameters = shard.size;
-            } else {
-                if(l != 0) continue;
-                ShardInfo shard = multi_gpu_get_shard_offset(model->param_elements[i], multi_gpu_config, 1);
-                global_offset = full_tensor_offset;
-                local_offset_full = full_tensor_offset + shard.offset;
-                local_offset_partial = partial_tensor_offset;
-                num_parameters = shard.size;
-            }
+            ShardInfo tensor = gtp2_get_tensor_at_layer(model, l, i);
+            ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
+            ptrdiff_t local_offset_full = tensor.offset + shard.offset;
+            ptrdiff_t local_offset_partial = tensor.offset / multi_gpu_config->num_processes;
 
             // we only want to weight decay the 2D tensors and leave all 1D tensors alone
             // in particular this also decays the embedding weights, but this is ok:
@@ -1276,18 +1084,23 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
             float* v_ptr = model->v_memory + opt_state_offset;
             float* master_ptr = NULL;
             if (model->master_weights != NULL) { master_ptr = model->master_weights + opt_state_offset; }
+            if(init_master_weights) {
+                size_t grid_size = CEIL_DIV(shard_num_parameters, 512);
+                copy_and_cast_kernel<<<grid_size, 512, 0, main_stream>>>(master_ptr, param_ptr, shard.size);
+                cudaCheck(cudaGetLastError());
+            }
 
             // ok finally call the kernel
             adamw_update(param_ptr, master_ptr, grad_ptr,
                          m_ptr, v_ptr,
-                         num_parameters, learning_rate,
+                         shard.size, learning_rate,
                          beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
             cudaCheck(cudaGetLastError());
 
             if (multi_gpu_config->zero_stage == 1) {
                 // gather updated shards of model->params_memory from each process
-                ncclCheck(ncclAllGather(param_ptr, (floatX*)model->params_memory + global_offset,
-                                        num_parameters, ncclFloatX,
+                ncclCheck(ncclAllGather(param_ptr, (floatX*)model->params_memory + tensor.offset,
+                                        shard.size, ncclFloatX,
                                         multi_gpu_config->nccl_comm, main_stream));
             }
             cudaCheck(cudaGetLastError());
@@ -1296,21 +1109,6 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
 
     cudaCheck(cudaDeviceSynchronize());
     return grad_norm_cpu;
-}
-
-void gpt2_multi_gpu_param_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
-{
-#ifdef MULTI_GPU
-    if (multi_gpu_config->num_processes == 1) { return; } // 1 process => noop
-    if (multi_gpu_config->zero_stage == 1) {
-        // gather updated shards of model->params_memory from each process
-        ncclCheck(ncclAllGather((floatX*)model->params_memory + multi_gpu_config->shard_offset, (floatX*)model->params_memory,
-                                multi_gpu_config->shard_num_parameters, ncclFloatX,
-                                multi_gpu_config->nccl_comm, main_stream));
-    }
-    cudaCheck(cudaGetLastError());
-#endif
-    cudaCheck(cudaDeviceSynchronize());
 }
 
 float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
