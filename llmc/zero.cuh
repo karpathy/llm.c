@@ -129,7 +129,8 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
     mpiCheck(MPI_Bcast((void *)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD));
     ncclCheck(ncclCommInitRank(&result.nccl_comm, result.num_processes, nccl_id, result.process_rank));
     cudaCheck(cudaStreamCreate(&result.nccl_stream));
-    cudaCheck(cudaEventCreate(&result.compute_nccl_sync));
+    // event without timing for maximum performance
+    cudaCheck(cudaEventCreate(&result.compute_nccl_sync, cudaEventDisableTiming));
     nvtxNameCudaStreamA(result.nccl_stream, "nccl stream");
     nvtxNameCudaEventA(result.compute_nccl_sync, "nccl compute sync");
     return result;
@@ -182,11 +183,12 @@ ShardInfo multi_gpu_get_shard_offset(size_t elements, const MultiGpuConfig* mult
 }
 
 // Block NCCL stream until computations on compute_stream are done, then aggregate multiple pointers in an NCCL group.
-// This can work either as an all-reduce (i.e., no ZeRo), or a reduce-scatter (ZeRO 1) depending on the scatter argument
+// This can work either as an all-reduce (i.e., no ZeRo), or a reduce-scatter (ZeRO 1).
+// The awkward `(&pointers)[N]` syntax ensures we are capturing the parameters as sized arrays, so that it becomes impossible
+// to call this function if pointers and pointers_sizes do not match.
 template<int N>
-void multi_gpu_async_reduce_pointer_group(
+void multi_gpu_async_reduce_gradient(
     floatX* const (&pointers)[N], const size_t (&pointers_sizes)[N],
-    bool scatter,
     MultiGpuConfig* multi_gpu_config, cudaStream_t compute_stream) {
     if (multi_gpu_config->num_processes == 1) {
         return; // no multi-GPU, just exit.
@@ -203,14 +205,14 @@ void multi_gpu_async_reduce_pointer_group(
     cudaCheck(cudaStreamWaitEvent(multi_gpu_config->nccl_stream, multi_gpu_config->compute_nccl_sync));
     ncclCheck(ncclGroupStart()); // NCCL group: aggregate all pointers in a single NCCL GPU kernel.
     for (int i = 0; i < N; ++i) {
-        if(!scatter) {
+        if(multi_gpu_config->zero_stage == 0) {
             ncclCheck(ncclAllReduce(
                 pointers[i], pointers[i],
                 pointers_sizes[i],
                 ncclFloatX, ncclAvg,
                 multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream
             ));
-        } else {
+        } else if(multi_gpu_config->zero_stage == 1) {
             size_t shard_size = pointers_sizes[i] / multi_gpu_config->num_processes;
             ptrdiff_t shard_offset = (ptrdiff_t)shard_size * multi_gpu_config->process_rank;
             ncclCheck(ncclReduceScatter(

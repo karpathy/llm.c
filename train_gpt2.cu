@@ -924,9 +924,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
                 4 * C * C, 4 * C,
                 C * 4 * C, C
             };
-            multi_gpu_async_reduce_pointer_group(pointers, nelem,
-                                                 multi_gpu_config.zero_stage == 1,
-                                                 &multi_gpu_config, main_stream);
+            multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
         }
     }
     encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
@@ -936,7 +934,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
     if(last_step) {
         floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
         const size_t nelem[] = {Vp * C, T * C, C, C};
-        multi_gpu_async_reduce_pointer_group(pointers, nelem, multi_gpu_config.zero_stage == 1, &multi_gpu_config, main_stream);
+        multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
     }
 
     cudaCheck(cudaDeviceSynchronize());
@@ -1101,7 +1099,6 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
                                         shard.size, ncclFloatX,
                                         multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
             }
-            cudaCheck(cudaGetLastError());
         }
     }
 
@@ -1700,7 +1697,6 @@ int main(int argc, char *argv[]) {
         }
         // update the model parameters
         float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
-        //gpt2_multi_gpu_param_gather(&model, &multi_gpu_config);
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
         cudaCheck(cudaEventRecord(end));
