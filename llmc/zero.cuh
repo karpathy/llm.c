@@ -182,15 +182,18 @@ ShardInfo multi_gpu_get_shard_offset(size_t elements, const MultiGpuConfig* mult
 }
 
 // Block NCCL stream until computations on compute_stream are done, then aggregate multiple pointers in an NCCL group.
+// This can work either as an all-reduce (i.e., no ZeRo), or a reduce-scatter (ZeRO 1) depending on the scatter argument
 template<int N>
-void multi_gpu_async_all_reduce_pointers_group(
+void multi_gpu_async_reduce_pointer_group(
     floatX* const (&pointers)[N], const size_t (&pointers_sizes)[N],
+    bool scatter,
     MultiGpuConfig* multi_gpu_config, cudaStream_t compute_stream) {
-#ifdef MULTI_GPU
-    NVTX_RANGE_FN();
     if (multi_gpu_config->num_processes == 1) {
         return; // no multi-GPU, just exit.
     }
+
+#ifdef MULTI_GPU
+    NVTX_RANGE_FN();
     // mark an event on the compute stream, and immediately wait on this in the nccl stream
     // this means that the nccl stream won't start executing before all compute kernels that
     // have been submitted before this point have finished.
@@ -200,12 +203,23 @@ void multi_gpu_async_all_reduce_pointers_group(
     cudaCheck(cudaStreamWaitEvent(multi_gpu_config->nccl_stream, multi_gpu_config->compute_nccl_sync));
     ncclCheck(ncclGroupStart()); // NCCL group: aggregate all pointers in a single NCCL GPU kernel.
     for (int i = 0; i < N; ++i) {
-        ncclCheck(ncclAllReduce(
-            pointers[i], pointers[i],
-            pointers_sizes[i],
-            ncclFloatX, ncclAvg,
-            multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream
-        ));
+        if(!scatter) {
+            ncclCheck(ncclAllReduce(
+                pointers[i], pointers[i],
+                pointers_sizes[i],
+                ncclFloatX, ncclAvg,
+                multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream
+            ));
+        } else {
+            size_t shard_size = pointers_sizes[i] / multi_gpu_config->num_processes;
+            ptrdiff_t shard_offset = (ptrdiff_t)shard_size * multi_gpu_config->process_rank;
+            ncclCheck(ncclReduceScatter(
+                pointers[i], pointers[i] + shard_offset,
+                shard_size,
+                ncclFloatX, ncclAvg,
+                multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream
+            ));
+        }
     }
     ncclCheck(ncclGroupEnd());
 #endif

@@ -908,7 +908,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
 
         // Accumulate gradients from this layer in a background stream.
         if(last_step) {
-            floatX* pointers[] = {
+            floatX* const pointers[] = {
                 dl_ln1w, dl_ln1b,
                 dl_qkvw, dl_qkvb,
                 dl_attprojw, dl_attprojb,
@@ -916,7 +916,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
                 dl_fcw, dl_fcb,
                 dl_fcprojw, dl_fcprojb
             };
-            size_t nelem[] = {
+            const size_t nelem[] = {
                 C, C,
                 3 * C * C, 3 * C,
                 C * C, C,
@@ -924,8 +924,9 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
                 4 * C * C, 4 * C,
                 C * 4 * C, C
             };
-            multi_gpu_async_all_reduce_pointers_group(pointers, nelem,
-                                                      &multi_gpu_config, main_stream);
+            multi_gpu_async_reduce_pointer_group(pointers, nelem,
+                                                 multi_gpu_config.zero_stage == 1,
+                                                 &multi_gpu_config, main_stream);
         }
     }
     encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
@@ -933,9 +934,9 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
 
     // Aggregate all gradients that are not part of the transformer blocks
     if(last_step) {
-        floatX* pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
-        size_t nelem[] = {Vp * C, T * C, C, C};
-        multi_gpu_async_all_reduce_pointers_group(pointers, nelem, &multi_gpu_config, main_stream);
+        floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
+        const size_t nelem[] = {Vp * C, T * C, C, C};
+        multi_gpu_async_reduce_pointer_group(pointers, nelem, multi_gpu_config.zero_stage == 1, &multi_gpu_config, main_stream);
     }
 
     cudaCheck(cudaDeviceSynchronize());
@@ -1016,35 +1017,32 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     // gradient clipping
     // repurposing this buffer (which isn't needed now) to write grad norm into it
     float* grad_norm_squared = (float*)model->acts.output;
+    float grad_norm_squared_cpu = 0.0f;
+
     if (multi_gpu_config->zero_stage == 1) {
-        // ^1 because of the ncclReduceScatter() in gpt2_multi_gpu_loss_and_grad_reduce,
-        // grads_memory only contains the averaged gradients at the local shard
-        // so we only calculate the grad norm at the grads_memory belonging to the local shard
-        cudaCheck(cudaMemsetAsync(grad_norm_squared, 0, sizeof(float), main_stream));
-        for(int l = 0; l < model->config.num_layers; ++l) {
-            for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        // because of the ncclReduceScatter() in backward,
+        // grads_memory only contains the averaged gradients at the local shards,
+        // so we only calculate the grad norm at the grads_memory belonging to the local shards
+        cudaCheck(cudaMemsetAsync(grad_norm_squared, 0, sizeof(float) * NUM_PARAMETER_TENSORS, main_stream));
+        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            for(int l = 0; l < model->config.num_layers; ++l) {
                 if((i < 2 || i > 13) && l != 0) {
                     continue;
                 }
-                // if(2 <= i && i <= 13)
-
                 ShardInfo tensor = gtp2_get_tensor_at_layer(model, l, i);
                 ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
-                ptrdiff_t local_offset_full = tensor.offset + shard.offset;
-                global_norm_squared(grad_norm_squared, grads_memory + local_offset_full, shard.size, false, main_stream);
+                ptrdiff_t offset = tensor.offset + shard.offset;
+                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, false, main_stream);
             }
         }
-    } else {
-        // the ncclAllReduce() in gpt2_multi_gpu_loss_and_grad_reduce has averaged the gradients across all GPUs
-        // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
-        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, true, main_stream);
-    }
-    // transfer the gradient norm to CPU
-    float grad_norm_squared_cpu = 0.0f;
-    cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
-    if (multi_gpu_config->zero_stage == 1) {
+        cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
         // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
         grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
+    } else {
+        // in regular DDP, backward has averaged the gradients across all GPUs
+        // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
+        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, true, main_stream);
+        cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
     }
 
     if(!isfinite(grad_norm_squared_cpu)) {
@@ -1101,7 +1099,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
                 // gather updated shards of model->params_memory from each process
                 ncclCheck(ncclAllGather(param_ptr, (floatX*)model->params_memory + tensor.offset,
                                         shard.size, ncclFloatX,
-                                        multi_gpu_config->nccl_comm, main_stream));
+                                        multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
             }
             cudaCheck(cudaGetLastError());
         }
@@ -1681,7 +1679,7 @@ int main(int argc, char *argv[]) {
             gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, grad_accum_steps);
             lossf += model.mean_loss; // the mean_loss was normalized by grad_accum_steps inside gpt2_forward
             // backward pass. all model params accumulate gradients with += inside this inner loop
-            gpt2_backward(&model, train_loader.inputs, micro_step != grad_accum_steps - 1);
+            gpt2_backward(&model, train_loader.inputs, micro_step == grad_accum_steps - 1);
         }
         // override the mean loss, accounting for the gradient accumulation loop
         // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
