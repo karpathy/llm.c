@@ -1408,7 +1408,7 @@ int main(int argc, char *argv[]) {
     int num_processes = 1;
     int process_rank = 0;
     int gpus_per_node = 8;
-    char *server_ip = "127.0.0.1";
+    char server_ip[50] = "127.0.0.1";
     int server_port = 8090;
 
     for (int i = 1; i < argc; i+=2) {
@@ -1442,7 +1442,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
         else if (argv[i][1] == 'p') { num_processes = atoi(argv[i+1]); }
         else if (argv[i][1] == 'k') { process_rank = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'i') { server_ip = argv[i+1]; }
+        else if (argv[i][1] == 'i') { strcpy(server_ip, argv[i+1]); }
         else if (argv[i][1] == 'j') { server_port = atoi(argv[i+1]); }        
         
         else { error_usage(); }
