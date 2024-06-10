@@ -1059,51 +1059,52 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     unsigned int seed = random_u32(&model->rng_state);
 
     // handle adamw for all the transformer blocks
-    for(int l = 0; l < model->config.num_layers; ++l) {
-        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-            if((i < 2 || i > 13) && l != 0) {
-                continue;
-            }
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        int num_layers = model->config.num_layers;
+        if((i < 2 || i > 13)) {
+            num_layers = 1;
+        }
 
-            ShardInfo tensor = gpt2_get_tensor_at_layer(model, l, i);
-            ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
-            ptrdiff_t local_offset_full = tensor.offset + shard.offset;
-            ptrdiff_t local_offset_partial = tensor.offset / multi_gpu_config->num_processes;
+        ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
+        ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
+        ptrdiff_t local_offset_full = tensor.offset + shard.offset;
+        ptrdiff_t local_offset_partial = tensor.offset / multi_gpu_config->num_processes;
 
-            // we only want to weight decay the 2D tensors and leave all 1D tensors alone
-            // in particular this also decays the embedding weights, but this is ok:
-            // - the token embeddings are weight shared and participate in the final projection to logits
-            // - the position embeddings actively participate at every forward/backward pass
-            float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
-            floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
-            floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
+        // we only want to weight decay the 2D tensors and leave all 1D tensors alone
+        // in particular this also decays the embedding weights, but this is ok:
+        // - the token embeddings are weight shared and participate in the final projection to logits
+        // - the position embeddings actively participate at every forward/backward pass
+        float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
+        floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
+        floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
 
-            ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ?  local_offset_full : local_offset_partial;
-            float* m_ptr = model->m_memory + opt_state_offset;
-            float* v_ptr = model->v_memory + opt_state_offset;
-            float* master_ptr = NULL;
-            if (model->master_weights != NULL) { master_ptr = model->master_weights + opt_state_offset; }
-            if(init_master_weights) {
-                size_t grid_size = CEIL_DIV(shard_num_parameters, 512);
-                copy_and_cast_kernel<<<grid_size, 512, 0, main_stream>>>(master_ptr, param_ptr, shard.size);
-                cudaCheck(cudaGetLastError());
-            }
-
-            // ok finally call the kernel
-            adamw_update(param_ptr, master_ptr, grad_ptr,
-                         m_ptr, v_ptr,
-                         shard.size, learning_rate,
-                         beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+        ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ?  local_offset_full : local_offset_partial;
+        float* m_ptr = model->m_memory + opt_state_offset;
+        float* v_ptr = model->v_memory + opt_state_offset;
+        float* master_ptr = NULL;
+        if (model->master_weights != NULL) { master_ptr = model->master_weights + opt_state_offset; }
+        if(init_master_weights) {
+            size_t grid_size = CEIL_DIV(shard_num_parameters, 512);
+            copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, param_ptr, shard.size,
+                                                                     shard.size, tensor.size);
             cudaCheck(cudaGetLastError());
+        }
 
-            if (multi_gpu_config->zero_stage == 1) {
+        // ok finally call the kernel
+        adamw_update(param_ptr, master_ptr, grad_ptr,
+                     m_ptr, v_ptr,
+                     shard.size, tensor.size, tensor.size, shard.size, num_layers,
+                     learning_rate,
+                     beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+        cudaCheck(cudaGetLastError());
+
+        if (multi_gpu_config->zero_stage == 1) {
 #if MULTI_GPU
-                // gather updated shards of model->params_memory from each process
-                ncclCheck(ncclAllGather(param_ptr, (floatX*)model->params_memory + tensor.offset,
-                                        shard.size, ncclFloatX,
-                                        multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
+            // gather updated shards of model->params_memory from each process
+            ncclCheck(ncclAllGather(param_ptr, (floatX*)model->params_memory + tensor.offset,
+                                    shard.size, ncclFloatX,
+                                    multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
 #endif
-            }
         }
     }
 
