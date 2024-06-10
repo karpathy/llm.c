@@ -84,6 +84,46 @@ __global__ void add_bias(float* out, const float* bias, int B, int T, int OC) {
     }
 }
 
+// kernel 4: register reuse kernel
+__global__ void matmul_forward_kernel4(float* out,
+                                       const float* inp, const float* weight, const float* bias,
+                                       int BT, int C, int OC) {
+    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
+    // inp is (B,T,C), weight is (OC, C), bias is (OC)
+    // in the naive kernel, every thread handles one element of out
+    int bt = 8*(blockIdx.x * blockDim.x + threadIdx.x);
+    int oc = 8*(blockIdx.y * blockDim.y + threadIdx.y);
+    if (bt < BT && oc < OC) {
+        float vals[8][8] = {};
+        if(bias != NULL) {
+            for (int i = 0; i < 8; i++) {
+                for (int j = 0; j < 8; j++) {
+                    vals[i][j] = bias[oc + j];
+                }
+            }
+        }
+
+        for (int k = 0; k < C; k++) {
+            float lhs[8];
+            float rhs[8];
+            for (int u = 0; u < 8; ++u) {
+                lhs[u] = inp[k + (bt+u) * C];
+                rhs[u] = weight[k + (oc+u) * C];
+            }
+            for (int i = 0; i < 8; ++i) {
+                for (int j = 0; j < 8; ++j) {
+                    vals[i][j] += lhs[i] * rhs[j];
+                }
+            }
+        }
+        for (int i = 0; i < 8; ++i) {
+            for (int j = 0; j < 8; ++j) {
+                out[(bt+i) * OC + oc + j] = vals[i][j];
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -218,6 +258,21 @@ void matmul_forward3(float* out,
     cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
 }
 
+// kernel 1 is the most naive matmul kernel
+void matmul_forward4(float* out,
+                     const float* inp, const float* weight, const float* bias,
+                     int B, int T, int C, int OC,
+                     int sqrt_block_size) {
+    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
+    // inp is (B,T,C), weight is (OC, C), bias is (OC)
+    if(sqrt_block_size > 16) sqrt_block_size = 16;
+
+    dim3 gridDim(ceil_div(B * T, sqrt_block_size), ceil_div(OC, sqrt_block_size));
+    dim3 blockDim(sqrt_block_size, sqrt_block_size);
+    matmul_forward_kernel4<<<gridDim, blockDim>>>(out, inp, weight, bias, B*T, C, OC);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void matmul_forward(int kernel_num,
                     float* out,
@@ -233,6 +288,9 @@ void matmul_forward(int kernel_num,
             break;
         case 3:
             matmul_forward3(out, inp, weight, bias, B, T, C, OC);
+            break;
+        case 4:
+            matmul_forward4(out, inp, weight, bias, B, T, C, OC, sqrt_block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -261,7 +319,7 @@ int main(int argc, char **argv) {
     cublasCheck(cublasCreate(&cublas_handle));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
-    int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
+    int enable_tf32 = false;  //deviceProp.major >= 8 ? 1 : 0;
     printf("enable_tf32: %d\n", enable_tf32);
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
