@@ -967,7 +967,7 @@ void gpt2_multi_gpu_loss_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 
 // Gets the offset of a specific tensor for a specific layer in the GPT2 model
 // layer_id is ignored for weights that are not part of a transformer block
-ShardInfo gtp2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_tensor_id) {
+ShardInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_tensor_id) {
     ptrdiff_t offset = 0;
     for (int i = 0; i < param_tensor_id; i++) {
         offset += (ptrdiff_t)model->param_elements[i];
@@ -1024,12 +1024,12 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         cudaCheck(cudaMemsetAsync(grad_norm_squared, 0, sizeof(float), main_stream));
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
             if((i < 2 || i > 13)) {
-                ShardInfo tensor = gtp2_get_tensor_at_layer(model, 0, i);
+                ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
                 ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
                 ptrdiff_t offset = tensor.offset + shard.offset;
                 global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, 0, 1, false, main_stream);
             } else {
-                ShardInfo tensor = gtp2_get_tensor_at_layer(model, 0, i);
+                ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
                 ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
                 ptrdiff_t offset = tensor.offset + shard.offset;
                 global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, tensor.size, model->config.num_layers,
@@ -1065,7 +1065,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
                 continue;
             }
 
-            ShardInfo tensor = gtp2_get_tensor_at_layer(model, l, i);
+            ShardInfo tensor = gpt2_get_tensor_at_layer(model, l, i);
             ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
             ptrdiff_t local_offset_full = tensor.offset + shard.offset;
             ptrdiff_t local_offset_partial = tensor.offset / multi_gpu_config->num_processes;
