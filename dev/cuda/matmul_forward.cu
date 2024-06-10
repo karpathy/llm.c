@@ -85,6 +85,14 @@ __global__ void add_bias(float* out, const float* bias, int B, int T, int OC) {
 }
 
 // kernel 4: register reuse kernel
+__device__ float4 ld_vec(const float* address) {
+    return *reinterpret_cast<const float4*>(address);
+}
+
+__device__ void st_vec(float* address, float4 val) {
+    *reinterpret_cast<float4*>(address) = val;
+}
+
 __global__ void matmul_forward_kernel4(float* out,
                                        const float* inp, const float* weight, const float* bias,
                                        int BT, int C, int OC) {
@@ -97,28 +105,39 @@ __global__ void matmul_forward_kernel4(float* out,
         float vals[8][8] = {};
         if(bias != NULL) {
             for (int i = 0; i < 8; i++) {
-                for (int j = 0; j < 8; j++) {
-                    vals[i][j] = bias[oc + j];
+                for (int j = 0; j < 8; j += 4) {
+                    float4 b =ld_vec(bias + oc + j);
+                    vals[i][j+0] = b.x;
+                    vals[i][j+1] = b.y;
+                    vals[i][j+2] = b.z;
+                    vals[i][j+3] = b.w;
                 }
             }
         }
 
-        for (int k = 0; k < C; k++) {
-            float lhs[8];
-            float rhs[8];
+        for (int k = 0; k < C; k += 4) {
+            float4 rhs[8];
             for (int u = 0; u < 8; ++u) {
-                lhs[u] = inp[k + (bt+u) * C];
-                rhs[u] = weight[k + (oc+u) * C];
+                rhs[u] = ld_vec(weight + k + (oc+u) * C);
             }
             for (int i = 0; i < 8; ++i) {
+                float4 lhs = ld_vec(inp + k + (bt+i) * C);
                 for (int j = 0; j < 8; ++j) {
-                    vals[i][j] += lhs[i] * rhs[j];
+                    vals[i][j] += lhs.x * rhs[j].x;
+                    vals[i][j] += lhs.y * rhs[j].y;
+                    vals[i][j] += lhs.z * rhs[j].z;
+                    vals[i][j] += lhs.w * rhs[j].w;
                 }
             }
         }
         for (int i = 0; i < 8; ++i) {
-            for (int j = 0; j < 8; ++j) {
-                out[(bt+i) * OC + oc + j] = vals[i][j];
+            for (int j = 0; j < 8; j += 4) {
+                float4 result;
+                result.x = vals[i][j + 0];
+                result.y = vals[i][j + 1];
+                result.z = vals[i][j + 2];
+                result.w = vals[i][j + 3];
+                st_vec(out + (bt+i) * OC + oc + j, result);
             }
         }
     }
