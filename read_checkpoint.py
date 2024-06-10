@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from train_gpt2 import GPTConfig, GPT
-
+from transformers import GPT2LMHeadModel, GPT2Config
 
 def read_bf16(tensor_size, file):
     bytes_to_read = np.prod(tensor_size) * 2  # 2 bytes per bfloat16
@@ -73,7 +73,7 @@ def read_tensors(state_dict, model_tensors, L, file, dtype):
     return state_dict
 
 
-def get_state(filename):
+def get_state(filename,return_config=False):
     # Reads the GPT-2 model's weights from a binary file
     file = open(filename, 'rb')
 
@@ -82,11 +82,11 @@ def get_state(filename):
 
     assert model_header[0] == 20240326  # magic number
     version = model_header[1]
-    config = GPTConfig(block_size=model_header[2],
-                       vocab_size=model_header[3],
-                       n_layer=model_header[4],
-                       n_head=model_header[5],
-                       n_embd=model_header[6],
+    config = GPTConfig(block_size=model_header[2].item(), # convert to native python int. Otherwise it causes problems when used to initiate HF Model.
+                       vocab_size=model_header[3].item(),
+                       n_layer=model_header[4].item(),
+                       n_head=model_header[5].item(),
+                       n_embd=model_header[6].item(),
                        )
     padded_vocab_size = model_header[7]
 
@@ -123,4 +123,43 @@ def get_state(filename):
     assert file.read() == b''  # Ensure the file is fully read
     file.close()
 
-    return state_dict
+    return (state_dict, config) if return_config else state_dict
+
+def get_hf_model(filename):
+    # Reads the GPT-2 model's weights from a binary file
+    sd,config = get_state(filename, return_config=True)
+    
+    # Construct a HF model with the same config
+    hf_config = GPT2Config(
+        vocab_size=config.vocab_size,
+        n_positions=config.block_size,
+        n_embd=config.n_embd,
+        n_layer=config.n_layer,
+        n_head=config.n_head,
+    )
+    model_hf = GPT2LMHeadModel(hf_config)
+
+    sd_hf = model_hf.state_dict()
+
+    # Processing the parameters which need to be ignored and those that need to be transposed (c.f train_gpt2.py)
+    sd_keys_hf = sd_hf.keys()
+    sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
+    sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+    transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+
+    # parameters that need to be transposed
+    for k in sd_keys_hf:
+        if any(k.endswith(w) for w in transposed):
+            assert sd_hf[k].shape[::-1] == sd[k].shape
+            with torch.no_grad():
+                sd[k]=sd[k].t()
+    
+    # Load the state dict into the HF model
+    m = model_hf.load_state_dict(sd,strict=False)
+    
+    assert len(m.missing_keys)==0
+    
+    for k in m.unexpected_keys: # these are OK, as we ignored them earlier
+        assert k.endswith('.attn.masked_bias') or k.endswith('.attn.bias')
+    
+    return model_hf
