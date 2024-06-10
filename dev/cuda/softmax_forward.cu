@@ -25,6 +25,10 @@ version 6 is softmax_online that parallelizes over all of B,T,C
 
 version 7 is softmax optimized for very large C.
 ./softmax_forward 7
+
+version 8 is a cooperative groups free implementation (compares to version 6) of online softmax.
+Which has close performance to version 6 but better code readability.
+./softmax_forward 8
 */
 
 #include <stdio.h>
@@ -541,9 +545,8 @@ __global__ void softmax_forward_online_kernel8(float* out, const float* inp, int
     // calculate the warp wised maxval and sumval
     float offsetMaxval, offsetSumval;
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-        __syncwarp();
-        offsetMaxval = __shfl_down_sync(0xFFFFFFFF, maxval, offset);
-        offsetSumval = __shfl_down_sync(0xFFFFFFFF, sumval, offset);
+        offsetMaxval = __shfl_xor_sync(0xFFFFFFFF, maxval, offset);
+        offsetSumval = __shfl_xor_sync(0xFFFFFFFF, sumval, offset);
         if (offsetMaxval > maxval) {
             sumval *= expf(maxval - offsetMaxval);
             maxval = offsetMaxval;
@@ -552,11 +555,6 @@ __global__ void softmax_forward_online_kernel8(float* out, const float* inp, int
         }
         sumval += offsetSumval;
     }
-
-    // sync the warp wised maxval and sumval
-    // which are also the maxval and sumval of one row in C
-    maxval = __shfl_sync(0xFFFFFFFF, maxval, 0);
-    sumval = __shfl_sync(0xFFFFFFFF, sumval, 0);
 
     for (int i = laneId; i < C; i += warpSize) {
         y[i] = expf(x[i] - maxval) / sumval;
