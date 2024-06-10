@@ -1100,10 +1100,15 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
 
         if (multi_gpu_config->zero_stage == 1) {
 #if MULTI_GPU
-            // gather updated shards of model->params_memory from each process
-            ncclCheck(ncclAllGather(param_ptr, (floatX*)model->params_memory + tensor.offset,
-                                    shard.size, ncclFloatX,
-                                    multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
+            ncclCheck(ncclGroupStart());
+            for(int l = 0; l < num_layers; ++l) {
+                // gather updated shards of model->params_memory from each process
+                ncclCheck(ncclAllGather(param_ptr+ l * tensor.size,
+                                        (floatX*) model->params_memory + tensor.offset + l * tensor.size,
+                                        shard.size, ncclFloatX,
+                                        multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
+            }
+            ncclCheck(ncclGroupEnd());
 #endif
         }
     }
