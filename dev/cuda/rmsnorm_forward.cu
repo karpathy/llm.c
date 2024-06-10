@@ -104,15 +104,13 @@ __inline__ __device__ int block_all_reduce_sum(float val, int block_size) {
 
     static __shared__ float shared[WARP_SIZE]; 
     int tid = threadIdx.x;
-    int lane = tid % WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
     int warp_id = tid / WARP_SIZE;
 
-    val = warp_all_reduce_sum(val); // reduction across all warps
-    if (lane == 0) { shared[warp_id] = val; }; // write final value stored in threadId 0 to shared memory
+    val = warp_all_reduce_sum(val); 
+    if (lane_id == 0) { shared[warp_id] = val; }; // write final value stored in threadId 0 to shared memory
 
-    __syncthreads();
-
-    val = (tid < block_size / WARP_SIZE) ? shared[lane] : 0.0f;
+    val = (lane_id < block_size / WARP_SIZE) ? shared[lane_id] : 0.0f;
     if (warp_id == 0) { val = warp_all_reduce_sum(val); } // warp-wise reduce into first warp
     
     return val;
@@ -133,7 +131,7 @@ __global__ void rms_val_kernel(
 
     // thread coarsening
     #pragma unroll
-    for (int i = tid; i < C; i += block_size) {
+    for (int i = tid; i < C; i += blockDim.x) {
         sum_of_squares += x[i] * x[i];
     }
     sum_of_squares = block_all_reduce_sum(sum_of_squares, block_size);
@@ -202,10 +200,8 @@ void rmsnorm_forward2(
     // in rms, threads cooperate within blocks via reductions
     rms_val_kernel<<<B * T, block_size, block_size * sizeof(float)>>>(rms, inp, N, C, block_size);
     cudaCheck(cudaGetLastError());
-    // in the normalization, everything just gets flattened out
-    const int block_size2 = 256;
-    const int grid_size = ceil_div(B * T * C, block_size2);
-    rmsnorm_forward_kernel2<<<grid_size, block_size2>>>(out, rms, inp, weight, bias, B, T, C);
+    const int grid_size = ceil_div(B * T * C, block_size);
+    rmsnorm_forward_kernel2<<<grid_size, block_size>>>(out, rms, inp, weight, bias, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
