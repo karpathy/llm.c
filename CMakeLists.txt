@@ -27,11 +27,16 @@ add_subdirectory(third_party/googletest)
 set(EIGEN3_INCLUDE_DIR third_party/eigen)
 include_directories(${EIGEN3_INCLUDE_DIR})
 
+# llm.c
 add_executable(train_gpt2 train_gpt2.c)
 target_link_libraries(train_gpt2 m OpenMP::OpenMP_CXX)
 
-add_executable(train_gpt2_cc train_gpt2.cc)
-target_link_libraries(train_gpt2_cc absl::strings glog::glog)
+add_executable(test_gpt2 test_gpt2.c)
+target_link_libraries(test_gpt2 m OpenMP::OpenMP_CXX)
+
+# llm.cpp
+add_executable(test_gpt2_cpp test_gpt2.cpp)
+target_link_libraries(test_gpt2_cpp absl::strings glog::glog)
 
 add_executable(nn_test nn_test.cpp)
 target_link_libraries(nn_test absl::strings glog::glog GTest::gtest_main)

@@ -104,7 +104,7 @@ TEST(Block, Forward) {
   /*
 torch.set_printoptions(precision=6)
 torch.manual_seed(42)
-config = GPTConfig(n_embd=6, n_head=2)x
+config = GPTConfig(n_embd=6, n_head=2)
 b = Block(config=config)
 B, T, C = 2, 4, 6
 x = torch.randn((B, T, C))
@@ -139,36 +139,63 @@ TEST(GPT, Forward) {
   /*
 torch.set_printoptions(precision=6)
 torch.manual_seed(42)
-config = GPTConfig(n_embd=6, n_head=2)x
-b = Block(config=config)
+config = GPTConfig(block_size=4, n_embd=6, n_head=2, n_layer=3, vocab_size=10)
+gpt2 = GPT(config=config)
 B, T, C = 2, 4, 6
-x = torch.randn((B, T, C))
-y = b(x)
+idx = torch.LongTensor([[1, 2, 4, 5], [4, 3, 2, 9]])
+targets = torch.LongTensor([[2, 4, 5, 6], [3, 2, 9, 0]])
+logits, loss = gpt2(idx)
   */
 
   nn::ManualSeed(42);
   int block_size = 4, n_embd = 6, n_head = 2, n_layer = 3, vocab_size = 10;
   int B = 2, T = block_size, C = n_embd, nh = n_head, hs = n_embd / nh;
-  gpt::GPT gpt(block_size, vocab_size, n_layer, n_head, n_embd);
+  gpt::GPT gpt(block_size, vocab_size, vocab_size, n_layer, n_head, n_embd);
 
   std::vector<int> idx = {1, 2, 4, 5, 4, 3, 2, 9};
   auto idx_m = Eigen::Map<nn::MatrixInt>(idx.data(), B, T);
-  auto targets = Eigen::Map<nn::MatrixInt>(nullptr, 0, 0);
-  std::vector<float> logits(B*T*vocab_size);
-  auto logits_2d = Eigen::Map<nn::Matrix>(logits.data(), B * T, vocab_size);
-  float loss = 0;
-  gpt.Forward(idx_m, logits_2d);
+  std::vector<float> logits(B * T * vocab_size);
+  //  auto logits_2d = Eigen::Map<nn::Matrix>(logits.data(), B * T, vocab_size);
+  auto logits_3d =
+      Eigen::TensorMap<nn::Tensor3D>(logits.data(), B, T, vocab_size);
 
-  //  std::vector<float> expected_y = {
-  //      -1.582970, -0.700668, -1.026945, 2.316710,  -1.464859, -1.201760,
-  //      -1.180800, -0.050612, -0.057298, -0.403900, -2.935433, -1.328336,
-  //      0.837885,  0.920688,  0.547759,  0.835524,  -1.913520, 1.494968,
-  //      -1.152616, 1.295917,  0.097820,  0.347780,  0.411883,  0.530892,
-  //      -0.818162, 1.144261,  -1.390720, 0.676694,  0.590124,  0.132416,
-  //      -0.988301, 0.740322,  -0.836062, -1.058745, -0.941910, -1.701103,
-  //      -1.085605, -0.035773, -1.859936, 0.101301,  -2.202660, -0.783755,
-  //      -0.486846, -0.363502, -0.317611, 1.436486,  0.691510,  -0.423726};
-  //  for (size_t i = 0; i < expected_y.size(); ++i) {
-  //    EXPECT_NEAR(expected_y[i], y[i], 1e-5);
-  //  }
+  // Without targets
+  gpt.Forward(idx_m, logits_3d);
+  nn::Tensor2D logits_last_t = logits_3d.chip(T - 1, 1);
+  auto logits_last_t_span =
+      absl::MakeSpan(logits_last_t.data(), B * vocab_size);
+  std::vector<float> expected_logits_last_t = {
+      0.090488,  0.989613,  0.485091,  -0.415317, 0.200022,
+      0.379014,  -0.672617, -0.472669, -1.369164, -0.364832,
+      -0.003667, 0.883650,  0.330532,  -0.294204, 0.039559,
+      0.409321,  -0.487800, -0.464272, -1.270504, -0.087506};
+  for (size_t i = 0; i < expected_logits_last_t.size(); ++i) {
+    EXPECT_NEAR(expected_logits_last_t[i], logits_last_t_span[i], 1e-5);
+  }
+
+  // With targets
+  std::vector<int> target = {2, 4, 5, 6, 3, 2, 9, 0};
+  auto target_m = Eigen::Map<nn::MatrixInt>(target.data(), B, T);
+  float loss = 0.0;
+  gpt.Forward(idx_m, target_m, logits_3d, &loss);
+
+  std::vector<float> expected_logits = {
+      0.216903,  0.192299,  0.709738,  0.015778,  0.065583,  -0.281998,
+      -1.127933, 0.322185,  -0.480652, -0.533178, -0.062928, 0.123535,
+      0.435241,  -0.103620, 0.005828,  -0.286582, -0.763048, 0.407561,
+      -0.216112, -0.469412, -0.259017, 0.510337,  0.519246,  -0.298064,
+      0.184779,  0.055917,  -0.883520, 0.297700,  -0.795307, -0.192879,
+      0.090488,  0.989613,  0.485091,  -0.415317, 0.200022,  0.379014,
+      -0.672618, -0.472669, -1.369164, -0.364831, 0.196027,  0.133897,
+      0.728029,  -0.036481, 0.245341,  -0.258133, -1.119066, 0.406560,
+      -0.388505, -0.505914, -0.096193, 0.023417,  0.352678,  -0.013193,
+      -0.164390, -0.367955, -0.687712, 0.449032,  -0.084536, -0.430618,
+      -0.296299, 0.513148,  0.478178,  -0.196040, -0.039647, 0.026517,
+      -0.887767, 0.282241,  -0.849578, -0.103470, -0.003667, 0.883650,
+      0.330532,  -0.294204, 0.039559,  0.409321,  -0.487800, -0.464272,
+      -1.270504, -0.087506};
+  for (size_t i = 0; i < expected_logits.size(); ++i) {
+    EXPECT_NEAR(expected_logits[i], logits[i], 1e-5);
+  }
+  EXPECT_NEAR(loss, 2.280785, 1e-5);
 }

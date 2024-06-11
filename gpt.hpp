@@ -88,6 +88,10 @@ struct MLP {
     c_fc_->Backward(x, fch_grad, x_grad);
   }
 
+  size_t NumParameters() const {
+    return c_fc_->NumParameters() + c_proj_->NumParameters();
+  }
+
   int n_embed_;
   std::unique_ptr<nn::Linear> c_fc_;
   std::unique_ptr<nn::NewGELU> gelu_;
@@ -204,6 +208,10 @@ struct CausalSelfAttention {
     // TODO:
   }
 
+  size_t NumParameters() const {
+    return c_attn_->NumParameters() + c_proj_->NumParameters();
+  }
+
   int n_head_;
   int n_embed_;
   std::unique_ptr<nn::Linear> c_attn_;
@@ -273,6 +281,11 @@ struct Block {
     y_2d.array() += att_y_2d.array();
   }
 
+  size_t NumParameters() const {
+    return ln1_->NumParameters() + attn_->NumParameters() +
+           ln2_->NumParameters() + mlp_->NumParameters();
+  }
+
   std::unique_ptr<nn::LayerNorm> ln1_;
   std::unique_ptr<CausalSelfAttention> attn_;
   std::unique_ptr<nn::LayerNorm> ln2_;
@@ -287,13 +300,16 @@ struct Block {
 };
 
 struct GPT {
-  GPT(int block_size, int vocab_size, int n_layer, int n_head, int n_embed)
+  GPT(int block_size, int vocab_size, int padded_vocab_size, int n_layer,
+      int n_head, int n_embed)
       : block_size_(block_size),
         vocab_size_(vocab_size),
+        padded_vocab_size_(padded_vocab_size),
         n_layer_(n_layer),
         n_embed_(n_embed) {
     CHECK_GT(n_layer, 0);
-    wte_ = std::make_unique<nn::Embedding>(vocab_size, n_embed);
+
+    wte_ = std::make_unique<nn::Embedding>(padded_vocab_size, n_embed);
     wpe_ = std::make_unique<nn::Embedding>(block_size, n_embed);
     for (int i = 0; i < n_layer; ++i) {
       h_.emplace_back(std::make_unique<Block>(block_size, n_head, n_embed));
@@ -305,40 +321,64 @@ struct GPT {
     std::memcpy(wte_->weight_.get(), lm_head_unused_->weight_.data(),
                 sizeof(float) * vocab_size * n_embed);
     lm_head_ = wte_->weight_.get();
+    cross_entropy_ =
+        std::make_unique<nn::CrossEntropy>(nn::CrossEntropy::MEAN, true);
   }
 
   void Forward(const Eigen::Map<nn::MatrixInt>& idx,
-               Eigen::Map<nn::Matrix>& logits) {
+               Eigen::TensorMap<nn::Tensor3D>& logits) {
     const int B = idx.rows(), T = idx.cols(), C = n_embed_;
-    CHECK_EQ(logits.rows(), B*T);
-    CHECK_EQ(logits.cols(), vocab_size_);
+    const int BT = B * T;
+    CHECK(logits.dimension(0) == B && logits.dimension(1) == T &&
+          logits.dimension(2) == vocab_size_)
+        << "B: " << B << ", T: " << T << ", vocab_size: " << vocab_size_;
     DoForward(idx);
-
 
     // OPTIMIZE:
     // inference-time mini-optimization: only forward the lm_head on the very
     // last position
     //    auto lnf_y_3d = Eigen::TensorMap<nn::Tensor3D>(lnf_y_.data(), B, T,
     //    C); nn::Tensor2D lnf_y_last_t = lnf_y_3d.chip(T - 1, 1);
-    auto lnf_y = Eigen::Map<nn::Matrix>(lnf_y_.data(), B * T, C);
+    auto lnf_y = Eigen::Map<nn::Matrix>(lnf_y_.data(), BT, C);
     auto lm_head = Eigen::Map<nn::Matrix>(lm_head_, vocab_size_, C);
-
-    nn::MatMul::Forward(lnf_y, lm_head, logits);
-    std::cout << "logits:\n" << logits << std::endl;
+    auto logits_2d = Eigen::Map<nn::Matrix>(logits.data(), BT, vocab_size_);
+    nn::MatMul::Forward(lnf_y, lm_head, logits_2d);
   }
 
   void Forward(const Eigen::Map<nn::MatrixInt>& idx,
                const Eigen::Map<nn::MatrixInt>& targets,
-               Eigen::Map<nn::Matrix>& logits, float* loss) {
+               Eigen::TensorMap<nn::Tensor3D>& logits, float* loss) {
+    // idx: [B, T], targets: [B, T]
+    // logits: [B, T, vocab_size]
     const int B = idx.rows(), T = idx.cols(), C = n_embed_;
     const int BT = B * T;
     CHECK(targets.rows() == B && targets.cols() == T);
+    CHECK(logits.dimension(0) == B && logits.dimension(1) == T &&
+          logits.dimension(2) == vocab_size_)
+        << "B: " << B << ", T: " << T << ", vocab_size: " << vocab_size_;
     DoForward(idx);
+
+    if (probs_.size() < BT * vocab_size_) {
+      probs_.resize(BT * vocab_size_);
+    }
 
     auto lnf_y = Eigen::Map<nn::Matrix>(lnf_y_.data(), BT, C);
     auto lm_head = Eigen::Map<nn::Matrix>(lm_head_, vocab_size_, n_embed_);
-    nn::MatMul::Forward(lnf_y, lm_head, logits);
-    std::cout << "logits:\n" << logits << std::endl;
+    auto logits_2d = Eigen::Map<nn::Matrix>(logits.data(), BT, vocab_size_);
+    auto probs_2d = Eigen::Map<nn::Matrix>(probs_.data(), BT, vocab_size_);
+    nn::MatMul::Forward(lnf_y, lm_head, logits_2d);
+    cross_entropy_->Forward(logits_2d, targets, probs_2d, loss);
+  }
+
+  size_t NumParameters() const {
+    size_t num_parameters = 0;
+    num_parameters += wte_->NumParameters();
+    num_parameters += wpe_->NumParameters();
+    for (const auto& b : h_) {
+      num_parameters += b->NumParameters();
+    }
+    num_parameters += lnf_->NumParameters();
+    return num_parameters;
   }
 
  private:
@@ -380,8 +420,6 @@ struct GPT {
     auto pos_w = Eigen::Map<nn::Matrix>(wpe_->weight_.get(), block_size_, C);
     auto tok_emb = Eigen::Map<nn::Matrix>(tok_emb_.data(), B, TC);
     auto pos_emb = Eigen::Map<Eigen::RowVectorXf>(pos_emb_.data(), TC);
-    std::cout << "tok_emb:\n" << tok_emb << std::endl;
-    std::cout << "pos_emb:\n" << pos_emb << std::endl;
     tok_emb.rowwise() += pos_emb;
 
     for (int l = 0; l < n_layer_; ++l) {
@@ -399,16 +437,12 @@ struct GPT {
     auto lnf_mean = Eigen::Map<Eigen::RowVectorXf>(lnf_mean_.data(), BT);
     auto lnf_rstd = Eigen::Map<Eigen::RowVectorXf>(lnf_rstd_.data(), BT);
     lnf_->Forward(block_out_2d, lnf_y, lnf_mean, lnf_rstd);
-    std::cout << "LNF:\n" << lnf_y << std::endl;
-
-    //    auto lm_head = Eigen::Map<nn::Matrix>(lm_head_, vocab_size_, C);
-    //    nn::MatMul::Forward(lnf_y, lm_head, logits);
-    //    std::cout << "logits:\n" << logits << std::endl;
   }
 
  public:
   int block_size_;
   int vocab_size_;
+  int padded_vocab_size_;
   int n_layer_;
   int n_embed_;
 
@@ -417,6 +451,7 @@ struct GPT {
   std::unique_ptr<nn::Embedding> wpe_;
   std::vector<std::unique_ptr<Block>> h_;
   std::unique_ptr<nn::LayerNorm> lnf_;
+  std::unique_ptr<nn::CrossEntropy> cross_entropy_;
 
   // head
   std::unique_ptr<nn::Linear> lm_head_unused_;
@@ -428,8 +463,9 @@ struct GPT {
   std::vector<float> block_y_;              // [L, B, T, C]
   std::vector<float> lnf_y_;                // [B*T, C]
   std::vector<float> lnf_mean_, lnf_rstd_;  // [B*T]
+  std::vector<float> probs_;                // [B*T, vocab_size]
 };
 
-}  // namespace gpt2
+}  // namespace gpt
 
 #endif  // LLM_CPP__GPT_HPP_

@@ -103,7 +103,7 @@ struct Linear {
     CHECK_EQ(x.rows(), y.rows());
 
     // y = x * w^T + b
-    y.noalias() = x * weight_.transpose() + bias_;
+    y.noalias() = (x * weight_.transpose()).rowwise() + bias_;
   }
 
   void Backward(const Eigen::Map<Matrix>& x, const Eigen::Map<Matrix>& y_grad,
@@ -115,29 +115,42 @@ struct Linear {
     CHECK_EQ(x.rows(), x_grad.rows());
 
     // Lazily allocate the memory for gradients
+    LazilyAllocateGradMemory();
+
+    // x_grad = dL/dy * dy/dx
+    //        = y_grad(B, out_features) * W(out_features, in_features)
+    //        = [B, in_features]
+    x_grad.noalias() += y_grad * weight_;
+
+    // w_grad = dL/dy * dy/dw
+    //        = y_grad^T(out_features, B) * x(B, in_features)
+    //        = [out_features, in_features]
+    weight_grad_.noalias() += y_grad.transpose() * x;
+
+    if (has_bias_) {
+      // b_grad = dL/dy * dy/db
+      //        = \sum_i^(B)(y_grad(B, out_features))
+      //        = [out_features,]
+      bias_grad_.noalias() += y_grad.colwise().sum();
+    }
+  }
+
+  void LazilyAllocateGradMemory() {
     if (weight_grad_.size() == 0) {
       weight_grad_ = Matrix::Zero(out_features_, in_features_);
     }
     if (bias_grad_.size() == 0) {
       bias_grad_ = Eigen::RowVectorXf::Zero(out_features_);
     }
+  }
 
-    // x_grad = dL/dy * dy/dx
-    //        = y_grad(B, out_features) * W(out_features, in_features)
-    //        = [B, in_features]
-    x_grad.noalias() = y_grad * weight_;
-
-    // w_grad = dL/dy * dy/dw
-    //        = y_grad^T(out_features, B) * x(B, in_features)
-    //        = [out_features, in_features]
-    weight_grad_.noalias() = y_grad.transpose() * x;
-
+  size_t NumParameters() const {
+    size_t num_parameters = out_features_ * in_features_;
     if (has_bias_) {
-      // b_grad = dL/dy * dy/db
-      //        = \sum_i^(B)(y_grad(B, out_features))
-      //        = [out_features,]
-      bias_grad_.noalias() = y_grad.colwise().sum();
+      num_parameters += out_features_;
     }
+
+    return num_parameters;
   }
 
   bool has_bias_;
@@ -169,10 +182,7 @@ struct Embedding {
     CHECK_EQ(grad_embedding.size(), idx.size() * embedding_dim_);
 
     // Lazily allocate the memory for gradients
-    if (weight_grad_ == nullptr) {
-      weight_grad_ =
-          std::make_unique<float[]>(num_embeddings_ * embedding_dim_);
-    }
+    LazilyAllocateGradMemory();
 
     for (size_t i = 0; i < idx.size(); ++i) {
       CHECK_LT(idx[i], num_embeddings_);
@@ -183,6 +193,15 @@ struct Embedding {
       }
     }
   }
+
+  void LazilyAllocateGradMemory() {
+    if (weight_grad_ == nullptr) {
+      weight_grad_ =
+          std::make_unique<float[]>(num_embeddings_ * embedding_dim_);
+    }
+  }
+
+  size_t NumParameters() const { return num_embeddings_ * embedding_dim_; }
 
   int num_embeddings_;
   int embedding_dim_;
@@ -250,12 +269,7 @@ struct LayerNorm {
     CHECK_EQ(rstd.size(), B);
 
     // Lazily allocate the memory for gradients
-    if (weight_grad_.size() == 0) {
-      weight_grad_ = Eigen::RowVectorXf::Zero(normalized_shape_);
-    }
-    if (bias_grad_.size() == 0) {
-      bias_grad_ = Eigen::RowVectorXf::Zero(normalized_shape_);
-    }
+    LazilyAllocateGradMemory();
 
     // x_grad = dL/dy * dy/dnorm
     //                * [dnorm/dxmean * dxmean/dx
@@ -279,18 +293,30 @@ struct LayerNorm {
     // w_grad = dL/dy * dy/dw
     //        = dL/dy * x_norm(B,D)
     //        = \sum_i^B [y_grad(B, D) \elewise_dot x_norm(B, D)]
-    weight_grad_ =
+    weight_grad_.array() +=
         (y_grad.array() * ((x.colwise() - mean.transpose()).array().colwise() *
                            rstd.transpose().array())
                               .array())
             .colwise()
-            .sum();
+            .sum()
+            .array();
 
     // b_grad = dL/dy * dy/db
     //        = \sum_i^(B)(y_grad(B, D))
     //        = [D,]
-    bias_grad_.noalias() = y_grad.colwise().sum();
+    bias_grad_.noalias() += y_grad.colwise().sum();
   }
+
+  void LazilyAllocateGradMemory() {
+    if (weight_grad_.size() == 0) {
+      weight_grad_ = Eigen::RowVectorXf::Zero(normalized_shape_);
+    }
+    if (bias_grad_.size() == 0) {
+      bias_grad_ = Eigen::RowVectorXf::Zero(normalized_shape_);
+    }
+  }
+
+  size_t NumParameters() const { return normalized_shape_ * 2; }
 
   int normalized_shape_;
   float eps_;
@@ -334,24 +360,31 @@ struct NewGELU {
       float dydx = 0.5f * (1.0f + tanh_out) +
                    0.5f * _x * (1.0f - tanh_out * tanh_out) *
                        (sqrt_2_over_pi * (1.0f + 3.f * 0.044715f * _x * _x));
-      x_grad[i] = y_grad[i] * dydx;
+      x_grad[i] += y_grad[i] * dydx;
     }
   }
 };
 
 struct Softmax {
-  static void Forward(const Eigen::Map<Matrix>& x, Eigen::Map<Matrix>& y) {
+  Softmax(bool subtract_max_value = false)
+      : subtract_max_value_(subtract_max_value) {}
+
+  void Forward(const Eigen::Map<Matrix>& x, Eigen::Map<Matrix>& y) {
     // x: [B, D], y: [B, D]
     CHECK_EQ(x.rows(), y.rows());
     CHECK_EQ(x.cols(), y.cols());
 
-    y = x.array().exp();
-    y = y.array().colwise() / y.rowwise().sum().array();
+    if (subtract_max_value_) {
+      auto x_exp = (x.colwise() - x.rowwise().maxCoeff()).array().exp();
+      y = x_exp.array().colwise() / x_exp.rowwise().sum().array();
+    } else {
+      auto x_exp = x.array().exp();
+      y = x_exp.array().colwise() / x_exp.rowwise().sum().array();
+    }
   }
 
-  static void Backward(const Eigen::Map<Matrix>& x,
-                       const Eigen::Map<Matrix>& y_grad,
-                       Eigen::Map<Matrix>& x_grad) {
+  void Backward(const Eigen::Map<Matrix>& x, const Eigen::Map<Matrix>& y_grad,
+                Eigen::Map<Matrix>& x_grad) {
     // x: [B, D], y_grad: [B, D], x_grad: [B, D]
     CHECK_EQ(x.rows(), y_grad.rows());
     CHECK_EQ(x.cols(), y_grad.cols());
@@ -362,46 +395,62 @@ struct Softmax {
     //       = ...
     // TODO:
   }
+
+  bool subtract_max_value_;
 };
 
 struct CrossEntropy {
-  static void Forward(const Eigen::Map<Matrix>& logits, absl::Span<const int> targets,
-               Eigen::Map<Matrix>& probs, absl::Span<float> losses) {
-    // logits: [B, C], targets: [B,], probs:[B, C], losses: [B]
+  enum Reduction { MEAN, SUM };
+
+  CrossEntropy(Reduction reduction = Reduction::MEAN,
+               bool softmax_subtract_max_value = false)
+      : reduction_(reduction) {
+    softmax_ = std::make_unique<Softmax>(softmax_subtract_max_value);
+  }
+
+  void Forward(const Eigen::Map<Matrix>& logits, absl::Span<const int> targets,
+               Eigen::Map<Matrix>& probs, float* loss) {
+    // logits: [B, C], targets: [B,], probs:[B, C], loss: scalar
     int B = logits.rows(), C = logits.cols();
-    CHECK(B == targets.size() && B == probs.rows() && B == losses.size());
-    CHECK_EQ(logits.cols(), probs.cols());
+    CHECK(B == targets.size() && B == probs.rows());
+    CHECK_EQ(C, probs.cols());
 
     // apply softmax to convert logits to (normalized) probabilities
-    Softmax::Forward(logits, probs);
+    softmax_->Forward(logits, probs);
 
-    // B * C
-    auto prob_span = absl::MakeSpan(probs.data(), probs.size());
+    // targets: [B,]
     for (int i = 0; i < targets.size(); ++i) {
       int ix = targets[i];
-      losses[i] = -std::log(prob_span[ix]);
+      *loss += -std::log(probs(i, ix));
+    }
+
+    if (reduction_ == Reduction::MEAN) {
+      *loss /= static_cast<float>(B);
     }
   }
 
   void Backward(const Eigen::Map<Matrix>& probs, absl::Span<const int> targets,
-                absl::Span<const float> losses,
                 Eigen::Map<Matrix>& logits_grad) {
-    // probs: [B, C], targets: [B,], losses: [B,]
+    // probs: [B, C], targets: [B,]
     // logits_grad: [B, C]
     int B = probs.rows(), C = probs.cols();
-    CHECK(B == targets.size() && B == losses.size() && B == logits_grad.rows());
+    CHECK(B == targets.size() && B == logits_grad.rows());
     CHECK_EQ(C, logits_grad.cols());
+
+    float factor =
+        reduction_ == Reduction::MEAN ? 1.0f / static_cast<float>(B) : 1.0f;
 
     for (int b = 0; b < B; ++b) {
       int ix = targets[b];
-      float loss = losses[b];
       for (int c = 0; c < C; ++c) {
-        float p = probs(b, c);
         float indicator = c == ix ? 1.0f : 0.0f;
-        logits_grad(b, c) += (p - indicator) * loss;
+        logits_grad(b, c) += (probs(b, c) - indicator) * factor;
       }
     }
   }
+
+  Reduction reduction_;
+  std::unique_ptr<Softmax> softmax_;
 };
 
 }  // namespace nn
