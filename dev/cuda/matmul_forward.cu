@@ -93,7 +93,7 @@ __device__ void st_vec(float* address, float4 val) {
     *reinterpret_cast<float4*>(address) = val;
 }
 
-__global__ void matmul_forward_kernel4(float* out,
+__global__ void __launch_bounds__(16*16) matmul_forward_kernel4(float* out,
                                        const float* inp, const float* weight, const float* bias,
                                        int BT, int C, int OC) {
     // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
@@ -101,12 +101,20 @@ __global__ void matmul_forward_kernel4(float* out,
     // in the naive kernel, every thread handles one element of out
     int bt = 8*(blockIdx.x * blockDim.x + threadIdx.x);
     int oc = 8*(blockIdx.y * blockDim.y + threadIdx.y);
+
+    __shared__ float lhs_s[128][32];
+    __shared__ float rhs_s[128][32];
+
+    inp += 128 * blockIdx.x * C;
+    weight += 128 * blockIdx.y * C;
+    out += 128 * blockIdx.x * OC + 128 * blockIdx.y;
+
     if (bt < BT && oc < OC) {
         float vals[8][8] = {};
         if(bias != NULL) {
             for (int i = 0; i < 8; i++) {
                 for (int j = 0; j < 8; j += 4) {
-                    float4 b =ld_vec(bias + oc + j);
+                    float4 b = ld_vec(bias + oc + j);
                     vals[i][j+0] = b.x;
                     vals[i][j+1] = b.y;
                     vals[i][j+2] = b.z;
@@ -115,18 +123,29 @@ __global__ void matmul_forward_kernel4(float* out,
             }
         }
 
-        for (int k = 0; k < C; k += 4) {
-            float4 rhs[8];
-            for (int u = 0; u < 8; ++u) {
-                rhs[u] = ld_vec(weight + k + (oc+u) * C);
+        int si_start = 16 * threadIdx.y + threadIdx.x;
+        for (int so = 0; so < C; so += 32) {
+            __syncthreads();
+            int xmod8 = threadIdx.x % 8;
+            int xby8 = threadIdx.x / 8;
+            for(int y = 2 * threadIdx.y + xby8; y < 128; y += 32) {
+                int xo = 4 * xmod8;
+                st_vec(&lhs_s[y][xo], ld_vec(inp + y * C + so + xo));
+                st_vec(&rhs_s[y][xo], ld_vec(weight + y * C + so + xo));
             }
-            for (int i = 0; i < 8; ++i) {
-                float4 lhs = ld_vec(inp + k + (bt+i) * C);
-                for (int j = 0; j < 8; ++j) {
-                    vals[i][j] += lhs.x * rhs[j].x;
-                    vals[i][j] += lhs.y * rhs[j].y;
-                    vals[i][j] += lhs.z * rhs[j].z;
-                    vals[i][j] += lhs.w * rhs[j].w;
+            __syncthreads();
+
+            for (int si = si_start; si < si_start + 32; ++si) {
+                float rhs[8];
+                for (int u = 0; u < 8; ++u) {
+                    rhs[u] = rhs_s[u + 8 * threadIdx.y][si % 32];
+                }
+
+                for (int ii = 0; ii < 8; ++ii) {
+                    float lhs = lhs_s[ii + 8 * threadIdx.x][si % 32];
+                    for (int ji = 0; ji < 8; ++ji) {
+                        vals[ii][ji] += lhs * rhs[ji];
+                    }
                 }
             }
         }
@@ -137,7 +156,7 @@ __global__ void matmul_forward_kernel4(float* out,
                 result.y = vals[i][j + 1];
                 result.z = vals[i][j + 2];
                 result.w = vals[i][j + 3];
-                st_vec(out + (bt+i) * OC + oc + j, result);
+                st_vec(out + (8*threadIdx.x+i) * OC + 8*threadIdx.y + j, result);
             }
         }
     }
@@ -284,7 +303,7 @@ void matmul_forward4(float* out,
                      int sqrt_block_size) {
     // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    if(sqrt_block_size > 16) sqrt_block_size = 16;
+    sqrt_block_size = 16;
 
     dim3 gridDim(ceil_div(B * T, sqrt_block_size), ceil_div(OC, sqrt_block_size));
     dim3 blockDim(sqrt_block_size, sqrt_block_size);
