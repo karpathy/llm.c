@@ -85,37 +85,6 @@ __global__ void rmsnorm_forward_kernel1(
     }
 }
 
-// modified from: https://developer.nvidia.com/blog/faster-parallel-reductions-kepler/
-__inline__ __device__ int warp_all_reduce_sum(float val) {
-    constexpr int WARP_SIZE = 32;
-    constexpr unsigned FULL_MASK = 0xFFFFFFFF;
-
-    #pragma unroll
-    for (int stride = WARP_SIZE >> 1; stride > 0; stride >>= 1) {
-        val += __shfl_xor_sync(FULL_MASK, val, stride);
-    }
-
-    return val;
-}
-
-// modified from: https://developer.nvidia.com/blog/faster-parallel-reductions-kepler/
-__inline__ __device__ int block_all_reduce_sum(float val, int block_size) {
-    constexpr int WARP_SIZE = 32;
-
-    static __shared__ float shared[WARP_SIZE]; 
-    int tid = threadIdx.x;
-    int lane_id = tid % WARP_SIZE;
-    int warp_id = tid / WARP_SIZE;
-
-    val = warp_all_reduce_sum(val); 
-    if (lane_id == 0) { shared[warp_id] = val; }; // write final value stored in threadId 0 to shared memory
-
-    val = (lane_id < block_size / WARP_SIZE) ? shared[lane_id] : 0.0f;
-    if (warp_id == 0) { val = warp_all_reduce_sum(val); } // warp-wise reduce into first warp
-    
-    return val;
-}
-
 __global__ void rms_val_kernel(
     float* rms, 
     const float* inp, 
@@ -123,22 +92,30 @@ __global__ void rms_val_kernel(
     int C, 
     int block_size
 ) {
-    int tid = threadIdx.x;
+    extern __shared__ float shared[];
     int idx = blockIdx.x; // range [0, B*T)
+    int tid = threadIdx.x; // range [0, blocksize]
+    const float *x = inp + idx * C;
 
-    const float* x = inp + idx * C;
     float sum_of_squares = 0.0f;
 
-    // thread coarsening
     #pragma unroll
-    for (int i = tid; i < C; i += blockDim.x) {
+    for (int i = tid; i < C; i += block_size) {
         sum_of_squares += x[i] * x[i];
     }
-    sum_of_squares = block_all_reduce_sum(sum_of_squares, block_size);
+    shared[tid] = sum_of_squares;
+    __syncthreads();
 
-    // write the final result (at thread 0) to global memory
+    #pragma unroll
+    for (int stride = block_size >> 1; stride > 0; stride >>= 1) {
+        __syncthreads();
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+    }
+
     if (tid == 0) {
-        rms[idx] = rsqrtf(sum_of_squares / C);
+        rms[idx] = rsqrt(shared[0] / C); // write back accumulated value in thread 0
     }
 }
 
@@ -153,10 +130,9 @@ __global__ void rmsnorm_forward_kernel2(
     int C
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
     int bt = idx / C;
     int c = idx % C;
-
+    
     float rms_val = rms[bt];
     float xi = inp[idx];
     float n = xi * rms_val;

@@ -18,6 +18,25 @@ __device__ float warpReduceSum(float val) {
     return val;
 }
 
+// modified from: https://developer.nvidia.com/blog/faster-parallel-reductions-kepler/
+__inline__ __device__ float blockAllReduceSum(float val) {
+    static __shared__ float shared[32]; 
+    int tid = threadIdx.x;
+    int num_warps = blockDim.x / 32;
+    int lane_id = tid % 32;
+    int warp_id = tid / 32;
+
+    val = warpReduceSum(val); 
+    if (lane_id == 0) { shared[warp_id] = val; }; // write final value stored in threadId 0 to shared memory
+
+    __syncthreads();
+
+    val = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+    if (warp_id == 0) { val = warpReduceSum(val); } // warp-wise reduce into first warp
+    
+    return val;
+}
+
 // ----------------------------------------------------------------------------
 // checking utils
 
