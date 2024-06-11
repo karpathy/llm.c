@@ -18,7 +18,7 @@ MPI_PATHS = -I/usr/lib/x86_64-linux-gnu/openmpi/include -L/usr/lib/x86_64-linux-
 	$(NVCC) $(CFLAGS) $(NVCCFLAGS) $< -o $@
 
 # Build all targets
-TARGETS = adamw attention_backward attention_forward classifier_fused crossentropy_forward crossentropy_softmax_backward encoder_backward encoder_forward gelu_backward gelu_forward layernorm_backward layernorm_forward matmul_backward matmul_backward_bias matmul_forward nccl_all_reduce residual_forward softmax_forward trimat_forward fused_residual_forward  global_norm
+TARGETS = adamw attention_backward attention_forward classifier_fused crossentropy_forward crossentropy_softmax_backward encoder_backward encoder_forward gelu_backward gelu_forward layernorm_backward layernorm_forward matmul_backward matmul_backward_bias matmul_forward nccl_all_reduce residual_forward softmax_forward trimat_forward permute_backwards fused_residual_forward  global_norm
 all: $(TARGETS)
 
 # Individual targets: forward pass
@@ -32,6 +32,10 @@ fused_residual_forward: fused_residual_forward.cu
 residual_forward: residual_forward.cu
 softmax_forward: softmax_forward.cu
 trimat_forward: trimat_forward.cu
+
+# permutations
+permute_backwards: permute_backwards.cu
+
 # matmul fwd/bwd also uses OpenMP (optionally) and cuBLASLt libs
 matmul_forward: matmul_forward.cu
 	$(NVCC) $(CFLAGS) $(NVCCFLAGS) -Xcompiler -fopenmp matmul_forward.cu -o matmul_forward
