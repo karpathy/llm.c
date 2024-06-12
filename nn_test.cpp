@@ -310,7 +310,7 @@ loss.backward()
   }
 }
 
-TEST(CrossEntropy, Forward) {
+TEST(SoftmaxCrossEntropy, ForwardAndBackward) {
   /*
 
 import torch
@@ -341,7 +341,7 @@ loss.backward()
   float loss1 = 0.0, loss2 = 0.0;
 
   // Reduction: MEAN
-  nn::CrossEntropy criterion1(nn::CrossEntropy::MEAN);
+  nn::SoftmaxCrossEntropy criterion1(nn::SoftmaxCrossEntropy::MEAN);
   criterion1.Forward(logits_m, absl::MakeSpan(target), probs_m, &loss1);
 
   auto logits_grad_m = Eigen::Map<nn::Matrix>(logits_grad.data(), batch, dim);
@@ -356,12 +356,80 @@ loss.backward()
   }
 
   // Reduction: SUM
-  nn::CrossEntropy criterion2(nn::CrossEntropy::SUM);
+  nn::SoftmaxCrossEntropy criterion2(nn::SoftmaxCrossEntropy::SUM);
   criterion2.Forward(logits_m, absl::MakeSpan(target), probs_m, &loss2);
   EXPECT_NEAR(loss1 * batch, loss2, 1e-5);
 
   logits_grad_m.setZero();
   criterion2.Backward(probs_m, absl::MakeSpan(target), logits_grad_m);
+  std::vector<float> expected_logits_grad2 = {
+      0.368307, -0.700823, 0.332516, 0.521469,  0.134755, -0.656224,
+      0.811398, -0.952886, 0.141488, -0.751628, 0.324564, 0.427064};
+
+  for (size_t i = 0; i < expected_logits_grad2.size(); ++i) {
+    EXPECT_NEAR(expected_logits_grad2[i], logits_grad[i], 1e-5);
+  }
+}
+
+TEST(VanillaCrossEntropy, ForwardAndBackward) {
+  /*
+
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+torch.manual_seed(42)
+torch.set_printoptions(precision=6)
+batch, dim = 4, 3
+x = torch.randn(batch, dim)
+x = nn.Parameter(x)
+target = torch.LongTensor([1, 2, 1, 0])
+l = nn.CrossEntropyLoss()
+loss = l(x, target)
+loss.backward()
+
+  */
+
+  nn::ManualSeed(42);
+  int batch = 4, dim = 3;
+  // forward
+  std::vector<float> logits(batch * dim), probs(batch * dim),
+      logits_grad(batch * dim, 0), probs_grad(batch * dim, 0);
+  nn::NormalFill(absl::MakeSpan(logits));
+  std::vector<int> target = {1, 2, 1, 0};
+
+  auto logits_m = Eigen::Map<nn::Matrix>(logits.data(), batch, dim);
+  auto probs_m = Eigen::Map<nn::Matrix>(probs.data(), batch, dim);
+  float loss1 = 0.0, loss2 = 0.0;
+
+  // Reduction: MEAN
+  nn::Softmax softmax;
+  nn::VanillaCrossEntropy criterion1(nn::VanillaCrossEntropy::MEAN);
+  softmax.Forward(logits_m, probs_m);
+  criterion1.Forward(probs_m, absl::MakeSpan(target), &loss1);
+
+  auto logits_grad_m = Eigen::Map<nn::Matrix>(logits_grad.data(), batch, dim);
+  auto probs_grad_m = Eigen::Map<nn::Matrix>(probs_grad.data(), batch, dim);
+  criterion1.Backward(probs_m, absl::MakeSpan(target), probs_grad_m);
+  softmax.Backward(probs_m, probs_grad_m, logits_grad_m);
+
+  std::vector<float> expected_logits_grad1 = {
+      0.092077, -0.175206, 0.083129, 0.130367,  0.033689, -0.164056,
+      0.202850, -0.238222, 0.035372, -0.187907, 0.081141, 0.106766};
+
+  for (size_t i = 0; i < expected_logits_grad1.size(); ++i) {
+    EXPECT_NEAR(expected_logits_grad1[i], logits_grad[i], 1e-5);
+  }
+
+  // Reduction: SUM
+  nn::VanillaCrossEntropy criterion2(nn::VanillaCrossEntropy::SUM);
+  softmax.Forward(logits_m, probs_m);
+  criterion2.Forward(probs_m, absl::MakeSpan(target), &loss2);
+  EXPECT_NEAR(loss1 * batch, loss2, 1e-5);
+
+  logits_grad_m.setZero();
+  probs_grad_m.setZero();
+  criterion2.Backward(probs_m, absl::MakeSpan(target), probs_grad_m);
+  softmax.Backward(probs_m, probs_grad_m, logits_grad_m);
   std::vector<float> expected_logits_grad2 = {
       0.368307, -0.700823, 0.332516, 0.521469,  0.134755, -0.656224,
       0.811398, -0.952886, 0.141488, -0.751628, 0.324564, 0.427064};

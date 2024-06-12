@@ -21,12 +21,21 @@ namespace gpt {
     CHECK(m.rows() == X && m.cols() == Y); \
   } while (false)
 
-#define LAZY_ALLOCATE_TENSOR(t, X, Y, Z)                                      \
+#define LAZY_ALLOCATE_TENSOR3D(t, X, Y, Z)                                    \
   do {                                                                        \
     if (t.size() == 0) {                                                      \
       t.resize(X, Y, Z);                                                      \
     }                                                                         \
     CHECK(t.dimension(0) == X && t.dimension(1) == Y && t.dimension(2) == Z); \
+  } while (false)
+
+#define LAZY_ALLOCATE_TENSOR4D(t, A, B, C, D)                                  \
+  do {                                                                         \
+    if (t.size() == 0) {                                                       \
+      t.resize(A, B, C, D);                                                    \
+    }                                                                          \
+    CHECK(t.dimension(0) == A && t.dimension(1) == B && t.dimension(2) == C && \
+          t.dimension(3) == D);                                                \
   } while (false)
 
 struct MLP {
@@ -113,6 +122,8 @@ struct CausalSelfAttention {
     // output projection
     c_proj_ = std::make_unique<nn::Linear>(n_embed, n_embed);
 
+    softmax_ = std::make_unique<nn::Softmax>(true);
+
     // mask
     bias_ = Eigen::MatrixXi::Ones(block_size, block_size)
                 .triangularView<Eigen::Lower>();
@@ -123,12 +134,19 @@ struct CausalSelfAttention {
     const int B = x.dimension(0);  // batch size
     const int T = x.dimension(1);  // sequence length
     const int C = x.dimension(2);  // embedding dimensionality (n_embd)
+    int NH = n_head_, HS = C / n_head_;
     CHECK_EQ(B, y.dimension(0));
     CHECK_EQ(T, y.dimension(1));
     CHECK(C == n_embed_ && C == y.dimension(2));
 
     // Lazily allocate the memory for activation
-    LAZY_ALLOCATE_TENSOR(qkv_, B, T, 3 * C);
+    LAZY_ALLOCATE_TENSOR3D(qkv_, B, T, 3 * C);
+    LAZY_ALLOCATE_TENSOR4D(q_, B, NH, T, HS);
+    LAZY_ALLOCATE_TENSOR4D(k_, B, NH, HS, T);
+    LAZY_ALLOCATE_TENSOR4D(v_, B, NH, T, HS);
+    LAZY_ALLOCATE_TENSOR4D(preatt_, B, NH, T, T);
+    LAZY_ALLOCATE_TENSOR4D(att_, B, NH, T, HS);
+    LAZY_ALLOCATE_TENSOR4D(att2_, B, T, NH, HS);
 
     auto _x = Eigen::Map<nn::Matrix>(x.data(), B * T, C);
     auto qkv = Eigen::Map<nn::Matrix>(qkv_.data(), B * T, 3 * C);
@@ -138,74 +156,100 @@ struct CausalSelfAttention {
     Eigen::array<Eigen::Index, 3> offsets_k = {0, 0, C};
     Eigen::array<Eigen::Index, 3> offsets_v = {0, 0, 2 * C};
     Eigen::array<Eigen::Index, 3> extents = {B, T, C};
-    nn::Tensor3D q3d = qkv_.slice(offsets_q, extents);  // [B, T, C]
-    nn::Tensor3D k3d = qkv_.slice(offsets_k, extents);  // [B, T, C]
-    nn::Tensor3D v3d = qkv_.slice(offsets_v, extents);  // [B, T, C]
-
-    int nh = n_head_, hs = C / n_head_;
-    const float factor = 1.0f / std::sqrt(static_cast<float>(hs));
-    auto q4d = Eigen::TensorMap<nn::Tensor4D>(q3d.data(), B, T, nh, hs);
-    auto k4d = Eigen::TensorMap<nn::Tensor4D>(k3d.data(), B, T, nh, hs);
-    auto v4d = Eigen::TensorMap<nn::Tensor4D>(v3d.data(), B, T, nh, hs);
+    Eigen::array<Eigen::Index, 4> shape = {B, T, NH, HS};
     Eigen::array<Eigen::Index, 4> shuffle_qv = {0, 2, 1, 3},
                                   shuffle_k = {0, 2, 3, 1};
-    nn::Tensor4D q = q4d.shuffle(shuffle_qv);  // (B, nh, T, hs)
-    nn::Tensor4D k = k4d.shuffle(shuffle_k);   // (B, nh, hs, T)
-    nn::Tensor4D v = v4d.shuffle(shuffle_qv);  // (B, nh, T, hs)
-    nn::Tensor4D att(B, nh, T, T), out(B, nh, T, hs);
-    for (int b = 0; b < B; ++b) {
-      for (int h = 0; h < nh; ++h) {
-        auto q2d =
-            Eigen::Map<nn::Matrix>(q.data() + (b * nh + h) * T * hs, T, hs);
-        auto k2d =
-            Eigen::Map<nn::Matrix>(k.data() + (b * nh + h) * hs * T, hs, T);
-        auto v2d =
-            Eigen::Map<nn::Matrix>(v.data() + (b * nh + h) * T * hs, T, hs);
-        auto att2d =
-            Eigen::Map<nn::Matrix>(att.data() + (b * nh + h) * T * T, T, T);
-        auto out2d =
-            Eigen::Map<nn::Matrix>(out.data() + (b * nh + h) * T * hs, T, hs);
+    q_ = qkv_.slice(offsets_q, extents)  // [B, T, C]
+             .reshape(shape)             // [B, T, NH, HS]
+             .shuffle(shuffle_qv)        // [B, NH, T, HS]
+        ;
+    k_ = qkv_.slice(offsets_k, extents)  // [B, T, C]
+             .reshape(shape)             //  [B, T, NH, HS]
+             .shuffle(shuffle_k)         //  [B, NH, T, HS]
+        ;
+    v_ = qkv_.slice(offsets_v, extents)  // [B, T, C]
+             .reshape(shape)             //  [B, T, NH, HS]
+             .shuffle(shuffle_qv)        //  [B, NH, T, HS]
+        ;
 
-        att2d.noalias() = (q2d * k2d) * factor;
+    const float factor = 1.0f / std::sqrt(static_cast<float>(HS));
+    for (int b = 0; b < B; ++b) {
+      for (int h = 0; h < NH; ++h) {
+        auto q2d =
+            Eigen::Map<nn::Matrix>(q_.data() + (b * NH + h) * T * HS, T, HS);
+        auto k2d =
+            Eigen::Map<nn::Matrix>(k_.data() + (b * NH + h) * HS * T, HS, T);
+        auto v2d =
+            Eigen::Map<nn::Matrix>(v_.data() + (b * NH + h) * T * HS, T, HS);
+        auto preatt2d =
+            Eigen::Map<nn::Matrix>(preatt_.data() + (b * NH + h) * T * T, T, T);
+        auto att2d =
+            Eigen::Map<nn::Matrix>(att_.data() + (b * NH + h) * T * HS, T, HS);
+
+        preatt2d.noalias() = (q2d * k2d) * factor;
         for (int i = 0; i < T; ++i) {
           for (int j = 0; j < T; ++j) {
             if (!bias_(i, j)) {
-              att2d(i, j) = -std::numeric_limits<float>::infinity();
+              preatt2d(i, j) = -std::numeric_limits<float>::infinity();
             }
           }
         }
 
         // softmax
-        att2d = att2d.array().exp();
-        att2d = att2d.array().colwise() / att2d.rowwise().sum().array();
+        //        preatt2d = preatt2d.array().exp();
+        //        preatt2d =
+        //            preatt2d.array().colwise() /
+        //            preatt2d.rowwise().sum().array();
+        softmax_->Forward(preatt2d, preatt2d);
 
         // att * v
-        out2d = att2d * v2d;
+        att2d = preatt2d * v2d;
       }
     }
 
     Eigen::array<Eigen::Index, 4> shuffle_att = {0, 2, 1, 3};
-    auto y4d = Eigen::TensorMap<nn::Tensor4D>(y.data(), B, T, nh, hs);
-    y4d = out.shuffle(shuffle_qv);  // (B, T, nh, hs)
+    att2_ = att_.shuffle(shuffle_att);  // [B, T, NH, HS]
+    auto att2_2d = Eigen::Map<nn::Matrix>(att2_.data(), B * T, C);
 
-    auto y2d = Eigen::Map<nn::Matrix>(y4d.data(), B * T, C);
-    c_proj_->Forward(y2d, y2d);
+    auto y2d = Eigen::Map<nn::Matrix>(y.data(), B * T, C);
+    c_proj_->Forward(att2_2d, y2d);
   }
 
   void Backward(const Eigen::TensorMap<nn::Tensor3D>& x,
+                const Eigen::TensorMap<nn::Tensor3D>& y,
                 const Eigen::TensorMap<nn::Tensor3D>& y_grad,
                 Eigen::TensorMap<nn::Tensor3D>& x_grad) {
     const int B = x.dimension(0);  // batch size
     const int T = x.dimension(1);  // sequence length
     const int C = x.dimension(2);  // embedding dimensionality (n_embd)
-    CHECK_EQ(B, y_grad.dimension(0));
-    CHECK_EQ(T, y_grad.dimension(1));
-    CHECK_EQ(C, y_grad.dimension(2));
-    CHECK_EQ(B, x_grad.dimension(0));
-    CHECK_EQ(T, x_grad.dimension(1));
-    CHECK_EQ(C, x_grad.dimension(2));
+    int NH = n_head_, HS = C / n_head_;
+    CHECK(B == y.dimension(0) && B == y_grad.dimension(0) &&
+          B == x_grad.dimension(0));
+    CHECK(T == y.dimension(1) && T == y_grad.dimension(1) &&
+          T == x_grad.dimension(1));
+    CHECK(C == y.dimension(2) && C == y_grad.dimension(2) &&
+          C == x_grad.dimension(2));
 
-    // TODO:
+    // Lazily allocate the memory for activation
+    LAZY_ALLOCATE_TENSOR3D(qkv_grad_, B, T, 3 * C);
+    LAZY_ALLOCATE_TENSOR4D(q_grad_, B, NH, T, HS);
+    LAZY_ALLOCATE_TENSOR4D(k_grad_, B, NH, HS, T);
+    LAZY_ALLOCATE_TENSOR4D(v_grad_, B, NH, T, HS);
+    LAZY_ALLOCATE_TENSOR4D(preatt_grad_, B, NH, T, T);
+    LAZY_ALLOCATE_TENSOR4D(att_grad_, B, NH, T, HS);
+    LAZY_ALLOCATE_TENSOR4D(att2_grad_, B, T, NH, HS);
+
+    // attproj backward
+    auto att2_2d = Eigen::Map<nn::Matrix>(att2_.data(), B * T, C);
+    auto y_grad_2d = Eigen::Map<nn::Matrix>(y_grad.data(), B * T, C);
+    auto att2_grad_2d = Eigen::Map<nn::Matrix>(att2_grad_.data(), B * T, C);
+    c_proj_->Backward(att2_2d, y_grad_2d, att2_grad_2d);
+
+    // shuffle backward
+    Eigen::array<Eigen::Index, 4> shuffle_att = {0, 2, 1, 3};
+    att_grad_ = att2_grad_.shuffle(shuffle_att);  // [B, NH, T, HS]
+
+    //
   }
 
   size_t NumParameters() const {
@@ -216,9 +260,16 @@ struct CausalSelfAttention {
   int n_embed_;
   std::unique_ptr<nn::Linear> c_attn_;
   std::unique_ptr<nn::Linear> c_proj_;
+  std::unique_ptr<nn::Softmax> softmax_;
 
   // activation tensors
-  nn::Tensor3D qkv_;
+  nn::Tensor3D qkv_, qkv_grad_;        // [B, T, 3C]
+  nn::Tensor4D q_, q_grad_;            // [B, NH, T, HS]
+  nn::Tensor4D k_, k_grad_;            // [B, NH, HS, T]
+  nn::Tensor4D v_, v_grad_;            // [B, NH, T, HS]
+  nn::Tensor4D preatt_, preatt_grad_;  // [B, NH, T, T]
+  nn::Tensor4D att_, att_grad_;        // [B, NH, T, HS]
+  nn::Tensor4D att2_, att2_grad_;      // [B, T, NH, HS]
 
   // not really a 'bias', more of a mask, but following the OpenAI/HF naming
   // though
@@ -246,7 +297,7 @@ struct Block {
     LAZY_ALLOCATE_MATRIX(ln1_y_, B * T, C);
     LAZY_ALLOCATE_VECTOR(ln1_mean_, B * T);
     LAZY_ALLOCATE_VECTOR(ln1_rstd_, B * T);
-    LAZY_ALLOCATE_TENSOR(att_y_, B, T, C);
+    LAZY_ALLOCATE_TENSOR3D(att_y_, B, T, C);
     LAZY_ALLOCATE_MATRIX(ln2_y_, B * T, C);
     LAZY_ALLOCATE_VECTOR(ln2_mean_, B * T);
     LAZY_ALLOCATE_VECTOR(ln2_rstd_, B * T);
@@ -322,7 +373,7 @@ struct GPT {
                 sizeof(float) * vocab_size * n_embed);
     lm_head_ = wte_->weight_.get();
     cross_entropy_ =
-        std::make_unique<nn::CrossEntropy>(nn::CrossEntropy::MEAN, true);
+        std::make_unique<nn::SoftmaxCrossEntropy>(nn::SoftmaxCrossEntropy::MEAN, true);
   }
 
   void Forward(const Eigen::Map<nn::MatrixInt>& idx,
@@ -451,7 +502,7 @@ struct GPT {
   std::unique_ptr<nn::Embedding> wpe_;
   std::vector<std::unique_ptr<Block>> h_;
   std::unique_ptr<nn::LayerNorm> lnf_;
-  std::unique_ptr<nn::CrossEntropy> cross_entropy_;
+  std::unique_ptr<nn::SoftmaxCrossEntropy> cross_entropy_;
 
   // head
   std::unique_ptr<nn::Linear> lm_head_unused_;

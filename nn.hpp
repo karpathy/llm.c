@@ -366,15 +366,14 @@ struct NewGELU {
 };
 
 struct Softmax {
-  Softmax(bool subtract_max_value = false)
-      : subtract_max_value_(subtract_max_value) {}
+  Softmax(bool stable_softmax = false) : stable_softmax_(stable_softmax) {}
 
   void Forward(const Eigen::Map<Matrix>& x, Eigen::Map<Matrix>& y) {
     // x: [B, D], y: [B, D]
     CHECK_EQ(x.rows(), y.rows());
     CHECK_EQ(x.cols(), y.cols());
 
-    if (subtract_max_value_) {
+    if (stable_softmax_) {
       auto x_exp = (x.colwise() - x.rowwise().maxCoeff()).array().exp();
       y = x_exp.array().colwise() / x_exp.rowwise().sum().array();
     } else {
@@ -383,27 +382,35 @@ struct Softmax {
     }
   }
 
-  void Backward(const Eigen::Map<Matrix>& x, const Eigen::Map<Matrix>& y_grad,
+  void Backward(const Eigen::Map<Matrix>& y, const Eigen::Map<Matrix>& y_grad,
                 Eigen::Map<Matrix>& x_grad) {
-    // x: [B, D], y_grad: [B, D], x_grad: [B, D]
-    CHECK_EQ(x.rows(), y_grad.rows());
-    CHECK_EQ(x.cols(), y_grad.cols());
-    CHECK_EQ(x.rows(), x_grad.rows());
-    CHECK_EQ(x.rows(), x_grad.cols());
+    // y:[B, D], y_grad: [B, D], x_grad: [B, D]
+    int B = y.rows(), D = y.cols();
+    CHECK(B == y_grad.rows() && B == x_grad.rows());
+    CHECK(D == y_grad.cols() && D == x_grad.cols());
 
-    // dL/dx = dL/dy * dy/dx
-    //       = ...
-    // TODO:
+    // dy_j / dx_i = S_i(1 - S_j) for i==j
+    //             = -S_j*S_i     for i!=j
+    // dL/dx_i = \sum_j dL/dy_j * dy_j / dx_i
+
+    for (int b = 0; b < B; ++b) {
+      for (int i = 0; i < D; ++i) {
+        for (int j = 0; j < D; ++j) {
+          float indicator = i == j ? 1.0f : 0.0f;
+          x_grad(b, i) += y_grad(b, j) * y(b, i) * (indicator - y(b, j));
+        }
+      }
+    }
   }
 
-  bool subtract_max_value_;
+  bool stable_softmax_;
 };
 
-struct CrossEntropy {
+struct SoftmaxCrossEntropy {
   enum Reduction { MEAN, SUM };
 
-  CrossEntropy(Reduction reduction = Reduction::MEAN,
-               bool softmax_subtract_max_value = false)
+  SoftmaxCrossEntropy(Reduction reduction = Reduction::MEAN,
+                      bool softmax_subtract_max_value = false)
       : reduction_(reduction) {
     softmax_ = std::make_unique<Softmax>(softmax_subtract_max_value);
   }
@@ -451,6 +458,49 @@ struct CrossEntropy {
 
   Reduction reduction_;
   std::unique_ptr<Softmax> softmax_;
+};
+
+struct VanillaCrossEntropy {
+  enum Reduction { MEAN, SUM };
+
+  VanillaCrossEntropy(Reduction reduction = Reduction::MEAN)
+      : reduction_(reduction) {}
+
+  void Forward(const Eigen::Map<Matrix>& probs, absl::Span<const int> targets,
+               float* loss) {
+    // probs:[B, C], targets: [B,] loss: scalar
+    int B = probs.rows(), C = probs.cols();
+    CHECK_EQ(B, targets.size());
+
+    // targets: [B,]
+    for (int i = 0; i < targets.size(); ++i) {
+      int ix = targets[i];
+      *loss += -std::log(probs(i, ix));
+    }
+
+    if (reduction_ == Reduction::MEAN) {
+      *loss /= static_cast<float>(B);
+    }
+  }
+
+  void Backward(const Eigen::Map<Matrix>& probs, absl::Span<const int> targets,
+                Eigen::Map<Matrix>& probs_grad) {
+    // probs: [B, C], targets: [B,]
+    // probs_grad: [B, C]
+    int B = probs.rows(), C = probs.cols();
+    CHECK(B == targets.size() && B == probs_grad.rows());
+    CHECK_EQ(C, probs_grad.cols());
+
+    float factor =
+        reduction_ == Reduction::MEAN ? 1.0f / static_cast<float>(B) : 1.0f;
+
+    for (int b = 0; b < B; ++b) {
+      int ix = targets[b];
+      probs_grad(b, ix) += -1.0f / probs(b, ix) * factor;
+    }
+  }
+
+  Reduction reduction_;
 };
 
 }  // namespace nn
