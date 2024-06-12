@@ -1,5 +1,5 @@
 # GPT-2 (774M) repro on FineWeb
-# 774M parameter model on ~100B tokens
+# 774M parameter model on ~150B tokens
 # => 6 * 774e6 * 150e9 = 6.966e20 ~= 7e20 capability model (10X 350M)
 # => 286,102 steps on 524,288 tokens/step
 # on 8X A100 80GB SXM ($14/hr) steps in ~1.7s/iter
