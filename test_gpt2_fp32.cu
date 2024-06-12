@@ -36,7 +36,6 @@ int main(int argc, char *argv[]) {
 
     // setup cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
-    cublasCheck(cublasLtCreate(&cublaslt_handle));
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
     enable_tf32 = 0; // NOTE: disable TF32 for testing!!!
@@ -44,7 +43,6 @@ int main(int argc, char *argv[]) {
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
-    cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
@@ -231,9 +229,7 @@ int main(int argc, char *argv[]) {
     free(expected_grads_memory);
     free(calculated_grads_memory);
     gpt2_free(&model);
-    cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
-    cublasCheck(cublasLtDestroy(cublaslt_handle));
 
     return 0;
 }
