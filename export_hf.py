@@ -24,11 +24,12 @@ from transformers import GPT2Config, GPT2Tokenizer, GPT2LMHeadModel
 
 # -----------------------------------------------------------------------------
 # Tensor functions for both bfloat16 (from int16) and normal float32
+# Both return float32 tensors
 
 def tensor_bf16(data_int16, transpose=False):
     if transpose:
         data_int16 = data_int16.transpose(1,0)
-    return torch.tensor(data_int16).view(torch.bfloat16)
+    return torch.tensor(data_int16).view(torch.bfloat16).to(torch.float32)
 
 def tensor_f32(data_float32, transpose=False):
     if transpose:
@@ -132,7 +133,7 @@ def convert(filepath, output, push_to_hub=False):
                         n_head = H)
     model = GPT2LMHeadModel(config)
     if version==5:
-        model = model.to(torch.bfloat16)
+        model = model.to(torch.float16)
 
     # Set the model dict and save
     model.load_state_dict(model_dict)
