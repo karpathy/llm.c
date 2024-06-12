@@ -39,7 +39,7 @@ def tensor_f32(data_float32, transpose=False):
 # -----------------------------------------------------------------------------
 # Main conversion function
 
-def convert(filepath, output, push_to_hub=False):
+def convert(filepath, output, push_to_hub=False, out_dtype="float16"):
     print(f"Converting model {filepath} to {output}")
     f = open(filepath, 'rb')
     # Read in our header, checking the magic number and version
@@ -132,7 +132,7 @@ def convert(filepath, output, push_to_hub=False):
                         n_layer = L,
                         n_head = H)
     model = GPT2LMHeadModel(config)
-    if version==5:
+    if out_dtype=="float16":
         model = model.to(torch.float16)
 
     # Set the model dict and save
@@ -165,6 +165,7 @@ if __name__== '__main__':
     parser=argparse.ArgumentParser()
     parser.add_argument("--input", "-i", help="The name of the llm.c model.bin file", type=str, required=True)
     parser.add_argument("--output","-o",  help="The Hugging Face output model name", type=str, required=True)
+    parser.add_argument("--dtype", "-d", help="Output as either float32 or float16 (default)", type=str, default="float16")
     parser.add_argument("--push", "-p", help="Push the model to your Hugging Face account", type=bool, default=False)
     args = parser.parse_args()
-    convert(args.input, args.output, args.push)
+    convert(args.input, args.output, args.push, args.dtype)
