@@ -1,13 +1,17 @@
 {
     "name": "nvidia-cuda",
     "image": "nvidia/cuda:12.5.0-devel-ubuntu22.04",
+    "hostRequirements": {
+      "gpu": "optional"
+    },
     "runArgs": [
       "--gpus",
       "all"
     ],
     "features": {
       "ghcr.io/devcontainers/features/python:1": {},
-      "ghcr.io/devcontainers/features/git:1": {}
+      "ghcr.io/devcontainers/features/git:1": {},
+      "ghcr.io/iterative/features/nvtop:1": {}
     },
     "extensions": [
       "ms-vscode.cpptools"
