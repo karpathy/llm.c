@@ -1672,7 +1672,7 @@ int main(int argc, char *argv[]) {
     }
 
     // train
-    char* mfu_str = (char*)malloc(16);
+    char mfu_str[16];
     cudaEvent_t start, end;
     cudaCheck(cudaEventCreate(&start));
     cudaCheck(cudaEventCreate(&end));
@@ -1866,7 +1866,6 @@ int main(int argc, char *argv[]) {
     printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);
 
     // free and destroy everything
-    free(mfu_str);
     cudaCheck(cudaEventDestroy(end));
     cudaCheck(cudaEventDestroy(start));
     if (run_hellaswag) { evalloader_free(&eval_loader); }
