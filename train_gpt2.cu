@@ -1474,8 +1474,8 @@ int main(int argc, char *argv[]) {
     multi_gpu_config = multi_gpu_config_init(&argc, &argv);
 
     // read in the (optional) command line arguments
-    const char* train_data_pattern = "/hdd/llmc/fineweb/bin/fineweb_train_*.bin";
-    const char* val_data_pattern = "/hdd/llmc/fineweb/bin/fineweb_val_*.bin";
+    const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+    const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write optimization checkpoints every how many steps?
