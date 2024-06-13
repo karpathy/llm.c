@@ -1219,7 +1219,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     assert(state_header[1] == 1); // version number
     assert(state_header[2] == multi_gpu_config.num_processes); // number of processes
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
-    bool should_shuffle = state_header[4]; // shuffle state of the dataloader
+    int should_shuffle = state_header[4]; // shuffle state of the dataloader
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
     size_t current_shard_idx = *((size_t*)&state_header[30]); // shard index
@@ -1250,7 +1250,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     free(cpu_buffer);
 
     if (should_shuffle) {
-        loader->should_shuffle = true;
+        loader->should_shuffle = 1;
 
         size_t glob_result_gl_pathc;
         freadCheck(&glob_result_gl_pathc, sizeof(size_t), 1, state_file);
@@ -1477,8 +1477,8 @@ int main(int argc, char *argv[]) {
 
     // build DataLoaders for both train and val
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, true);
-    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, false);
+    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 1);
+    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 0);
     // figure out the number of training steps we will run for
     int train_num_batches = max_steps; // passed in from command line
     if (train_num_batches == -1) {
