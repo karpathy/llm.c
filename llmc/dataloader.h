@@ -15,8 +15,6 @@ Implements:
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck
 // defines: mallocCheck
 #include "utils.h"
-// defines: random_u32
-#include "sampler.h"
 #include "rand.h"
 
 // ----------------------------------------------------------------------------
@@ -118,8 +116,7 @@ void dataloader_reset(DataLoader *loader) {
     if (loader->should_shuffle) {
         // shuffle the examples inside the shards
         if (loader->intra_shard_indices != NULL) {
-            // these might change from shard to shard, but we always have the same number of shards
-            // so we don't have to dynamically allocate them on every reset
+            // in case shards have different number of samples / sizes
             free(loader->intra_shard_indices);
         }
         loader->intra_shard_indices = (int*)malloc(loader->shard_num_samples * sizeof(int));
