@@ -1348,7 +1348,7 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     // model state, state, start at 20 to leave some padding
     *((unsigned long long*)&state_header[20]) = model->rng_state; // random number generator state
     // dataloader state, start at 30 to leave some padding
-    state_header[30] = loader->current_shard; // shard of the dataset
+    state_header[30] = loader->current_shard_idx; // shard of the dataset
     *((int64_t*)&state_header[31]) = loader->current_position; // position in shard
     fwrite(state_header, sizeof(int), 256, state_file);
     // write AdamW m, v, and master_weights here (they are all float)
@@ -1372,9 +1372,9 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
-    int current_shard = state_header[30]; // shard of the dataset
+    int current_shard_idx = state_header[30]; // shard of the dataset
     int64_t current_position = *((int64_t*)&state_header[31]); // position in shard
-    dataloader_resume(loader, current_shard, current_position);
+    dataloader_resume(loader, current_shard_idx, current_position);
     // read AdamW m, v (they are all float)
     // also allocate the m, v memory in the model, if it does not yet exist
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
@@ -1441,8 +1441,8 @@ int main(int argc, char *argv[]) {
     multi_gpu_config = multi_gpu_config_init(&argc, &argv);
 
     // read in the (optional) command line arguments
-    const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
-    const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
+    const char* train_data_pattern = "/hdd/llmc/fineweb/bin/fineweb_train_*.bin";
+    const char* val_data_pattern = "/hdd/llmc/fineweb/bin/fineweb_val_*.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write optimization checkpoints every how many steps?
@@ -1597,8 +1597,8 @@ int main(int argc, char *argv[]) {
 
     // build DataLoaders for both train and val
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, &model.rng_state);
-    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, NULL);
+    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 1);
+    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 0);
     // figure out the number of training steps we will run for
     int train_num_batches = max_steps; // passed in from command line
     if (train_num_batches == -1) {
@@ -1686,7 +1686,7 @@ int main(int argc, char *argv[]) {
         if (step % val_loss_every == 0 || last_step) {
             NvtxRange validation_range("validation");
             float val_loss = 0.0f;
-            dataloader_reset(&val_loader, NULL);
+            dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
                 gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);

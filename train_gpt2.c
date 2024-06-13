@@ -1083,8 +1083,8 @@ int main() {
     int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
     int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_tokens, B, T, 0, 1, NULL);
-    dataloader_init(&val_loader, val_tokens, B, T, 0, 1, NULL);
+    dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
+    dataloader_init(&val_loader, val_tokens, B, T, 0, 1, 0);
     printf("train dataset num_batches: %zu\n", train_loader.num_tokens / (B*T));
     printf("val dataset num_batches: %zu\n", val_loader.num_tokens / (B*T));
     int val_num_batches = 5;
@@ -1105,7 +1105,7 @@ int main() {
         // once in a while estimate the validation loss
         if (step % 10 == 0) {
             float val_loss = 0.0f;
-            dataloader_reset(&val_loader, NULL);
+            dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
                 gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
