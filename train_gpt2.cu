@@ -73,10 +73,12 @@ cudaStream_t main_stream;
 MultiGpuConfig multi_gpu_config;
 
 // convenience function that only prints if the rank of process is zero
-template<class... Args>
-void printf0(const char *format, Args... args) {
+void printf0(const char *format, ...) {
     if (multi_gpu_config.process_rank == 0) {
-        printf(format, args...);
+        va_list args;
+        va_start(args, format);
+        vprintf(format, args);
+        va_end(args);
     }
 }
 
@@ -968,18 +970,17 @@ void gpt2_multi_gpu_loss_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 // Gets the offset of a specific tensor for a specific layer in the GPT2 model
 // layer_id is ignored for weights that are not part of a transformer block
 ShardInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_tensor_id) {
+    // first offset our way to the parameter tensor start
     ptrdiff_t offset = 0;
     for (int i = 0; i < param_tensor_id; i++) {
         offset += (ptrdiff_t)model->param_elements[i];
     }
-
     size_t size = model->param_elements[param_tensor_id] ;
-
+    // if we are in the transformer block, we need to additionally offset by the layer id
     if(2 <= param_tensor_id && param_tensor_id <= 13) {
         size /= model->config.num_layers;
         offset += (ptrdiff_t)(layer_id * size);
     }
-
     return {offset, size};
 }
 
@@ -1103,7 +1104,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
             ncclCheck(ncclGroupStart());
             for(int l = 0; l < num_layers; ++l) {
                 // gather updated shards of model->params_memory from each process
-                ncclCheck(ncclAllGather(param_ptr+ l * tensor.size,
+                ncclCheck(ncclAllGather(param_ptr + l * tensor.size,
                                         (floatX*) model->params_memory + tensor.offset + l * tensor.size,
                                         shard.size, ncclFloatX,
                                         multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
