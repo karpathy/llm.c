@@ -133,11 +133,11 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
 template <typename Type>
 void fused_classifier(Type* logits, Type* losses,
                       const float dloss, const int* targets,
-                      int B, int T, int V, int P) {
+                      int B, int T, int V, int P, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = N;
-    fused_classifier_kernel5<<<grid_size, block_size>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
+    fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
     cudaCheck(cudaGetLastError());
 }

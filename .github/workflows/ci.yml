@@ -139,6 +139,33 @@ jobs:
         call "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Auxiliary\\Build\\vcvars64.bat"
         make-4.4.1\dist\make -j WIN_CI_BUILD=1 train_gpt2fp32cu test_gpt2fp32cu test_gpt2cu train_gpt2cu profile_gpt2cu
 
+  build-ubuntu20-04:
+    runs-on: ubuntu-20.04
+    container:
+      image: nvidia/cuda:11.8.0-cudnn8-devel-ubuntu20.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: System Info
+        run: |
+          nvcc --version
+          g++ --version
+
+      - name: Install cudnn frontend
+        run: |
+          apt-get update && apt-get install -y git
+          git clone https://github.com/NVIDIA/cudnn-frontend.git
+
+      - name: Build FP32 checkpoint
+        run: make train_gpt2fp32cu test_gpt2fp32cu
+
+      - name: Build FP32 precision
+        run: PRECISION=FP32 make train_gpt2cu test_gpt2cu profile_gpt2cu
+
+      - name: Build with CUDNN
+        run: PRECISION=BF16 USE_CUDNN=1 make train_gpt2cu test_gpt2cu profile_gpt2cu
+
   build-cuda-fp32:
     runs-on: ubuntu-latest
     container:
