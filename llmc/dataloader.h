@@ -48,7 +48,7 @@ typedef struct {
     int* targets; // target tokens for the transformer
     // random shuffle related variables
     mt19937_state shuffle_rng;
-    bool should_shuffle;
+    int should_shuffle;
     int* shard_indices;
     int* intra_shard_indices;
     // sizes in bytes
@@ -103,6 +103,16 @@ void dataloader_resume(DataLoader *loader, size_t current_shard_idx, size_t curr
     dataloader_load_shard_(loader, loader->current_shard_idx);
 }
 
+void prepare_intra_shard_indices_(DataLoader *loader) {
+    // shuffle the examples inside the shards
+    if (loader->intra_shard_indices != NULL) {
+        // in case shards have different number of samples / sizes
+        free(loader->intra_shard_indices);
+    }
+    loader->intra_shard_indices = (int*)malloc(loader->shard_num_samples * sizeof(int));
+    random_permutation_with_init(loader->intra_shard_indices, loader->shard_num_samples, &loader->shuffle_rng);
+}
+
 void dataloader_reset(DataLoader *loader) {
     loader->current_shard_idx = 0;
     loader->current_sample_idx = 0;
@@ -114,13 +124,7 @@ void dataloader_reset(DataLoader *loader) {
     dataloader_load_shard_(loader, loader->current_shard_idx);
 
     if (loader->should_shuffle) {
-        // shuffle the examples inside the shards
-        if (loader->intra_shard_indices != NULL) {
-            // in case shards have different number of samples / sizes
-            free(loader->intra_shard_indices);
-        }
-        loader->intra_shard_indices = (int*)malloc(loader->shard_num_samples * sizeof(int));
-        random_permutation_with_init(loader->intra_shard_indices, loader->shard_num_samples, &loader->shuffle_rng);
+        prepare_intra_shard_indices_(loader);
     }
 }
 
@@ -135,6 +139,10 @@ void dataloader_advance_(DataLoader *loader) {
     loader->current_shard_idx = (loader->current_shard_idx + 1) % loader->glob_result.gl_pathc;
     loader->current_sample_idx = 0;
     dataloader_load_shard_(loader, loader->current_shard_idx);
+
+    if (loader->should_shuffle) {
+        prepare_intra_shard_indices_(loader);
+    }
 }
 
 void dataloader_init(DataLoader *loader,
@@ -143,7 +151,7 @@ void dataloader_init(DataLoader *loader,
                      size_t T,
                      int process_rank,
                      int num_processes,
-                     bool should_shuffle) {
+                     int should_shuffle) {
     loader->process_rank = process_rank;
     loader->num_processes = num_processes;
     loader->B = B;
