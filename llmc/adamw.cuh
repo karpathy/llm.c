@@ -16,9 +16,9 @@ __device__ float lerp(float start, float end, float weight) {
 }
 
 template <typename Tp, typename Tg>
-__global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
-                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
-                              float grad_scale, unsigned int seed) {
+__device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+                             float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
+                             float grad_scale, unsigned int seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_parameters) { return; }  // guard
 
@@ -41,7 +41,7 @@ __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg
     // update our low precision version of the parameters using stochastic rounding
     // this will be used in the next forward pass
     // TODO: simply doing `params_memory[i] = (floatX)param;` breaks everything (why?)
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x + blockDim.y * gridDim.y, seed);
     stochastic_rounding(param, &params_memory[idx], random);
     // write the full, float version of the param into our master copy, if we maintain one
     // this will be used in the next update
@@ -49,16 +49,31 @@ __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg
 }
 
 template <typename Tp, typename Tg>
+__global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+                              ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride,
+                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
+                              float grad_scale, unsigned int seed) {
+    adamw_update(params_memory + blockIdx.y * w_stride,
+                 master_params_memory ? master_params_memory + blockIdx.y * s_stride : NULL,
+                 grads_memory + blockIdx.y * g_stride,
+                 m_memory + blockIdx.y * s_stride,
+                 v_memory + blockIdx.y * s_stride,
+                 num_parameters, learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, grad_scale,
+                 seed
+                 );
+}
+
+template <typename Tp, typename Tg>
 void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
-                  float learning_rate, float beta1, float beta2, int t, float eps, float weight_decay,
+                  ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride,  int num_slices, float learning_rate, float beta1, float beta2, int t, float eps, float weight_decay,
                   float grad_scale, unsigned int seed, cudaStream_t stream) {
     // AdamW update
     int block_size = 512;
     int num_blocks = CEIL_DIV(num_parameters, block_size);
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
-    adamw_kernel3<<<num_blocks, block_size, 0, stream>>>(params_memory, master_params_memory, grads_memory,
-                                                         m_memory, v_memory, num_parameters,
+    adamw_kernel3<<<dim3(num_blocks, num_slices), block_size, 0, stream>>>(params_memory, master_params_memory, grads_memory,
+                                                         m_memory, v_memory, num_parameters, w_stride, g_stride, s_stride,
                                                          learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
                                                          grad_scale, seed);
     cudaCheck(cudaGetLastError());
