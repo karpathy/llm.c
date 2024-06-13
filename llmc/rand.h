@@ -220,4 +220,17 @@ void normal_(float* data, unsigned int numel, float mean, float std, mt19937_sta
     }
 }
 
+void random_permutation(unsigned int* data, unsigned int numel, mt19937_state* state) {
+    for (unsigned int i = 0; i < numel; i++) {
+        data[i] = i;
+    }
+    for (unsigned int i = numel - 1; i > 0; i--) {
+        unsigned int j = randint32(state) % (i + 1);
+        // swap
+        unsigned int tmp = data[i];
+        data[i] = data[j];
+        data[j] = tmp;
+    }
+}
+
 #endif
