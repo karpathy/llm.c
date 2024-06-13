@@ -1179,13 +1179,14 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     state_header[2] = multi_gpu_config.num_processes; // number of processes
     state_header[3] = multi_gpu_config.process_rank; // rank of this process
     state_header[4] = model->use_master_weights;  // whether we're using fp32 master weights
+    state_header[5] = loader->should_shuffle; // shuffle state of the dataloader
     // int main state, start at 10 to leave some padding
     state_header[10] = step; // step of the optimization
     // model state, state, start at 20 to leave some padding
     *((unsigned long long*)&state_header[20]) = model->rng_state; // random number generator state
     // dataloader state, start at 30 to leave some padding
     state_header[30] = loader->current_shard_idx; // shard of the dataset
-    *((int64_t*)&state_header[31]) = loader->current_position; // position in shard
+    *((size_t*)&state_header[31]) = loader->current_sample_idx; // position in shard
     fwrite(state_header, sizeof(int), 256, state_file);
     // write AdamW m, v, and master_weights here (they are all float)
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
@@ -1197,6 +1198,18 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     if (model->use_master_weights == 1) {
         cudaCheck(cudaMemcpy(cpu_buffer, model->master_weights, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
         fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    }
+    if (loader->should_shuffle) {
+        // save num of shards
+        fwrite(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);
+        // save loader->shard_indices of type unsigned int
+        fwrite(loader->shard_indices, sizeof(unsigned int), loader->glob_result.gl_pathc, state_file);
+        // save num samples
+        fwrite(&loader->num_samples, sizeof(size_t), 1, state_file);
+        // save loader->intra_shard_indices of type unsigned int
+        fwrite(loader->intra_shard_indices, sizeof(unsigned int), loader->num_samples, state_file);
+        // save shuffle_rng (of type mt19937_state)
+        fwrite(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
     }
     free(cpu_buffer);
     fclose(state_file);
@@ -1212,9 +1225,9 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
-    int current_shard_idx = state_header[30]; // shard of the dataset
-    int64_t current_position = *((int64_t*)&state_header[31]); // position in shard
-    dataloader_resume(loader, current_shard_idx, current_position);
+    bool should_shuffle = state_header[4]; // shuffle state of the dataloader
+    size_t current_shard_idx = state_header[30]; // shard of the dataset
+    size_t current_sample_idx = *((size_t*)&state_header[31]); // position in shard
     // read AdamW m, v (they are all float)
     // also allocate the m, v memory in the model, if it does not yet exist
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
@@ -1238,6 +1251,28 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         cudaCheck(cudaMemcpy(model->master_weights, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     }
     free(cpu_buffer);
+
+    if (should_shuffle) {
+        loader->should_shuffle = true;
+
+        size_t glob_result_gl_pathc;
+        freadCheck(&glob_result_gl_pathc, sizeof(size_t), 1, state_file);
+        assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
+
+        loader->shard_indices = (unsigned int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(unsigned int));
+        freadCheck(loader->shard_indices, sizeof(unsigned int), loader->glob_result.gl_pathc, state_file);
+
+        size_t num_samples;
+        freadCheck(&num_samples, sizeof(size_t), 1, state_file);
+        assert(num_samples == loader->num_samples);
+
+        loader->intra_shard_indices = (unsigned int*)mallocCheck(loader->num_samples * sizeof(unsigned int));
+        freadCheck(loader->intra_shard_indices, sizeof(unsigned int), loader->num_samples, state_file);
+
+        freadCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
+    }
+
+    dataloader_resume(loader, current_shard_idx, current_sample_idx);
     fclose(state_file);
 }
 
