@@ -51,8 +51,8 @@ typedef struct {
     // random shuffle related variables
     mt19937_state shuffle_rng;
     bool should_shuffle;
-    size_t* shard_indices;
-    size_t* intra_shard_indices;
+    int* shard_indices;
+    int* intra_shard_indices;
     // sizes in bytes
     size_t total_batch_size_bytes;  // total across all processes
     size_t local_batch_offset_bytes;  // inner-sample offset for this process
@@ -122,7 +122,7 @@ void dataloader_reset(DataLoader *loader) {
             // so we don't have to dynamically allocate them on every reset
             free(loader->intra_shard_indices);
         }
-        loader->intra_shard_indices = (size_t*)malloc(loader->shard_num_samples * sizeof(size_t));
+        loader->intra_shard_indices = (int*)malloc(loader->shard_num_samples * sizeof(int));
         random_permutation_with_init(loader->intra_shard_indices, loader->shard_num_samples, &loader->shuffle_rng);
     }
 }
@@ -170,9 +170,9 @@ void dataloader_init(DataLoader *loader,
 
     if (should_shuffle) {
         mt19937_state shuffle_rng;
-        manual_seed(&shuffle_rng, process_rank);
+        manual_seed(&shuffle_rng, 42 + process_rank);
         loader->shuffle_rng = shuffle_rng;
-        loader->shard_indices = (size_t*)malloc(loader->glob_result.gl_pathc * sizeof(size_t));
+        loader->shard_indices = (int*)malloc(loader->glob_result.gl_pathc * sizeof(int));
         for (int i = 0; i < loader->glob_result.gl_pathc; i++) {
             loader->shard_indices[i] = i;  // start with identity permutation
         }
