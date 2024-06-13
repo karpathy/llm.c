@@ -38,11 +38,10 @@ typedef struct {
     size_t T;
     // input handling and its state
     glob_t glob_result; // stores the result of glob, for all shards we want to iterate
-    int current_shard_idx; // the current shard we are reading from
-    int current_sample_idx; // the current sample we are reading from
+    size_t current_shard_idx; // the current shard we are reading from
+    size_t current_sample_idx; // the current sample we are reading from
     FILE* tokens_file;
     int64_t file_size;
-    int64_t current_position;
     uint16_t* buffer; // we fread data from file into this buffer
     // public variables that could be accessed from outside
     size_t num_tokens; // total number of tokens
@@ -55,8 +54,8 @@ typedef struct {
     unsigned int* intra_shard_indices;
     size_t total_batch_size_bytes;  // total across all processes
     size_t num_samples;  // total number of samples in the current shard per process
-    int64_t token_bytes_offset;  // inner-sample offset for this process
-    int64_t header_bytes;  // header size in bytes
+    size_t token_bytes_offset;  // inner-sample offset for this process
+    size_t header_bytes;  // header size in bytes
 } DataLoader;
 
 int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
@@ -97,11 +96,13 @@ int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
     return ntok;
 }
 
-// TODO(gordicaleksa): we'll have to store the shuffle rng into the state
-void dataloader_resume(DataLoader *loader, int current_shard_idx, int64_t current_position) {
+void dataloader_resume(
+    DataLoader *loader,
+    size_t current_shard_idx,
+    size_t current_sample_idx) {
     // used during model resumption (-y 1) flag
     loader->current_shard_idx = current_shard_idx;
-    loader->current_position = current_position;
+    loader->current_sample_idx = current_sample_idx;
     dataloader_load_shard_(loader, loader->current_shard_idx);
 }
 
@@ -207,12 +208,12 @@ void dataloader_init(DataLoader *loader,
 void dataloader_next_batch(DataLoader *loader) {
     size_t idx = loader->should_shuffle ? loader->intra_shard_indices[loader->current_sample_idx] : loader->current_sample_idx;
     size_t global_token_bytes_offset = idx * loader->total_batch_size_bytes;
-    loader->current_position = loader->header_bytes + global_token_bytes_offset + loader->token_bytes_offset;
+    int64_t current_position = loader->header_bytes + global_token_bytes_offset + loader->token_bytes_offset;
 
     size_t B = loader->B;
     size_t T = loader->T;
     // read B*T+1 uint16_t tokens from the file into buffer
-    fseekCheck(loader->tokens_file, loader->current_position, SEEK_SET);
+    fseekCheck(loader->tokens_file, current_position, SEEK_SET);
     freadCheck(loader->buffer, sizeof(uint16_t), B*T+1, loader->tokens_file);
     // decode the buffer into inputs and targets (cast to int)
     for (int i = 0; i < B*T; i++) {
