@@ -85,6 +85,12 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
         losses[idx] = (floatX)(-logf(prob));
     }
 
+    // without this synchronization point we have a race condition:
+    // the logits used above to compute the loss are concurrently (race) modified to carry backward pass grads.
+    // since the "logits" are overwritten to be in the [-1, 1] range and sp.Offset is sometimes smaller than -90
+    // we errouneously end up computing exp^(90+) which gives us infinities in the loss! this is the fix.
+    __syncthreads();
+
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
     const floatX* logits_vec = logits + idx * P;

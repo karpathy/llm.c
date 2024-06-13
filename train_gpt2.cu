@@ -974,13 +974,12 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         // because of the ncclReduceScatter() in backward,
         // grads_memory only contains the averaged gradients at the local shards,
         // so we only calculate the grad norm at the grads_memory belonging to the local shards
-        cudaCheck(cudaMemsetAsync(grad_norm_squared, 0, sizeof(float), main_stream));
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
             if((i < 2 || i > 13)) {
                 ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
                 ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
                 ptrdiff_t offset = tensor.offset + shard.offset;
-                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, 0, 1, false, main_stream);
+                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, 0, 1, i == 0, main_stream);
             } else {
                 ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
                 ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
@@ -989,6 +988,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
                                     false, main_stream);
             }
         }
+        global_norm_squared_aggregate(grad_norm_squared, main_stream);
         cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
         // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
         grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
@@ -996,6 +996,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         // in regular DDP, backward has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
         global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, 0, 1, true, main_stream);
+        global_norm_squared_aggregate(grad_norm_squared, main_stream);
         cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
     }
 
