@@ -4,6 +4,9 @@
     "hostRequirements": {
       "gpu": "optional"
     },
+    "containerEnv": {
+      "NVIDIA_VISIBLE_DEVICES": "all"
+    },
     "runArgs": [
       "--gpus",
       "all"
@@ -16,8 +19,5 @@
     "extensions": [
       "ms-vscode.cpptools"
     ],
-    "containerEnv": {
-      "NVIDIA_VISIBLE_DEVICES": "all"
-    },
     "postCreateCommand": "apt-get update && apt-get install -y sudo && sudo apt-get install -y openmpi-bin openmpi-doc libopenmpi-dev && pip install -r requirements.txt"
   }
