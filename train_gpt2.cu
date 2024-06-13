@@ -1239,7 +1239,7 @@ void gpt2_multi_gpu_param_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
     cudaCheck(cudaDeviceSynchronize());
 }
 
-float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
+void gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt, char* mfu_str) {
     /*
     Estimate model flops utilization (MFU)
     ref: Section 2.1 of https://arxiv.org/pdf/2001.08361
@@ -1261,11 +1261,12 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
     // express our flops throughput as ratio of A100 bfloat16 peak flops
     float flops_achieved = (float)flops_per_step * (1.0f / dt); // per second
     float flops_promised = get_flops_promised(deviceProp.name, PRECISION_MODE) * 1e12f;
-    if(flops_promised < 0) {
-        return -1.f;   // don't know
+    if(flops_promised < 0) {  // don't know
+        snprintf(mfu_str, sizeof(mfu_str), "n/a");
+    } else {
+        float mfu = flops_achieved / flops_promised;
+        snprintf(mfu_str, sizeof(mfu_str), "%.1f%%", 100 * mfu);
     }
-    float mfu = flops_achieved / flops_promised;
-    return mfu;
 }
 
 void gpt2_free(GPT2 *model) {
@@ -1671,6 +1672,7 @@ int main(int argc, char *argv[]) {
     }
 
     // train
+    char* mfu_str = (char*)malloc(16);
     cudaEvent_t start, end;
     cudaCheck(cudaEventCreate(&start));
     cudaCheck(cudaEventCreate(&end));
@@ -1851,10 +1853,10 @@ int main(int argc, char *argv[]) {
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
-        float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
-        printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
+        gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f, mfu_str);
+        printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %s bf16 MFU | %.0f tok/s\n",
                 step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
-                time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
+                time_elapsed_ms, mfu_str, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss, step_learning_rate, grad_norm);
 
         // disable the profiler after 3 steps of optimization
@@ -1864,6 +1866,7 @@ int main(int argc, char *argv[]) {
     printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);
 
     // free and destroy everything
+    free(mfu_str);
     cudaCheck(cudaEventDestroy(end));
     cudaCheck(cudaEventDestroy(start));
     if (run_hellaswag) { evalloader_free(&eval_loader); }
