@@ -1200,15 +1200,10 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
         fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     }
     if (loader->should_shuffle) {
-        // save num of shards
         fwrite(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);
-        // save loader->shard_indices of type unsigned int
-        fwrite(loader->shard_indices, sizeof(unsigned int), loader->glob_result.gl_pathc, state_file);
-        // save num samples
-        fwrite(&loader->num_samples, sizeof(size_t), 1, state_file);
-        // save loader->intra_shard_indices of type unsigned int
-        fwrite(loader->intra_shard_indices, sizeof(unsigned int), loader->num_samples, state_file);
-        // save shuffle_rng (of type mt19937_state)
+        fwrite(loader->shard_indices, sizeof(size_t), loader->glob_result.gl_pathc, state_file);
+        fwrite(&loader->shard_num_samples, sizeof(size_t), 1, state_file);
+        fwrite(loader->intra_shard_indices, sizeof(size_t), loader->shard_num_samples, state_file);
         fwrite(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
     }
     free(cpu_buffer);
@@ -1259,15 +1254,15 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         freadCheck(&glob_result_gl_pathc, sizeof(size_t), 1, state_file);
         assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
 
-        loader->shard_indices = (unsigned int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(unsigned int));
-        freadCheck(loader->shard_indices, sizeof(unsigned int), loader->glob_result.gl_pathc, state_file);
+        loader->shard_indices = (size_t*)mallocCheck(loader->glob_result.gl_pathc * sizeof(size_t));
+        freadCheck(loader->shard_indices, sizeof(size_t), loader->glob_result.gl_pathc, state_file);
 
-        size_t num_samples;
-        freadCheck(&num_samples, sizeof(size_t), 1, state_file);
-        assert(num_samples == loader->num_samples);
+        size_t shard_num_samples;
+        freadCheck(&shard_num_samples, sizeof(size_t), 1, state_file);
+        assert(shard_num_samples == loader->shard_num_samples);
 
-        loader->intra_shard_indices = (unsigned int*)mallocCheck(loader->num_samples * sizeof(unsigned int));
-        freadCheck(loader->intra_shard_indices, sizeof(unsigned int), loader->num_samples, state_file);
+        loader->intra_shard_indices = (size_t*)mallocCheck(loader->shard_num_samples * sizeof(size_t));
+        freadCheck(loader->intra_shard_indices, sizeof(size_t), loader->shard_num_samples, state_file);
 
         freadCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
     }
