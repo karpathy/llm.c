@@ -17,6 +17,8 @@ void rmsnorm_forward_cpu(
     int T,
     int C
 ) {
+    const float eps = 1e-6f;
+
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // seek to the input position inp[b,t,:]
@@ -26,7 +28,7 @@ void rmsnorm_forward_cpu(
             for (int i = 0; i < C; i++) {
                 sum_of_squares += x[i] * x[i];
             }
-            float rms_val = rsqrtf(sum_of_squares / C);
+            float rms_val = rsqrtf(sum_of_squares / C + eps);
             // seek to the output position in out[b,t,:]
             float* out_bt = out + b * T * C + t * C;
             for (int i = 0; i < C; i++) {
@@ -52,6 +54,7 @@ __global__ void rmsnorm_forward_kernel1(
     int N, 
     int C
 ) {
+    const float eps = 1e-6f;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < N) {
@@ -68,7 +71,7 @@ __global__ void rmsnorm_forward_kernel1(
 
         // Compute RMS value
         sum_of_squares = sum_of_squares / C;
-        float rms_val = rsqrtf(sum_of_squares);
+        float rms_val = rsqrtf(sum_of_squares + eps);
 
         // Seek to the output position in out[idx,:]
         float* out_idx = out + idx * C;
@@ -97,6 +100,7 @@ __global__ void rms_val_kernel(
     int tid = threadIdx.x; // range [0, blocksize]
     const float *x = inp + idx * C;
 
+    const float eps = 1e-6f;
     float sum_of_squares = 0.0f;
 
     #pragma unroll
@@ -115,7 +119,7 @@ __global__ void rms_val_kernel(
     }
 
     if (tid == 0) {
-        rms[idx] = rsqrt(shared[0] / C); // write back accumulated value in thread 0
+        rms[idx] = rsqrt(shared[0] / C + eps); // write back accumulated value in thread 0
     }
 }
 
@@ -146,7 +150,7 @@ __global__ void rmsnorm_forward_kernel3(
     float* __restrict__ rms,
     const float* __restrict__ inp, 
     const float* __restrict__ weight, 
-    const float* __restrict__ bias,
+    const float* __restrict__ bias, 
     int B,
     int T, 
     int C
@@ -162,6 +166,7 @@ __global__ void rmsnorm_forward_kernel3(
     __shared__ float shared[WARP_SIZE];
     const float *x = inp + idx * C;
 
+    const float eps = 1e-6f;
     float thread_sum_of_squares = 0.0f;
 
     #pragma unroll
@@ -183,7 +188,7 @@ __global__ void rmsnorm_forward_kernel3(
     float block_sum_of_squares = cg::reduce(warp, warp_sum_of_squares, cg::plus<float>{}); // sum(x * x)
     
     // compute rms
-    float rms_val = rsqrtf(block_sum_of_squares / C);
+    float rms_val = rsqrtf(block_sum_of_squares / C + eps);
     if (threadIdx.x == 0 && rms != nullptr) {
         __stcs(rms + idx, rms_val);
     }
