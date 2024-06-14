@@ -73,6 +73,7 @@ static GPUEntry gpu_db[] = {
     {"NVIDIA GeForce RTX 4070", &ADA, 184, 2475},
     {"NVIDIA GeForce RTX 4060 Ti", &ADA, 136, 2535},
     {"NVIDIA GeForce RTX 4060", &ADA, 96, 2460},
+    {"NVIDIA H100 PCIe", &HOPPER, 456, 1620},
     {"NVIDIA H100 80GB HBM3", &HOPPER, 528, 1830}, // HBM3 = SXM5
 };
 
