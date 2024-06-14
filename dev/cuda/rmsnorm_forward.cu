@@ -141,6 +141,62 @@ __global__ void rmsnorm_forward_kernel2(
     out[idx] = o;
 }
 
+__global__ void rmsnorm_forward_kernel3(
+    float* __restrict__ out, 
+    float* __restrict__ rms,
+    const float* __restrict__ inp, 
+    const float* __restrict__ weight, 
+    const float* __restrict__ bias,
+    int B,
+    int T, 
+    int C
+) {
+    namespace cg = cooperative_groups;
+    constexpr unsigned WARP_SIZE = 32;
+
+    int num_warps = blockDim.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int idx = blockIdx.x;
+
+    __shared__ float shared[WARP_SIZE];
+    const float *x = inp + idx * C;
+
+    float thread_sum_of_squares = 0.0f;
+
+    #pragma unroll
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        float xi = x[i];
+        thread_sum_of_squares += xi * xi;
+    }
+
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
+
+    float warp_sum_of_squares = cg::reduce(warp, thread_sum_of_squares, cg::plus<float>{}); // sum(x * x)
+    if (lane_id == 0) { 
+        shared[warp_id] = warp_sum_of_squares; 
+        __syncthreads();
+    }
+
+    warp_sum_of_squares = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+    float block_sum_of_squares = cg::reduce(warp, warp_sum_of_squares, cg::plus<float>{}); // sum(x * x)
+    
+    // compute rms
+    float rms_val = rsqrtf(block_sum_of_squares / C);
+    if (threadIdx.x == 0 && rms != nullptr) {
+        __stcs(rms + idx, rms_val);
+    }
+    
+    float *o = out + idx * C;
+    
+    #pragma unroll
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        float n =  __ldcs(x+i) * rms_val;
+        __stcs(o+i, n * weight[i] + bias[i]);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -181,6 +237,23 @@ void rmsnorm_forward2(
     cudaCheck(cudaGetLastError());
 }
 
+void rmsnorm_forward3(
+    float* out, 
+    float* rms,
+    const float* inp, 
+    const float* weight, 
+    const float* bias,
+    int B, 
+    int T, 
+    int C,
+    const int block_size
+) {
+    assert(block_size % 32 == 0);
+    const int N = B * T;
+    const int grid_size = N;
+    rmsnorm_forward_kernel3<<<grid_size, block_size>>>(out, rms, inp, weight, bias, B, T, C);
+    cudaCheck(cudaGetLastError());
+}
 
 // kernel version dispatch
 void rmsnorm_forward(
@@ -201,6 +274,9 @@ void rmsnorm_forward(
             break;
         case 2:
             rmsnorm_forward2(out, rms, inp, weight, bias, B, T, C, block_size);
+            break;
+        case 3:
+            rmsnorm_forward3(out, rms, inp, weight, bias, B, T, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -243,7 +319,7 @@ int main(int argc, char **argv) {
     cudaCheck(cudaMemcpy(d_bias, bias, C * sizeof(float), cudaMemcpyHostToDevice));
 
     // read kernel_num from command line
-    int kernel_num = 2;
+    int kernel_num = 3;
     if (argc > 1) {
         kernel_num = atoi(argv[1]);
     }
