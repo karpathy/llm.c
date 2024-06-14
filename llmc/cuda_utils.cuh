@@ -136,7 +136,15 @@ __global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n, ptrdiff_t
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // need to try grid stride looping for more perf later
     if (idx < n) {
-        dst[idx + stride_dst * blockIdx.y] = cast_value<Td, Ts>(src[idx + stride_src * blockIdx.y]);
+        dst[idx + stride_dst * blockIdx.y] = cast_value<Td>(src[idx + stride_src * blockIdx.y]);
+    }
+}
+
+template<class Td, class Ts>
+__global__ void vector_add(Td* dst, const Ts* src, size_t n) {
+    ptrdiff_t idx = (ptrdiff_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] = (Td)((float)dst[idx] + (float)src[idx]);
     }
 }
 
