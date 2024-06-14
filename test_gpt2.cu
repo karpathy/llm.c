@@ -109,6 +109,13 @@ int main(int argc, char *argv[]) {
     size_t L = model.config.num_layers;
     size_t C = model.config.channels;
 
+    for (int i = 1; i < argc; i+=2) {
+        if (i + 1 >= argc) { exit(EXIT_FAILURE);  } // must have arg after flag
+        if (argv[i][0] != '-') { exit(EXIT_FAILURE); } // must start with dash
+        if (argv[i][1] == 'w') { model.use_master_weights = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'r') { model.recompute = atoi(argv[i+1]); }
+    }
+
     // load additional information that we will use for debugging and error checking
     FILE *state_file = fopenCheck("gpt2_124M_debug_state.bin", "rb");
     int state_header[256];
@@ -203,7 +210,7 @@ int main(int argc, char *argv[]) {
         clock_gettime(CLOCK_MONOTONIC, &start);
         gpt2_forward(&model, x, y, B, T);
         gpt2_zero_grad(&model);
-        gpt2_backward(&model, x);
+        gpt2_backward(&model, x, true);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
@@ -320,5 +327,5 @@ int main(int argc, char *argv[]) {
     free(expected_grads_memory);
     free(grads_memory_cpu);
     free(grads_memory_cpu_float);
-    return 0;
+    return allok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

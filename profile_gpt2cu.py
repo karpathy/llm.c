@@ -130,7 +130,7 @@ for rid, row in kernel_profile_data:
         # the classifier part, counts only once
         pass_name = "cls"
         phase = "bwd"
-    elif "adamw" in kernel or "global_norm" in kernel:
+    elif "adamw" in kernel or "global_norm" in kernel or "copy_and_cast" in kernel:
         # encoder layer or adam
         pass_name = "opt"
     # before the first optimizer run, we create weight copies.
