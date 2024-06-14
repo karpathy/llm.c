@@ -92,7 +92,7 @@ int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
         exit(EXIT_FAILURE);
     }
     // -1 uint16_t due to us taking B*T+1 tokens but moving by B*T tokens
-    loader->shard_num_samples = (loader->file_size_bytes - sizeof(uint16_t)) / loader->total_batch_size_bytes;
+    loader->shard_num_samples = (ntok * sizeof(uint16_t) - sizeof(uint16_t)) / loader->total_batch_size_bytes;
     return ntok;
 }
 
