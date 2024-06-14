@@ -204,9 +204,8 @@ Copy pasting the section on the eval datafile format, from data_common.py:
 
 // for now, could relax later
 #define ASSUMED_NUM_COMPLETIONS 4
-// helper macro for ceildiv and floordiv
+// helper macro for ceildiv
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-#define FLOOR_DIV(M, N) ((M) / (N))
 
 typedef struct {
     // variables related to distributed training
@@ -237,7 +236,7 @@ void evalloader_reset(EvalLoader *loader) {
     // For example if there are N examples in the file and 4 processes,
     // then process 0 should start at 0, process 1 at N/4, process 2 at N/2, etc.
     // determine how much work there is for all processes
-    int examples_per_process = FLOOR_DIV(loader->num_examples, loader->num_processes);
+    int examples_per_process = loader->num_examples / loader->num_processes;
     // determine the start and end example indices for this process
     loader->start_example_index = examples_per_process * loader->process_rank;
     loader->end_example_index = examples_per_process * (loader->process_rank + 1);
