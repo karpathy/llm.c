@@ -110,7 +110,7 @@ void prepare_intra_shard_indices_(DataLoader *loader) {
         free(loader->intra_shard_indices);
     }
     loader->intra_shard_indices = (int*)malloc(loader->shard_num_samples * sizeof(int));
-    random_permutation_with_init(loader->intra_shard_indices, loader->shard_num_samples, &loader->shuffle_rng);
+    random_permutation_with_init(loader->intra_shard_indices, loader->shard_num_samples, &loader->shuffle_rng, 1);
 }
 
 void dataloader_reset(DataLoader *loader) {
@@ -118,7 +118,7 @@ void dataloader_reset(DataLoader *loader) {
     loader->current_sample_idx = 0;
 
     if (loader->should_shuffle) {  // shuffle the shards
-        random_permutation_with_init(loader->shard_indices, loader->glob_result.gl_pathc, &loader->shuffle_rng);
+        random_permutation_with_init(loader->shard_indices, loader->glob_result.gl_pathc, &loader->shuffle_rng, 0);
     }
 
     dataloader_load_shard_(loader, loader->current_shard_idx);
@@ -130,7 +130,7 @@ void dataloader_reset(DataLoader *loader) {
 
 void dataloader_advance_(DataLoader *loader) {
     if (loader->current_shard_idx == loader->glob_result.gl_pathc - 1) {
-        // if we are at the last shard, we reset the loader
+        // if we are at the last shard, we reset the loader and start a new epoch
         dataloader_reset(loader);
         return;
     }
@@ -181,7 +181,7 @@ void dataloader_init(DataLoader *loader,
         for (int i = 0; i < loader->glob_result.gl_pathc; i++) {
             loader->shard_indices[i] = i;  // start with identity permutation
         }
-        loader->intra_shard_indices = NULL;  // dynamically allocated
+        loader->intra_shard_indices = NULL;  // dynamically allocated allowing different shard sizes
     }
 
     // inspect and validate all shards so we don't get any runtime errors later
