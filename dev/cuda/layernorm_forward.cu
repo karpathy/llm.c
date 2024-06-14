@@ -29,6 +29,10 @@ verstion 5 allocates blocks per row instead of warps per row, same alg as 4 othe
 #include <cooperative_groups/reduce.h>
 #include "common.h"
 
+
+// WarpSize set as the compile time constant, this allows the compiler to optimize
+constexpr int WARP_SIZE = 32;
+
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -285,11 +289,11 @@ __global__ void layernorm_forward_kernel5(float* __restrict__ out, float* __rest
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    __shared__ float shared_sum[32]; // block_size max is 1024 = 32 * 32 warps
-    __shared__ float shared_sum2[32]; // warps will be writing into shared memeory after warp-reduce
-    int num_warps = blockDim.x / 32;
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
+    __shared__ float shared_sum[WARP_SIZE]; // block_size max is 1024 = 32 * 32 warps
+    __shared__ float shared_sum2[WARP_SIZE]; // warps will be writing into shared memeory after warp-reduce
+    int num_warps = blockDim.x / WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
     int idx = blockIdx.x; // simpoy one block per row
     // the row of input that this group of threads is responsible for
     const float* x = inp + idx * C;

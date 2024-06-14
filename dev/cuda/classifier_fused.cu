@@ -32,6 +32,10 @@ typedef float floatX;
 #endif
 typedef Packed128<floatX> x128;
 
+
+// WarpSize set as the compile time constant, this allows the compiler to optimize
+constexpr int WARP_SIZE = 32;
+
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -214,11 +218,11 @@ __device__ SoftmaxParams prepare_softmax_blockwide(cg::thread_block_tile<32>& wa
     // two reductions of up to 1024 threads:
     // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
     // this results in much cleaner assembly than a multi-warp cg::reduce
-    __shared__ float shared_maxval[32];
-    __shared__ float shared_sumval[32];
-    int num_warps = blockDim.x / 32;
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
+    __shared__ float shared_maxval[WARP_SIZE];
+    __shared__ float shared_sumval[WARP_SIZE];
+    int num_warps = blockDim.x / WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
 
     // reduce maxval within each warp
     float warp_maxval = cg::reduce(warp, thread_maxval, cg::greater<float>{});
@@ -313,11 +317,11 @@ __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(cg::thread_block_til
     // two reductions of up to 1024 threads:
     // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
     // this results in much cleaner assembly than a multi-warp cg::reduce
-    __shared__ float shared_maxval[32];
-    __shared__ float shared_sumval[32];
-    int num_warps = blockDim.x / 32;
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
+    __shared__ float shared_maxval[WARP_SIZE];
+    __shared__ float shared_sumval[WARP_SIZE];
+    int num_warps = blockDim.x / WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
 
     // reduce maxval within each warp
     float warp_maxval = cg::reduce(warp, thread_maxval, cg::greater<float>{});
@@ -405,11 +409,11 @@ __device__ SoftmaxParams prepare_softmax_blockwide2(int64_t idx, const floatX* i
     // two reductions of up to 1024 threads:
     // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
     // this results in much cleaner assembly than a multi-warp cg::reduce
-    __shared__ float shared_maxval[32];
-    __shared__ float shared_sumval[32];
-    int num_warps = blockDim.x / 32;
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
+    __shared__ float shared_maxval[WARP_SIZE];
+    __shared__ float shared_sumval[WARP_SIZE];
+    int num_warps = blockDim.x / WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
 
     // reduce maxval within each warp
     float warp_maxval = warpReduceMax(thread_maxval);
@@ -491,10 +495,10 @@ template<reduction_func_t warp_reduction>
 __device__ float blockReduce(float val, bool final_sync=false, float out_of_bounds=0.0f) {
     // two reductions of up to 1024 threads:
     // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
-    __shared__ float shared_val[32];
-    const int lane_id = threadIdx.x % 32;
-    const int warp_id = threadIdx.x / 32;
-    const int num_warps = blockDim.x / 32;
+    __shared__ float shared_val[WARP_SIZE];
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int num_warps = blockDim.x / WARP_SIZE;
 
     float warp_val = warp_reduction(val);
     if (lane_id == 0) { shared_val[warp_id] = warp_val; }
@@ -626,7 +630,7 @@ void fused_classifier1(float* dlogits, float* losses,
     const int N = B * T; // total number of rows in the input
     // how many rows of the input can each block of threads process?
     // e.g. in block_size=128, 4 rows get handled by 4 warps (of 32 threads each)
-    const int rows_per_block = block_size / 32;
+    const int rows_per_block = block_size / WARP_SIZE;
     const int grid_size = N / rows_per_block; // total number of blocks needed
     fused_classifier_kernel1<<<grid_size, block_size>>>(dlogits, losses, logits, dlosses, targets, B, T, V, P);
     cudaCheck(cudaGetLastError());
