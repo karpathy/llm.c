@@ -359,7 +359,7 @@ void gpt2_init_common(GPT2 *model) {
     model->v_memory = NULL;
     model->master_weights = NULL;
     // other default settings
-    model->rng_state = 13371337; // used in stochastic rounding
+    model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
     model->use_master_weights = 1; // safe default: do keep master weights in fp32
     model->recompute = 1; // good default: recompute gelu but not layernorm
 }
@@ -1173,14 +1173,16 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     state_header[1] = 1; // version number
     state_header[2] = multi_gpu_config.num_processes; // number of processes
     state_header[3] = multi_gpu_config.process_rank; // rank of this process
+    state_header[4] = loader->should_shuffle; // shuffle state of the dataloader
     // int main state, start at 10 to leave some padding
     state_header[10] = step; // step of the optimization
-    // model state, state, start at 20 to leave some padding
+    // model rng state, start at 20 to leave some padding
     *((unsigned long long*)&state_header[20]) = model->rng_state; // random number generator state
     // dataloader state, start at 30 to leave some padding
-    state_header[30] = loader->current_shard; // shard of the dataset
-    *((int64_t*)&state_header[31]) = loader->current_position; // position in shard
+    *((size_t*)&state_header[30]) = loader->current_shard_idx; // shard of the dataset
+    *((size_t*)&state_header[32]) = loader->current_sample_idx; // position in shard
     fwrite(state_header, sizeof(int), 256, state_file);
+
     // write AdamW m, v, and master_weights here (they are all float)
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
     float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
@@ -1189,6 +1191,14 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     cudaCheck(cudaMemcpy(cpu_buffer, model->v_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     free(cpu_buffer);
+
+    if (loader->should_shuffle) {
+        fwrite(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);  // number of shards
+        fwrite(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
+        fwrite(&loader->shard_num_samples, sizeof(size_t), 1, state_file);
+        fwrite(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
+        fwrite(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
+    }
     fclose(state_file);
 }
 
@@ -1200,11 +1210,12 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     assert(state_header[1] == 1); // version number
     assert(state_header[2] == multi_gpu_config.num_processes); // number of processes
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
+    int should_shuffle = state_header[4]; // shuffle state of the dataloader
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
-    int current_shard = state_header[30]; // shard of the dataset
-    int64_t current_position = *((int64_t*)&state_header[31]); // position in shard
-    dataloader_resume(loader, current_shard, current_position);
+    size_t current_shard_idx = *((size_t*)&state_header[30]); // shard index
+    size_t current_sample_idx = *((size_t*)&state_header[32]); // position in shard
+
     // read AdamW m, v (they are all float)
     // also allocate the m, v memory in the model, if it does not yet exist
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
@@ -1220,6 +1231,28 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     cudaCheck(cudaMemcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     free(cpu_buffer);
+
+    if (should_shuffle) {
+        loader->should_shuffle = 1;
+
+        size_t glob_result_gl_pathc;
+        freadCheck(&glob_result_gl_pathc, sizeof(size_t), 1, state_file);
+        assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
+
+        loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
+        freadCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
+
+        size_t shard_num_samples;
+        freadCheck(&shard_num_samples, sizeof(size_t), 1, state_file);
+        assert(shard_num_samples == loader->shard_num_samples);
+
+        loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
+        freadCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
+
+        freadCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
+    }
+
+    dataloader_resume(loader, current_shard_idx, current_sample_idx);
     fclose(state_file);
 }
 
@@ -1427,8 +1460,8 @@ int main(int argc, char *argv[]) {
 
     // build DataLoaders for both train and val
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
-    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 1);
+    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 0);
     // figure out the number of training steps we will run for
     int train_num_batches = max_steps; // passed in from command line
     if (train_num_batches == -1) {
