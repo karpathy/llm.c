@@ -1131,12 +1131,15 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         // ok finally call the kernel
         adamw_update(param_ptr, master_ptr, grad_ptr,
                      m_ptr, v_ptr,
-                     shard.size, tensor.size, multi_gpu_config->zero_stage == 2 ? shard.size : tensor.size, shard.size, num_layers,
+                     shard.size, tensor.size,
+                     multi_gpu_config->zero_stage == 2 ? shard.size : tensor.size,
+                     shard.size,
+                     num_layers,
                      learning_rate,
                      beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
         cudaCheck(cudaGetLastError());
 
-        if (multi_gpu_config->zero_stage == 1) {
+        if (multi_gpu_config->zero_stage != 0) {
 #if MULTI_GPU
             ncclCheck(ncclGroupStart());
             for(int l = 0; l < num_layers; ++l) {
