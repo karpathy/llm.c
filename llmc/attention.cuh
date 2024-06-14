@@ -149,8 +149,8 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     }
 }
 
-__global__ void softmax_autoregressive_backward_kernel(floatX* dpreatt, const floatX* datt, const floatX* att,
-                                                       int B, int T, int C, float scale) {
+__global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, const floatX* att,
+                                                               int B, int T, int C, float scale) {
     constexpr const int BlockSize = 256;
     constexpr int T_per_block = 4;
 
@@ -160,14 +160,13 @@ __global__ void softmax_autoregressive_backward_kernel(floatX* dpreatt, const fl
 
     att += idx * T * T;
     datt += idx * T * T;
-    dpreatt += idx * T * T;
 
     for(int to = 0; to < T_per_block; ++to) {
         int t = t0 - to;
         if(t < 0) return;
         const floatX* att_bth = att + t * T;
         const floatX* datt_bth = datt + t * T;
-        floatX* dpreatt_bth = dpreatt + t * T;
+        floatX* dpreatt_bth = datt + t * T;
 
         float local_sum = 0;
         for (int t2 = threadIdx.x; t2 <= t; t2 += BlockSize) {
@@ -176,11 +175,16 @@ __global__ void softmax_autoregressive_backward_kernel(floatX* dpreatt, const fl
 
         local_sum = blockReduce<warpReduceSum>(local_sum);
 
-        for (int t3 = threadIdx.x; t3 <= t; t3 += BlockSize) {
+        for (int t3 = threadIdx.x; t3 < T; t3 += BlockSize) {
             // don't touch the cache. Some parts will still be here from the previous loop, and
             // we want to exploit those.
-            float acc = (float)__ldcs(att_bth + t3) * ((float)__ldcs(datt_bth + t3) - local_sum);
-            __stcs(dpreatt_bth + t3, (floatX)(scale * acc));
+            if(t3 <= t) {
+                float acc = (float) __ldcs(att_bth + t3) * ((float) __ldcs(datt_bth + t3) - local_sum);
+                __stcs(dpreatt_bth + t3, (floatX) (scale * acc));
+            } else {
+                // explicitly set non-causal elements to zero
+                __stcs(dpreatt_bth + t3, (floatX)0.f);
+            }
         }
     }
 }
@@ -200,7 +204,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // inp is (B, T, 3C) QKV
     // preatt, att are (B, NH, T, T)
     // output is (B, T, C)
-    int HS = C / NH; // head size
+    const int HS = C / NH; // head size
 
     // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
     floatX *q, *k, *v;
@@ -223,7 +227,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
                                      B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
 
     // multiply all elements of preatt elementwise by scale
-    float scale = 1.0 / sqrtf(HS);
+    float scale = 1.f / sqrtf(HS);
     int grid_size = CEIL_DIV(B * NH * T * WARP_SIZE, block_size);
     softmax_forward_kernel5<<<grid_size, block_size, 0, stream>>>(att, scale, preatt, B * NH, T);
 
@@ -247,13 +251,13 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
-void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* datt, floatX* scratch,
+void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
                         const floatX* dout,
                         const floatX* qkvr, const floatX* att,
                         int B, int T, int C, int NH, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
-    int HS = C / NH; // head size
+    const int HS = C / NH; // head size
     const float alpha = 1.0f, beta = 0.0f;
 
     // unpack convenience pointers into q, k, v
@@ -279,10 +283,10 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* da
     cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &alpha,
                                            scratch, CUBLAS_LOWP, HS, T * HS, att, CUBLAS_LOWP, T, T * T, &beta,
                                            dv, CUBLAS_LOWP, HS, T * HS, B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
-    // backward into preatt
-    int hs = C / NH; // head size
-    float scale = 1.0f / sqrtf(hs);
-    softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256, 0, stream>>>(dpreatt, datt, att, B, T, C, scale);
+    const float scale = 1.0f / sqrtf((float)HS);
+    // backward into preatt. this is an in-place operation; datt turns into dpreatt here
+    softmax_autoregressive_backward_inplace_kernel<<<dim3(T / 4, B * NH), 256>>>(datt, att, B, T, C, scale);
+    const floatX* dpreatt = datt;
     // backward into q
     cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha,
                                            k, CUBLAS_LOWP, HS, T * HS, dpreatt, CUBLAS_LOWP, T, T * T, &beta,
