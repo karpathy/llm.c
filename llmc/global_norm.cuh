@@ -31,7 +31,7 @@ __global__ void global_norm_squared_kernel(float* out, const T* data, size_t cou
     // that sums up the partial block sums
     if(threadIdx.x == 0) {
         size_t out_index = blockIdx.y * gridDim.x + blockIdx.x;
-        *(out + out_index) = *(out + out_index) + block_sum;
+        out[out_index] = out[out_index] + block_sum;
     }
 }
 
@@ -41,7 +41,7 @@ __global__ void global_norm_aggregate_kernel(float* out, size_t grid_size) {
     float block_sum = (index < grid_size) ? out[index] : 0.f;
     float sum = blockReduce<warpReduceSum>(block_sum);
     if(threadIdx.x == 0) {
-        *out = sum;  // out[0] ends up with the final norm squared
+        out[0] = sum;  // out[0] ends up with the final norm squared
     }
 }
 
@@ -59,12 +59,15 @@ void global_norm_squared(float* out, const T* values, size_t count, ptrdiff_t st
     const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
     assert(grid_size > 0);      // gives a better error than letting the call below fail
     assert(grid_size < 1024);  // we want to later accumulate the block sums in a single block
-    // initialize out with zero
-    if(reset) {
-        cudaCheck(cudaMemsetAsync(out, 0, grid_size * sizeof(float), stream));
-    }
+    // if not the case we have to find the biggest gx*gy and pass that into `global_norm_squared_aggregate`
+    assert(grid_size % num_slices == 0);
+
     const int gx = CEIL_DIV(grid_size, num_slices);
     const int gy = num_slices;
+
+    if (reset) {
+        cudaCheck(cudaMemsetAsync(out, 0, gx * gy * sizeof(float), stream));
+    }
     global_norm_squared_kernel<<<dim3(gx, gy), block_size, 0, stream>>>(out, values, count, stride);
     cudaCheck(cudaGetLastError());
 }
@@ -72,9 +75,7 @@ void global_norm_squared(float* out, const T* values, size_t count, ptrdiff_t st
 void global_norm_squared_aggregate(float* out, cudaStream_t stream) {
     const int block_size = 512;
     const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
-    assert(grid_size > 0);
-    assert(grid_size < 1024);
-
-    global_norm_aggregate_kernel<<<1, grid_size, 0, stream>>>(out, grid_size);
+    assert(grid_size > 0 && grid_size < 1024);  // we need to accumulate the block sums in a single block
+    global_norm_aggregate_kernel<<<1, 1024, 0, stream>>>(out, grid_size);
     cudaCheck(cudaGetLastError());
 }
