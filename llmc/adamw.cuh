@@ -40,9 +40,7 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
     float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * old_param));
     // update our low precision version of the parameters using stochastic rounding
     // this will be used in the next forward pass
-    // TODO: simply doing `params_memory[i] = (floatX)param;` breaks everything (why?)
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x + blockDim.y * gridDim.y, seed);
-    stochastic_rounding(param, &params_memory[idx], random);
+    stochastic_rounding(param, &params_memory[idx], seed);
     // write the full, float version of the param into our master copy, if we maintain one
     // this will be used in the next update
     if (master_params_memory != NULL) { master_params_memory[idx] = param; }
