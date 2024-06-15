@@ -109,8 +109,9 @@ void prepare_intra_shard_indices_(DataLoader *loader) {
         // in case shards have different number of samples / sizes
         free(loader->intra_shard_indices);
     }
-    loader->intra_shard_indices = (int*)malloc(loader->shard_num_samples * sizeof(int));
-    random_permutation_with_init(loader->intra_shard_indices, loader->shard_num_samples, &loader->shuffle_rng, 1);
+    loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
+    init_identity_permutation(loader->intra_shard_indices, loader->shard_num_samples);
+    random_permutation(loader->intra_shard_indices, loader->shard_num_samples, &loader->shuffle_rng);
 }
 
 void dataloader_reset(DataLoader *loader) {
@@ -118,7 +119,7 @@ void dataloader_reset(DataLoader *loader) {
     loader->current_sample_idx = 0;
 
     if (loader->should_shuffle) {  // shuffle the shards
-        random_permutation_with_init(loader->shard_indices, loader->glob_result.gl_pathc, &loader->shuffle_rng, 0);
+        random_permutation(loader->shard_indices, loader->glob_result.gl_pathc, &loader->shuffle_rng);
     }
 
     dataloader_load_shard_(loader, loader->current_shard_idx);
@@ -177,10 +178,8 @@ void dataloader_init(DataLoader *loader,
         mt19937_state shuffle_rng;
         manual_seed(&shuffle_rng, 42 + process_rank);
         loader->shuffle_rng = shuffle_rng;
-        loader->shard_indices = (int*)malloc(loader->glob_result.gl_pathc * sizeof(int));
-        for (int i = 0; i < loader->glob_result.gl_pathc; i++) {
-            loader->shard_indices[i] = i;  // start with identity permutation
-        }
+        loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
+        init_identity_permutation(loader->shard_indices, loader->glob_result.gl_pathc);
         loader->intra_shard_indices = NULL;  // dynamically allocated allowing different shard sizes
     }
 
@@ -199,9 +198,9 @@ void dataloader_init(DataLoader *loader,
     // printf("DataLoader: Found %ld tokens across %zu shards\n", ntok_total, loader->glob_result.gl_pathc);
 
     // allocate all the space we'll need
-    loader->buffer = (uint16_t*)malloc((B * T + 1) * sizeof(uint16_t));
-    loader->inputs = (int*)malloc(B * T * sizeof(int));
-    loader->targets = (int*)malloc(B * T * sizeof(int));
+    loader->buffer = (uint16_t*)mallocCheck((B * T + 1) * sizeof(uint16_t));
+    loader->inputs = (int*)mallocCheck(B * T * sizeof(int));
+    loader->targets = (int*)mallocCheck(B * T * sizeof(int));
     loader->num_tokens = ntok_total;
 
     // reset the loader, to initialize it
@@ -359,11 +358,11 @@ void evalloader_init(EvalLoader *loader,
 
     // allocate all the space we'll need
     int can_fit_examples = B / ASSUMED_NUM_COMPLETIONS;
-    loader->buffer = (uint16_t*)malloc(longest_example_bytes);
+    loader->buffer = (uint16_t*)mallocCheck(longest_example_bytes);
     loader->inputs = (int*)calloc(B * T, sizeof(int));
     loader->targets = (int*)calloc(B * T, sizeof(int));
-    loader->mask = (char*)malloc(B * T * sizeof(char));
-    loader->label = (int*)malloc(can_fit_examples * sizeof(int));
+    loader->mask = (char*)mallocCheck(B * T * sizeof(char));
+    loader->label = (int*)mallocCheck(can_fit_examples * sizeof(int));
 
     // reset the loader, to initialize it
     evalloader_reset(loader);
