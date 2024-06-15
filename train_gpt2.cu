@@ -1037,7 +1037,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         float* master_ptr = NULL;
         if (model->master_weights != NULL) { master_ptr = model->master_weights + opt_state_offset; }
         if(init_master_weights) {
-            size_t grid_size = CEIL_DIV(shard_num_parameters, 512);
+            size_t grid_size = CEIL_DIV(shard.size, 512);
             copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, param_ptr, shard.size,
                                                                      shard.size, tensor.size);
             cudaCheck(cudaGetLastError());
