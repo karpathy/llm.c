@@ -179,15 +179,15 @@ __global__ void normalization_kernel(float* out, const float* inp, float* mean, 
     out[idx] = o;
 }
 
-__global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
-                                    const float*  __restrict__ inp, const float*  __restrict__ weight,
-                                    const float* __restrict__ bias, int N, int C) {
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    // meta_group_size is the number of warps in a block, and meta_group_rank is the warp index
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    if(idx >= N) {
+__global__ void layernorm_forward_kernel3(
+    float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+    const float* __restrict__ inp, const float* __restrict__ weight,
+    const float* __restrict__ bias, int N, int C) {
+    int warpsPerBlock = blockDim.x / warpSize;
+    int warpId = threadIdx.x / warpSize;
+    int laneId = threadIdx.x % warpSize;
+    int idx = blockIdx.x * warpsPerBlock + warpId;
+    if (idx >= N) {
         return;
     }
 
@@ -196,47 +196,49 @@ __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __rest
 
     // mean
     float sum = 0.0f;
-    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+    for (int i = laneId; i < C; i += warpSize) {
         sum += x[i];
     }
-    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    sum = warpReduceSum(sum);
     float m = sum / C;
-    if(warp.thread_rank() == 0 && mean != nullptr) {
+    if (laneId == 0 && mean != nullptr) {
         __stcs(mean + idx, m);
     }
 
     // rstd
     sum = 0.0f;
-    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+    for (int i = laneId; i < C; i += warpSize) {
         float diff = x[i] - m;
         sum += diff * diff;
     }
-    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    sum = warpReduceSum(sum);
     float s = rsqrtf(sum / C + 1e-5f);
-    if(warp.thread_rank() == 0 && rstd != nullptr) {
+    if (laneId == 0 && rstd != nullptr) {
         __stcs(rstd + idx, s);
     }
 
     // final normalization and scaling by weight/bias
     float* o = out + idx * C;
-    for (int c = warp.thread_rank(); c < C; c += warp.size()) {
+    for (int c = laneId; c < C; c += warpSize) {
         // load and store using the .cs "streaming" hint to the compiler,
-        // indicating that this data will not be reused soon, and can be streamed through the caches
-        // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
-        float n = s * (__ldcs(x+c) - m);
-        __stcs(o+c, n * weight[c] + bias[c]);
+        // indicating that this data will not be reused soon, and can be
+        // streamed through the caches this allows the threads to get more
+        // cache-hits for the (shared) weight and bias parameters
+        float n = s * (__ldcs(x + c) - m);
+        __stcs(o + c, n * weight[c] + bias[c]);
     }
 }
 
 // same as kernel 3 but uses var(x) == mean(x**2) - mean(x)**2
-__global__ void layernorm_forward_kernel4(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
-                                    const float*  __restrict__ inp, const float*  __restrict__ weight,
-                                    const float* __restrict__ bias, int N, int C) {
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    if(idx >= N) {
+__global__ void layernorm_forward_kernel4(
+    float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+    const float* __restrict__ inp, const float* __restrict__ weight,
+    const float* __restrict__ bias, int N, int C) {
+    int warpsPerBlock = blockDim.x / warpSize;
+    int warpId = threadIdx.x / warpSize;
+    int laneId = threadIdx.x % warpSize;
+    int idx = blockIdx.x * warpsPerBlock + warpId;
+    if (idx >= N) {
         return;
     }
 
@@ -244,37 +246,34 @@ __global__ void layernorm_forward_kernel4(float* __restrict__ out, float* __rest
     const float* x = inp + idx * C;
 
     // thread coarsening through the row, reduce the sum in series
-    float sum = 0.0; // stores sum(x)
-    float sum2 = 0.0; // stores sum(x**2)
-    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+    float sum1 = 0.0;  // stores sum(x)
+    float sum2 = 0.0;  // stores sum(x**2)
+    for (int i = laneId; i < C; i += warpSize) {
         float xi = x[i];
-        sum += xi;
+        sum1 += xi;
         sum2 += xi * xi;
     }
     // warp-level reduction at the end
-    sum = cg::reduce(warp, sum, cg::plus<float>{}); // sum(x)
-    sum2 = cg::reduce(warp, sum2, cg::plus<float>{}); // sum(x**2)
-    sum /= C; // mean(x)
-    sum2 /= C; // mean(x**2)
+    float mean1 = warpReduceSum(sum1) / C;  // mean(x)
+    float mean2 = warpReduceSum(sum2) / C;  // mean(x**2)
 
     // mean, var, rstd
-    float m = sum;
-    float var = sum2 - sum * sum;
+    float var = mean2 - mean1 * mean1;
     float s = rsqrtf(var + 1e-5f);
 
     // store the mean, no need to cache it
-    if(warp.thread_rank() == 0 && mean != nullptr) {
-        __stcs(mean + idx, m);
+    if (laneId == 0 && mean != nullptr) {
+        __stcs(mean + idx, mean1);
     }
     // store the rstd, no need to cache it
-    if(warp.thread_rank() == 0 && rstd != nullptr) {
+    if (laneId == 0 && rstd != nullptr) {
         __stcs(rstd + idx, s);
     }
     // final normalization and scaling by weight/bias
     float* o = out + idx * C;
-    for (int c = warp.thread_rank(); c < C; c += warp.size()) {
-        float n = s * (__ldcs(x+c) - m);
-        __stcs(o+c, n * weight[c] + bias[c]);
+    for (int c = laneId; c < C; c += warpSize) {
+        float n = s * (__ldcs(x + c) - mean1);
+        __stcs(o + c, n * weight[c] + bias[c]);
     }
 }
 
@@ -282,9 +281,6 @@ __global__ void layernorm_forward_kernel4(float* __restrict__ out, float* __rest
 __global__ void layernorm_forward_kernel5(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const float*  __restrict__ inp, const float*  __restrict__ weight,
                                     const float* __restrict__ bias, int N, int C) {
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     __shared__ float shared_sum[32]; // block_size max is 1024 = 32 * 32 warps
     __shared__ float shared_sum2[32]; // warps will be writing into shared memeory after warp-reduce
     int num_warps = blockDim.x / 32;
@@ -303,8 +299,8 @@ __global__ void layernorm_forward_kernel5(float* __restrict__ out, float* __rest
         thread_sum2 += xi * xi;
     }
     // warp-level reduction
-    float warp_sum = cg::reduce(warp, thread_sum, cg::plus<float>{}); // sum(x)
-    float warp_sum2 = cg::reduce(warp, thread_sum2, cg::plus<float>{}); // sum(x**2)
+    float warp_sum = warpReduceSum(thread_sum);
+    float warp_sum2 = warpReduceSum(thread_sum2);
     // store the warp-level reduction in shared memory (we could have lane_id == 0 guard but not needed)
     shared_sum[warp_id] = warp_sum;
     shared_sum2[warp_id] = warp_sum2;
@@ -313,8 +309,8 @@ __global__ void layernorm_forward_kernel5(float* __restrict__ out, float* __rest
     warp_sum = (lane_id < num_warps) ? shared_sum[lane_id] : 0.0f;
     warp_sum2 = (lane_id < num_warps) ? shared_sum2[lane_id] : 0.0f;
     // now reduce the warp-level reductions
-    float block_sum = cg::reduce(warp, warp_sum, cg::plus<float>{}); // sum(x)
-    float block_sum2 = cg::reduce(warp, warp_sum2, cg::plus<float>{}); // sum(x**2)
+    float block_sum = warpReduceSum(warp_sum); // sum(x)
+    float block_sum2 = warpReduceSum(warp_sum2); // sum(x**2)
     // mean, var, rstd
     block_sum /= C; // mean(x)
     block_sum2 /= C; // mean(x**2)
