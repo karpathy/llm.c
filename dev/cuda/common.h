@@ -25,8 +25,9 @@ __device__ float warpReduceSum(float val) {
 // the fact it's unique shared memory allows us to avoid an extra __syncthreads() call at the end
 // but if called inside a loop, the shared memory will be implicitly reused, so set final_sync to 1
 using reduction_func_t = float (*) (float);
+
 template<reduction_func_t warp_reduction>
-__device__ inline float blockReduce(float val, bool final_sync=false, float out_of_bounds=0.0f) {
+__device__ inline float blockReduce(float val, bool final_sync, float out_of_bounds) {
     // two reductions of up to 1024 threads:
     // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
     __shared__ float shared_val[WARP_SIZE];
@@ -44,6 +45,12 @@ __device__ inline float blockReduce(float val, bool final_sync=false, float out_
         __syncthreads(); // only needed in loops when effectively reusing shared memory etc.
     }
     return block_val;
+}
+
+// Helper function to call blockReduce with default arguments
+template<reduction_func_t warp_reduction>
+__device__ inline float blockReduce(float val) {
+    return blockReduce<warp_reduction>(val, false, 0.0f);
 }
 
 // ----------------------------------------------------------------------------
