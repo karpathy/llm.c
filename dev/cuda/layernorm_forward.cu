@@ -333,6 +333,51 @@ __global__ void layernorm_forward_kernel5(float* __restrict__ out, float* __rest
     }
 }
 
+// similar to kernel4, plus using smem to temporaily store input data
+// due to the smem limit, this kernel cannot handle block size > 512 (with fixed C 768 and warp size 32)
+// not so much modification, but decently improve bandwidth
+__global__ void __launch_bounds__(512) layernorm_forward_kernel6(float* __restrict__ out, float* __restrict__ mean,
+                              float* __restrict__ rstd,
+                              const float* __restrict__ inp,
+                              const float* __restrict__ weight,
+                              const float* __restrict__ bias, int N, int C) {
+    float eps = 1e-5f;
+    extern __shared__ float xShared[];
+    int warpsPerBlock = blockDim.x / warpSize;
+    int warpId = threadIdx.x / warpSize;
+    int laneId = threadIdx.x % warpSize;
+    float* const xSharedThisWarp = xShared + warpId * C;
+    int row = blockIdx.x * warpsPerBlock + warpId;
+    if (row < N) {
+        const float* const x = inp + row * C;
+        float* const y = out + row * C;
+        float partialSum = 0.0f, partialSum2 = 0.0f;
+
+        for (int i = laneId; i < C; i += warpSize) {
+            float xi = x[i];
+            xSharedThisWarp[i] = xi;
+            partialSum += xi;
+            partialSum2 += xi * xi;
+        }
+
+        float mean1 = warpReduceSum(partialSum) / C;
+        float mean2 = warpReduceSum(partialSum2) / C;
+
+        if (laneId == 0 && mean != nullptr) __stcs(mean + row, mean1);
+
+        float var = (mean2 - mean1 * mean1);
+
+        float invStd = rsqrtf(var + eps);
+
+        if (laneId == 0 && rstd != nullptr) __stcs(rstd + row, invStd);
+
+        // load from smem for accleration
+        for (int i = laneId; i < C; i += warpSize) {
+            __stcs(y + i, weight[i] * (xSharedThisWarp[i] - mean1) * invStd + bias[i]);
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -396,6 +441,27 @@ void layernorm_forward5(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
+void layernorm_forward6(float* out, float* mean, float* rstd, const float* inp,
+                        const float* weight, const float* bias, int B, int T,
+                        int C, const int block_size) {
+    assert(block_size % 32 == 0);
+    const int maxBlockSizeKernel6 = 512;
+    const int N = B * T;
+    const int grid_size =
+        ceil_div(N * 32, min(maxBlockSizeKernel6, block_size));
+
+    int device;
+    cudaCheck(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    cudaCheck(cudaGetDeviceProperties(&prop, device));
+    unsigned int smemSize =
+        C * sizeof(float) * (min(maxBlockSizeKernel6, block_size) / 32);
+    layernorm_forward_kernel6<<<grid_size, min(maxBlockSizeKernel6, block_size),
+                                smemSize>>>(out, mean, rstd, inp, weight, bias,
+                                            N, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void layernorm_forward(int kernel_num,
                     float* out, float* mean, float* rstd,
@@ -417,6 +483,9 @@ void layernorm_forward(int kernel_num,
             break;
         case 5:
             layernorm_forward5(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
+            break;
+        case 6:
+            layernorm_forward6(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
