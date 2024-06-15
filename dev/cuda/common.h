@@ -6,6 +6,7 @@
 #include <float.h>
 
 #define WARP_SIZE 32U
+extern cudaDeviceProp deviceProp;
 
 template<class T>
 __host__ __device__ T ceil_div(T dividend, T divisor) {

@@ -16,6 +16,7 @@ nvcc -O3 --use_fast_math global_norm.cu -o global_norm
 #define ENABLE_BF16
 #include "common.h"
 
+cudaDeviceProp deviceProp;
 
 float global_norm_cpu(const float* data, size_t count) {
     // accumulate in double so we have an accurate numerical reference
@@ -160,7 +161,7 @@ void global_norm2(float* out, const T* values, size_t count, int block_size) {
 }
 
 template<typename T>
-void global_norm3(float* out, const T* values, size_t count, int block_size, cudaDeviceProp deviceProp) {
+void global_norm3(float* out, const T* values, size_t count, int block_size) {
     // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
     // having one block less than possible is a tiny performance hit, having
     // one block too many is catastrophic, since it only can start once all the other
@@ -173,7 +174,7 @@ void global_norm3(float* out, const T* values, size_t count, int block_size, cud
 }
 
 template<typename T>
-void global_norm4(float* out, const T* values, size_t count, int block_size, cudaDeviceProp deviceProp) {
+void global_norm4(float* out, const T* values, size_t count, int block_size) {
     if (block_size <= 64) {
         block_size = 128;  // to avoid triggering the assert below
     }
@@ -191,22 +192,21 @@ void global_norm4(float* out, const T* values, size_t count, int block_size, cud
     cudaCheck(cudaGetLastError());
 }
 
-void global_norm(int kernel_num, float* out, const floatX* values, size_t count, int block_size, cudaDeviceProp deviceProp) {
+void global_norm(int kernel_num, float* out, const floatX* values, size_t count, int block_size) {
     switch (kernel_num) {
         case 1:
             return global_norm1(out, values, count, block_size);
         case 2:
             return global_norm2(out, values, count, block_size);
         case 3:
-            return global_norm3(out, values, count, block_size, deviceProp);
+            return global_norm3(out, values, count, block_size);
         case 4:
-            return global_norm4(out, values, count, block_size, deviceProp);
+            return global_norm4(out, values, count, block_size);
     }
 }
 
 int main(int argc, const char **argv) {
     setup_main();
-    cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, 0);
 
     int C = 768;
@@ -243,7 +243,7 @@ int main(int argc, const char **argv) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
         cudaCheck(cudaMemset(d_out, 0, sizeof(float)));
-        global_norm(kernel_num, d_out, d_inp, num_params, block_size, deviceProp);
+        global_norm(kernel_num, d_out, d_inp, num_params, block_size);
         validate_result(d_out, &out, "out", 1, 1e-2f);
     }
 
@@ -256,7 +256,7 @@ int main(int argc, const char **argv) {
 
         float elapsed_time = benchmark_kernel(repeat_times, global_norm,
                                               kernel_num, d_out, d_inp,
-                                              num_params, block_size, deviceProp);
+                                              num_params, block_size);
         size_t memory_ops = num_params * sizeof(floatX);
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
 
