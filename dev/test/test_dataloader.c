@@ -37,7 +37,7 @@ void checkEquals(const int *tokens, const int n, const int expected) {
     // printf("tokens all equal to %d OK\n", expected);
 }
 
-void test_simple() {
+void test_simple(void) {
     /*
     Tests the simplest DataLoader functionality:
     - multi-shard
@@ -58,7 +58,7 @@ void test_simple() {
     int batches_fit = num_tokens / (B * T); // number of batches that fit per shard
     int BT = B * T;
     int num_epochs = 4;
-    for (int e = 0; e < num_epochs; e ++) { // epoch
+    for (int e = 0; e < num_epochs; e++) { // epoch
         for (int s = 0; s < num_shards; s++) { // shard
             int start = s * num_tokens;
             for (int b = 0; b < batches_fit; b++) { // batch
@@ -73,7 +73,47 @@ void test_simple() {
     printf("OK\n");
 }
 
-void test_shuffled() {
+void test_multiprocess_simple(void) {
+    /*
+    Same as simple above, but using 2 processes.
+    (which we of course use in a serial, single process way here)
+    The DataLoaders simply pull chunks of consecutive tokens, so
+    we expect them to alternate in the "token space".
+    */
+    printf("test_multiprocess_simple... ");
+    int B = 4;
+    int T = 8;
+    int num_processes = 2;
+    int should_shuffle = 0;
+    snprintf(shard_name, 64, "shard_????.bin");
+    DataLoader loader0, loader1;
+    dataloader_init(&loader0, shard_name, B, T, 0, num_processes, should_shuffle);
+    dataloader_init(&loader1, shard_name, B, T, 1, num_processes, should_shuffle);
+
+    int batches_fit = num_tokens / (B * T * num_processes); // number of batches that fit per shard
+    int BT = B * T;
+    int num_epochs = 4;
+    for (int e = 0; e < num_epochs; e++) { // epoch
+        for (int s = 0; s < num_shards; s++) { // shard
+            int start = s * num_tokens;
+            for (int b = 0; b < batches_fit; b++) { // batch
+                dataloader_next_batch(&loader0);
+                dataloader_next_batch(&loader1);
+                checkRange(loader0.inputs, start, start + BT);
+                checkRange(loader1.inputs, start + BT, start + 2*BT);
+                checkRange(loader0.targets, start + 1, start + BT + 1);
+                checkRange(loader1.targets, start + BT + 1, start + 2*BT + 1);
+                start += 2*BT;
+            }
+        }
+    }
+
+    dataloader_free(&loader0);
+    dataloader_free(&loader1);
+    printf("OK\n");
+}
+
+void test_shuffled(void) {
     /*
     Tests the DataLoader when using shuffled:
     - multi-shard
@@ -163,6 +203,7 @@ int main(void) {
     }
 
     test_simple();
+    test_multiprocess_simple();
     test_shuffled();
 
     // clean up the shards
@@ -171,4 +212,5 @@ int main(void) {
         remove(shard_name);
     }
 
+    return EXIT_SUCCESS;
 }
