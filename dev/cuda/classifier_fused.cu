@@ -481,33 +481,6 @@ __global__ void fused_classifier_kernel4(floatX* dlogits, floatX* losses, floatX
     }
 }
 
-// todo - move to common.h - or ideally somewhere it's not duplicated between train & common?
-// requires all 32 threads in the warp to be active, but should work for any block size
-// uses non-dynamic shared memory so every call increases shared memory requirements by 128 bytes
-// the fact it's unique shared memory allows us to avoid an extra __syncthreads() call at the end
-// but if called inside a loop, the shared memory will be implicitly reused, so set final_sync to 1
-using reduction_func_t = float (*) (float);
-template<reduction_func_t warp_reduction>
-__device__ float blockReduce(float val, bool final_sync=false, float out_of_bounds=0.0f) {
-    // two reductions of up to 1024 threads:
-    // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
-    __shared__ float shared_val[32];
-    const int lane_id = threadIdx.x % 32;
-    const int warp_id = threadIdx.x / 32;
-    const int num_warps = blockDim.x / 32;
-
-    float warp_val = warp_reduction(val);
-    if (lane_id == 0) { shared_val[warp_id] = warp_val; }
-    __syncthreads();
-    warp_val = (lane_id < num_warps) ? shared_val[lane_id] : out_of_bounds;
-    float block_val = warp_reduction(warp_val);
-
-    if (final_sync) {
-        __syncthreads(); // only needed in loops when effectively reusing shared memory etc.
-    }
-    return block_val;
-}
-
 __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* inp, int V, int P) {
     // same but not float4
     // one row of inp, i.e. inp[idx, :] of shape (V,)
