@@ -62,7 +62,7 @@ loss.backward()
   }
 }
 
-TEST(CausalSelfAttention, Forward) {
+TEST(CausalSelfAttention, ForwardAndBackward) {
   /*
 torch.set_printoptions(precision=6)
 torch.manual_seed(42)
@@ -77,7 +77,8 @@ y = attn(x)
   int B = 2, T = 4, C = 6, nh = 2, hs = C / nh;
   gpt::CausalSelfAttention attn(T, nh, C);
 
-  std::vector<float> x(B * T * C), y(B * T * C);
+  std::vector<float> x(B * T * C), y(B * T * C), x_grad(B * T * C),
+      y_grad(B * T * C, 1.0f);
   nn::NormalFill(absl::MakeSpan(x));
   Eigen::TensorMap<nn::Tensor3D> xt(x.data(), B, T, C);
   Eigen::TensorMap<nn::Tensor3D> yt(y.data(), B, T, C);
@@ -98,17 +99,40 @@ y = attn(x)
   for (size_t i = 0; i < expected_y.size(); ++i) {
     EXPECT_NEAR(expected_y[i], y[i], 1e-5);
   }
+
+  // backward
+  Eigen::TensorMap<nn::Tensor3D> x_grad_t(x_grad.data(), B, T, C);
+  Eigen::TensorMap<nn::Tensor3D> y_grad_t(y_grad.data(), B, T, C);
+  attn.Backward(xt, y_grad_t, x_grad_t);
+  std::vector<float> expected_x_grad = {
+      1.341534, 0.306510, -0.398248, -1.307186, 0.308231,  1.364989,
+      0.722659, 0.155880, -0.282098, -0.693888, 0.194182,  0.756926,
+      0.348222, 0.125258, 0.032523,  -0.342366, 0.064738,  0.288353,
+      0.173461, 0.051528, -0.036712, -0.158987, 0.042912,  0.170093,
+      1.512321, 0.363056, -0.505860, -1.425764, 0.427224,  1.476094,
+      0.599044, 0.077030, -0.059634, -0.600186, 0.065210,  0.628942,
+      0.319907, 0.015346, -0.002683, -0.284920, -0.009112, 0.374621,
+      0.279890, 0.017215, -0.036771, -0.177604, -0.009638, 0.332324};
+
+  for (size_t i = 0; i < expected_y.size(); ++i) {
+    EXPECT_NEAR(expected_x_grad[i], x_grad[i], 1e-5);
+  }
 }
 
-TEST(Block, Forward) {
+TEST(Block, ForwardAndBackward) {
   /*
+
 torch.set_printoptions(precision=6)
 torch.manual_seed(42)
 config = GPTConfig(n_embd=6, n_head=2)
 b = Block(config=config)
 B, T, C = 2, 4, 6
 x = torch.randn((B, T, C))
+x = nn.Parameter(x)
 y = b(x)
+loss = torch.sum(y)
+loss.backward()
+
   */
 
   nn::ManualSeed(42);
@@ -133,6 +157,10 @@ y = b(x)
   for (size_t i = 0; i < expected_y.size(); ++i) {
     EXPECT_NEAR(expected_y[i], y[i], 1e-5);
   }
+
+  // backward
+  std::vector<float> x_grad(B*T*C), y_grad(B*T*C, 1.0f);
+
 }
 
 TEST(GPT, Forward) {

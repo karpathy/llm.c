@@ -55,53 +55,53 @@ TEST(MatMul, ForwardAndBackward) {
   /*
 torch.set_printoptions(precision=6)
 torch.manual_seed(42)
-m = nn.Linear(3, 2, bias=False)
-x = torch.randn(4, 3)
-x = nn.Parameter(x)
-y = m(x)
+x1 = torch.randn(4, 3)
+x2 = torch.randn(3, 2)
+x1 = nn.Parameter(x1)
+x2 = nn.Parameter(x2)
+y = torch.matmul(x1, x2)
 loss = torch.sum(y)
 loss.backward()
   */
 
   nn::ManualSeed(42);
-  int B = 4, in_features = 3, out_features = 2;
-  std::vector<float> x(B * in_features), w(out_features * in_features);
-  nn::KaimingUniformFill(absl::MakeSpan(w), in_features);
-  nn::NormalFill(absl::MakeSpan(x));
+  int M = 4, N = 3, K = 2;
+  std::vector<float> x1(M * N), x2(N * K);
+  nn::NormalFill(absl::MakeSpan(x1));
+  nn::NormalFill(absl::MakeSpan(x2));
 
   // forward
-  std::vector<float> y(B * out_features);
-  auto xm = Eigen::Map<nn::Matrix>(x.data(), B, in_features);
-  auto wm = Eigen::Map<nn::Matrix>(w.data(), out_features, in_features);
-  auto ym = Eigen::Map<nn::Matrix>(y.data(), B, out_features);
-  nn::MatMul::Forward(xm, wm, ym);
+  std::vector<float> y(M * K);
+  auto x1m = Eigen::Map<nn::Matrix>(x1.data(), M, N);
+  auto x2m = Eigen::Map<nn::Matrix>(x2.data(), N, K);
+  auto ym = Eigen::Map<nn::Matrix>(y.data(), M, K);
+  nn::MatMul::Forward(x1m, x2m, ym);
 
-  std::vector<float> expected_y = {1.033869, 0.275703,  0.364816, 0.123444,
-                                   0.565156, -0.005050, 1.014951, 0.552350};
+  std::vector<float> expected_y = {0.556428, -0.253943, 1.119845, -1.617147,
+                                   3.693071, -3.965338, 0.837917, 0.722053};
   for (size_t i = 0; i < expected_y.size(); ++i) {
     EXPECT_NEAR(expected_y[i], y[i], 1e-5);
   }
 
   // backward
   std::vector<float> y_grad(y.size(), 1.0);
-  std::vector<float> x_grad(x.size(), 0.0), w_grad(w.size(), 0.0);
-  auto y_gradm = Eigen::Map<nn::Matrix>(y_grad.data(), B, out_features);
-  auto x_gradm = Eigen::Map<nn::Matrix>(x_grad.data(), B, in_features);
-  auto w_gradm =
-      Eigen::Map<nn::Matrix>(w_grad.data(), out_features, in_features);
-  nn::MatMul::Backward(xm, wm, y_gradm, x_gradm, w_gradm);
+  std::vector<float> x1_grad(x1.size(), 0.0), x2_grad(x2.size(), 0.0);
+  auto y_gradm = Eigen::Map<nn::Matrix>(y_grad.data(), M, K);
+  auto x1_gradm = Eigen::Map<nn::Matrix>(x1_grad.data(), M, N);
+  auto x2_gradm = Eigen::Map<nn::Matrix>(x2_grad.data(), N, K);
+  nn::MatMul::Backward(x1m, x2m, y_gradm, x1_gradm, x2_gradm);
 
-  std::vector<float> expected_w_grad = {3.267881, 1.874520, -4.717285,
-                                        3.267881, 1.874520, -4.717285};
-  std::vector<float> expected_x_grad = {
-      0.971767, 0.352706, -0.018753, 0.971767, 0.352706, -0.018753,
-      0.971767, 0.352706, -0.018753, 0.971767, 0.352706, -0.018753};
+  std::vector<float> expected_x1_grad = {
+      -0.579509, -0.030988, 2.139325, -0.579509, -0.030988, 2.139325,
+      -0.579509, -0.030988, 2.139325, -0.579509, -0.030988, 2.139325};
+  std::vector<float> expected_x2_grad = {3.042576,  3.042576, -1.097139,
+                                         -1.097139, 1.319149, 1.319149};
 
-  for (size_t i = 0; i < expected_x_grad.size(); ++i) {
-    EXPECT_NEAR(expected_x_grad[i], x_grad[i], 1e-5);
+  for (size_t i = 0; i < expected_x1_grad.size(); ++i) {
+    EXPECT_NEAR(expected_x1_grad[i], x1_grad[i], 1e-5);
   }
-  for (size_t i = 0; i < expected_w_grad.size(); ++i) {
-    EXPECT_NEAR(expected_w_grad[i], w_grad[i], 1e-5);
+  for (size_t i = 0; i < expected_x2_grad.size(); ++i) {
+    EXPECT_NEAR(expected_x2_grad[i], x2_grad[i], 1e-5);
   }
 }
 

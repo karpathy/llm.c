@@ -43,41 +43,66 @@ inline Eigen::Map<Matrix> GetMatrixMap(Matrix& m) {
 }
 
 struct MatMul {
-  static void Forward(const Eigen::Map<Matrix>& x, const Eigen::Map<Matrix>& w,
-                      Eigen::Map<Matrix>& y) {
-    // x: [B, in_features], w: [out_features, in_features], y: [B, out_features]
-    CHECK_EQ(x.rows(), y.rows());  // B
-    CHECK_EQ(x.cols(), w.cols());  // in_features
-    CHECK_EQ(w.rows(), y.cols());  // out_features
+  static void Forward(const Eigen::Map<Matrix>& x1,
+                      const Eigen::Map<Matrix>& x2, Eigen::Map<Matrix>& y) {
+    // x: [M, N], x2: [N, K], y: [M, K]
+    CHECK_EQ(x1.rows(), y.rows());
+    CHECK_EQ(x1.cols(), x2.rows());
+    CHECK_EQ(x2.cols(), y.cols());
 
-    // y = x * w^T
-    y.noalias() = x * w.transpose();
+    // y = x1 * x2
+    y.noalias() = x1 * x2;
   }
 
-  static void Backward(const Eigen::Map<Matrix>& x, const Eigen::Map<Matrix>& w,
+  static void Backward(const Eigen::Map<Matrix>& x1,
+                       const Eigen::Map<Matrix>& x2,
                        const Eigen::Map<Matrix>& y_grad,
-                       Eigen::Map<Matrix>& x_grad, Eigen::Map<Matrix>& w_grad) {
+                       Eigen::Map<Matrix>& x1_grad,
+                       Eigen::Map<Matrix>& x2_grad) {
     // input:
-    // x: [B, in_features], w:[out_features, in_features]
-    // y_grad: [B, out_features]
+    // x1: [M, N], x2:[N, K]
+    // y_grad: [M, K]
     //
     // output:
-    // x_grad: [B, in_features], w_grad: [out_features, in_features]
-    CHECK(x.rows() == y_grad.rows() && x.rows() == x_grad.rows());  // B
-    CHECK(x.cols() == w.cols() && x.cols() == x_grad.cols() &&
-          x.cols() == w_grad.cols());  // in_features
-    CHECK(w.rows() == y_grad.cols() &&
-          w.rows() == w_grad.rows());  // out_features
+    // x1_grad: [M, N], x2_grad: [N, K]
+    int M = x1.rows(), N = x1.cols(), K = x2.cols();
+    CHECK(M == y_grad.rows() && M == x1_grad.rows());
+    CHECK(N == x2.rows() && N == x1_grad.cols() && N == x2_grad.rows());
+    CHECK(K == y_grad.cols() && K == x2_grad.cols());
 
-    // x_grad = dL/dy * dy/dx
-    //        = y_grad(B, out_features) * W(out_features, in_features)
-    //        = [B, in_features]
-    x_grad.noalias() += y_grad * w;
+    // x1_grad = dL/dy * dy/dx1
+    //        = y_grad(M, K) * x2^T (K, N)
+    //        = [M, N]
+    x1_grad.noalias() += y_grad * x2.transpose();
 
-    // w_grad = dL/dy * dy/dw
-    //        = y_grad^T(out_features, B) * x(B, in_features)
-    //        = [out_features, in_features]
-    w_grad.noalias() += y_grad.transpose() * x;
+    // x2_grad = dL/dy * dy/dx2
+    //        = x1^T(N, M) * y_grad(M, K)
+    //        = [N, K]
+    x2_grad.noalias() += x1.transpose() * y_grad;
+  }
+};
+
+struct Residual {
+  static void Forward(absl::Span<const float> x, absl::Span<const float> Fx,
+                      absl::Span<float> Hx) {
+    int N = x.size();
+    CHECK(N == Fx.size() && N == Hx.size());
+
+    // H(x) = x + F(x) -> F(x) = H(x) - x
+    for (int i = 0; i < N; ++i) {
+      Hx[i] = x[i] + Fx[i];
+    }
+  }
+
+  static void Backward(absl::Span<const float> Hx_grad,
+                       absl::Span<float> x_grad, absl::Span<float> Fx_grad) {
+    int N = Hx_grad.size();
+    CHECK(N == x_grad.size() && N == Fx_grad.size());
+
+    for (int i = 0; i < N; ++i) {
+      x_grad[i] += Hx_grad[i];
+      Fx_grad[i] = Hx_grad[i];
+    }
   }
 };
 
