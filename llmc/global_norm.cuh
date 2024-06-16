@@ -48,6 +48,23 @@ __global__ void global_norm_aggregate_kernel(float* out, size_t grid_size) {
 // ----------------------------------------------------------------------------
 // kernel launcher
 
+// Helper function determines the maximum number of block sums
+int get_max_num_block_sums(int* num_slices_all, int numel) {
+    // NOTE: this needs to be kept in sync with `global_norm_squared` below.
+    const int block_size = 512;
+    const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
+    assert(grid_size > 0);
+    int max_num_block_sums = 0;
+    for (int i = 0; i < numel; i++) {
+        int num_slices = num_slices_all[i];
+        const int gx = CEIL_DIV(grid_size, num_slices);
+        const int gy = num_slices;
+        max_num_block_sums = max(max_num_block_sums, gx * gy);
+    }
+
+    return max_num_block_sums;
+}
+
 template<typename T>
 void global_norm_squared(float* out, const T* values, size_t count, ptrdiff_t stride, int num_slices, int max_num_block_sums, bool reset, cudaStream_t stream) {
     const int block_size = 512;
@@ -76,20 +93,4 @@ void global_norm_squared_aggregate(float* out, int max_num_block_sums, cudaStrea
     // important to use 1024 here for determinism, otherwise blockreduce might introduce errors
     global_norm_aggregate_kernel<<<1, 1024, 0, stream>>>(out, max_num_block_sums);
     cudaCheck(cudaGetLastError());
-}
-
-// Helper function determines the maximum number of block sums
-int get_max_num_block_sums(int* num_slices_all, int numel) {
-    const int block_size = 512;
-    const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
-    assert(grid_size > 0);
-    int max_num_block_sums = 0;
-    for (int i = 0; i < numel; i++) {
-        int num_slices = num_slices_all[i];
-        const int gx = CEIL_DIV(grid_size, num_slices);
-        const int gy = num_slices;
-        max_num_block_sums = max(max_num_block_sums, gx * gy);
-    }
-
-    return max_num_block_sums;
 }
