@@ -290,7 +290,7 @@ __global__ void layernorm_forward_kernel5(float* __restrict__ out, float* __rest
     int num_warps = blockDim.x / 32;
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
-    int idx = blockIdx.x; // simpoy one block per row
+    int idx = blockIdx.x; // simply one block per row
     // the row of input that this group of threads is responsible for
     const float* x = inp + idx * C;
     // thread coarsening through the row, reduce the sum in series
@@ -356,9 +356,9 @@ void layernorm_forward2(float* out, float* mean, float* rstd,
                        const int block_size) {
     int N = B * T;
     // in mean and rstd, threads cooperate within blocks via reductions
-    mean_kernel<<<B * T, block_size, block_size * sizeof(float)>>>(mean, inp, N, C, block_size);
+    mean_kernel<<<N, block_size, block_size * sizeof(float)>>>(mean, inp, N, C, block_size);
     cudaCheck(cudaGetLastError());
-    rstd_kernel<<<B * T, block_size, block_size * sizeof(float)>>>(rstd, inp, mean, N, C, block_size);
+    rstd_kernel<<<N, block_size, block_size * sizeof(float)>>>(rstd, inp, mean, N, C, block_size);
     cudaCheck(cudaGetLastError());
     // in the normalization, everything just gets flattened out
     const int block_size2 = 256;
@@ -394,6 +394,7 @@ void layernorm_forward5(float* out, float* mean, float* rstd,
                        int B, int T, int C,
                        const int block_size) {
     assert(block_size % 32 == 0);
+    assert(block_size <= 1024);
     const int N = B * T;
     const int grid_size = N;
     layernorm_forward_kernel5<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
@@ -473,9 +474,6 @@ int main(int argc, char **argv) {
     printf("Using kernel %d\n", kernel_num);
 
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
-    float* out_gpu = (float*)malloc(B * T * C * sizeof(float));
-    float* mean_gpu = (float*)malloc(B * T * sizeof(float));
-    float* rstd_gpu = (float*)malloc(B * T * sizeof(float));
 
     layernorm_forward_cpu(out, mean, rstd, inp, weight, bias, B, T, C);
 
