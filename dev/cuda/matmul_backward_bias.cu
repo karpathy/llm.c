@@ -2,7 +2,7 @@
 Kernels for matmul backward pass bias only.
 
 Compile example:
-nvcc -O3 -lcublas -lcublasLt matmul_backward_bias.cu -lineinfo -o matmul_backward_bias
+nvcc -O3 -lcublas -lcublasLt -std=c++17 matmul_backward_bias.cu -lineinfo -o matmul_backward_bias
 
 ./matmul_backward_bias 1
 ./matmul_backward_bias 2
@@ -116,7 +116,7 @@ __global__ void matmul_backward_bias_kernel2(floatX* dbias, const floatX* dout, 
     sum = cg::reduce(warp, sum, cg::plus<float>{});
     // write the result to output (global memory)
     if(warp.thread_rank() == 0) {
-        dbias[idx] += (floatX)sum;
+        dbias[idx] = (float)dbias[idx] + sum;
     }
 }
 
@@ -149,7 +149,7 @@ __global__ void matmul_backward_bias_kernel3(floatX* dbias, const floatX* dout, 
     float block_sum = cg::reduce(warp, warp_sum, cg::plus<float>{}); // sum(x)
     // write the result to output (global memory)
     if(threadIdx.x == 0) {
-        dbias[idx] += block_sum;
+        dbias[idx] = (float)dbias[idx] + block_sum;
     }
 }
 
@@ -189,7 +189,7 @@ __global__ void matmul_backward_bias_kernel4(floatX* dbias, const floatX* dout, 
         for (int j = 0; j < vstep; j++) {
             dout_sum += smem[lane_id + j * warpSize];
         }
-        dbias[tl + lane_id] += dout_sum;
+        dbias[tl + lane_id] = (float)dbias[tl + lane_id] + dout_sum;
     }
 }
 
