@@ -108,7 +108,7 @@ __global__ void wte_backward_kernel(floatX* dwte,
     // Add the result to dwte and write back to global memory (read-modify-write)
     for (unsigned int k = 0; k < x128::size; k++) {
         // We use stochastic rounding to go from FP32 to BF16 but the seed should be deterministic
-        stochastic_rounding(accum[k] + (float)packed_in_out[k], &packed_in_out[k], seed + k);
+        stochastic_rounding(accum[k] + (float)packed_in_out[k], &packed_in_out[k], seed + bucket * WARP_SIZE + threadIdx.x + k);
     }
     store128(dwte_ix, packed_in_out);
 }
@@ -140,7 +140,7 @@ __global__ void wpe_backward_kernel(floatX* dwpe,
     x128 packed_dwpe = load128(dwpe_tc);
     for (unsigned int k = 0; k < x128::size; k++) {
         // We use stochastic rounding to go from FP32 to BF16 but the seed should be deterministic
-        stochastic_rounding(accum[k] + (float)packed_dwpe[k], &packed_dwpe[k], seed + k);
+        stochastic_rounding(accum[k] + (float)packed_dwpe[k], &packed_dwpe[k], seed + idx + k);
     }
     store128(dwpe_tc, packed_dwpe);
 }
