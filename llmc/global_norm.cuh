@@ -48,8 +48,25 @@ __global__ void global_norm_aggregate_kernel(float* out, size_t grid_size) {
 // ----------------------------------------------------------------------------
 // kernel launcher
 
+// Helper function determines the maximum number of block sums
+int get_max_num_block_sums(int* num_slices_all, int numel) {
+    // NOTE: this needs to be kept in sync with `global_norm_squared` below.
+    const int block_size = 512;
+    const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
+    assert(grid_size > 0);
+    int max_num_block_sums = 0;
+    for (int i = 0; i < numel; i++) {
+        int num_slices = num_slices_all[i];
+        const int gx = CEIL_DIV(grid_size, num_slices);
+        const int gy = num_slices;
+        max_num_block_sums = max(max_num_block_sums, gx * gy);
+    }
+
+    return max_num_block_sums;
+}
+
 template<typename T>
-void global_norm_squared(float* out, const T* values, size_t count, ptrdiff_t stride, int num_slices, bool reset, cudaStream_t stream) {
+void global_norm_squared(float* out, const T* values, size_t count, ptrdiff_t stride, int num_slices, int max_num_block_sums, bool reset, cudaStream_t stream) {
     const int block_size = 512;
     // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
     // having one block less than possible is a tiny performance hit, having
@@ -58,24 +75,22 @@ void global_norm_squared(float* out, const T* values, size_t count, ptrdiff_t st
     // on all gpus, so the division really is going to be exact.
     const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
     assert(grid_size > 0);      // gives a better error than letting the call below fail
-    assert(grid_size < 1024);  // we want to later accumulate the block sums in a single block
-    // if not the case we have to find the biggest gx*gy and pass that into `global_norm_squared_aggregate`
-    assert(grid_size % num_slices == 0);
 
     const int gx = CEIL_DIV(grid_size, num_slices);
     const int gy = num_slices;
 
+    assert(gx * gy < 1024);  // we want to later accumulate the block sums in a single block
+
     if (reset) {
-        cudaCheck(cudaMemsetAsync(out, 0, gx * gy * sizeof(float), stream));
+        cudaCheck(cudaMemsetAsync(out, 0, max_num_block_sums * sizeof(float), stream));
     }
     global_norm_squared_kernel<<<dim3(gx, gy), block_size, 0, stream>>>(out, values, count, stride);
     cudaCheck(cudaGetLastError());
 }
 
-void global_norm_squared_aggregate(float* out, cudaStream_t stream) {
-    const int block_size = 512;
-    const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
-    assert(grid_size > 0 && grid_size < 1024);  // we need to accumulate the block sums in a single block
-    global_norm_aggregate_kernel<<<1, 1024, 0, stream>>>(out, grid_size);
+void global_norm_squared_aggregate(float* out, int max_num_block_sums, cudaStream_t stream) {
+    assert(max_num_block_sums > 0 && max_num_block_sums < 1024);  // we need to accumulate the block sums in a single block
+    // important to use 1024 here for determinism, otherwise blockreduce might introduce errors
+    global_norm_aggregate_kernel<<<1, 1024, 0, stream>>>(out, max_num_block_sums);
     cudaCheck(cudaGetLastError());
 }
