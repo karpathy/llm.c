@@ -1009,10 +1009,12 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     float grad_scale = (grad_norm_cpu > grad_clip) ? grad_clip / grad_norm_cpu : 1.0f;
 
     // AdamW update
-    unsigned int seed = random_u32(&model->rng_state);
 
     // handle adamw for all the transformer blocks
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        // generate a unique seed for each tensor
+        unsigned int seed = random_u32(&model->rng_state);
+
         int num_layers = model->config.num_layers;
         if((i < 2 || i > 13)) {
             num_layers = 1;
