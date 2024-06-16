@@ -970,6 +970,8 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     float* grad_norm_squared = (float*)model->acts.output;
     float grad_norm_squared_cpu = 0.0f;
 
+    int num_slices[2] = {1, model->config.num_layers};
+    int max_num_block_sums = get_max_num_block_sums(num_slices, 2);
     if (multi_gpu_config->zero_stage == 1) {
         // because of the ncclReduceScatter() in backward,
         // grads_memory only contains the averaged gradients at the local shards,
@@ -979,24 +981,24 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
                 ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
                 ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
                 ptrdiff_t offset = tensor.offset + shard.offset;
-                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, 0, 1, i == 0, main_stream);
+                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, 0, 1, max_num_block_sums, i == 0, main_stream);
             } else {
                 ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
                 ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
                 ptrdiff_t offset = tensor.offset + shard.offset;
                 global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, tensor.size, model->config.num_layers,
-                                    false, main_stream);
+                                    max_num_block_sums, false, main_stream);
             }
         }
-        global_norm_squared_aggregate(grad_norm_squared, main_stream);
+        global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
         cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
         // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
         grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
     } else {
         // in regular DDP, backward has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
-        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, 0, 1, true, main_stream);
-        global_norm_squared_aggregate(grad_norm_squared, main_stream);
+        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, 0, 1, max_num_block_sums, true, main_stream);
+        global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
         cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
     }
 
