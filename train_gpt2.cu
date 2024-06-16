@@ -974,13 +974,12 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         // because of the ncclReduceScatter() in backward,
         // grads_memory only contains the averaged gradients at the local shards,
         // so we only calculate the grad norm at the grads_memory belonging to the local shards
-        cudaCheck(cudaMemsetAsync(grad_norm_squared, 0, sizeof(float), main_stream));
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
             if((i < 2 || i > 13)) {
                 ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
                 ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
                 ptrdiff_t offset = tensor.offset + shard.offset;
-                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, 0, 1, false, main_stream);
+                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, 0, 1, i == 0, main_stream);
             } else {
                 ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
                 ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
@@ -989,6 +988,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
                                     false, main_stream);
             }
         }
+        global_norm_squared_aggregate(grad_norm_squared, main_stream);
         cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
         // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
         grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
@@ -996,6 +996,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         // in regular DDP, backward has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
         global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, 0, 1, true, main_stream);
+        global_norm_squared_aggregate(grad_norm_squared, main_stream);
         cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
     }
 
@@ -1175,6 +1176,7 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     state_header[1] = 1; // version number
     state_header[2] = multi_gpu_config.num_processes; // number of processes
     state_header[3] = multi_gpu_config.process_rank; // rank of this process
+    state_header[4] = model->use_master_weights;  // whether we're using fp32 master weights
     // int main state, start at 10 to leave some padding
     state_header[10] = step; // step of the optimization
     // model state, state, start at 20 to leave some padding
@@ -1190,6 +1192,10 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     cudaCheck(cudaMemcpy(cpu_buffer, model->v_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    if (model->use_master_weights == 1) {
+        cudaCheck(cudaMemcpy(cpu_buffer, model->master_weights, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
+        fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    }
     free(cpu_buffer);
     fclose(state_file);
 }
@@ -1216,11 +1222,19 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
         cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
     }
+    if (state_header[4] == 1 && model->master_weights == NULL) {
+        printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
+        cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
+    }
     float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     cudaCheck(cudaMemcpy(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     cudaCheck(cudaMemcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+    if (state_header[4] == 1) {  // if we used master weights during the state save
+        freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+        cudaCheck(cudaMemcpy(model->master_weights, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+    }
     free(cpu_buffer);
     fclose(state_file);
 }
