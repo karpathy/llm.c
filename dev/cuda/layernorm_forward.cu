@@ -179,10 +179,9 @@ __global__ void normalization_kernel(float* out, const float* inp, float* mean, 
     out[idx] = o;
 }
 
-__global__ void layernorm_forward_kernel3(
-    float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
-    const float* __restrict__ inp, const float* __restrict__ weight,
-    const float* __restrict__ bias, int N, int C) {
+__global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+                                    const float*  __restrict__ inp, const float*  __restrict__ weight,
+                                    const float* __restrict__ bias, int N, int C) {
     int warpsPerBlock = blockDim.x / warpSize;
     int warpId = threadIdx.x / warpSize;
     int laneId = threadIdx.x % warpSize;
@@ -230,10 +229,9 @@ __global__ void layernorm_forward_kernel3(
 }
 
 // same as kernel 3 but uses var(x) == mean(x**2) - mean(x)**2
-__global__ void layernorm_forward_kernel4(
-    float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
-    const float* __restrict__ inp, const float* __restrict__ weight,
-    const float* __restrict__ bias, int N, int C) {
+__global__ void layernorm_forward_kernel4(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+                                    const float*  __restrict__ inp, const float*  __restrict__ weight,
+                                    const float* __restrict__ bias, int N, int C) {
     int warpsPerBlock = blockDim.x / warpSize;
     int warpId = threadIdx.x / warpSize;
     int laneId = threadIdx.x % warpSize;
@@ -336,11 +334,9 @@ __global__ void layernorm_forward_kernel5(float* __restrict__ out, float* __rest
 // similar to kernel4, plus using smem to temporaily store input data
 // due to the smem limit, this kernel cannot handle block size > 512 (with fixed C 768 and warp size 32)
 // not so much modification, but decently improve bandwidth
-__global__ void __launch_bounds__(512) layernorm_forward_kernel6(float* __restrict__ out, float* __restrict__ mean,
-                              float* __restrict__ rstd,
-                              const float* __restrict__ inp,
-                              const float* __restrict__ weight,
-                              const float* __restrict__ bias, int N, int C) {
+__global__ void __launch_bounds__(512) layernorm_forward_kernel6(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+                                    const float*  __restrict__ inp, const float*  __restrict__ weight,
+                                    const float* __restrict__ bias, int N, int C) {
     float eps = 1e-5f;
     extern __shared__ float xShared[];
     int warpsPerBlock = blockDim.x / warpSize;
