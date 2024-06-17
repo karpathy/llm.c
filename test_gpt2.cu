@@ -227,7 +227,7 @@ int main(int argc, char *argv[]) {
             }
 
             // move the (mixed precision) grads from GPU to CPU
-            cudaMemcpy(grads_memory_cpu, model.grads_memory, model.num_parameters_bytes, cudaMemcpyDeviceToHost);
+            cudaCheck(cudaMemcpy(grads_memory_cpu, model.grads_memory, model.num_parameters_bytes, cudaMemcpyDeviceToHost));
 
             // convert all gradients to float on the CPU
             char* src_iterator = (char*)grads_memory_cpu; // can be lower precision, so we use char*
