@@ -1,4 +1,12 @@
-#include "llmc/cuda_common.h"
+/*
+Tests device <-> file IO functions
+
+compile and run as (from dev/test directory)
+nvcc -o device_file_io device_file_io.cu && ./device_file_io
+*/
+
+
+#include "../../llmc/cuda_common.h"
 #include <vector>
 #include <random>
 #include <algorithm>
