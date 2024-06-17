@@ -4,11 +4,14 @@ Tests our DataLoader
 compile and run as (from dev/test directory)
 gcc -O3 -I../../llmc -o test_dataloader test_dataloader.c -lm && ./test_dataloader
 
+TODOs:
+- test load/save state of DataLoader
 */
 
 #include "../../llmc/dataloader.h"
 
-char shard_name[64];
+#define SHARD_NAME_LEN 64
+char shard_name[SHARD_NAME_LEN];
 int num_tokens = 140;
 int num_shards = 4;
 
@@ -59,7 +62,7 @@ void test_simple(void) {
     int process_rank = 0;
     int num_processes = 1;
     int should_shuffle = 0;
-    snprintf(shard_name, 64, "shard_????.bin");
+    snprintf(shard_name, SHARD_NAME_LEN, "shard_????.bin");
     DataLoader loader;
     dataloader_init(&loader, shard_name, B, T, process_rank, num_processes, should_shuffle);
 
@@ -93,7 +96,7 @@ void test_multiprocess_simple(void) {
     int T = 8;
     int num_processes = 2;
     int should_shuffle = 0;
-    snprintf(shard_name, 64, "shard_????.bin");
+    snprintf(shard_name, SHARD_NAME_LEN, "shard_????.bin");
     DataLoader loader0, loader1;
     dataloader_init(&loader0, shard_name, B, T, 0, num_processes, should_shuffle);
     dataloader_init(&loader1, shard_name, B, T, 1, num_processes, should_shuffle);
@@ -203,7 +206,7 @@ void test_multiprocess_shuffled(void) {
     int T = 8;
     int num_processes = 2;
     int should_shuffle = 0;
-    snprintf(shard_name, 64, "shard_????.bin");
+    snprintf(shard_name, SHARD_NAME_LEN, "shard_????.bin");
     DataLoader loaders[num_processes];
     for (int i = 0; i < num_processes; i++) {
         dataloader_init(&loaders[i], shard_name, B, T, i, num_processes, should_shuffle);
@@ -273,7 +276,7 @@ int main(void) {
             tokens[i] = token_offset + i;
         }
         // write the shard
-        snprintf(shard_name, 64, "shard_%04d.bin", shard_id);
+        snprintf(shard_name, SHARD_NAME_LEN, "shard_%04d.bin", shard_id);
         header[0] = 20240520; // magic
         header[1] = 1; // version
         header[2] = num_tokens; // number of tokens within
@@ -291,7 +294,7 @@ int main(void) {
 
     // clean up the shards
     for (int shard_id = 0; shard_id < num_shards; shard_id++) {
-        snprintf(shard_name, 64, "shard_%04d.bin", shard_id);
+        snprintf(shard_name, SHARD_NAME_LEN, "shard_%04d.bin", shard_id);
         remove(shard_name);
     }
 
