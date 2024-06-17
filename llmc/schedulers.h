@@ -25,6 +25,11 @@ typedef struct {
     int step_size;
 } CyclicTriangularLearningRateScheduler;
 
+// Constant learning rate scheduler
+typedef struct {
+    float learning_rate;
+} ConstantLearningRateScheduler;
+
 //
 // Learning rate scheduler functions
 //
@@ -47,10 +52,15 @@ float get_learning_rate_cosine(CosineLearningRateScheduler *scheduler, int step)
 
 // cyclic triangular learning rate schedule: linearly increase LR from min LR to max LR, then linearly decrease LR to min LR (repeat)
 float get_learning_rate_triangular(CyclicTriangularLearningRateScheduler *scheduler, int step) {
-    int cycle = 1 + step / (2 * scheduler->step_size);
-    float x = fabsf((float)step / scheduler->step_size - 2 * cycle + 1);
+    int cycle_index = 1 + step / (2 * scheduler->step_size);  // tells us which cycle we are in, starting at 1
+    float x = fabsf((float)step / scheduler->step_size - 2 * cycle_index + 1);  // goes from 0 to 1 to 0
     float lr = scheduler->min_lr + (scheduler->max_lr - scheduler->min_lr) * fmaxf(0, (1 - x));
     return lr;
+}
+
+// constant learning rate schedule
+float get_learning_rate_constant(ConstantLearningRateScheduler *scheduler, int step) {
+    return scheduler->learning_rate;
 }
 
 //
@@ -68,6 +78,10 @@ void lr_scheduler_init_triangular(CyclicTriangularLearningRateScheduler *schedul
     scheduler->min_lr = min_lr;
     scheduler->max_lr = max_lr;
     scheduler->step_size = step_size;
+}
+
+void lr_scheduler_init_constant(ConstantLearningRateScheduler *scheduler, float learning_rate) {
+    scheduler->learning_rate = learning_rate;
 }
 
 #endif // SCHEDULERS_H
