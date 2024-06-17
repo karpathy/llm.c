@@ -1,7 +1,6 @@
-
-
-// Cosine learning rate scheduler
-
+/*
+Implements various learning rate schedulers.
+*/
 #ifndef SCHEDULERS_H
 
 #define SCHEDULERS_H
@@ -15,7 +14,6 @@ typedef struct {
     int train_num_batches;
     float final_learning_rate_frac;
 } CosineLearningRateScheduler;
-
 
 // learning rate schedule: warmup linearly to max LR, then cosine decay to LR * final_learning_rate_frac
 float get_learning_rate(CosineLearningRateScheduler *scheduler, int step) {
