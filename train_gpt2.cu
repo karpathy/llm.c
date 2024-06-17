@@ -1201,6 +1201,7 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
         fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     }
     free(cpu_buffer);
+
     if (loader->should_shuffle) {
         fwrite(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);  // number of shards
         fwrite(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
@@ -1219,7 +1220,8 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     assert(state_header[1] == 1); // version number
     assert(state_header[2] == multi_gpu_config.num_processes); // number of processes
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
-    int should_shuffle = state_header[4]; // shuffle state of the dataloader
+    int use_master_weights = state_header[4];  // whether we're using fp32 master weights
+    int should_shuffle = state_header[5]; // shuffle state of the dataloader
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
     size_t current_shard_idx = *((size_t*)&state_header[30]); // shard index
@@ -1234,7 +1236,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
         cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
     }
-    if (state_header[4] == 1 && model->master_weights == NULL) {
+    if (use_master_weights == 1 && model->master_weights == NULL) {
         printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
         cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
     }
@@ -1243,7 +1245,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     cudaCheck(cudaMemcpy(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     cudaCheck(cudaMemcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
-    if (state_header[4] == 1) {  // if we used master weights during the state save
+    if (use_master_weights == 1) {  // if we used master weights during the state save
         freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
         cudaCheck(cudaMemcpy(model->master_weights, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     }
