@@ -802,6 +802,11 @@ if __name__ == "__main__":
                 or (args.overfit_single_batch and step == 0 and micro_step == 0):
                 x, y = train_loader.next_batch()
                 x, y = x.to(device), y.to(device)
+            if ddp:
+                # we want only the last micro-step to sync grads in a DDP model
+                # the official way to do this is with model.no_sync(), but that is a
+                # context manager that bloats the code, so we just toggle this variable
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             # forward pass
             with ctx:
                 _, loss = model(x, y, return_logits=False)
@@ -812,11 +817,6 @@ if __name__ == "__main__":
                 loss = loss / grad_accum_steps
                 lossf += loss.detach() # keep track of the mean loss
             # backward pass
-            if ddp:
-                # we want only the last micro-step to sync grads in a DDP model
-                # the official way to do this is with model.no_sync(), but that is a
-                # context manager that bloats the code, so we just toggle this variable
-                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             if not args.inference_only:
                 loss.backward()
         if ddp:
