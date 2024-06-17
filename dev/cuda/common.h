@@ -18,7 +18,6 @@ __device__ float warpReduceSum(float val) {
     return val;
 }
 
-
 // ----------------------------------------------------------------------------
 // checking utils
 
