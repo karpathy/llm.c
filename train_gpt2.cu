@@ -350,6 +350,7 @@ void gpt2_init_common(GPT2 *model) {
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f designates no loss, set at end of forward()
+    model->params_memory = NULL;
     // memory lazily initialized in backward()
     model->grads_memory = NULL;
     model->workload_indices = NULL; // on cpu, for encoder_backward
@@ -444,6 +445,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     }
 
     // create memory for model parameters on the device
+    assert(model->params_memory == nullptr && "Old model needs to be freed before loading from checkpoint again");
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 
     // read in all the parameters from file and copy them to device
@@ -453,7 +455,6 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     free(params_memory_cpu);
     fcloseCheck(model_file);
 
-    gpt2_init_common(model);
     // only return from this function once we are certain the params are ready on the GPU
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -543,8 +544,6 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     // copy them to GPU
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     free(params_memory_cpu);
-
-    gpt2_init_common(model);
 }
 
 void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, size_t T, int grad_accum_steps=1) {
@@ -1105,14 +1104,14 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
 }
 
 void gpt2_free(GPT2 *model) {
-    cudaCheck(cudaFree(model->params_memory));
-    cudaCheck(cudaFree(model->grads_memory));
-    cudaCheck(cudaFree(model->m_memory));
-    cudaCheck(cudaFree(model->v_memory));
-    cudaCheck(cudaFree(model->master_weights));
-    cudaCheck(cudaFree(model->acts_memory));
-    cudaCheck(cudaFree(model->inputs));
-    cudaCheck(cudaFree(model->targets));
+    cudaFreeCheck(&model->params_memory);
+    cudaFreeCheck(&model->grads_memory);
+    cudaFreeCheck(&model->m_memory);
+    cudaFreeCheck(&model->v_memory);
+    cudaFreeCheck(&model->master_weights);
+    cudaFreeCheck(&model->acts_memory);
+    cudaFreeCheck(&model->inputs);
+    cudaFreeCheck(&model->targets);
     cudaCheck(cudaFreeHost(model->cpu_losses));
     cudaCheck(cudaFreeHost(model->cpu_losses_fp32));
     free(model->workload_indices);
@@ -1160,13 +1159,6 @@ void common_free(GPT2 &model) {
     #endif
 }
 
-#ifndef TESTING
-// if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
-
-// ----------------------------------------------------------------------------
-// training resumption logic, very useful when jobs crash once in a while
-// the goal is that we can resume optimization from any checkpoint, bit-perfect
-// note that "state" refers to things not already saved in the model checkpoint file
 
 void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
     printf("Writing state to %s\n", filename);
@@ -1183,9 +1175,11 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     state_header[10] = step; // step of the optimization
     // model state, state, start at 20 to leave some padding
     *((unsigned long long*)&state_header[20]) = model->rng_state; // random number generator state
-    // dataloader state, start at 30 to leave some padding
+    // dataloader state, start at 30 to leave some padding. Testing currently doesn't have a dataloader
+#ifndef TESTING
     state_header[30] = loader->current_shard; // shard of the dataset
     *((int64_t*)&state_header[31]) = loader->current_position; // position in shard
+#endif
     fwrite(state_header, sizeof(int), 256, state_file);
     // write AdamW m, v, and master_weights here (they are all float)
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
@@ -1212,9 +1206,11 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
+#ifndef TESTING
     int current_shard = state_header[30]; // shard of the dataset
     int64_t current_position = *((int64_t*)&state_header[31]); // position in shard
     dataloader_resume(loader, current_shard, current_position);
+#endif
     // read AdamW m, v (they are all float)
     // also allocate the m, v memory in the model, if it does not yet exist
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
@@ -1240,6 +1236,15 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     free(cpu_buffer);
     fclose(state_file);
 }
+
+
+#ifndef TESTING
+// if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
+
+// ----------------------------------------------------------------------------
+// training resumption logic, very useful when jobs crash once in a while
+// the goal is that we can resume optimization from any checkpoint, bit-perfect
+// note that "state" refers to things not already saved in the model checkpoint file
 
 // ----------------------------------------------------------------------------
 // CLI, poor man's argparse
@@ -1414,6 +1419,7 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model
     GPT2 model;
+    gpt2_init_common(&model);
     // if load_filename is of the form "dX" where X is an integer (e.g. d12), then we build
     // a random model with the depth of the model specified by X (e.g. 12). otherwise interpret
     // this variable as a checkpoint filename, and load that checkpoint
