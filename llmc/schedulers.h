@@ -19,6 +19,14 @@ typedef struct {
     float final_learning_rate_frac;
 } CosineLearningRateScheduler;
 
+// Linear with warmup learning rate scheduler
+typedef struct {
+    float learning_rate;
+    int warmup_iterations;
+    int train_num_batches;
+    float final_learning_rate_frac;
+} LinearLearningRateScheduler;
+
 typedef struct {
     float min_lr;
     float max_lr;
@@ -50,6 +58,20 @@ float get_learning_rate_cosine(CosineLearningRateScheduler *scheduler, int step)
     return lr;
 }
 
+// linear warmup learning rate schedule: warmup linearly to max LR, then decay linearly to LR * final_learning_rate_frac
+float get_learning_rate_linear(LinearLearningRateScheduler *scheduler, int step) {
+    float lr = scheduler->learning_rate;
+    if (step < scheduler->warmup_iterations) {
+        lr = scheduler->learning_rate * ((float)(step + 1)) / scheduler->warmup_iterations;
+    } else {
+        float decay_ratio = ((float)(step - scheduler->warmup_iterations)) / (scheduler->train_num_batches - scheduler->warmup_iterations);
+        assert(0.0f <= decay_ratio && decay_ratio <= 1.0f);
+        float min_lr = scheduler->learning_rate * scheduler->final_learning_rate_frac;
+        lr = scheduler->learning_rate - decay_ratio * (scheduler->learning_rate - min_lr);
+    }
+    return lr;
+}
+
 // cyclic triangular learning rate schedule: linearly increase LR from min LR to max LR, then linearly decrease LR to min LR (repeat)
 float get_learning_rate_triangular(CyclicTriangularLearningRateScheduler *scheduler, int step) {
     int cycle_index = 1 + step / (2 * scheduler->step_size);  // tells us which cycle we are in, starting at 1
@@ -68,6 +90,13 @@ float get_learning_rate_constant(ConstantLearningRateScheduler *scheduler, int s
 //
 
 void lr_scheduler_init_cosine(CosineLearningRateScheduler *scheduler, float learning_rate, int warmup_iterations, int train_num_batches, float final_learning_rate_frac) {
+    scheduler->learning_rate = learning_rate;
+    scheduler->warmup_iterations = warmup_iterations;
+    scheduler->train_num_batches = train_num_batches;
+    scheduler->final_learning_rate_frac = final_learning_rate_frac;
+}
+
+void lr_scheduler_init_linear(LinearLearningRateScheduler *scheduler, float learning_rate, int warmup_iterations, int train_num_batches, float final_learning_rate_frac) {
     scheduler->learning_rate = learning_rate;
     scheduler->warmup_iterations = warmup_iterations;
     scheduler->train_num_batches = train_num_batches;
