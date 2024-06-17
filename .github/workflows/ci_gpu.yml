@@ -31,19 +31,19 @@ jobs:
         run: python train_gpt2.py
 
       - name: Compile training and testing program
-        run: make test_gpt2cu train_gpt2cu test_gpt2fp32cu train_gpt2fp32cu 
+        run: make test_gpt2cu train_gpt2cu test_gpt2fp32cu train_gpt2fp32cu
 
       - name: Train model (With OpenMP)
         run: OMP_NUM_THREADS=8 ./train_gpt2cu
 
       - name: Train model (FP32) with gpt2_124M.bin
-        run: | 
+        run: |
           PRECISION=FP32 make train_gpt2cu
           ./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -e gpt2_124M.bin
-        
+
       - name: Build FP32 precision
         run: PRECISION=FP32 make test_gpt2cu profile_gpt2cu
-  
+
       - name: Run default
         run: ./test_gpt2cu
 
@@ -52,7 +52,7 @@ jobs:
 
       - name: Run recompute LN
         run: ./test_gpt2cu -r 2
-  
+
       - name: Build BF16 precision
         run: PRECISION=BF16 make train_gpt2cu test_gpt2cu profile_gpt2cu
 
@@ -67,18 +67,18 @@ jobs:
 
       - name: Run recompute LN
         run: ./test_gpt2cu -r 2
-        
+
       - name: Train model fp32 (With OpenMP)
         run: OMP_NUM_THREADS=8 ./train_gpt2fp32cu
 
       - name: Execute testing program (With OpenMP)
         run: OMP_NUM_THREADS=8 ./test_gpt2cu
-      
+
       - name: Execute testing program fp32 (With OpenMP)
         run: OMP_NUM_THREADS=8 ./test_gpt2fp32cu
 
       - name: Compile training and testing program without OpenMP
-        run: NO_OMP=1 make test_gpt2cu train_gpt2cu test_gpt2fp32cu train_gpt2fp32cu 
+        run: NO_OMP=1 make test_gpt2cu train_gpt2cu test_gpt2fp32cu train_gpt2fp32cu
 
       - name: Train model (No OpenMP)
         run: NO_OMP=1 ./train_gpt2cu
@@ -88,14 +88,14 @@ jobs:
 
       - name: Execute testing program (No OpenMP)
         run: ./test_gpt2cu -b 32
-      
+
       - name: Execute testing program fp32 (No OpenMP)
         run: ./test_gpt2fp32cu
 
       - name: Install cuDNN-frontend
-        run: 
+        run:
           git clone https://github.com/NVIDIA/cudnn-frontend.git
-      
+
       - name: Build with cuDNN
         run: USE_CUDNN=1 make test_gpt2cu train_gpt2cu test_gpt2fp32cu train_gpt2fp32cu
 

@@ -368,7 +368,7 @@ void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
 void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
-    assert(N % block_size == 0);
+    assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
     residual_forward_kernel<<<grid_size, block_size, 0, stream>>>(out, inp1, inp2);
     cudaCheck(cudaGetLastError());

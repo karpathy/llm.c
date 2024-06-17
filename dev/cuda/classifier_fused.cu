@@ -114,7 +114,7 @@ __device__ SoftmaxParams prepare_softmax(cg::thread_block_tile<32>& warp,
                                          int64_t idx, const float* inp, int V, int P) {
     // this warp (of 32) threads processes one row of inp, i.e. inp[idx, :] of shape (V,)
     // note that inp is actually (B * T, P) but we only use the first V elements
-    // this function tehen calculates:
+    // this function then calculates:
     // 1) the max value to subtract for numerical stability and
     // 2) the sum normalization factor
     const float* x = inp + idx * P;
@@ -680,8 +680,8 @@ int main(int argc, char **argv) {
     cudaCheck(cudaSetDevice(deviceIdx));
 
     // create host memory of random numbers
-    float* logits = make_random_float_01(B * T * V);
-    float* probs = (float*)malloc(B * T * V * sizeof(float));
+    float* logits = make_random_float(B * T * V);
+    float* probs = make_random_float_01(B * T * V);
     float* dlogits = (float*)malloc(B * T * V * sizeof(float));
     float* losses = (float*)malloc(B * T * sizeof(float));
     float* dlosses = make_random_float(B * T);
@@ -760,6 +760,7 @@ int main(int argc, char **argv) {
     free(losses);
     free(dlosses);
     free(targets);
+    free(outliers);
     cudaCheck(cudaFree(d_dlogits));
     cudaCheck(cudaFree(d_losses));
     cudaCheck(cudaFree(d_logits));
