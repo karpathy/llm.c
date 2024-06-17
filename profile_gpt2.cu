@@ -33,6 +33,7 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
+    gpt2_init_common(&model);
     gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
 
     int B = 24; // if program OOMs decrease this number, e.g. all the way down to 4 or etc

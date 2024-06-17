@@ -101,6 +101,7 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
+    gpt2_init_common(&model);
 
     gpt2_build_from_checkpoint(&model, load_filename);
     size_t V = model.config.vocab_size;
@@ -226,7 +227,7 @@ int main(int argc, char *argv[]) {
             }
 
             // move the (mixed precision) grads from GPU to CPU
-            cudaMemcpy(grads_memory_cpu, model.grads_memory, model.num_parameters_bytes, cudaMemcpyDeviceToHost);
+            cudaCheck(cudaMemcpy(grads_memory_cpu, model.grads_memory, model.num_parameters_bytes, cudaMemcpyDeviceToHost));
 
             // convert all gradients to float on the CPU
             char* src_iterator = (char*)grads_memory_cpu; // can be lower precision, so we use char*
@@ -312,10 +313,56 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // Finally, let's check determinism
+    gpt2_write_to_checkpoint(&model, "test_gpt2cu_model.ckpt");
+
+    DataLoader loader;
+    dataloader_init(&loader, "dev/data/tinyshakespeare/tiny_shakespeare_val.bin", B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 1);
+    dataloader_next_batch(&loader);
+    save_state("test_gpt2cu_state.ckpt", 10, &model, &loader);
+    int tokens[10];
+    for (int step = 0; step < 10; step++) {
+        gpt2_forward(&model, loader.inputs, loader.targets, B, T);
+        gpt2_zero_grad(&model);
+        gpt2_backward(&model, loader.inputs, true);
+        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
+        losses[step] = model.mean_loss;
+        tokens[step] = loader.inputs[0];
+        dataloader_next_batch(&loader);
+    }
+
+    // reload
+    gpt2_free(&model);
+    gpt2_build_from_checkpoint(&model, "test_gpt2cu_model.ckpt");
+    int ld_step;
+    load_state(&ld_step, &model, &loader, "test_gpt2cu_state.ckpt");
+    for (int step = 0; step < 10; step++) {
+        gpt2_forward(&model, loader.inputs, loader.targets, B, T);
+        gpt2_zero_grad(&model);
+        gpt2_backward(&model, loader.inputs, true);
+        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
+
+        if(loader.inputs[0] != tokens[step]) {
+            printf("Nondeterminism! Token mismatch at step %d: %d vs %d\n", step, tokens[step], loader.inputs[0]);
+            allok = false;
+            break;
+        }
+
+        if(losses[step] != model.mean_loss) {
+            printf("Nondeterminism! Loss mismatch at step %d: %.15f vs %.15f\n", step, losses[step], model.mean_loss);
+            allok = false;
+            break;
+        } else {
+            printf("loss ok at step %d: %f %f\n", step, losses[step], model.mean_loss);
+        }
+        dataloader_next_batch(&loader);
+    }
+
     // final approval
     printf("overall okay: %d\n", allok);
 
     // free everything
+    dataloader_free(&loader);
     gpt2_free(&model);
     common_free(model);
     free(x);
