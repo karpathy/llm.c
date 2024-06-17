@@ -101,6 +101,7 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
+    gpt2_init_common(&model);
 
     gpt2_build_from_checkpoint(&model, load_filename);
     size_t V = model.config.vocab_size;
@@ -304,11 +305,42 @@ int main(int argc, char *argv[]) {
 
     // compare
     for (int i = 0; i < 10; i++) {
-        if (fabsf(losses[i] - expected_losses[i]) >= loss_diff_threshold) {
+        if (fabsf(losses[i] - expected_losses[i]) < loss_diff_threshold && isfinite(losses[i])) {
+            printf("loss ok at step %d: %f %f\n", i+1, losses[i], expected_losses[i]);
+        } else {
             printf("LOSS MISMATCH AT STEP %d: %f %f\n", i+1, losses[i], expected_losses[i]);
             allok = 0;
+        }
+    }
+
+    // Finally, let's check determinism
+    gpt2_write_to_checkpoint(&model, "test_gpt2cu_model.ckpt");
+    save_state("test_gpt2cu_state.ckpt", 10, &model, nullptr);
+    for (int step = 10; step < 20; step++) {
+        gpt2_forward(&model, x, y, B, T);
+        gpt2_zero_grad(&model);
+        gpt2_backward(&model, x, true);
+        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+1, &multi_gpu_config);
+        losses[step - 10] = model.mean_loss;
+    }
+
+    // reload
+    gpt2_free(&model);
+    gpt2_build_from_checkpoint(&model, "test_gpt2cu_model.ckpt");
+    int ld_step;
+    load_state(&ld_step, &model, nullptr, "test_gpt2cu_state.ckpt");
+    for (int step = 10; step < 20; step++) {
+        gpt2_forward(&model, x, y, B, T);
+        gpt2_zero_grad(&model);
+        gpt2_backward(&model, x, true);
+        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+1, &multi_gpu_config);
+
+        if(losses[step-10] != model.mean_loss) {
+            printf("Nondeterminism! Loss mismatch at step %d: %.15f vs %.15f\n", step, losses[step-10], model.mean_loss);
+            allok = false;
+            break;
         } else {
-            printf("loss ok at step %d: %f %f\n", i+1, losses[i], expected_losses[i]);
+            printf("loss ok at step %d: %f %f\n", step, losses[step-10], model.mean_loss);
         }
     }
 
