@@ -99,7 +99,7 @@ int main(int argc, char **argv) {
     cudaCheck(cudaSetDevice(deviceIdx));
 
     // create host memory of random numbers
-    float* probs = make_random_float(B * T * V);
+    float* probs = make_random_float_01(B * T * V);
     int* targets = make_random_int(B * T, V);
     float* dlosses = make_random_float(B * T);
     float* dlogits = make_zeros_float(B * T * V);

@@ -98,7 +98,7 @@ void attention_forward_cpu(float* out, float* preatt, float* att,
                 float* att_bth = att + b*NH*T*T + h*T*T + t*T;
 
                 // pass 1: calculate query dot key and maxval
-                float maxval = -10000.0f; // TODO something better
+                float maxval = -FLT_MAX;
                 for (int t2 = 0; t2 <= t; t2++) {
                     const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
 
@@ -203,7 +203,7 @@ __global__ void attention_softmax_kernel1(float* att, const float* preatt,
         float* att_bth = att + b*NH*T*T + h*T*T + t*T;
 
         // find maxval
-        float maxval = -10000.0f; // TODO something better
+        float maxval = -FLT_MAX;
         for (int t2 = 0; t2 <= t; t2++) {
             if (preatt_bth[t2] > maxval) {
                 maxval = preatt_bth[t2];
