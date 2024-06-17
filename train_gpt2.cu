@@ -1550,7 +1550,7 @@ int main(int argc, char *argv[]) {
 
     // set up learning rate scheduler
     CosineLearningRateScheduler lr_scheduler;
-    lr_scheduler_init(&lr_scheduler, learning_rate, warmup_iterations, train_num_batches, final_learning_rate_frac);
+    lr_scheduler_init_cosine(&lr_scheduler, learning_rate, warmup_iterations, train_num_batches, final_learning_rate_frac);
 
     // some memory for generating samples from the model
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
@@ -1711,7 +1711,7 @@ int main(int argc, char *argv[]) {
         // average the loss and the gradients between all processes
         gpt2_multi_gpu_loss_reduce(&model, &multi_gpu_config);
         // fetch the next learning rate
-        float step_learning_rate = get_learning_rate(&lr_scheduler, step);
+        float step_learning_rate = get_learning_rate_cosine(&lr_scheduler, step);
         // update the model parameters
         float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
         // zero out the gradients for the next iteration
