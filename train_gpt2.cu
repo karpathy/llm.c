@@ -21,6 +21,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/dataloader.h"
 // defines: manual_seed, normal_ (same as torch.manual_seed and torch.normal)
 #include "llmc/rand.h"
+// defines learning rate schedulers
+#include "llmc/schedulers.h"
 // defines: sample_softmax, random_f32
 #include "llmc/sampler.h"
 // defines: logger_init, logger_log_eval, logger_log_val, logger_log_train
@@ -1546,6 +1548,10 @@ int main(int argc, char *argv[]) {
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
+    // set up learning rate scheduler
+    CosineLearningRateScheduler lr_scheduler;
+    lr_scheduler_init(&lr_scheduler, learning_rate, warmup_iterations, train_num_batches, final_learning_rate_frac);
+
     // some memory for generating samples from the model
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     floatX* cpu_logits_raw = (floatX*)mallocCheck(model.config.vocab_size * sizeof(floatX));
@@ -1704,18 +1710,8 @@ int main(int argc, char *argv[]) {
         model.mean_loss = lossf;
         // average the loss and the gradients between all processes
         gpt2_multi_gpu_loss_reduce(&model, &multi_gpu_config);
-        // learning rate schedule: warmup linearly to max LR, then cosine decay to LR * final_learning_rate_frac
-        float step_learning_rate = learning_rate;
-        if (step < warmup_iterations) {
-            step_learning_rate = learning_rate * ((float)(step + 1)) / warmup_iterations;
-        } else {
-            float decay_ratio = ((float)(step - warmup_iterations)) / (train_num_batches - warmup_iterations);
-            assert(0.0f <= decay_ratio && decay_ratio <= 1.0f);
-            float coeff = 0.5f * (1.0f + cosf(M_PI * decay_ratio)); // coeff starts at 1 and goes to 0
-            assert(0.0f <= coeff && coeff <= 1.0f);
-            float min_lr = learning_rate * final_learning_rate_frac;
-            step_learning_rate = min_lr + coeff * (learning_rate - min_lr);
-        }
+        // fetch the next learning rate
+        float step_learning_rate = get_learning_rate(&lr_scheduler, step);
         // update the model parameters
         float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
         // zero out the gradients for the next iteration
