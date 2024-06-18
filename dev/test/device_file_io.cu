@@ -9,9 +9,10 @@ nvcc -o device_file_io device_file_io.cu && ./device_file_io
 #include "../../llmc/cuda_common.h"
 #include <vector>
 #include <random>
+#include <cstdio>
 #include <algorithm>
 
-void test(size_t nelem, size_t wt_buf, size_t rd_buf) {
+void test(size_t nelem, size_t wt_buf_size, size_t rd_buf_size) {
 
     float* data;
     cudaCheck(cudaMalloc(&data, nelem*sizeof(float)));
@@ -28,7 +29,7 @@ void test(size_t nelem, size_t wt_buf, size_t rd_buf) {
     cudaStreamCreate(&stream);
 
     FILE* tmp = fopenCheck("tmp.bin", "w");
-    device_to_file(tmp, data, nelem * sizeof(float), wt_buf, stream);
+    device_to_file(tmp, data, nelem * sizeof(float), wt_buf_size, stream);
     fcloseCheck(tmp);
 
 
@@ -36,20 +37,22 @@ void test(size_t nelem, size_t wt_buf, size_t rd_buf) {
     cudaCheck(cudaMalloc(&reload, nelem*sizeof(float)));
 
     tmp  = fopenCheck("tmp.bin", "r");
-    file_to_device(reload, tmp, nelem * sizeof(float), rd_buf, stream);
+    file_to_device(reload, tmp, nelem * sizeof(float), rd_buf_size, stream);
     fcloseCheck(tmp);
 
     std::vector<float> cmp(nelem);
     cudaCheck(cudaMemcpy(cmp.data(), reload, nelem * sizeof(float), cudaMemcpyDeviceToHost));
     for(int i = 0; i < nelem; ++i) {
-        if(random_data[i]  != cmp[i])  {
+        if(random_data[i] != cmp[i])  {
             fprintf(stderr, "FAIL: Mismatch at position %d: %f vs %f\n", i, random_data[i], cmp[i]);
+            remove("tmp.bin");
             exit(EXIT_FAILURE);
         }
     }
 
     cudaCheck(cudaFree(reload));
     cudaCheck(cudaFree(data));
+    remove("tmp.bin");
 }
 
 int main() {
