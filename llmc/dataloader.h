@@ -200,7 +200,8 @@ void dataloader_init(DataLoader *loader,
     // reset the loader, to initialize it
     dataloader_reset(loader);
     // we haven't drawn a current sample yet
-    loader->current_sample_idx = -1;
+    // note that this line will underflow but that's ok, as +1 later will just overflow to 0
+    loader->current_sample_idx = (size_t) -1;
 }
 
 void dataloader_load_batch(DataLoader* loader) {
