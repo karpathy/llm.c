@@ -410,22 +410,19 @@ __global__ void layernorm_forward_kernel6(float* __restrict__ out, float* __rest
 // similar to kernel4, plus using smem to temporaily store input data
 // due to the smem limit, this kernel cannot handle block size > 512 (with fixed C 768 and warp size 32)
 // not so much modification, but decently improve bandwidth
-__global__ void __launch_bounds__(512) layernorm_forward_kernel7(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+__global__ void layernorm_forward_kernel7(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const float*  __restrict__ inp, const float*  __restrict__ weight,
                                     const float* __restrict__ bias, int N, int C) {
     float eps = 1e-5f;
     extern __shared__ char xShared[];
-    int warpsPerBlock = blockDim.x / WARP_SIZE;
-    int warpId = threadIdx.x / WARP_SIZE;
-    int laneId = threadIdx.x % WARP_SIZE;
-    x128* const xSharedThisWarp = reinterpret_cast<x128*>(xShared) + warpId * (C / x128::size);
-    int row = blockIdx.x * warpsPerBlock + warpId;
+    x128* const xSharedThisWarp = reinterpret_cast<x128*>(xShared) + threadIdx.y * (C / x128::size);
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row < N) {
         const float* const x = inp + row * C;
         float* const y = out + row * C;
         float partialSum = 0.0f, partialSum2 = 0.0f;
 
-        for (int c = laneId * x128::size; c < C; c += WARP_SIZE * x128::size) {
+        for (int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
             x128 xi = load128cs(x + c);
             xSharedThisWarp[c / x128::size] = xi;
             for (int k = 0; k < x128::size; ++k) {
@@ -438,24 +435,24 @@ __global__ void __launch_bounds__(512) layernorm_forward_kernel7(float* __restri
         float mean1 = warpReduceSum(partialSum) / C;
         float mean2 = warpReduceSum(partialSum2) / C;
 
-        if (laneId == 0 && mean != nullptr) __stcs(mean + row, mean1);
+        if (threadIdx.x == 0 && mean != nullptr) __stcs(mean + row, mean1);
 
         float var = (mean2 - mean1 * mean1);
 
         float invStd = rsqrtf(var + eps);
 
-        if (laneId == 0 && rstd != nullptr) __stcs(rstd + row, invStd);
-        
+        if (threadIdx.x == 0 && rstd != nullptr) __stcs(rstd + row, invStd);
+
         // load from smem for accleration
-        for (int c = laneId * x128::size; c < C; c += WARP_SIZE * x128::size) {
+        for (int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
+            x128 w = load128cs(weight + c);
+            x128 b = load128cs(bias + c);
             x128 out;
             for (int k = 0; k < x128::size; ++k) {
-                out[k] = weight[c + k] * ((float)xSharedThisWarp[c / x128::size][k] - mean1) * invStd + bias[c + k];
+                out[k] = w[k] * ((float)xSharedThisWarp[c / x128::size][k] - mean1) * invStd + b[k];
             }
             store128cs(y + c, out);
         }
-
-
     }
 }
 
@@ -554,18 +551,16 @@ void layernorm_forward7(float* out, float* mean, float* rstd, const float* inp,
     assert(block_size % 32 == 0);
     const int maxBlockSizeKernel7 = 512;
     const int N = B * T;
-    const int grid_size =
-        ceil_div(N * 32, min(maxBlockSizeKernel7, block_size));
-
-    int device;
-    cudaCheck(cudaGetDevice(&device));
-    cudaDeviceProp prop;
-    cudaCheck(cudaGetDeviceProperties(&prop, device));
-    unsigned int smemSize =
-        C * sizeof(float) * (min(maxBlockSizeKernel7, block_size) / 32);
-    layernorm_forward_kernel7<<<grid_size, min(maxBlockSizeKernel7, block_size),
-                                smemSize>>>(out, mean, rstd, inp, weight, bias,
-                                            N, C);
+    dim3 blockDim(WARP_SIZE, block_size / WARP_SIZE);
+    dim3 gridDim(ceil_div(N * 32, block_size));
+    size_t smemSize = C * sizeof(float) * (block_size / 32);
+    cudaError_t status = cudaFuncSetAttribute(layernorm_forward_kernel7, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize);
+    if (status != cudaSuccess) {
+        blockDim = dim3(WARP_SIZE, maxBlockSizeKernel7 / WARP_SIZE);
+        gridDim = dim3(ceil_div(N * 32, maxBlockSizeKernel7));
+        smemSize = C * sizeof(float) * (maxBlockSizeKernel7 / 32);
+    } 
+    layernorm_forward_kernel7<<<gridDim, blockDim, smemSize>>>(out, mean, rstd, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
 
