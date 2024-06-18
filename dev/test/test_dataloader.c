@@ -181,13 +181,8 @@ void test_shuffled(void) {
         checkEquals(num_seen_inputs + start + tokens_fit, num_tokens - tokens_fit, 0);
         // verify the target counts. same thing but offset by 1
         checkEquals(num_seen_targets + start + 1, tokens_fit, num_epochs);
-        if (s == (num_shards - 1)) {
-            // last shard check should have one less target token
-            checkEquals(num_seen_targets + start + 1 + tokens_fit, num_tokens - tokens_fit - 1, 0);
-        }
-        else {
-            checkEquals(num_seen_targets + start + 1 + tokens_fit, num_tokens - tokens_fit, 0);
-        }
+        checkEquals(num_seen_targets + start + 1 + tokens_fit,
+            (s == (num_shards - 1)) ? num_tokens - tokens_fit - 1 : num_tokens - tokens_fit,0);
     }
 
     dataloader_free(&loader);
@@ -258,13 +253,8 @@ void test_multiprocess_shuffled(void) {
         checkEquals(num_seen_inputs + start + tokens_fit, num_tokens - tokens_fit, 0);
         // verify the target counts. same thing but offset by 1
         checkEquals(num_seen_targets + start + 1, tokens_fit, num_epochs);
-        if (s == (num_shards - 1)) {
-            // last shard should have one less target token
-            checkEquals(num_seen_targets + start + 1 + tokens_fit, num_tokens - tokens_fit - 1, 0);
-        }
-        else {
-            checkEquals(num_seen_targets + start + 1 + tokens_fit, num_tokens - tokens_fit, 0);
-        }
+        checkEquals(num_seen_targets + start + 1 + tokens_fit,
+            (s == (num_shards - 1)) ? num_tokens - tokens_fit - 1 : num_tokens - tokens_fit,0);
     }
 
     // cleanup
