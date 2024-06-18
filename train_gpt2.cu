@@ -71,6 +71,8 @@ cudaDeviceProp deviceProp; // fills in common_start()
 cudaStream_t main_stream;
 // one global variable to hold the multi-GPU configuration for this process
 MultiGpuConfig multi_gpu_config;
+// buffer size to use for device <-> disk io
+constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 
 // convenience function that only prints if the rank of process is zero
 void printf0(const char *format, ...) {
@@ -448,7 +450,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in all the parameters from file and copy them to device
     file_to_device(model->params_memory, model_file, model->num_parameters_bytes,
-                   32*1024*1024, main_stream);
+                   IO_BUF_SIZE, main_stream);
     fcloseCheck(model_file);
 
     // only return from this function once we are certain the params are ready on the GPU
@@ -1179,10 +1181,10 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
 
     // write AdamW m, v, and master_weights here (they are all float)
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
-    device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(float), 32*1024*1024, main_stream);
-    device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(float), 32*1024*1024, main_stream);
+    device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     if(model->use_master_weights) {
-        device_to_file(state_file, model->master_weights, shard_num_parameters * sizeof(float), 32*1024*1024, main_stream);
+        device_to_file(state_file, model->master_weights, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     }
 
     // write dataloader state if we are using the Permuted version of it
@@ -1235,10 +1237,10 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
     }
 
-    file_to_device(model->m_memory, state_file, shard_num_parameters * sizeof(float), 32*1024*1024, main_stream);
-    file_to_device(model->v_memory, state_file, shard_num_parameters * sizeof(float), 32*1024*1024, main_stream);
+    file_to_device(model->m_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    file_to_device(model->v_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     if(model->use_master_weights) {
-        file_to_device(model->master_weights, state_file, shard_num_parameters * sizeof(float), 32*1024*1024, main_stream);
+        file_to_device(model->master_weights, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     }
 
     // revive the DataLoader object and its state
