@@ -318,17 +318,16 @@ int main(int argc, char *argv[]) {
 
     DataLoader loader;
     dataloader_init(&loader, "dev/data/tinyshakespeare/tiny_shakespeare_val.bin", B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 1);
-    dataloader_next_batch(&loader);
     save_state("test_gpt2cu_state.ckpt", 10, &model, &loader);
     int tokens[10];
     for (int step = 0; step < 10; step++) {
+        dataloader_next_batch(&loader);
         gpt2_forward(&model, loader.inputs, loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model, loader.inputs, true);
         gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
         losses[step] = model.mean_loss;
         tokens[step] = loader.inputs[0];
-        dataloader_next_batch(&loader);
     }
 
     // reload
@@ -337,6 +336,7 @@ int main(int argc, char *argv[]) {
     int ld_step;
     load_state(&ld_step, &model, &loader, "test_gpt2cu_state.ckpt");
     for (int step = 0; step < 10; step++) {
+        dataloader_next_batch(&loader);
         gpt2_forward(&model, loader.inputs, loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model, loader.inputs, true);
@@ -355,7 +355,6 @@ int main(int argc, char *argv[]) {
         } else {
             printf("loss ok at step %d: %f %f\n", step, losses[step], model.mean_loss);
         }
-        dataloader_next_batch(&loader);
     }
 
     // final approval
