@@ -361,6 +361,10 @@ int main(int argc, char *argv[]) {
     // final approval
     printf("overall okay: %d\n", allok);
 
+    // delete intermediate test files
+    remove("test_gpt2cu_model.ckpt");
+    remove("test_gpt2cu_state.ckpt");
+
     // free everything
     dataloader_free(&loader);
     gpt2_free(&model);
