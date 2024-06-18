@@ -109,9 +109,7 @@ void prepare_intra_shard_indices_(DataLoader *loader) {
 
 void dataloader_reset(DataLoader *loader) {
     loader->current_shard_idx = 0;
-    // we haven't drawn a current sample yet
-    // note that this line will underflow but that's ok, as +1 later will just overflow to 0
-    loader->current_sample_idx = (size_t) -1;
+    loader->current_sample_idx = 0;
 
     if (loader->should_shuffle) {  // shuffle the shards
         random_permutation(loader->shard_indices, loader->glob_result.gl_pathc, &loader->shuffle_rng);
@@ -133,9 +131,7 @@ void dataloader_advance_(DataLoader *loader) {
 
     // advance the loader by loading the next data shard and resetting the position
     loader->current_shard_idx = (loader->current_shard_idx + 1) % loader->glob_result.gl_pathc;
-    // we haven't drawn a current sample yet
-    // note that this line will underflow but that's ok, as +1 later will just overflow to 0
-    loader->current_sample_idx = (size_t) -1;
+    loader->current_sample_idx = 0;
     dataloader_load_shard_(loader, loader->current_shard_idx);
 
     if (loader->should_shuffle) {
@@ -224,12 +220,12 @@ void dataloader_load_batch(DataLoader* loader) {
 }
 
 void dataloader_next_batch(DataLoader *loader) {
-    loader->current_sample_idx += 1;
     // if the next batch would go past the end of the file, advance the loader
     if (loader->current_sample_idx >= loader->shard_num_samples) {
         dataloader_advance_(loader);
     }
     dataloader_load_batch(loader);
+    loader->current_sample_idx += 1;
 }
 
 
