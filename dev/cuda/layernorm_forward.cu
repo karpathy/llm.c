@@ -29,8 +29,6 @@ verstion 5 allocates blocks per row instead of warps per row, same alg as 4 othe
 #include <cooperative_groups/reduce.h>
 #include "common.h"
 
-#define WARP_SIZE 32
-
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -416,22 +414,25 @@ __global__ void __launch_bounds__(512) layernorm_forward_kernel7(float* __restri
                                     const float*  __restrict__ inp, const float*  __restrict__ weight,
                                     const float* __restrict__ bias, int N, int C) {
     float eps = 1e-5f;
-    extern __shared__ float xShared[];
-    int warpsPerBlock = blockDim.x / warpSize;
-    int warpId = threadIdx.x / warpSize;
-    int laneId = threadIdx.x % warpSize;
-    float* const xSharedThisWarp = xShared + warpId * C;
+    extern __shared__ char xShared[];
+    int warpsPerBlock = blockDim.x / WARP_SIZE;
+    int warpId = threadIdx.x / WARP_SIZE;
+    int laneId = threadIdx.x % WARP_SIZE;
+    x128* const xSharedThisWarp = reinterpret_cast<x128*>(xShared) + warpId * (C / x128::size);
     int row = blockIdx.x * warpsPerBlock + warpId;
     if (row < N) {
         const float* const x = inp + row * C;
         float* const y = out + row * C;
         float partialSum = 0.0f, partialSum2 = 0.0f;
 
-        for (int i = laneId; i < C; i += warpSize) {
-            float xi = x[i];
-            xSharedThisWarp[i] = xi;
-            partialSum += xi;
-            partialSum2 += xi * xi;
+        for (int c = laneId * x128::size; c < C; c += WARP_SIZE * x128::size) {
+            x128 xi = load128cs(x + c);
+            xSharedThisWarp[c / x128::size] = xi;
+            for (int k = 0; k < x128::size; ++k) {
+                partialSum += xi[k];
+                partialSum2 += xi[k] * xi[k];
+
+            }
         }
 
         float mean1 = warpReduceSum(partialSum) / C;
@@ -444,11 +445,17 @@ __global__ void __launch_bounds__(512) layernorm_forward_kernel7(float* __restri
         float invStd = rsqrtf(var + eps);
 
         if (laneId == 0 && rstd != nullptr) __stcs(rstd + row, invStd);
-
+        
         // load from smem for accleration
-        for (int i = laneId; i < C; i += warpSize) {
-            __stcs(y + i, weight[i] * (xSharedThisWarp[i] - mean1) * invStd + bias[i]);
+        for (int c = laneId * x128::size; c < C; c += WARP_SIZE * x128::size) {
+            x128 out;
+            for (int k = 0; k < x128::size; ++k) {
+                out[k] = weight[c + k] * ((float)xSharedThisWarp[c / x128::size][k] - mean1) * invStd + bias[c + k];
+            }
+            store128cs(y + c, out);
         }
+
+
     }
 }
 
@@ -545,18 +552,18 @@ void layernorm_forward7(float* out, float* mean, float* rstd, const float* inp,
                         const float* weight, const float* bias, int B, int T,
                         int C, const int block_size) {
     assert(block_size % 32 == 0);
-    const int maxBlockSizeKernel6 = 512;
+    const int maxBlockSizeKernel7 = 512;
     const int N = B * T;
     const int grid_size =
-        ceil_div(N * 32, min(maxBlockSizeKernel6, block_size));
+        ceil_div(N * 32, min(maxBlockSizeKernel7, block_size));
 
     int device;
     cudaCheck(cudaGetDevice(&device));
     cudaDeviceProp prop;
     cudaCheck(cudaGetDeviceProperties(&prop, device));
     unsigned int smemSize =
-        C * sizeof(float) * (min(maxBlockSizeKernel6, block_size) / 32);
-    layernorm_forward_kernel7<<<grid_size, min(maxBlockSizeKernel6, block_size),
+        C * sizeof(float) * (min(maxBlockSizeKernel7, block_size) / 32);
+    layernorm_forward_kernel7<<<grid_size, min(maxBlockSizeKernel7, block_size),
                                 smemSize>>>(out, mean, rstd, inp, weight, bias,
                                             N, C);
     cudaCheck(cudaGetLastError());
