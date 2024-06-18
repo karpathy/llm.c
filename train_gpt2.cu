@@ -547,32 +547,48 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
 }
 
 void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, size_t T, int grad_accum_steps=1) {
-    // right now, this function is fully synchronous with the host
     NVTX_RANGE_FN();
-    // targets are optional and could be NULL
-    // in this function we must be careful and use size_t instead of int, otherwise
-    // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
 
-    // ensure the model was initialized or error out
     if (model->params_memory == NULL) {
         printf("Error: model was not initialized properly.\n");
         exit(EXIT_FAILURE);
     }
 
-    // convenience parameters
     const size_t V = model->config.vocab_size;
     const size_t Vp = model->config.padded_vocab_size;
     const size_t L = model->config.num_layers;
     const size_t NH = model->config.num_heads;
     const size_t C = model->config.channels;
 
-    // allocate space for all the activations if needed (done here, lazily)
-    if(model->acts_memory == NULL) {
+    // static CUDA streams and events for reuse
+    static cudaStream_t input_copy_stream, target_copy_stream, compute_stream, loss_stream;
+    static cudaEvent_t input_done, target_done, compute_done, loss_done;
+    static bool streams_created = false;
+    
+
+    // create four cuda streams: input copy, target copy, compute, loss
+    // async data transfers (input/target) overlap with compute and loss
+    // non-blocking streams prioritize compute and loss for performance
+    // cuda events manage sync and dependencies between streams
+
+    if (!streams_created) {
+        cudaCheck(cudaStreamCreateWithPriority(&input_copy_stream, cudaStreamNonBlocking, 0));
+        cudaCheck(cudaStreamCreateWithPriority(&target_copy_stream, cudaStreamNonBlocking, 0));
+        cudaCheck(cudaStreamCreateWithPriority(&compute_stream, cudaStreamNonBlocking, -1));
+        cudaCheck(cudaStreamCreateWithPriority(&loss_stream, cudaStreamNonBlocking, -1));
+
+        cudaCheck(cudaEventCreate(&input_done));
+        cudaCheck(cudaEventCreate(&target_done));
+        cudaCheck(cudaEventCreate(&compute_done));
+        cudaCheck(cudaEventCreate(&loss_done));
+
+        streams_created = true;
+    }
+
+    if (model->acts_memory == NULL) {
         NvtxRange rng("InitActs");
-        // record the current B,T as well
         model->batch_size = B;
         model->seq_len = T;
-        // allocate the space
         fill_in_activation_sizes(model->act_sizes, B, T, model->config, model->recompute);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
@@ -581,123 +597,213 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
         model->num_activations = num_activations;
         printf0("allocating %d MiB for activations\n", (int)round(num_activations * sizeof(floatX) / (1024 * 1024)));
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
-        // also create memory for caching inputs and targets
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(floatX)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses_fp32, B * T * sizeof(float)));
     } else {
-        // validate B,T is consistent with how we've allocated the memory before
-        // in principle we could get more clever here in the future, for now this is safest
         if (B != model->batch_size || T != model->seq_len) {
             printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, (int)B, (int)T);
             exit(EXIT_FAILURE);
         }
     }
 
-    // copy inputs/targets to the model
-    cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
-    if (targets != NULL) {
-        cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
-    }
-
-    // validate inputs, all indices must be in the range [0, V)
-    // we can do this while the copies are already underway
-    for(int i = 0; i < B * T; i++) {
+    // Validate and copy inputs in a single stream
+    cudaCheck(cudaMemcpyAsync(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice, input_copy_stream));
+    #pragma omp parallel for
+    for (size_t i = 0; i < B * T; i++) {
         assert(0 <= inputs[i] && inputs[i] < V);
-        if (targets != NULL) {
+    }
+    cudaCheck(cudaEventRecord(input_done, input_copy_stream));
+
+    if (targets != NULL) {
+        cudaCheck(cudaMemcpyAsync(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice, target_copy_stream));
+        #pragma omp parallel for
+        for (size_t i = 0; i < B * T; i++) {
             assert(0 <= targets[i] && targets[i] < V);
         }
+        cudaCheck(cudaEventRecord(target_done, target_copy_stream));
     }
 
-    // forward pass
-    ParameterTensors params = model->params; // for brevity
-    ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    // Wait for data transfer to complete before starting computation
+    cudaCheck(cudaStreamWaitEvent(compute_stream, input_done, 0));
+    if (targets != NULL) {
+        cudaCheck(cudaStreamWaitEvent(compute_stream, target_done, 0));
+    }
 
-    // first layernorm isn't fused
-    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
+    ParameterTensors params = model->params;
+    ActivationTensors acts = model->acts;
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, compute_stream);
+
+    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, compute_stream);
+
+    // Offsets for QKV and attention projection weights and biases
+    size_t qkvw_offset = 3 * C * C;
+    size_t qkvb_offset = 3 * C;
+    size_t attprojw_offset = C * C;
+    size_t attprojb_offset = C;
+
+    // Offsets for layer normalization weights and biases
+    size_t ln2w_offset = C;
+    size_t ln2b_offset = C;
+
+    // Offsets for fully connected weights and biases
+    size_t fcw_offset = 4 * C * C;
+    size_t fcb_offset = 4 * C;
+    size_t fcprojw_offset = C * 4 * C;
+    size_t fcprojb_offset = C;
+
+    // Offsets for activations
+    size_t ln1_offset = B * T * C;
+    size_t qkvr_offset = B * T * 3 * C;
+    size_t atty_offset = B * T * C;
+    size_t attproj_offset = B * T * C;
+    size_t residual2_offset = B * T * C;
+    size_t ln2_offset = B * T * C;
+    size_t ln2_mean_offset = B * T;
+    size_t ln2_rstd_offset = B * T;
+    size_t fch_offset = B * T * 4 * C;
+    size_t fch_gelu_offset = B * T * 4 * C;
+    size_t fcproj_offset = B * T * C;
+    size_t residual3_offset = B * T * C;
+
+    // Offsets for layer normalization recomputation
+    size_t ln1_mean_offset = B * T;
+    size_t ln1_rstd_offset = B * T;
+    size_t ln1w_offset = C;
+    size_t ln1b_offset = C;
+
+    // Offsets for CUDNN and non-CUDNN cases
+    #ifdef ENABLE_CUDNN
+    size_t att_offset = B * NH * T;
+    #else
+    size_t att_offset_noncudnn = B * NH * T * T;
+    #endif
+
+    // prefetch the offsets into cache
+
+    // prefetch offsets into cache (the real reason for pulling offsets out of the loop below is to gain the prefetches benefits)
+    // prefetching here enables the CPU to start loading the data into cache while the GPU is still working on the previous layer
+
+    // in the prefetch instructions below, the first argument is the address to prefetch (the offset name in this case)
+    // the second argument (0) means prefetch for read, and the third argument (3) is a locality hint
+    // 0 in the second argument means prefetch for read, 1 means prefetch for write
+    // 3 in the third argument means high temporal locality: the data is expected to be accessed again very soon
+
+    // as a reference, the locality hint values are:
+    // 0: no temporal locality: the data is not expected to be accessed again soon
+    // 1: low temporal locality: the data may be accessed again, but not immediately
+    // 2: moderate temporal locality: the data is likely to be accessed again in the near future
+    // 3: high temporal locality: the data is expected to be accessed again very soon
+
+    __builtin_prefetch(&qkvw_offset, 0, 3);
+    __builtin_prefetch(&qkvb_offset, 0, 3);
+    __builtin_prefetch(&attprojw_offset, 0, 3);
+    __builtin_prefetch(&attprojb_offset, 0, 3);
+
+    __builtin_prefetch(&ln2w_offset, 0, 3);
+    __builtin_prefetch(&ln2b_offset, 0, 3);
+
+    __builtin_prefetch(&fcw_offset, 0, 3);
+    __builtin_prefetch(&fcb_offset, 0, 3);
+    __builtin_prefetch(&fcprojw_offset, 0, 3);
+    __builtin_prefetch(&fcprojb_offset, 0, 3);
+
+    __builtin_prefetch(&ln1_offset, 0, 3);
+    __builtin_prefetch(&qkvr_offset, 0, 3);
+    __builtin_prefetch(&atty_offset, 0, 3);
+    __builtin_prefetch(&attproj_offset, 0, 3);
+    __builtin_prefetch(&residual2_offset, 0, 3);
+    __builtin_prefetch(&ln2_offset, 0, 3);
+    __builtin_prefetch(&ln2_mean_offset, 0, 3);
+    __builtin_prefetch(&ln2_rstd_offset, 0, 3);
+    __builtin_prefetch(&fch_offset, 0, 3);
+    __builtin_prefetch(&fch_gelu_offset, 0, 3);
+    __builtin_prefetch(&fcproj_offset, 0, 3);
+    __builtin_prefetch(&residual3_offset, 0, 3);
+
+    __builtin_prefetch(&ln1_mean_offset, 0, 3);
+    __builtin_prefetch(&ln1_rstd_offset, 0, 3);
+    __builtin_prefetch(&ln1w_offset, 0, 3);
+    __builtin_prefetch(&ln1b_offset, 0, 3);
+
+    #ifdef ENABLE_CUDNN
+    __builtin_prefetch(&att_offset, 0, 3);
+    #else
+    __builtin_prefetch(&att_offset_noncudnn, 0, 3);
+    #endif
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
 
-        floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
+        floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l - 1) * residual3_offset;
 
-        // get the pointers of the weights for this layer
-        floatX* l_qkvw = params.qkvw + l * 3*C * C;
-        floatX* l_qkvb = params.qkvb + l * 3*C;
-        floatX* l_attprojw = params.attprojw + l * C * C;
-        floatX* l_attprojb = params.attprojb + l * C;
-        floatX* l_ln2w = params.ln2w + l * C;
-        floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcb = params.fcb + l * 4*C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
-        floatX* l_fcprojb = params.fcprojb + l * C;
+        floatX* l_qkvw = params.qkvw + l * qkvw_offset;
+        floatX* l_qkvb = params.qkvb + l * qkvb_offset;
+        floatX* l_attprojw = params.attprojw + l * attprojw_offset;
+        floatX* l_attprojb = params.attprojb + l * attprojb_offset;
+        floatX* l_ln2w = params.ln2w + l * ln2w_offset;
+        floatX* l_ln2b = params.ln2b + l * ln2b_offset;
+        floatX* l_fcw = params.fcw + l * fcw_offset;
+        floatX* l_fcb = params.fcb + l * fcb_offset;
+        floatX* l_fcprojw = params.fcprojw + l * fcprojw_offset;
+        floatX* l_fcprojb = params.fcprojb + l * fcprojb_offset;
 
-        // get the pointers of the activations for this layer
-        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
-        floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
-        floatX* l_atty = acts.atty + l * B * T * C;
-        floatX* l_attproj = acts.attproj + l * B * T * C;
-        floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
-        floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
-        floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch = acts.fch + l * B * T * 4*C;
-        // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
-        // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
-        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
-        floatX* l_fcproj = acts.fcproj + l * B * T * C;
-        floatX* l_residual3 = acts.residual3 + l * B * T * C;
+        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * ln1_offset : acts.lnf;
+        floatX* l_qkvr = acts.qkvr + l * qkvr_offset;
+        floatX* l_atty = acts.atty + l * atty_offset;
+        floatX* l_attproj = acts.attproj + l * attproj_offset;
+        floatX* l_residual2 = acts.residual2 + l * residual2_offset;
+        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * ln2_offset : acts.lnf;
+        floatX* l_ln2_mean = acts.ln2_mean + l * ln2_mean_offset;
+        floatX* l_ln2_rstd = acts.ln2_rstd + l * ln2_rstd_offset;
+        floatX* l_fch = acts.fch + l * fch_offset;
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * fch_gelu_offset : acts.fch_gelu;
+        floatX* l_fcproj = acts.fcproj + l * fcproj_offset;
+        floatX* l_residual3 = acts.residual3 + l * residual3_offset;
 
-        // now do the forward pass
         #ifdef ENABLE_CUDNN
-        float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
+        float* l_att = (float*)acts.att + l * att_offset;
+        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, compute_stream);
+        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, compute_stream);
         #else
-        floatX* l_att = acts.att + l * B * NH * T * T;
-        // these are only needed as scratchpads for the forward pass, but
-        // need not be stored for backward
+        floatX* l_att = acts.att + l * att_offset_noncudnn;
         floatX* scratch = (floatX*)acts.output;
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
+        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, compute_stream);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, compute_stream);
         #endif
 
-        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
-        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, l_attproj, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream);
-        gelu_forward(l_fch_gelu, l_fch, B*T*4*C, main_stream);
-        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C, compute_stream);
+        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, l_attproj, l_ln2w, l_ln2b, B*T, C, compute_stream);
+        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, compute_stream);
+        gelu_forward(l_fch_gelu, l_fch, B*T*4*C, compute_stream);
+        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, compute_stream);
 
-        // OK, fusion across blocks.
-        if(l+1 != L) {
-            floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
-            floatX* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
-            floatX* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
-            const floatX* l_ln1w = params.ln1w + (l + 1) * C;
-            const floatX* l_ln1b = params.ln1b + (l + 1) * C;
-            fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, l_fcproj, l_ln1w, l_ln1b,
-                                    B * T, C, main_stream);
+        if (l + 1 != L) {
+            floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * ln1_offset : acts.lnf;
+            floatX* l_ln1_mean = acts.ln1_mean + (l + 1) * ln1_mean_offset;
+            floatX* l_ln1_rstd = acts.ln1_rstd + (l + 1) * ln1_rstd_offset;
+            const floatX* l_ln1w = params.ln1w + (l + 1) * ln1w_offset;
+            const floatX* l_ln1b = params.ln1b + (l + 1) * ln1b_offset;
+            fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, l_fcproj, l_ln1w, l_ln1b, B * T, C, compute_stream);
         } else {
-            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, l_fcproj,
-                                    params.lnfw, params.lnfb,
-                                    B * T, C, main_stream);
+            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, l_fcproj, params.lnfw, params.lnfb, B * T, C, compute_stream);
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, compute_stream);
 
-    // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
+        cudaCheck(cudaStreamSynchronize(compute_stream));
         NvtxRange classifier_and_loss_range("classifier_and_loss");
-        // fused classifier: does the forward pass and first part of the backward pass
-        const float dloss = 1.0f / (B * T * grad_accum_steps); // results in the uniform average loss over all elements
-        fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, main_stream);
-        // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
-        cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost));
+        const float dloss = 1.0f / (B * T * grad_accum_steps);
+        fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, loss_stream);
+        cudaCheck(cudaMemcpyAsync(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost, loss_stream));
+        cudaCheck(cudaEventRecord(compute_done, compute_stream));
+        cudaCheck(cudaStreamWaitEvent(loss_stream, compute_done, 0));
+        cudaCheck(cudaStreamSynchronize(loss_stream));
         float mean_loss = 0.0f;
+        #pragma omp parallel for reduction(+:mean_loss)
         for (int i = 0; i < B*T; i++) {
             float loss = (float)(model->cpu_losses[i]);
             model->cpu_losses_fp32[i] = loss;
@@ -706,10 +812,14 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
         mean_loss /= B*T*grad_accum_steps;
         model->mean_loss = mean_loss;
     } else {
-        // if we don't have targets, we don't have loss
         model->mean_loss = -1.0f;
     }
-    cudaCheck(cudaDeviceSynchronize());
+
+    cudaCheck(cudaStreamSynchronize(compute_stream));
+    cudaCheck(cudaStreamSynchronize(loss_stream));
+
+    // streams and events are not destroyed here, as they are reused. 
+    // a performance bonus of using the static variables and events
 }
 
 void gpt2_zero_grad(GPT2 *model) {
