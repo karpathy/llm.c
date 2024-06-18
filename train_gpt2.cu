@@ -381,7 +381,7 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model_header[5] = model->config.num_heads;
     model_header[6] = model->config.channels;
     model_header[7] = model->config.padded_vocab_size;
-    fwrite(model_header, sizeof(int), 256, model_file);
+    fwriteCheck(model_header, sizeof(int), 256, model_file);
     // write the parameters
     device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
                    1024*1024*32, main_stream);
@@ -1175,7 +1175,7 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     // dataloader state, start at 30 to leave some padding
     *((size_t*)&state_header[30]) = loader->current_shard_idx; // shard of the dataset
     *((size_t*)&state_header[32]) = loader->current_sample_idx; // position in shard
-    fwrite(state_header, sizeof(int), 256, state_file);
+    fwriteCheck(state_header, sizeof(int), 256, state_file);
 
     // write AdamW m, v, and master_weights here (they are all float)
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
@@ -1187,13 +1187,13 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
 
     // write dataloader state if we are using the Permuted version of it
     if (loader->should_shuffle) {
-        fwrite(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);  // number of shards
-        fwrite(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
-        fwrite(&loader->shard_num_samples, sizeof(size_t), 1, state_file);
-        fwrite(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
-        fwrite(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
+        fwriteCheck(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);  // number of shards
+        fwriteCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
+        fwriteCheck(&loader->shard_num_samples, sizeof(size_t), 1, state_file);
+        fwriteCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
+        fwriteCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
     }
-    fclose(state_file);
+    fcloseCheck(state_file);
 }
 
 void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename) {
@@ -1264,7 +1264,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     dataloader_resume(loader, current_shard_idx, current_sample_idx);
 
     // all done, close state file
-    fclose(state_file);
+    fcloseCheck(state_file);
 }
 
 
