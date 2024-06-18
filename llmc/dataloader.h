@@ -96,13 +96,6 @@ int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
     return ntok;
 }
 
-void dataloader_resume(DataLoader *loader, size_t current_shard_idx, size_t current_sample_idx) {
-    // used during model resumption (-y 1) flag
-    loader->current_shard_idx = current_shard_idx;
-    loader->current_sample_idx = current_sample_idx;
-    dataloader_load_shard_(loader, loader->current_shard_idx);
-}
-
 void prepare_intra_shard_indices_(DataLoader *loader) {
     // shuffle the examples inside the shards
     if (loader->intra_shard_indices != NULL) {
@@ -206,12 +199,14 @@ void dataloader_init(DataLoader *loader,
 
     // reset the loader, to initialize it
     dataloader_reset(loader);
+    // we haven't drawn a current sample yet
+    // note that this line will underflow but that's ok, as +1 later will just overflow to 0
+    loader->current_sample_idx = (size_t) -1;
 }
 
-void dataloader_next_batch(DataLoader *loader) {
+void dataloader_load_batch(DataLoader* loader) {
     assert(!loader->should_shuffle || (loader->should_shuffle && loader->intra_shard_indices != NULL));
     assert(loader->current_sample_idx < loader->shard_num_samples);
-
     size_t idx = loader->should_shuffle ? loader->intra_shard_indices[loader->current_sample_idx] : loader->current_sample_idx;
     size_t global_batch_offset_bytes = idx * loader->total_batch_size_bytes;
     int64_t current_offset = loader->header_bytes + global_batch_offset_bytes + loader->local_batch_offset_bytes;
@@ -226,12 +221,24 @@ void dataloader_next_batch(DataLoader *loader) {
         loader->inputs[i] = (int)loader->buffer[i];
         loader->targets[i] = (int)loader->buffer[i+1];
     }
+}
 
+void dataloader_next_batch(DataLoader *loader) {
     loader->current_sample_idx += 1;
     // if the next batch would go past the end of the file, advance the loader
     if (loader->current_sample_idx >= loader->shard_num_samples) {
         dataloader_advance_(loader);
     }
+    dataloader_load_batch(loader);
+}
+
+
+void dataloader_resume(DataLoader *loader, size_t current_shard_idx, size_t current_sample_idx) {
+    // used during model resumption (-y 1) flag
+    loader->current_shard_idx = current_shard_idx;
+    loader->current_sample_idx = current_sample_idx;
+    dataloader_load_shard_(loader, loader->current_shard_idx);
+    dataloader_load_batch(loader);
 }
 
 void dataloader_free(DataLoader *loader) {
