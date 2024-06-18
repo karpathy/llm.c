@@ -194,6 +194,7 @@ inline void file_to_device(void* dest, FILE* src, size_t num_bytes, size_t buffe
 
     // copy the last remaining write buffer to gpu
     cudaCheck(cudaMemcpyAsync(gpu_write_ptr, write_buffer, write_buffer_size, cudaMemcpyHostToDevice, stream));
+    cudaCheck(cudaStreamSynchronize(stream));
     cudaCheck(cudaFreeHost(buffer_space));
 }
 
