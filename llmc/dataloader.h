@@ -103,7 +103,8 @@ void prepare_intra_shard_indices_(DataLoader *loader) {
         free(loader->intra_shard_indices);
     }
     loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
-    random_permutation_with_init(loader->intra_shard_indices, loader->shard_num_samples, &loader->shuffle_rng, 1);
+    init_identity_permutation(loader->intra_shard_indices, loader->shard_num_samples);
+    random_permutation(loader->intra_shard_indices, loader->shard_num_samples, &loader->shuffle_rng);
 }
 
 void dataloader_reset(DataLoader *loader) {
@@ -111,7 +112,7 @@ void dataloader_reset(DataLoader *loader) {
     loader->current_sample_idx = 0;
 
     if (loader->should_shuffle) {  // shuffle the shards
-        random_permutation_with_init(loader->shard_indices, loader->glob_result.gl_pathc, &loader->shuffle_rng, 0);
+        random_permutation(loader->shard_indices, loader->glob_result.gl_pathc, &loader->shuffle_rng);
     }
 
     dataloader_load_shard_(loader, loader->current_shard_idx);
@@ -171,9 +172,7 @@ void dataloader_init(DataLoader *loader,
         manual_seed(&shuffle_rng, 42 + process_rank);
         loader->shuffle_rng = shuffle_rng;
         loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
-        for (int i = 0; i < loader->glob_result.gl_pathc; i++) {
-            loader->shard_indices[i] = i;  // start with identity permutation
-        }
+        init_identity_permutation(loader->shard_indices, loader->glob_result.gl_pathc);
         loader->intra_shard_indices = NULL;  // dynamically allocated allowing different shard sizes
     }
 
