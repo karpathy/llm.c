@@ -226,8 +226,15 @@ jobs:
       image: nvidia/cuda:12.4.1-devel-ubuntu22.04
 
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install  Clang-Tidy
+        run: apt-get update && apt-get install -y clang clang-tidy
+
       - name: C version
         run: |
+          ls
           clang-tidy train_gpt2.c
           clang-tidy test_gpt2.c
 
