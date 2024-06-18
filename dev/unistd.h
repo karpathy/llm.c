@@ -26,7 +26,7 @@ static inline int clock_gettime(int ignore_variable, struct timespec* tv)
 
 
 #include <stdlib.h> // for malloc and free
-#include <string.h> // for malloc and free
+#include <string.h>
 #include <direct.h> // for _mkdir and _stat
 #define mkdir(path, mode) _mkdir(path) /* sketchy way to get mkdir to work on windows */
 #define stat _stat

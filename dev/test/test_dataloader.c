@@ -7,12 +7,12 @@ gcc -O3 -I../../llmc -o test_dataloader test_dataloader.c -lm && ./test_dataload
 TODOs:
 - test load/save state of DataLoader
 */
-
+#include <unistd.h>
 #include "../../llmc/dataloader.h"
 
 #define SHARD_NAME_LEN 64
 char shard_name[SHARD_NAME_LEN];
-int num_tokens = 140;
+const int num_tokens = 140;
 int num_shards = 4;
 
 void check_range(const int *tokens, const int start, const int end, const char *file, int line) {
@@ -181,7 +181,13 @@ void test_shuffled(void) {
         checkEquals(num_seen_inputs + start + tokens_fit, num_tokens - tokens_fit, 0);
         // verify the target counts. same thing but offset by 1
         checkEquals(num_seen_targets + start + 1, tokens_fit, num_epochs);
-        checkEquals(num_seen_targets + start + 1 + tokens_fit, num_tokens - tokens_fit, 0);
+        if (s == (num_shards - 1)) {
+            // last shard check should have one less target token
+            checkEquals(num_seen_targets + start + 1 + tokens_fit, num_tokens - tokens_fit - 1, 0);
+        }
+        else {
+            checkEquals(num_seen_targets + start + 1 + tokens_fit, num_tokens - tokens_fit, 0);
+        }
     }
 
     dataloader_free(&loader);
@@ -204,7 +210,7 @@ void test_multiprocess_shuffled(void) {
     printf("test_multiprocess_shuffled... ");
     int B = 4;
     int T = 8;
-    int num_processes = 2;
+    const int num_processes = 2;
     int should_shuffle = 0;
     snprintf(shard_name, SHARD_NAME_LEN, "shard_????.bin");
     DataLoader loaders[num_processes];
@@ -252,7 +258,13 @@ void test_multiprocess_shuffled(void) {
         checkEquals(num_seen_inputs + start + tokens_fit, num_tokens - tokens_fit, 0);
         // verify the target counts. same thing but offset by 1
         checkEquals(num_seen_targets + start + 1, tokens_fit, num_epochs);
-        checkEquals(num_seen_targets + start + 1 + tokens_fit, num_tokens - tokens_fit, 0);
+        if (s == (num_shards - 1)) {
+            // last shard should have one less target token
+            checkEquals(num_seen_targets + start + 1 + tokens_fit, num_tokens - tokens_fit - 1, 0);
+        }
+        else {
+            checkEquals(num_seen_targets + start + 1 + tokens_fit, num_tokens - tokens_fit, 0);
+        }
     }
 
     // cleanup
