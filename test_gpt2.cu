@@ -172,7 +172,7 @@ int main(int argc, char *argv[]) {
     }
 
     float logit_accuracy_threshold = 1e-3f;
-    float loss_diff_threshold = 0.00001f;
+    float loss_diff_threshold = 1e-5f;
     // FP16 and lower require very high tolerances unfortunately. TODO look into more
     #if defined(ENABLE_BF16) || defined(ENABLE_F16)
     logit_accuracy_threshold = 25.0f; // 15.0f was too low even without cuDNN?! :(
