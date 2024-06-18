@@ -119,4 +119,4 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Test Device<->File IO
-        run: nvcc -o device_file_io device_file_io.cu && ./device_file_io
+        run: cd dev/test && nvcc -o device_file_io device_file_io.cu && ./device_file_io
