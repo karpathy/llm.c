@@ -711,7 +711,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     printf("[GPT-2]\n");
     printf("max_seq_len: %d\n", maxT);
     printf("vocab_size: %d\n", V);
-    printf("padded_vocab_size: %zu\n", Vp);
+    printf("padded_vocab_size: %d\n", Vp);
     printf("num_layers: %d\n", L);
     printf("num_heads: %d\n", NH);
     printf("channels: %d\n", C);

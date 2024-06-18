@@ -1208,9 +1208,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
         printf("allocated %zu MiB for activations\n", (num_activations * sizeof(float)) >> 20); // >> 20 is /(1024*1024)
         // also create memory for caching inputs and targets
-        cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
-        cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
-        cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
+        cudaCheck(cudaMalloc((void**)&model->inputs, (size_t)B * T * sizeof(int)));
+        cudaCheck(cudaMalloc((void**)&model->targets, (size_t)B * T * sizeof(int)));
+        cudaCheck(cudaMallocHost((void**)&model->cpu_losses, (size_t)B * T * sizeof(float)));
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -1221,9 +1221,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     }
 
     // copy inputs/targets to the model
-    cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(model->inputs, inputs, (size_t)B * T * sizeof(int), cudaMemcpyHostToDevice));
     if (targets != NULL) {
-        cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
+        cudaCheck(cudaMemcpy(model->targets, targets, (size_t)B * T * sizeof(int), cudaMemcpyHostToDevice));
     }
 
     // forward pass
@@ -1656,7 +1656,7 @@ int main(int argc, char *argv[]) {
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
+    int* gen_tokens = (int*)mallocCheck((size_t)B * T * sizeof(int));
     float* cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
     // train

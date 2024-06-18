@@ -1548,7 +1548,7 @@ int main(int argc, char *argv[]) {
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
     // some memory for generating samples from the model
-    int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
+    int* gen_tokens = (int*)mallocCheck((size_t)B * T * sizeof(int));
     floatX* cpu_logits_raw = (floatX*)mallocCheck(model.config.vocab_size * sizeof(floatX));
     float*  cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
