@@ -198,9 +198,6 @@ void dataloader_init(DataLoader *loader,
 
     // reset the loader, to initialize it
     dataloader_reset(loader);
-    // we haven't drawn a current sample yet
-    // note that this line will underflow but that's ok, as +1 later will just overflow to 0
-    loader->current_sample_idx = (size_t) -1;
 }
 
 void dataloader_load_batch(DataLoader* loader) {
@@ -223,12 +220,12 @@ void dataloader_load_batch(DataLoader* loader) {
 }
 
 void dataloader_next_batch(DataLoader *loader) {
-    loader->current_sample_idx += 1;
     // if the next batch would go past the end of the file, advance the loader
     if (loader->current_sample_idx >= loader->shard_num_samples) {
         dataloader_advance_(loader);
     }
     dataloader_load_batch(loader);
+    loader->current_sample_idx += 1;
 }
 
 
@@ -237,7 +234,6 @@ void dataloader_resume(DataLoader *loader, size_t current_shard_idx, size_t curr
     loader->current_shard_idx = current_shard_idx;
     loader->current_sample_idx = current_sample_idx;
     dataloader_load_shard_(loader, loader->current_shard_idx);
-    dataloader_load_batch(loader);
 }
 
 void dataloader_free(DataLoader *loader) {
