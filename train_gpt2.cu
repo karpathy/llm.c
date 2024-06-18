@@ -1225,9 +1225,9 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
     }
 
-    if(state_header[4] == 1 && !model->use_master_weights) {
+    if(use_master_weights == 1 && !model->use_master_weights) {
         printf0("Warning: Master weights are present in state, but not enabled for current run.");
-    } else if (state_header[4] == 0 && model->use_master_weights) {
+    } else if (use_master_weights == 0 && model->use_master_weights) {
         printf0("Error: Master weights requested, but not present in state file.");
         exit(EXIT_FAILURE);
     }
