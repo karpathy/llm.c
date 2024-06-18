@@ -407,33 +407,33 @@ __global__ void layernorm_forward_kernel6(float* __restrict__ out, float* __rest
     }
 }
 
-// similar to kernel4, plus using smem to temporaily store input data
-// due to the smem limit, this kernel cannot handle block size > 512 (with fixed C 768 and warp size 32)
-// not so much modification, but decently improve bandwidth
+// Combines the merits of kernel 4 and kernel 6
 __global__ void layernorm_forward_kernel7(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const float*  __restrict__ inp, const float*  __restrict__ weight,
                                     const float* __restrict__ bias, int N, int C) {
     float eps = 1e-5f;
-    extern __shared__ char xShared[];
-    x128* const xSharedThisWarp = reinterpret_cast<x128*>(xShared) + threadIdx.y * (C / x128::size);
+    extern __shared__ x128 xShared[];
+    // only use smem store the input data, since weight and bias are only used once in the end
+    // therefore is unnecessary to cache them
+    x128* const xSharedWarp = xShared + threadIdx.y * C / x128::size;
     int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row < N) {
         const float* const x = inp + row * C;
         float* const y = out + row * C;
-        float partialSum = 0.0f, partialSum2 = 0.0f;
+        float warpSum = 0.0f, warpSum2 = 0.0f;
 
-        for (int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-            x128 xi = load128cs(x + c);
-            xSharedThisWarp[c / x128::size] = xi;
+        for (int i = threadIdx.x * x128::size; i < C; i += WARP_SIZE * x128::size) {
+            x128 xi = load128cs(x + i);
+            xSharedWarp[i / x128::size] = xi;
             for (int k = 0; k < x128::size; ++k) {
-                partialSum += xi[k];
-                partialSum2 += xi[k] * xi[k];
+                warpSum += xi[k];
+                warpSum2 += xi[k] * xi[k];
 
             }
         }
 
-        float mean1 = warpReduceSum(partialSum) / C;
-        float mean2 = warpReduceSum(partialSum2) / C;
+        float mean1 = warpReduceSum(warpSum) / C;
+        float mean2 = warpReduceSum(warpSum2) / C;
 
         if (threadIdx.x == 0 && mean != nullptr) __stcs(mean + row, mean1);
 
@@ -444,14 +444,15 @@ __global__ void layernorm_forward_kernel7(float* __restrict__ out, float* __rest
         if (threadIdx.x == 0 && rstd != nullptr) __stcs(rstd + row, invStd);
 
         // load from smem for accleration
-        for (int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-            x128 w = load128cs(weight + c);
-            x128 b = load128cs(bias + c);
-            x128 out;
+        for (int i = threadIdx.x * x128::size; i < C; i += WARP_SIZE * x128::size) {
+            x128 w = load128cs(weight + i);
+            x128 b = load128cs(bias + i);
+            x128 _x = xSharedWarp[i / x128::size];
+            x128 _out;
             for (int k = 0; k < x128::size; ++k) {
-                out[k] = w[k] * ((float)xSharedThisWarp[c / x128::size][k] - mean1) * invStd + b[k];
+                _out[k] = w[k] * invStd * ((float)_x[k] - mean1) + b[k];
             }
-            store128cs(y + c, out);
+            store128cs(y + i, _out);
         }
     }
 }
