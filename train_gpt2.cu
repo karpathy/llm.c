@@ -2,6 +2,28 @@
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 
+// todo where to put this, really should NOT be here, or hardcoded, or...
+#define ENABLE_ANALYSIS_STATS
+#ifdef ENABLE_ANALYSIS_STATS
+#define MAX_ANALYSIS_STATS 100000 // will stop recording for given micro-step after that point
+#define ANALYSIS_MEMORY_SIZE (MAX_ANALYSIS_STATS * ANALYSIS_SIZE * sizeof(uint))
+uint* analysis_memory;
+char* analysis_names[MAX_ANALYSIS_STATS];
+uint analysis_layer[MAX_ANALYSIS_STATS];
+uint analysis_step[MAX_ANALYSIS_STATS];
+uint analysis_micro_step[MAX_ANALYSIS_STATS];
+uint current_analysis = 0;
+uint global_current_layer = 0;
+uint global_current_step = 0;
+uint global_current_micro_step = 0;
+// include std map
+#include <set>
+#include <string>
+// hashmap of the tensor names seen so far including layer (reset on every micro-step)
+std::set<std::pair<std::string, uint>> analysis_tensor_names;
+#endif
+// ...
+
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -611,6 +633,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
     }
 
     // forward pass
+    global_current_layer = 0;
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
@@ -620,6 +643,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
+        global_current_layer = l+1;
 
         floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
@@ -687,6 +711,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
         }
     }
 
+    global_current_layer = L+1;
     matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
 
     // also forward the cross-entropy loss function if we have the targets
@@ -781,6 +806,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
         NvtxRange layer_range("Layer", l);
+        global_current_layer = l+1;
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
@@ -828,7 +854,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
         if(model->recompute >= 1) {
             // recompute >= 1 means we recompute gelu. in this case,
             // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
-            gelu_forward(l_fch_gelu, l_fch, B*T*4*C, main_stream);
+            gelu_forward(l_fch_gelu, l_fch, B*T*4*C, main_stream, true);
         }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream);
         gelu_backward_inplace(dl_bt4c, l_fch, B*T*4*C, main_stream);
@@ -880,6 +906,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
         }
     }
+    global_current_layer = 0;
     encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
                      dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
 
@@ -1146,6 +1173,12 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
     #ifdef ENABLE_CUDNN
     create_cudnn();
     #endif
+
+    #ifdef ENABLE_ANALYSIS_STATS
+    cudaCheck(cudaMalloc(&analysis_memory, ANALYSIS_MEMORY_SIZE));
+    cudaCheck(cudaMemset(analysis_memory, 0, ANALYSIS_MEMORY_SIZE));
+    cudaCheck(cudaGetLastError());
+    #endif
 }
 
 void common_free(GPT2 &model) {
@@ -1155,6 +1188,13 @@ void common_free(GPT2 &model) {
     cublasCheck(cublasLtDestroy(cublaslt_handle));
     #ifdef ENABLE_CUDNN
     destroy_cudnn();
+    #endif
+
+    #ifdef ENABLE_ANALYSIS_STATS
+    cudaFree(analysis_memory);
+    for (int i = 0; i < current_analysis && i < MAX_ANALYSIS_STATS; i++) {
+        free(analysis_names[i]);
+    }
     #endif
 }
 
@@ -1567,7 +1607,7 @@ int main(int argc, char *argv[]) {
     float ema_tokens_per_second = 0.0f;
     for (; step <= train_num_batches; step++) {
         NvtxRange step_range("Train step", step);
-
+        global_current_step = step;
         int last_step = step == train_num_batches;
 
         // once in a while estimate the validation loss (all processes collaborate)
@@ -1687,6 +1727,9 @@ int main(int argc, char *argv[]) {
         // gradient accumulation loop over micro-batches
         float lossf = 0.0f; // for getting the mean loss over the accumulation steps
         for (int micro_step = 0; micro_step < grad_accum_steps; micro_step++) {
+            global_current_micro_step = micro_step;
+            analysis_tensor_names.clear();
+
             // fetch the next data batch
             // and if we're overfitting a single batch, we'll only call this a single time
             if (overfit_single_batch == 0 ||
@@ -1698,6 +1741,7 @@ int main(int argc, char *argv[]) {
             lossf += model.mean_loss; // the mean_loss was normalized by grad_accum_steps inside gpt2_forward
             // backward pass. all model params accumulate gradients with += inside this inner loop
             gpt2_backward(&model, train_loader.inputs, micro_step == grad_accum_steps - 1);
+            write_analysis();
         }
         // override the mean loss, accounting for the gradient accumulation loop
         // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
@@ -1724,6 +1768,7 @@ int main(int argc, char *argv[]) {
         cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
         // --------------- TRAINING SECTION END -------------------
         // everything that follows now is just diagnostics, prints, logging, etc.
+        write_analysis();
 
         // todo - move or double-buffer all of this timing logic to avoid idling the GPU at this point!
         float time_elapsed_ms;

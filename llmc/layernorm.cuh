@@ -440,6 +440,10 @@ void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
     const int grid_size = CEIL_DIV(N, block_y);
     size_t smem = (2 + block_y) * C * sizeof(floatX);
 
+    generate_analysis(weight, C,  "layernorm_weight");
+    generate_analysis(bias, C,    "layernorm_bias");
+    generate_analysis(inp, B*T*C, "layernorm_input");
+
     // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
     // this may fail, in which case we fall back to the smem free implementation.
     cudaCheck(cudaGetLastError());
@@ -453,6 +457,10 @@ void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
         layernorm_forward_kernel3<<<grid_size_fb, block_size, 0, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
     }
     cudaCheck(cudaGetLastError());
+
+    generate_analysis(out, B*T*C, "layernorm_act_out");
+    generate_analysis(mean, B*T,  "layernorm_special_mean");
+    generate_analysis(rstd, B*T,  "layernorm_special_rstd");
 }
 
 void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N, cudaStream_t stream) {
@@ -460,8 +468,14 @@ void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N
     const int block_size = 256;
     assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
+
+    generate_analysis(inp1, N, "residual_inp1");
+    generate_analysis(inp2, N, "residual_inp2");
+
     residual_forward_kernel<<<grid_size, block_size, 0, stream>>>(out, inp1, inp2);
     cudaCheck(cudaGetLastError());
+
+    generate_analysis(out, N, "residual_act_out");
 }
 
 void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
@@ -472,6 +486,11 @@ void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, flo
     int block_y = block_size / WARP_SIZE;
     const int grid_size = CEIL_DIV(N, block_y);
     size_t smem = (2 + block_y) * C * sizeof(floatX);
+
+    generate_analysis(weight, C, "residual_layernorm_weight");
+    generate_analysis(bias, C, "residual_layernorm_bias");
+    generate_analysis(inp1, N, "residual_layernorm_inp1");
+    generate_analysis(inp2, N, "residual_layernorm_inp2");
 
     // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
     // this may fail, in which case we fall back to the smem free implementation.
@@ -487,6 +506,11 @@ void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, flo
         layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C, stream);
     }
     cudaCheck(cudaGetLastError());
+
+    generate_analysis(mean, N, "residual_layernorm_out_mean");
+    generate_analysis(rstd, N, "residual_layernorm_out_rstd");
+    generate_analysis(residual, N, "residual_layernorm_act_fused_residual");
+    generate_analysis(normed, N*C, "residual_layernorm_act_normed");
 }
 
 void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
@@ -499,7 +523,17 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     size_t rounded_C = CEIL_DIV(C, (32 * x128::size)) * (32 * x128::size);
     size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - 32) * f128::size) * sizeof(float);
 
+    generate_analysis(dout, B*T*C, "layernorm_bwd_dout");
+    generate_analysis(inp, B*T*C, "layernorm_bwd_inp");
+    generate_analysis(weight, C, "layernorm_bwd_weight");
+    generate_analysis(mean, B*T, "layernorm_bwd_special_mean");
+    generate_analysis(rstd, B*T, "layernorm_bwd_special_rstd");
+
     cudaCheck(cudaMemsetAsync(scratch, 0, 1 * sizeof(float), stream)); // only need to reset the flag to 0
     layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
+
+    generate_analysis(dinp, B*T*C, "layernorm_bwd_agrad_dinp");
+    generate_analysis(dweight, C,  "layernorm_bwd_wgrad_dweight");
+    generate_analysis(dbias, C,    "layernorm_bwd_wgrad_dbias");
 }

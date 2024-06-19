@@ -20,7 +20,7 @@ __device__ float global_norm_squared_for_range(const T* data, size_t count) {
         accumulator += (float)data[i] * (float)data[i];
     }
     // block-level reduce
-    return blockReduce<warpReduceSum>(accumulator);
+    return blockReduce<float, warpReduceSum>(accumulator);
 }
 
 template<class T>
@@ -39,7 +39,7 @@ __global__ void global_norm_aggregate_kernel(float* out, size_t grid_size) {
     size_t index = threadIdx.x;
     // grab block sums from the previous kernel, use 0. as the neutral sum element
     float block_sum = (index < grid_size) ? out[index] : 0.f;
-    float sum = blockReduce<warpReduceSum>(block_sum);
+    float sum = blockReduce<float, warpReduceSum>(block_sum);
     if(threadIdx.x == 0) {
         out[0] = sum;  // out[0] ends up with the final norm squared
     }
@@ -87,7 +87,6 @@ void global_norm_squared(float* out, const T* values, size_t count, ptrdiff_t st
     global_norm_squared_kernel<<<dim3(gx, gy), block_size, 0, stream>>>(out, values, count, stride);
     cudaCheck(cudaGetLastError());
 }
-
 void global_norm_squared_aggregate(float* out, int max_num_block_sums, cudaStream_t stream) {
     assert(max_num_block_sums > 0 && max_num_block_sums < 1024);  // we need to accumulate the block sums in a single block
     // important to use 1024 here for determinism, otherwise blockreduce might introduce errors

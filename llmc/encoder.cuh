@@ -161,7 +161,11 @@ void encoder_forward(floatX* out,
     const int block_size = 256;
     const int N = B * T * C;
     const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
+
+    generate_analysis(wte, T*C, "encoder_wte_weight");
+    generate_analysis(wpe, T*C, "encoder_wpe_weight");
     encoder_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, inp, wte, wpe, B, T, C);
+    generate_analysis(out, B*T*C, "encoder_act_out");
     cudaCheck(cudaGetLastError());
 }
 
@@ -171,6 +175,11 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
                       const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
                       int B, int T, int C, unsigned int seed, cudaStream_t stream) {
     NVTX_RANGE_FN();
+
+    generate_analysis(dout, B*T*C, "encoder_bwd_agrad_dout");
+    generate_analysis(inp, B*T, "encoder_bwd_in_inp");
+    generate_analysis(dwpe, T*C, "encoder_bwd_in_dwpe");
+    generate_analysis(dwte, T*C, "encoder_bwd_in_dwte");
 
     // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
     const int block_size = 256;
@@ -231,4 +240,7 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
     // todo - profile block sizes on more content (depends on number of buckets and on GPU?)
     wte_backward_kernel<256><<<num_buckets, 256, 0, stream>>>(dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C);
     cudaCheck(cudaGetLastError());
+
+    generate_analysis(dwpe, T*C, "encoder_bwd_wgrad_dwpe");
+    generate_analysis(dwte, T*C, "encoder_bwd_wgrad_dwte");
 }

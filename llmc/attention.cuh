@@ -173,7 +173,7 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
             local_sum += (float)att_bth[t2] * (float)datt_bth[t2];
         }
 
-        local_sum = blockReduce<warpReduceSum>(local_sum);
+        local_sum = blockReduce<float, warpReduceSum>(local_sum);
 
         for (int t3 = threadIdx.x; t3 < T; t3 += BlockSize) {
             // don't touch the cache. Some parts will still be here from the previous loop, and
@@ -215,6 +215,10 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     int num_blocks = CEIL_DIV(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, B, T, NH, HS);
 
+    generate_analysis(q, B*T*C, "attention_fwd_act_q");
+    generate_analysis(k, B*T*C, "attention_fwd_act_k");
+    generate_analysis(v, B*T*C, "attention_fwd_act_v");
+
     floatX* preatt = inp;
     cublasCheck(cublasSetStream(cublas_handle, stream));
     cublasCheck(cublasSetWorkspace(cublas_handle, cublaslt_workspace, cublaslt_workspace_size));
@@ -247,6 +251,8 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     num_blocks = CEIL_DIV(B * T * C, block_size);
     unpermute_kernel<<<num_blocks, block_size, 0, stream>>>(vaccum, out, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
+
+    generate_analysis(out, B*T*C, "attention_fwd_act_out");
 }
 
 // the sequence of transformations in this compound op is:
@@ -269,6 +275,10 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     dq = dqkvr + 0 * B * T * C;
     dk = dqkvr + 1 * B * T * C;
     dv = dqkvr + 2 * B * T * C;
+
+    generate_analysis(q, B*T*C, "attention_bwd_in_q");
+    generate_analysis(k, B*T*C, "attention_bwd_in_k");
+    generate_analysis(v, B*T*C, "attention_bwd_in_v");
 
     // backward through the unpermute operation
     int num_blocks = CEIL_DIV(B * T * C, block_size);
@@ -299,4 +309,9 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
     permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dinp, dq, dk, dv, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
+
+    generate_analysis(dq, B*T*C, "attention_bwd_agrad_dq");
+    generate_analysis(dk, B*T*C, "attention_bwd_agrad_dk");
+    generate_analysis(dv, B*T*C, "attention_bwd_agrad_dv");
+    generate_analysis(dinp, B*T*NH*HS, "attention_bwd_agrad_dinp");
 }

@@ -47,12 +47,16 @@ __global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const floatX* inp
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-void gelu_forward(floatX* out, const floatX* inp, int N, cudaStream_t stream) {
+void gelu_forward(floatX* out, const floatX* inp, int N, cudaStream_t stream, bool recompute=false) {
     NVTX_RANGE_FN();
     const int block_size = 512;
     assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
+
+    generate_analysis(inp, N, recompute ? "gelu_bwd_recompute_inp" : "gelu_fwd_inp");
     gelu_forward_kernel2<<<grid_size, block_size, 0, stream>>>(out, inp);
+    generate_analysis(out, N, recompute ? "gelu_bwd_recompute_out" : "gelu_fwd_act_out");
+
     cudaCheck(cudaGetLastError());
 }
 
@@ -61,6 +65,11 @@ void gelu_backward_inplace(floatX* d_in_out, const floatX* inp, const int N, cud
     const int block_size = 128;
     assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
+
+    generate_analysis(inp, N, "gelu_bwd_inp");
+    generate_analysis(d_in_out, N, "gelu_bwd_din");
     gelu_backward_inplace_kernel<<<grid_size, block_size, 0, stream>>>(d_in_out, inp);
+    generate_analysis(d_in_out, N, "gelu_bwd_agrad_dout");
+
     cudaCheck(cudaGetLastError());
 }
