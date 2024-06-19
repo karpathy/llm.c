@@ -67,18 +67,6 @@
         <select id="step-microstep-select" autocomplete="off">
             <!-- Step / MicroStep options will be dynamically populated -->
         </select>
-        <label for="threshold-select">Select Threshold:</label>
-        <select id="threshold-select" autocomplete="off">
-            <option value="1.01">Everything</option>
-            <option value="0.995">99.5th Percentile</option>
-            <option value="0.99">99th Percentile</option>
-            <option value="0.95" selected>95th Percentile</option>
-            <option value="0.90">90th Percentile</option>
-            <option value="0.75">75th Percentile</option>
-            <option value="0.50">50th Percentile</option>
-            <option value="0.25">25th Percentile</option>
-            <option value="0.10">10th Percentile</option>
-        </select>
         <button id="toggle-tensor-list">Show/Hide Sorted Tensor List</button>
     </div>
 
@@ -111,6 +99,18 @@
     </div>
 
     <div>
+        <label for="threshold-select">Select Threshold:</label>
+        <select id="threshold-select" autocomplete="off">
+            <option value="1.01">Everything</option>
+            <option value="0.995">99.5th Percentile</option>
+            <option value="0.99">99th Percentile</option>
+            <option value="0.95" selected>95th Percentile</option>
+            <option value="0.90">90th Percentile</option>
+            <option value="0.75">75th Percentile</option>
+            <option value="0.50">50th Percentile</option>
+            <option value="0.25">25th Percentile</option>
+            <option value="0.10">10th Percentile</option>
+        </select>
         <label for="exponent-bits-zmin">Exponent Range Heatmap - Min:</label>
         <input type="number" id="exponent-bits-zmin" value="0" autocomplete="off">
         <label for="exponent-bits-zmax">Exponent Range Heatmap - Max:</label>
@@ -219,7 +219,7 @@
             layers.forEach(layer => {
                 const option = document.createElement('option');
                 option.value = layer;
-                option.text = `Layer ${layer}`;
+                option.text = `${layer}`;
                 layerSelect.appendChild(option);
             });
 
@@ -241,31 +241,38 @@
             });
 
             // Function to find and update the layer details and histogram
-            function updateLayerDetails(name, layerDetails, stepMicroStep="Step 0 / MicroStep 0") {
-                const selectedData = processedData.find(d => d.Name === name &&d.Layer === parseInt(layer) && `Step ${d.Step} / MicroStep ${d.MicroStep}` === stepMicroStep);
+            function updateLayerDetails(name, layer, stepMicroStep="Step 0 / MicroStep 0") {
+                const selectedData = processedData.find(d => d.Name === name && (d.Layer === parseInt(layer) || d.Layer == layer) && `Step ${d.Step} / MicroStep ${d.MicroStep}` === stepMicroStep);
 
                 if (!selectedData) {
-                    console.log('No data found for', name, layerDetails);
+                    console.log('No data found for', name, layer, stepMicroStep);
+
+                    // Print everything in processedData
+                    console.log('Processed Data:', processedData);
+                    for (let i = 0; i < processedData.length && i < 5; i++) {
+                        console.log('Data', i, ':', processedData[i].Name, processedData[i].Layer, processedData[i].Step, processedData[i].MicroStep, `Step ${processedData[i].Step} / MicroStep ${processedData[i].MicroStep}`);
+                    }
+
                     // If no data matches, find the closest match and update the other dropdown
                     const closestData = processedData.find(d => d.Name === name);
-                    const closestDetails = `Layer ${closestData.Layer} / Step ${closestData.Step} / MicroStep ${closestData.MicroStep}`;
 
-                    // Find the index of closestDetails in the dropdown options
-                    let closestDetailsIndex = -1;
-                    for (let i = 0; i < layerDetailsSelect.options.length; i++) {
-                        if (layerDetailsSelect.options[i].text === closestDetails) {
-                            closestDetailsIndex = i;
-                            break;
-                        }
+                    // Is there any match?
+                    if (!closestData) {
+                        console.log('No match found for', name);
+                        return;
                     }
 
-                    // If closestDetailsIndex is found, set the dropdown value
-                    if (closestDetailsIndex !== -1) {
-                        layerDetailsSelect.selectedIndex = closestDetailsIndex;
-                        updateLayerDetails(name, closestDetails);
-                    }
+                    // Get layer/step/microstep
+                    const closestLayer = closestData.Layer;
+                    const closestStep = closestData.Step;
+                    const closestMicroStep = closestData.MicroStep;
+                    const StepMicroStepString = `Step ${closestStep} / MicroStep ${closestMicroStep}`;
+
+                    updateLayerDetails(name, closestLayer, StepMicroStepString);
+                    layerSelect.selectedIndex = closestLayer;
                     return;
                 }
+                console.log('FOUND for', name, layer, stepMicroStep);
 
                 const detailsDiv = document.getElementById('data-details');
                 // Display all available stats except the 2^n bins and MSB bins
@@ -411,7 +418,7 @@
             });
 
             // Initial load
-            updateLayerDetails(tensorNames[0], layerDetails[0]);
+            updateLayerDetails(tensorNames[0], 0);
 
             // Plot the initial histograms
             Plotly.newPlot('histogram-maxexp-all', [{

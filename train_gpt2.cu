@@ -3,7 +3,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 
 // todo where to put this, really should NOT be here, or hardcoded, or...
-//#define ENABLE_ANALYSIS_STATS
+#define ENABLE_ANALYSIS_STATS
 #ifdef ENABLE_ANALYSIS_STATS
 #define MAX_ANALYSIS_STATS 100000 // will stop recording for given micro-step after that point
 #define ANALYSIS_MEMORY_SIZE (MAX_ANALYSIS_STATS * ANALYSIS_SIZE * sizeof(uint))
@@ -1714,6 +1714,7 @@ int main(int argc, char *argv[]) {
             multi_gpu_barrier(&multi_gpu_config);
         }
         resuming = 0;
+        reset_analysis();
 
         // bit confusing: we want to make sure to eval and sample on 0th iteration
         // but also after the very last iteration. so we loop for step <= train_num_batches

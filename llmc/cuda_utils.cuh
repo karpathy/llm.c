@@ -368,6 +368,18 @@ __global__ void analysis_variance_kernel(unsigned int* analysis_gmem, const T* i
     }
 }
 
+__host__ void reset_analysis() {
+    for (int h = 0; h < current_analysis && h < MAX_ANALYSIS_STATS; h++) {
+        free(analysis_names[h]);
+        analysis_names[h] = NULL;
+    }
+
+    current_analysis = 0;
+    analysis_tensor_names.clear();
+    cudaMemset(analysis_memory, 0, ANALYSIS_MEMORY_SIZE);
+    cudaCheck(cudaGetLastError());
+}
+
 __host__ void write_analysis() {
     unsigned int* analysis_data_cpu = (unsigned int*)malloc(ANALYSIS_MEMORY_SIZE);
     cudaMemcpy(analysis_data_cpu, analysis_memory, ANALYSIS_MEMORY_SIZE, cudaMemcpyDeviceToHost);
@@ -424,8 +436,6 @@ __host__ void write_analysis() {
         continue;
 
         printf("==================\n%s (layer %d, step %d[%d])\n==================\n", analysis_names[h], analysis_layer[h], analysis_step[h], analysis_micro_step[h]);
-        free(analysis_names[h]);
-        analysis_names[h] = NULL;
 
         for (int i = 0; i < ANALYSIS_SIZE; i++) {
             if (stats[i] != 0) {
@@ -461,11 +471,8 @@ __host__ void write_analysis() {
     }
     fclose(f);
 
-    current_analysis = 0;
     free(analysis_data_cpu);
-    analysis_tensor_names.clear();
-    cudaMemset(analysis_memory, 0, ANALYSIS_MEMORY_SIZE);
-    cudaCheck(cudaGetLastError());
+    reset_analysis();
     exit(1);
 }
 
