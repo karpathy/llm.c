@@ -6,10 +6,10 @@ It can optinally upload to your account on Hugging Face if you have the CLI:
   huggingface-cli login
 
 Export to a local HF model:
-  python export_hf.py --input input_file.bin --output model_name
+  python export_hf.py --input input_file.bin --output output_dir
 
 Export to a local HF model and also push to your account on Hugging Face:
-  python export_hf.py --input input_file.bin --output model_name --push true
+  python export_hf.py --input input_file.bin --output output_dir --push true
 """
 
 import numpy as np
@@ -148,8 +148,10 @@ def spin(output):
     print('-'*80)
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(output)
-    model = AutoModelForCausalLM.from_pretrained(output)
+    model = AutoModelForCausalLM.from_pretrained(output, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16, device_map='cuda')
+    model.eval()
     tokens = tokenizer.encode("During photosynthesis in green plants", return_tensors="pt")
+    tokens = tokens.to('cuda')
     output = model.generate(tokens, max_new_tokens=64, repetition_penalty=1.3)
     samples = tokenizer.batch_decode(output)
     for sample in samples:

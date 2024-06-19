@@ -1,3 +1,8 @@
+# example run command
+# python dev/eval/summarize_eval.py lm-evaluation-harness/results/result774M
+# this script is optional, the run_eval.sh should already print these
+# but this script can be used to re-print them
+
 import json, sys
 
 RESULT = sys.argv[1]
