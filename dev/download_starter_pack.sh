@@ -8,7 +8,7 @@ BASE_URL="https://huggingface.co/datasets/chrisdryden/llmcDatasets/resolve/main/
 
 # Directory paths based on script location
 SAVE_DIR_PARENT="$SCRIPT_DIR/.."
-SAVE_DIR_TINY="$SCRIPT_DIR/../dev/data/tinyshakespeare"
+SAVE_DIR_TINY="$SCRIPT_DIR/data/tinyshakespeare"
 
 # Create the directories if they don't exist
 mkdir -p "$SAVE_DIR_TINY"
