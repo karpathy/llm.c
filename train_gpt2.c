@@ -11,7 +11,6 @@ There will be other versions of this code that specialize it and make it fast.
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <ctype.h>
 #include <stdint.h>
 #include <float.h>
 #include <assert.h>
@@ -776,22 +775,22 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         model->seq_len = T;
         // and now allocate the space
         model->act_sizes[0] = (size_t)B * T * C; // encoded
-        model->act_sizes[1] = (size_t)L * B * T * C; // ln1
-        model->act_sizes[2] = (size_t)L * B * T;  // ln1_mean
-        model->act_sizes[3] = (size_t)L * B * T;  // ln1_rstd
-        model->act_sizes[4] = (size_t)L * B * T * 3*C; // qkv
-        model->act_sizes[5] = (size_t)L * B * T * C;  // atty
-        model->act_sizes[6] = (size_t)L * B * NH * T * T;  // preatt
-        model->act_sizes[7] = (size_t)L * B * NH * T * T;  // att
-        model->act_sizes[8] = (size_t)L * B * T * C; // attproj
-        model->act_sizes[9] = (size_t)L * B * T * C; // residual2
-        model->act_sizes[10] = (size_t)L * B * T * C; // ln2
-        model->act_sizes[11] = (size_t)L * B * T; // ln2_mean
-        model->act_sizes[12] = (size_t)L * B * T; // ln2_rstd
-        model->act_sizes[13] = (size_t)L * B * T * 4*C; // fch
-        model->act_sizes[14] = (size_t)L * B * T * 4*C; // fch_gelu
-        model->act_sizes[15] = (size_t)L * B * T * C; // fcproj
-        model->act_sizes[16] = (size_t)L * B * T * C; // residual3
+        model->act_sizes[1] = L * B * T * C; // ln1
+        model->act_sizes[2] = L * B * T;  // ln1_mean
+        model->act_sizes[3] = L * B * T;  // ln1_rstd
+        model->act_sizes[4] = L * B * T * 3*C; // qkv
+        model->act_sizes[5] = L * B * T * C;  // atty
+        model->act_sizes[6] = L * B * NH * T * T;  // preatt
+        model->act_sizes[7] = L * B * NH * T * T;  // att
+        model->act_sizes[8] = L * B * T * C; // attproj
+        model->act_sizes[9] = L * B * T * C; // residual2
+        model->act_sizes[10] = L * B * T * C; // ln2
+        model->act_sizes[11] = L * B * T; // ln2_mean
+        model->act_sizes[12] = L * B * T; // ln2_rstd
+        model->act_sizes[13] = L * B * T * 4*C; // fch
+        model->act_sizes[14] = L * B * T * 4*C; // fch_gelu
+        model->act_sizes[15] = L * B * T * C; // fcproj
+        model->act_sizes[16] = L * B * T * C; // residual3
         model->act_sizes[17] = (size_t)B * T * C; // lnf
         model->act_sizes[18] = (size_t)B * T; // lnf_mean
         model->act_sizes[19] = (size_t)B * T; // lnf_rstd
