@@ -216,8 +216,6 @@ __device__ __forceinline__ void stochastic_rounding(float in, float *out, unsign
     *out = in; // dummy function for when floatX is float (FP32 mode)
 }
 
-#include <float.h> // todo - needed for FLT_MAX, but already included elsewhere later
-
 constexpr int STATS_NUM_HISTOGRAM_BINS  = 256;
 constexpr int STATS_HISTOGRAM           = 0;
 constexpr int STATS_OCP_HISTOGRAM       = STATS_HISTOGRAM+STATS_NUM_HISTOGRAM_BINS;
@@ -236,8 +234,10 @@ constexpr int STATS_ABSSUM              = STATS_SUM+1;
 constexpr int STATS_VARIANCE            = STATS_ABSSUM+1;
 constexpr int STATS_TENSOR_DIM          = STATS_VARIANCE+1;
 constexpr int ANALYSIS_SIZE             = STATS_TENSOR_DIM+1;
-
 constexpr int STATS_ELEMENTS_PER_THREAD = 8;
+
+#ifdef ENABLE_ANALYSIS_STATS
+#include <float.h> // todo - needed for FLT_MAX, but already included elsewhere later
 
 // Calculate analysis of exponent bits (8 bins) for all elements in the input matrix + ...
 // templated
@@ -459,14 +459,13 @@ __host__ void write_analysis() {
             }
         }
     }
-
     fclose(f);
 
     current_analysis = 0;
     free(analysis_data_cpu);
+    analysis_tensor_names.clear();
     cudaMemset(analysis_memory, 0, ANALYSIS_MEMORY_SIZE);
     cudaCheck(cudaGetLastError());
-
     exit(1);
 }
 
@@ -484,7 +483,7 @@ __host__ void generate_analysis(const T* tensor, size_t count, const char* name)
     // Check if tensor name is in the hashmap
     if (analysis_tensor_names.find(std::make_pair(name, global_current_layer)) != analysis_tensor_names.end()) {
         // Add " [2]" unless also already in hashmap, then add " [3]", etc...
-        analysis_names[current_analysis] = (char*)malloc(strlen(name) + 5);
+        analysis_names[current_analysis] = (char*)malloc(strlen(name) + 7);
         int i = 2;
         do {
             assert(i < 100);
@@ -508,5 +507,11 @@ __host__ void generate_analysis(const T* tensor, size_t count, const char* name)
 
     cudaCheck(cudaGetLastError());
 }
+
+#else
+template<typename T>
+__host__ void generate_analysis(const T* tensor, size_t count, const char* name) { }
+__host__ void write_analysis() { }
+#endif
 
 #endif

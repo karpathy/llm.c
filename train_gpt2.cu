@@ -3,7 +3,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 
 // todo where to put this, really should NOT be here, or hardcoded, or...
-#define ENABLE_ANALYSIS_STATS
+//#define ENABLE_ANALYSIS_STATS
 #ifdef ENABLE_ANALYSIS_STATS
 #define MAX_ANALYSIS_STATS 100000 // will stop recording for given micro-step after that point
 #define ANALYSIS_MEMORY_SIZE (MAX_ANALYSIS_STATS * ANALYSIS_SIZE * sizeof(uint))
@@ -13,16 +13,16 @@ uint analysis_layer[MAX_ANALYSIS_STATS];
 uint analysis_step[MAX_ANALYSIS_STATS];
 uint analysis_micro_step[MAX_ANALYSIS_STATS];
 uint current_analysis = 0;
-uint global_current_layer = 0;
-uint global_current_step = 0;
-uint global_current_micro_step = 0;
 // include std map
 #include <set>
 #include <string>
 // hashmap of the tensor names seen so far including layer (reset on every micro-step)
 std::set<std::pair<std::string, uint>> analysis_tensor_names;
 #endif
-// ...
+uint global_current_layer = 0;
+uint global_current_step = 0;
+uint global_current_micro_step = 0;
+
 
 #include <unistd.h>
 #include <stdio.h>
@@ -1728,7 +1728,6 @@ int main(int argc, char *argv[]) {
         float lossf = 0.0f; // for getting the mean loss over the accumulation steps
         for (int micro_step = 0; micro_step < grad_accum_steps; micro_step++) {
             global_current_micro_step = micro_step;
-            analysis_tensor_names.clear();
 
             // fetch the next data batch
             // and if we're overfitting a single batch, we'll only call this a single time
