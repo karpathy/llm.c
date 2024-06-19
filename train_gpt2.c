@@ -417,9 +417,9 @@ void attention_backward(float* dinp, float* dpreatt, float* datt,
 }
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-void gelu_forward(float* out, const float* inp, int N) {
+void gelu_forward(float* out, const float* inp, ptrdiff_t N) {
     // (approximate) GeLU elementwise non-linearity in the MLP block of Transformer
-    for (int i = 0; i < N; i++) {
+    for (ptrdiff_t i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
         out[i] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
@@ -431,8 +431,8 @@ void gelu_forward(float* out, const float* inp, int N) {
 #if defined(__GNUC__) && !defined(__clang__)
 __attribute__((optimize("no-finite-math-only")))
 #endif
-void gelu_backward(float* dinp, const float* inp, const float* dout, int N) {
-    for (int i = 0; i < N; i++) {
+void gelu_backward(float* dinp, const float* inp, const float* dout, ptrdiff_t N) {
+    for (ptrdiff_t i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
         float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
@@ -445,14 +445,14 @@ void gelu_backward(float* dinp, const float* inp, const float* dout, int N) {
 }
 #pragma float_control(pop)
 
-void residual_forward(float* out, const float* inp1, const float* inp2, int N) {
-    for (int i = 0; i < N; i++) {
+void residual_forward(float* out, const float* inp1, const float* inp2, ptrdiff_t N) {
+    for (ptrdiff_t i = 0; i < N; i++) {
         out[i] = inp1[i] + inp2[i];
     }
 }
 
-void residual_backward(float* dinp1, float* dinp2, const float* dout, int N) {
-    for (int i = 0; i < N; i++) {
+void residual_backward(float* dinp1, float* dinp2, const float* dout, ptrdiff_t N) {
+    for (ptrdiff_t i = 0; i < N; i++) {
         dinp1[i] += dout[i];
         dinp2[i] += dout[i];
     }
@@ -869,12 +869,12 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-        residual_forward(l_residual2, residual, l_attproj, B*T*C);
+        residual_forward(l_residual2, residual, l_attproj, (ptrdiff_t)B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
         matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
-        gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+        gelu_forward(l_fch_gelu, l_fch, (ptrdiff_t)B*T*4*C);
         matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
-        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+        residual_forward(l_residual3, l_residual2, l_fcproj, (ptrdiff_t)B*T*C);
     }
     residual = acts.residual3 + (ptrdiff_t)(L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
@@ -1098,8 +1098,8 @@ int main() {
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_tokens, B, T, 0, 1, 0);
-    printf("train dataset num_batches: %zu\n", train_loader.num_tokens / (B*T));
-    printf("val dataset num_batches: %zu\n", val_loader.num_tokens / (B*T));
+    printf("train dataset num_batches: %zu\n", train_loader.num_tokens / ((size_t)B*T));
+    printf("val dataset num_batches: %zu\n", val_loader.num_tokens / ((size_t)B*T));
     int val_num_batches = 5;
 
     // build the Tokenizer
@@ -1146,7 +1146,7 @@ int main() {
                 // we're in principle running B "inference streams" in parallel here
                 // but only using position 0
                 // get the Vp-dimensional vector probs[0, t-1, :]
-                float* probs = model.acts.probs + (t-1) * model.config.padded_vocab_size;
+                float* probs = model.acts.probs + (ptrdiff_t)(t-1) * model.config.padded_vocab_size;
                 float coin = random_f32(&rng_state);
                 // note we're only sampling from the first V elements, ignoring padding
                 // (the probabilities in the padded region should be zero anyway)
