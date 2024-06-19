@@ -164,13 +164,10 @@ int main(int argc, char *argv[]) {
     gpt2_forward(&model, x, NULL, B, T);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
-    floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
-    float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
-    cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < B * T * Vp; i++) {
     floatX* logits_cpu_raw = (floatX*)mallocCheck((size_t)B * T * Vp * sizeof(floatX));
     float* logits_cpu = (float*)mallocCheck((size_t)B * T * Vp * sizeof(float));
     cudaCheck(cudaMemcpy(logits_cpu_raw, model.acts.output, (size_t)B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost));
+    for (ptrdiff_t i = 0; i < (ptrdiff_t)B * T * Vp; i++) {
         logits_cpu[i] = (float)logits_cpu_raw[i];
     }
 
