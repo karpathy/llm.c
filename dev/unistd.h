@@ -7,8 +7,11 @@
 
 #include <stdio.h>
 #include <math.h>
-//#define gen_max_length 64 // compile as C++ to skip this VLA issue
 #include <time.h>
+#include <stdlib.h> // for malloc and free
+#include <string.h>
+#include <direct.h> // for _mkdir and _stat
+#include <io.h> // needed for _access below and _findfirst, _findnext, _findclose
 
 #define CLOCK_MONOTONIC 0
 static inline int clock_gettime(int ignore_variable, struct timespec* tv)
@@ -17,14 +20,12 @@ static inline int clock_gettime(int ignore_variable, struct timespec* tv)
 }
 
 #define OMP /* turn it on */
-#include <io.h> /* needed for access below */
 #define F_OK 0
 #define access _access
 
 #define TURN_OFF_FP_FAST __pragma(float_control( precise, on, push )) // Save current setting and turn on /fp:precise
 #define TURN_ON_FP_FAST  __pragma(float_control(pop)) // Restore file's default settings
 
-#include <direct.h> /* for _mkdir and _stat */
 #define mkdir(path, mode) _mkdir(path) /* sketchy way to get mkdir to work on windows */
 #define stat _stat
 
@@ -59,7 +60,7 @@ static inline int glob(const char* pattern, int ignored_flags, int (*ignored_err
 
     replace_forward_slashes (pattern_copy); // Replace forward slashes with backslashes
 
-    if (strchr(pattern_copy, '\\') != NULL) {
+    if (strchr(pattern_copy, '\\') != (void*) NULL) {
         strncpy_s(directory_path, sizeof(directory_path) - 1, pattern_copy, strrchr(pattern_copy, '\\') - pattern_copy + 1);
         directory_path[strrchr(pattern_copy, '\\') - pattern_copy + 1] = '\0';
     }
