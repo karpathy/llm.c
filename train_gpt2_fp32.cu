@@ -1007,7 +1007,7 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
     size_t C = config.channels;
-    act_sizes[0] = B * T * C; // encoded
+    act_sizes[0] = (size_t)B * T * C; // encoded
     act_sizes[1] = L * B * T * C; // ln1
     act_sizes[2] = L * B * T; // ln1_mean
     act_sizes[3] = L * B * T; // ln1_rstd
@@ -1022,12 +1022,12 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[12] = L * B * T * 4*C; // fch_gelu
     act_sizes[13] = L * B * T * C; // fcproj
     act_sizes[14] = L * B * T * C; // residual3
-    act_sizes[15] = B * T * C; // lnf
-    act_sizes[16] = B * T; // lnf_mean
-    act_sizes[17] = B * T; // lnf_rstd
-    act_sizes[18] = B * T; // losses
+    act_sizes[15] = (size_t)B * T * C; // lnf
+    act_sizes[16] = (size_t)B * T; // lnf_mean
+    act_sizes[17] = (size_t)B * T; // lnf_rstd
+    act_sizes[18] = (size_t)B * T; // losses
     act_sizes[19] = L * B * T * 3*C; // qkvr
-    act_sizes[20] = B * T * std::max(3*C, std::max(NH*T, Vp)); // output / scratch
+    act_sizes[20] = (size_t)B * T * std::max(3*C, std::max(NH*T, Vp)); // output / scratch
 }
 
 // Backward pass is conceptually quite different from forward, because we can discard
