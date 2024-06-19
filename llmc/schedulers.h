@@ -7,6 +7,7 @@ Implements various learning rate schedulers.
 
 #include <assert.h>
 #include <math.h>
+#include <cstring>
 
 typedef enum {
     LR_SCHEDULER_COSINE,
@@ -62,24 +63,6 @@ void lr_scheduler_init(LearningRateScheduler *scheduler, float learning_rate, in
 // Learning rate scheduler functions
 //
 
-// switch to the appropriate learning rate scheduler
-float get_learning_rate(LRSchedulerType lr_scheduler_type, LearningRateScheduler *scheduler, int step) {
-    float step_learning_rate;
-    if (lr_scheduler_type == LR_SCHEDULER_COSINE) {
-        step_learning_rate = get_learning_rate_cosine(scheduler, step);
-    } else if (lr_scheduler_type == LR_SCHEDULER_LINEAR) {
-        step_learning_rate = get_learning_rate_linear(scheduler, step);
-    } else if (lr_scheduler_type == LR_SCHEDULER_TRIANGULAR) {
-        step_learning_rate = get_learning_rate_triangular(scheduler, step);
-    } else if (lr_scheduler_type == LR_SCHEDULER_CONSTANT) {
-        step_learning_rate = get_learning_rate_constant(scheduler, step);
-    } else {
-        printf("Unknown learning rate scheduler type\n");
-        exit(EXIT_FAILURE);
-    }
-    return step_learning_rate;
-}
-
 // cosine learning rate schedule: warmup linearly to max LR, then cosine decay to LR * final_learning_rate_frac
 float get_learning_rate_cosine(LearningRateScheduler *scheduler, int step) {
     float lr = scheduler->learning_rate;
@@ -113,6 +96,7 @@ float get_learning_rate_linear(LearningRateScheduler *scheduler, int step) {
 // cyclic triangular learning rate schedule: linearly increase LR from min LR to max LR, then linearly decrease LR to min LR (repeat)
 // currently hardcoded to support only a single cycle
 float get_learning_rate_triangular(LearningRateScheduler *scheduler, int step) {
+    // warmup_iterations <- not used.
     int step_size = scheduler->train_num_batches / 2;  // number of steps in half a cycle
     float min_lr = scheduler->learning_rate * scheduler->final_learning_rate_frac;
     float max_lr = scheduler->learning_rate;
@@ -125,7 +109,29 @@ float get_learning_rate_triangular(LearningRateScheduler *scheduler, int step) {
 
 // constant learning rate schedule
 float get_learning_rate_constant(LearningRateScheduler *scheduler, int step) {
+    // warmup_iterations <- not used.
+    // train_num_batches <- not used.
+    // final_learning_rate_frac <- not used.
     return scheduler->learning_rate;
 }
+
+// switch to the appropriate learning rate scheduler
+float get_learning_rate(LRSchedulerType lr_scheduler_type, LearningRateScheduler *scheduler, int step) {
+    float step_learning_rate;
+    if (lr_scheduler_type == LR_SCHEDULER_COSINE) {
+        step_learning_rate = get_learning_rate_cosine(scheduler, step);
+    } else if (lr_scheduler_type == LR_SCHEDULER_LINEAR) {
+        step_learning_rate = get_learning_rate_linear(scheduler, step);
+    } else if (lr_scheduler_type == LR_SCHEDULER_TRIANGULAR) {
+        step_learning_rate = get_learning_rate_triangular(scheduler, step);
+    } else if (lr_scheduler_type == LR_SCHEDULER_CONSTANT) {
+        step_learning_rate = get_learning_rate_constant(scheduler, step);
+    } else {
+        printf("Unknown learning rate scheduler type\n");
+        exit(EXIT_FAILURE);
+    }
+    return step_learning_rate;
+}
+
 
 #endif // SCHEDULERS_H
