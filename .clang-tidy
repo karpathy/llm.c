@@ -1,3 +1,4 @@
-Checks: '-*,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions,misc-confusable-identifiers,misc-const-correctness,performance-*'
+Checks: '-*,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions,misc-confusable-identifiers,performance-*'
 # bugprone-narrowing-conversions would be great, but this happens too many times to be usable right now
 # similarly, cert-*-c might be good, but for now it is just too noisy
+# misc-const-correctness also is too aggressive for now
