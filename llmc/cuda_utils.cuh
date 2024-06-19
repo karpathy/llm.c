@@ -183,8 +183,11 @@ __device__ __host__ constexpr unsigned int SquirrelNoise5(int positionX, unsigne
 }
 __device__ __host__ constexpr unsigned int Get2dNoiseUint(int indexX, int indexY, unsigned int seed)
 {
-    constexpr int PRIME_NUMBER = 198491317; // Large prime number with non-boring bits
-    return SquirrelNoise5(indexX + (PRIME_NUMBER * indexY), seed);
+    constexpr unsigned int PRIME_NUMBER = 198491317u; // Large prime number with non-boring bits
+    unsigned int x = static_cast<unsigned int>(indexX);
+    unsigned int y = static_cast<unsigned int>(indexY);
+
+    return SquirrelNoise5(x + (PRIME_NUMBER * y), seed);
 }
 
 // stochastic rounding built on top of Squirel Noise above (with seed updated per step via xorshift)
