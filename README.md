@@ -126,7 +126,25 @@ sudo apt-get update
 sudo apt-get -y install libcudnn9-dev-cuda-12
 ```
 
-On top of this you need the [cuDNN frontend](https://github.com/NVIDIA/cudnn-frontend/tree/main), but this is just header files. Simply clone the repo to your disk. The Makefile currently looks for it in either your home directory or the current directory. If you have put it elsewhere, add `CUDNN_FRONTEND_PATH=/path/to/your/cudnn-frontend/include` to the `make` command-line.
+Note: For Arch linux users, `cudnn` package is part of the extras of many distributions, install it with `sudo pacman -S cudnn` or using paru. However, note that presently it does not come packaged with the necessary cudnn-frontend mentioned below.
+
+On top of this you need the [cuDNN frontend](https://github.com/NVIDIA/cudnn-frontend/tree/main), but this is just header only files.
+The Makefile currently looks for it in either your home directory or the current directory. 
+Let's say your include folder on your system is located at /usr/include/, Simply clone the repo to your disk. 
+
+To use install cudnn frontend to your systems include folder, you can do the following:
+```bash
+git clone https://github.com/NVIDIA/cudnn-frontend.git
+sudo cp cudnn-frontend/include/cudnn_frontend*.h /usr/include/
+ls /usr/include/cudnn_frontend*.h
+```
+
+If you have put it elsewhere, add `CUDNN_FRONTEND_PATH=/path/to/your/cudnn-frontend/include` to the `make` command-line.
+
+Example of building the project with CUDNN frontend headers installed in /usr/include:
+```bash
+make USE_CUDNN=1 CUDNN_FRONTEND_PATH=/usr/include/
+```
 
 **multi-GPU training**. As of April 26, 2024 there is now also support for multi-GPU training using MPI and NCCL. Make sure you install MPI, e.g. on Linux:
 

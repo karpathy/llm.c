@@ -965,28 +965,28 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     }
 
     // gradient clipping
+    // gradient norm calculation and aggregation
     // repurposing this buffer (which isn't needed now) to write grad norm into it
     float* grad_norm_squared = (float*)model->acts.output;
     float grad_norm_squared_cpu = 0.0f;
 
     int num_slices[2] = {1, model->config.num_layers};
     int max_num_block_sums = get_max_num_block_sums(num_slices, 2);
+
     if (multi_gpu_config->zero_stage == 1) {
         // because of the ncclReduceScatter() in backward,
         // grads_memory only contains the averaged gradients at the local shards,
         // so we only calculate the grad norm at the grads_memory belonging to the local shards
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-            if((i < 2 || i > 13)) {
-                ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
-                ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
-                ptrdiff_t offset = tensor.offset + shard.offset;
-                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, 0, 1, max_num_block_sums, i == 0, main_stream);
+            ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
+            ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
+            ptrdiff_t offset = tensor.offset + shard.offset;
+            bool is_first_pass = i == 0;  // track first iteration, typically only the first tensor zeroes grad_norm_squared
+
+            if (i < 2 || i > 13) {
+                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, 0, 1, max_num_block_sums, is_first_pass, main_stream);
             } else {
-                ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
-                ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
-                ptrdiff_t offset = tensor.offset + shard.offset;
-                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, tensor.size, model->config.num_layers,
-                                    max_num_block_sums, false, main_stream);
+                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, tensor.size, model->config.num_layers, max_num_block_sums, is_first_pass, main_stream);
             }
         }
         global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
