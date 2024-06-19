@@ -1303,6 +1303,7 @@ void error_usage() {
     // workload (number of steps)
     fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
     // optimization
+    fprintf(stderr, "  -k <string> learning rate scheduler (default = cosine)\n");
     fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
     fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
     fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
@@ -1333,6 +1334,7 @@ int main(int argc, char *argv[]) {
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
+    LRSchedulerType lr_scheduler_type = LR_SCHEDULER_COSINE;
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write optimization checkpoints every how many steps?
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
@@ -1383,6 +1385,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'k') { lr_scheduler_type = get_lr_scheduler_type_from_name(argv[i + 1]); }
         else { error_usage(); }
     }
     // should do a bit more error checking here
@@ -1416,6 +1419,7 @@ int main(int argc, char *argv[]) {
     printf0("| micro batch size B    | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
+    printf0("| LR scheduler          | %-50s |\n", get_lr_scheduler_name(lr_scheduler_type));
     printf0("| learning rate (LR)    | %-50e |\n", learning_rate);
     printf0("| warmup iterations     | %-50d |\n", warmup_iterations);
     printf0("| final LR fraction     | %-50e |\n", final_learning_rate_frac);
@@ -1549,8 +1553,26 @@ int main(int argc, char *argv[]) {
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
     // set up learning rate scheduler
-    CosineLearningRateScheduler lr_scheduler;
-    lr_scheduler_init_cosine(&lr_scheduler, learning_rate, warmup_iterations, train_num_batches, final_learning_rate_frac);
+    CosineLearningRateScheduler lr_scheduler_cosine;
+    LinearLearningRateScheduler lr_scheduler_linear;
+    CyclicTriangularLearningRateScheduler lr_scheduler_triangular;
+    ConstantLearningRateScheduler lr_scheduler_constant;
+    if (lr_scheduler_type == LR_SCHEDULER_COSINE) {
+        lr_scheduler_init_cosine(&lr_scheduler_cosine, learning_rate, warmup_iterations, train_num_batches, final_learning_rate_frac);
+    } else if (lr_scheduler_type == LR_SCHEDULER_LINEAR) {
+        lr_scheduler_init_linear(&lr_scheduler_linear, learning_rate, warmup_iterations, train_num_batches, final_learning_rate_frac);
+    } else if (lr_scheduler_type == LR_SCHEDULER_TRIANGULAR) {
+        // Hardcode some reasonable defaults for now
+        float min_lr = learning_rate / 10.0f;
+        float max_lr = learning_rate;
+        int step_size = train_num_batches / 4;
+        lr_scheduler_init_triangular(&lr_scheduler_triangular, min_lr, max_lr, step_size);
+    } else if (lr_scheduler_type == LR_SCHEDULER_CONSTANT) {
+        lr_scheduler_init_constant(&lr_scheduler_constant, learning_rate);
+    } else {
+        printf("Unknown learning rate scheduler type\n");
+        exit(EXIT_FAILURE);
+    }
 
     // some memory for generating samples from the model
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
@@ -1711,7 +1733,19 @@ int main(int argc, char *argv[]) {
         // average the loss and the gradients between all processes
         gpt2_multi_gpu_loss_reduce(&model, &multi_gpu_config);
         // fetch the next learning rate
-        float step_learning_rate = get_learning_rate_cosine(&lr_scheduler, step);
+        float step_learning_rate;
+        if (lr_scheduler_type == LR_SCHEDULER_COSINE) {
+            step_learning_rate = get_learning_rate_cosine(&lr_scheduler_cosine, step);
+        } else if (lr_scheduler_type == LR_SCHEDULER_LINEAR) {
+            step_learning_rate = get_learning_rate_linear(&lr_scheduler_linear, step);
+        } else if (lr_scheduler_type == LR_SCHEDULER_TRIANGULAR) {
+            step_learning_rate = get_learning_rate_triangular(&lr_scheduler_triangular, step);
+        } else if (lr_scheduler_type == LR_SCHEDULER_CONSTANT) {
+            step_learning_rate = get_learning_rate_constant(&lr_scheduler_constant, step);
+        } else {
+            printf("Unknown learning rate scheduler type\n");
+            exit(EXIT_FAILURE);
+        }
         // update the model parameters
         float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
         // zero out the gradients for the next iteration

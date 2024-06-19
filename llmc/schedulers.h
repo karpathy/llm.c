@@ -8,6 +8,38 @@ Implements various learning rate schedulers.
 #include <assert.h>
 #include <math.h>
 
+typedef enum {
+    LR_SCHEDULER_COSINE,
+    LR_SCHEDULER_LINEAR,
+    LR_SCHEDULER_TRIANGULAR,
+    LR_SCHEDULER_CONSTANT,
+    NUM_LR_SCHEDULERS   // To keep track of the number of schedulers
+} LRSchedulerType;
+
+const char* lr_scheduler_names[] = {
+    "cosine",
+    "linear",
+    "triangular",
+    "constant",
+};
+
+const char* get_lr_scheduler_name(LRSchedulerType type) {
+    if (type < 0 || type >= NUM_LR_SCHEDULERS) {
+        exit(EXIT_FAILURE);
+    }
+    return lr_scheduler_names[type];
+}
+
+LRSchedulerType get_lr_scheduler_type_from_name(const char* name) {
+    for (int i = 0; i < NUM_LR_SCHEDULERS; ++i) {
+        if (strcmp(name, lr_scheduler_names[i]) == 0) {
+            return (LRSchedulerType)i;
+        }
+    }
+    printf("Warning: Unknown learning rate scheduler name: %s\n. Using cosine as default.", name);
+    return LR_SCHEDULER_COSINE;  // Default to cosine if not found
+}
+
 //
 // Learning rate scheduler structs
 //
