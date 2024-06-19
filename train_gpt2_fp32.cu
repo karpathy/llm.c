@@ -1027,7 +1027,7 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[17] = B * T; // lnf_rstd
     act_sizes[18] = B * T; // losses
     act_sizes[19] = L * B * T * 3*C; // qkvr
-    act_sizes[20] = B * T * max(3*C, max(NH*T, Vp)); // output / scratch
+    act_sizes[20] = B * T * std::max(3*C, std::max(NH*T, Vp)); // output / scratch
 }
 
 // Backward pass is conceptually quite different from forward, because we can discard
@@ -1232,7 +1232,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     float* residual;
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
 
-    for (int l = 0; l < L; l++) {
+    for (ptrdiff_t l = 0; l < L; l++) {
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
@@ -1367,7 +1367,7 @@ void gpt2_backward(GPT2 *model) {
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
 
     // now backward all the layers
-    for (int l = L-1; l >= 0; l--) {
+    for (ptrdiff_t l = L-1; l >= 0; l--) {
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
