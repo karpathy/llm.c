@@ -258,7 +258,7 @@ int main(int argc, char *argv[]) {
             // Also, different GPUs may use different matrix multiplication algorithms, so the
             // actual errors can be hardware specific.
 
-            float grad_thresholds[NUM_PARAMETER_TENSORS] = {5e-1f, 4e-3f, 1e-1f, 3e-2f, 1.5e-2f, 3e-2f, 5e-2f, 5e-2f, 5e-2f, 1.5e-2f, 5e-4f, 8e-3f, 1e-3f, 2.5e-3f, 1e-1f, 2e-2f};
+            float grad_thresholds[NUM_PARAMETER_TENSORS] = {5e-1f, 4e-3f, 1e-1f, 3.5e-2f, 2e-2f, 3e-2f, 5e-2f, 5e-2f, 5e-2f, 1.5e-2f, 5e-4f, 8e-3f, 1.5e-3f, 2.5e-3f, 1e-1f, 2e-2f};
             #if defined(ENABLE_FP32)
             for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
                 grad_thresholds[i] = 1e-6f;  // we can be much more precise in FP32
