@@ -134,11 +134,13 @@ sudo apt-get -y install libcudnn9-dev-cuda-12
 
 On top of this you need the [cuDNN frontend](https://github.com/NVIDIA/cudnn-frontend/tree/main), but this is just header files. Simply clone the repo to your disk. The Makefile currently looks for it in either your home directory or the current directory. If you have put it elsewhere, add `CUDNN_FRONTEND_PATH=/path/to/your/cudnn-frontend/include` to the `make` command-line.
 
-**multi-GPU training**. As of April 26, 2024 there is now also support for multi-GPU training using MPI and NCCL. Make sure you install MPI, e.g. on Linux:
+**multi-GPU training using MPI and NCCL**. Make sure you install MPI and NCCL, e.g. on Linux:
 
 ```bash
 sudo apt install openmpi-bin openmpi-doc libopenmpi-dev
 ```
+
+For NCCL follow the instructions from the [official website](https://developer.nvidia.com/nccl/nccl-download) (e.g. network installer)
 
 and then:
 
