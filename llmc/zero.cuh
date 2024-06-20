@@ -73,15 +73,15 @@ MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank, int gp
         idFile = fopen(filename, "wb");
         assert(idFile != NULL);
         fwrite(&nccl_id, sizeof(nccl_id), 1, idFile);
-        fclose(idFile);
+        fcloseCheck(idFile);
     } else {                        // Other ranks wait until the file is available and read the unique ID
         do {
             usleep(1000000);
             idFile = fopen(filename, "rb");
             if (idFile != NULL) break;
         } while (idFile == NULL);
-        fread(&nccl_id, sizeof(nccl_id), 1, idFile);
-        fclose(idFile);
+        freadCheck(&nccl_id, sizeof(nccl_id), 1, idFile);
+        fcloseCheck(idFile);
     }
 
     printf("ProcessID:%d, NumProcess::%d, DeviceId:%d\n", result.process_rank, result.num_processes, result.device_idx);

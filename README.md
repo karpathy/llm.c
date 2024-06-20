@@ -144,7 +144,7 @@ and then:
 
 ```bash
 make train_gpt2cu
-mpirun -np <number of GPUs> bach -c './train_gpt2cu -pn <number of GPUs> -pr $OMPI_COMM_WORLD_RANK'
+mpirun -np <number of GPUs> bash -c './train_gpt2cu -pn <number of GPUs> -pr $OMPI_COMM_WORLD_RANK'
 ```
 
 **multi-node training**. For SLURM enabled cluster, use the sample script in [scripts/run_gpt2_124M.sbatch](scripts/run_gpt2_124M.sbatch)

@@ -1289,7 +1289,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
 
 // ----------------------------------------------------------------------------
 // CLI, poor man's argparse
-// unclaimed flags lol: k,p
+// unclaimed flags lol: k
 
 void error_usage() {
     fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
@@ -1326,6 +1326,11 @@ void error_usage() {
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
+    // distributed training
+    fprintf(stderr, "  -pn <int>   number of processes (GPUs) in total\n");
+    fprintf(stderr, "  -pr <int>   process rank\n");
+    fprintf(stderr, "  -pg <int>   number of GPUs per node\n");
+    fprintf(stderr, "  -pd <string> dfs (distributed file system) path to write temporary files to\n"); // todo delete
     exit(EXIT_FAILURE);
 }
 
@@ -1365,7 +1370,7 @@ int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
-        if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x (one dash, one letter)
+        if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x (one dash, 1-2 letters)
         // read in the args
         if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }

@@ -57,7 +57,7 @@ MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank, int gp
         idFile = fopen(filename, "wb");
         assert(idFile != NULL);
         fwrite(&nccl_id, sizeof(nccl_id), 1, idFile);
-        fclose(idFile);            
+        fclose(idFile);
     } else {                        // Other ranks wait until the file is available and read the unique ID
         do {
             usleep(1000000);

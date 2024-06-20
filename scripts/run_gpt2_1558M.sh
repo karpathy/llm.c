@@ -20,7 +20,8 @@ while true; do
 
     # run python dev/data/fineweb.py --version 100B to prepro data
     # run python dev/data/hellaswag.py to prepro hellaswag eval
-    mpirun -np 8 ./train_gpt2cu \
+    mpirun -np 8 bash -c "
+                ./train_gpt2cu \
                 -i "dev/data/fineweb100B/fineweb_train_*.bin" \
                 -j "dev/data/fineweb100B/fineweb_val_*.bin" \
                 -o $out_dir \
@@ -37,7 +38,9 @@ while true; do
                 -n 2000 \
                 -x 100000 \
                 -y 1 \
-                -e "d48"
+                -e "d48" \
+                -pn \$OMPI_COMM_WORLD_SIZE \
+                -pr \$OMPI_COMM_WORLD_RANK"
 
     sleep 1
 done

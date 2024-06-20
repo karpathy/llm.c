@@ -39,7 +39,7 @@ while true; do
                 -x 60000 \
                 -y 1 \
                 -e "d24" \
-                -pn 8 \
+                -pn \$OMPI_COMM_WORLD_SIZE \
                 -pr \$OMPI_COMM_WORLD_RANK"
 
     sleep 1
