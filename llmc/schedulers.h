@@ -7,7 +7,7 @@ Implements various learning rate schedulers.
 
 #include <assert.h>
 #include <math.h>
-#include <cstring>
+#include <string.h>
 
 typedef enum {
     LR_SCHEDULER_COSINE,
