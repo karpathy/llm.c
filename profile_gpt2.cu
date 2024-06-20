@@ -28,7 +28,7 @@ the profile.ncu-rep from a cloud box to local to pretty view.
 #include "train_gpt2.cu"
 
 int main(int argc, char *argv[]) {
-    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
+    multi_gpu_config = multi_gpu_config_init(1, 0, 8, ".");
     common_start(true, true);
 
     // build the GPT-2 model from a checkpoint

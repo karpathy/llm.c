@@ -134,18 +134,20 @@ sudo apt-get -y install libcudnn9-dev-cuda-12
 
 On top of this you need the [cuDNN frontend](https://github.com/NVIDIA/cudnn-frontend/tree/main), but this is just header files. Simply clone the repo to your disk. The Makefile currently looks for it in either your home directory or the current directory. If you have put it elsewhere, add `CUDNN_FRONTEND_PATH=/path/to/your/cudnn-frontend/include` to the `make` command-line.
 
-**multi-GPU training**. As of April 26, 2024 there is now also support for multi-GPU training using MPI and NCCL. Make sure you install MPI, e.g. on Linux:
+**multi-GPU training**. Support for multi-GPU training is availabel using NCCL. Make sure you download and install [NCCL](https://docs.nvidia.com/deeplearning/nccl/install-guide/index.html), e.g. on Linux:
 
 ```bash
-sudo apt install openmpi-bin openmpi-doc libopenmpi-dev
+sudo sudo apt install libnccl2 libnccl-dev
 ```
 
 and then:
 
 ```bash
 make train_gpt2cu
-mpirun -np <number of GPUs> ./train_gpt2cu
+mpirun -np <number of GPUs> bach -c './train_gpt2cu -pn <number of GPUs> -pr $OMPI_COMM_WORLD_RANK'
 ```
+
+**multi-node training**. For SLURM enabled cluster, use the sample script in [scripts/run_gpt2_124M.sbatch](scripts/run_gpt2_124M.sbatch)
 
 ## experiments / sweeps
 
