@@ -44,10 +44,13 @@ elif args.version == "100B":
 
 # create the cache the local directory if it doesn't exist yet
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
+# change the cache directory to a custom location if needed
+HUGGINGFACE_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache/huggingface/datasets")
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
+os.makedirs(HUGGINGFACE_CACHE_DIR, exist_ok=True)
 
 # download the dataset
-fw = load_dataset("HuggingFaceFW/fineweb", name=remote_name, split="train")
+fw = load_dataset("HuggingFaceFW/fineweb", name=remote_name, split="train", cache_dir=HUGGINGFACE_CACHE_DIR)
 
 # init the tokenizer
 enc = tiktoken.get_encoding("gpt2")
