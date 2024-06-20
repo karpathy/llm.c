@@ -133,7 +133,7 @@ __global__ void fused_residual_forward2(floatX* residual, floatX* normed, floatX
     for(int c = 0; c < C; ++c) {
         float out = (float)inp1[c] + (float)inp2[c];
         m += out;
-        residual[c] = out;
+        residual[c] = (floatX)out;
     }
 
     m = m / C;
@@ -149,11 +149,11 @@ __global__ void fused_residual_forward2(floatX* residual, floatX* normed, floatX
     for (int c = 0; c < C; c++) {
         float n = (s * ((float)residual[c] - m)); // normalized output
         float o = n * (float)weight[c] + (float)bias[c]; // scale and shift it
-        normed[c] = o; // write
+        normed[c] = (floatX)o; // write
     }
     // cache the mean and rstd for the backward pass later
-    mean[idx] = m;
-    rstd[idx] = s;
+    mean[idx] = (floatX)m;
+    rstd[idx] = (floatX)s;
 }
 
 // handle one token per warp for coalesced access
@@ -232,7 +232,7 @@ __global__ void fused_residual_forward_kernel4(floatX* residual, floatX* normed,
         const x128 in2 = load128cs(inp2 + c);
         x128 out;
         for(int k = 0; k < x128::size; ++k) {
-            out[k] = (float)in1[k] + (float)in2[k];
+            out[k] = (floatX)((float)in1[k] + (float)in2[k]);
             sum += (float)out[k];
             sum_sq += (float)out[k] * (float)out[k];
         }
@@ -309,7 +309,7 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
         const x128 in2 = load128cs(inp2 + c);
         x128 out;
         for(int k = 0; k < x128::size; ++k) {
-            out[k] = (float)in1[k] + (float)in2[k];
+            out[k] = (floatX)((float)in1[k] + (float)in2[k]);
             sum += (float)out[k];
         }
         store128cs(residual + c, out);
@@ -372,8 +372,8 @@ __global__ void fused_residual_forward_kernel6(floatX* residual, floatX* normed,
     // weights and biases are  shared among all tokens
     x128* s_weight = reinterpret_cast<x128*>(params);
     x128* s_bias = reinterpret_cast<x128*>(params + C * sizeof(floatX));
-    // residual output (input to layernorm) is indpendent for each sub-block indicates by threadIdx.z
-    x128* s_res = reinterpret_cast<x128*>(params + (2 + threadIdx.z) * C * sizeof(floatX)  );
+    // residual output (input to layernorm) is independent for each sub-block indicates by threadIdx.z
+    x128* s_res = reinterpret_cast<x128*>(params + (2 + threadIdx.z) * C * sizeof(floatX));
     // similarly, each sub-block needs its own reduction buffers
     float* s_mean = reinterpret_cast<float*>(params + (2 + blockDim.z) * C * sizeof(floatX) + threadIdx.z * 32 * sizeof(float));
     float* s_var = reinterpret_cast<float*>(params + (2 + blockDim.z) * C * sizeof(floatX) + 32 * sizeof(float) * (blockDim.z + threadIdx.z));
@@ -385,9 +385,9 @@ __global__ void fused_residual_forward_kernel6(floatX* residual, floatX* normed,
         s_weight[c / x128::size] = load128(weight + c);
         s_bias[c / x128::size] = load128(bias + c);
     }
+
     // the block-level reductions will cause sync before the first time we read these
     // => no syncthreads needed here
-
 
     // loop over all tokens
     for(int tidx = blockIdx.x * blockDim.z + threadIdx.z; tidx < N; tidx += gridDim.x * blockDim.z) {

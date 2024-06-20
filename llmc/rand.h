@@ -220,4 +220,21 @@ void normal_(float* data, unsigned int numel, float mean, float std, mt19937_sta
     }
 }
 
+void init_identity_permutation(int *data, int numel) {
+    for (int i = 0; i < numel; i++) {
+        data[i] = i;
+    }
+}
+
+void random_permutation(int* data, int numel, mt19937_state* state) {
+    for (int i = numel - 1; i > 0; i--) {
+        // pick an index j in [0, i] with equal probability
+        int j = randint32(state) % (i + 1);
+        // swap i <-> j
+        int tmp = data[i];
+        data[i] = data[j];
+        data[j] = tmp;
+    }
+}
+
 #endif

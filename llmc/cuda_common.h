@@ -42,13 +42,25 @@ extern cudaDeviceProp deviceProp;
 // Error checking
 
 // CUDA error checking
-void inline cudaCheck(cudaError_t error, const char *file, int line) {
+inline void cudaCheck(cudaError_t error, const char *file, int line) {
   if (error != cudaSuccess) {
     printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line, cudaGetErrorString(error));
     exit(EXIT_FAILURE);
   }
 };
 #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
+
+// like cudaFree, but checks for errors _and_ resets the pointer.
+template<class T>
+inline void cudaFreeCheck(T** ptr, const char *file, int line) {
+    cudaError_t error = cudaFree(*ptr);
+    if (error != cudaSuccess) {
+        printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line, cudaGetErrorString(error));
+        exit(EXIT_FAILURE);
+    }
+    *ptr = nullptr;
+}
+#define cudaFreeCheck(ptr) (cudaFreeCheck(ptr, __FILE__, __LINE__))
 
 // ----------------------------------------------------------------------------
 // CUDA Precision settings and defines

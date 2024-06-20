@@ -29,6 +29,8 @@ verstion 5 allocates blocks per row instead of warps per row, same alg as 4 othe
 #include <cooperative_groups/reduce.h>
 #include "common.h"
 
+#define WARP_SIZE 32
+
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -290,7 +292,7 @@ __global__ void layernorm_forward_kernel5(float* __restrict__ out, float* __rest
     int num_warps = blockDim.x / 32;
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
-    int idx = blockIdx.x; // simpoy one block per row
+    int idx = blockIdx.x; // simply one block per row
     // the row of input that this group of threads is responsible for
     const float* x = inp + idx * C;
     // thread coarsening through the row, reduce the sum in series
@@ -337,6 +339,82 @@ __global__ void layernorm_forward_kernel5(float* __restrict__ out, float* __rest
     }
 }
 
+// Inspired by `fused_residual_forward_kernel5` in fused_residual_forward.cu
+__global__ void layernorm_forward_kernel6(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+                                    const float*  __restrict__ inp, const float*  __restrict__ weight,
+                                    const float* __restrict__ bias, int N, int C) {
+    assert(blockDim.x == WARP_SIZE);
+
+    // load weights and biases into shared memory
+    // do this before we allow any threads to exit!
+    extern __shared__ char params[];
+    // load128/store128 sometimes generated multiple instructions when the types here were floatX*, so
+    // let's keep everything as x128
+    x128* s_weight = reinterpret_cast<x128*>(params);
+    x128* s_bias = reinterpret_cast<x128*>(params) + (C / x128::size);
+    x128* s_in = reinterpret_cast<x128*>(params) + ((2 + threadIdx.y) * C / x128::size);
+
+    int sidx = (threadIdx.x + WARP_SIZE * threadIdx.y) * x128::size;
+    for(int i = sidx; i < C; i += blockDim.y * WARP_SIZE * x128::size) {
+        s_weight[i/x128::size] = load128(weight + i);
+        s_bias[i/x128::size] = load128(bias + i);
+    }
+    __syncthreads();
+
+    int idx = blockIdx.x * blockDim.y + threadIdx.y;
+    if(idx >= N) { return; } // guard
+
+    // adjust pointers to current token
+    inp += idx * C;
+    out += idx * C;
+
+    const float eps = 1e-5f;
+    float sum = 0.0f;
+    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
+        const x128 in_data = load128cs(inp + c);
+        for(int k = 0; k < x128::size; ++k) {
+            sum += (float)in_data[k];
+        }
+        s_in[c / x128::size] = in_data;
+    }
+
+    sum = warpReduceSum(sum);
+    float m = sum / C;
+    float v = 0.f;
+
+    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
+        const x128 in_data = s_in[c / x128::size];
+        for(int k = 0; k < x128::size; ++k) {
+            v += ((float)in_data[k] - m) * ((float)in_data[k] - m);
+        }
+    }
+
+    v = warpReduceSum(v) / C;
+    float s = rsqrtf(v + eps);
+
+    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
+        const x128 in_data = s_in[c / x128::size];
+        const x128 w = s_weight[c / x128::size];
+        const x128 b = s_bias[c / x128::size];
+        x128 out_data;
+        for(int k = 0; k < x128::size; ++k) {
+            float n = s * ((float)in_data[k] - m); // normalized output
+            float o = n * (float)w[k] + (float)b[k]; // scale and shift it
+            out_data[k] = o;
+        }
+
+        store128cs(out + c, out_data);
+    }
+    // cache the mean and rstd for the backward pass later
+    if(threadIdx.x == 0 && mean != nullptr) {
+        __stcs(mean + idx, m);
+    }
+    // store the rstd, no need to cache it
+    if(threadIdx.x == 0 && rstd != nullptr) {
+        __stcs(rstd + idx, s);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -356,9 +434,9 @@ void layernorm_forward2(float* out, float* mean, float* rstd,
                        const int block_size) {
     int N = B * T;
     // in mean and rstd, threads cooperate within blocks via reductions
-    mean_kernel<<<B * T, block_size, block_size * sizeof(float)>>>(mean, inp, N, C, block_size);
+    mean_kernel<<<N, block_size, block_size * sizeof(float)>>>(mean, inp, N, C, block_size);
     cudaCheck(cudaGetLastError());
-    rstd_kernel<<<B * T, block_size, block_size * sizeof(float)>>>(rstd, inp, mean, N, C, block_size);
+    rstd_kernel<<<N, block_size, block_size * sizeof(float)>>>(rstd, inp, mean, N, C, block_size);
     cudaCheck(cudaGetLastError());
     // in the normalization, everything just gets flattened out
     const int block_size2 = 256;
@@ -394,9 +472,35 @@ void layernorm_forward5(float* out, float* mean, float* rstd,
                        int B, int T, int C,
                        const int block_size) {
     assert(block_size % 32 == 0);
+    assert(block_size <= 1024);
     const int N = B * T;
     const int grid_size = N;
     layernorm_forward_kernel5<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
+void layernorm_forward6(float* out, float* mean, float* rstd,
+                       const float* inp, const float* weight, const float* bias,
+                       int B, int T, int C,
+                       int block_size) {
+    assert(block_size % 32 == 0);
+    const int N = B * T;
+    int block_y = block_size / WARP_SIZE;
+    const int grid_size = ceil_div(N, block_y);
+    size_t smem = (2 + block_y) * C * sizeof(float);
+
+    // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
+    // this may fail, in which case we fall back to the smem free implementation.
+    cudaCheck(cudaGetLastError());
+    auto status = cudaFuncSetAttribute(layernorm_forward_kernel6, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaGetLastError();
+    if (status == cudaSuccess) {
+        layernorm_forward_kernel6<<<grid_size, dim3(32, block_y), smem>>>(out, mean, rstd, inp, weight, bias, N, C);
+    } else {
+        const int grid_size = N;
+        // fall back to the version without shared memory
+        layernorm_forward_kernel5<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
+    }
     cudaCheck(cudaGetLastError());
 }
 
@@ -421,6 +525,9 @@ void layernorm_forward(int kernel_num,
             break;
         case 5:
             layernorm_forward5(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
+            break;
+        case 6:
+            layernorm_forward6(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -473,9 +580,6 @@ int main(int argc, char **argv) {
     printf("Using kernel %d\n", kernel_num);
 
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
-    float* out_gpu = (float*)malloc(B * T * C * sizeof(float));
-    float* mean_gpu = (float*)malloc(B * T * sizeof(float));
-    float* rstd_gpu = (float*)malloc(B * T * sizeof(float));
 
     layernorm_forward_cpu(out, mean, rstd, inp, weight, bias, B, T, C);
 

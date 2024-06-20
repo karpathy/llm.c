@@ -159,7 +159,7 @@ int main(int argc, char **argv) {
     // create random data on host (to be used for the CPU reference implementation)
     float* params_memory = make_random_float(num_parameters);
     float* grads_memory = make_random_float(num_parameters);
-    float* m_memory = make_random_float_01(num_parameters);
+    float* m_memory = make_random_float(num_parameters);
     float* v_memory = make_random_float_01(num_parameters);
 
     // move to GPU
