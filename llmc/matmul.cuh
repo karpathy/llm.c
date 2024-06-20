@@ -14,56 +14,57 @@ Matrix Multiplication, with help from cuBLASLt
 template<typename OutFloat, bool UseAuxBuffer>
 __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
                                              std::bool_constant<UseAuxBuffer>) {
+    static_assert(WARP_SIZE % 4 == 0, "WARP_SIZE must be a multiple of 4");
+    constexpr int bdx = 4;
+    constexpr int bdy = WARP_SIZE / bdx;
+    assert(blockDim.x == bdx && blockDim.y == bdy);
+    
+    int warp_d = threadIdx.x;
+    int warp_c = threadIdx.y;
+    int block_d = threadIdx.z;
+    int global_oc = blockIdx.x * bdy * x128::size + warp_c * x128::size; // 64 OCs at BF16
 
-        static_assert(WARP_SIZE % 4 == 0, "WARP_SIZE must be a multiple of 4");
-        constexpr const int bdx = 4;
-        constexpr const int bdy = WARP_SIZE / bdx;
-        assert(blockDim.x == bdx && blockDim.y == bdy);
+    __shared__ float sub_results[x128::size][WARP_SIZE][bdy];
     
-        int warp_d = threadIdx.x, warp_c = threadIdx.y, block_d = threadIdx.z;
-        int global_oc = blockIdx.x * bdy * x128::size + warp_c * x128::size; // 64 OCs at BF16
-    
-        if (global_oc < OC) {
-            int bt_per_block = bdx * blockDim.z;
-            float accumulators[x128::size] = {0};
-            int idx = blockIdx.y * bt_per_block + warp_d + bdx * block_d;
+    if (global_oc < OC) {
+        int bt_per_block = bdx * blockDim.z;
+        float accumulators[x128::size] = {0.0f};
+        int idx = blockIdx.y * bt_per_block + warp_d + bdx * block_d;
 
-            // sum up over all bt within registers
-            #pragma unroll
-            for (; idx < B * T; idx += gridDim.y * bt_per_block) {
-                x128 packed_dout = load128(dout + global_oc + idx*OC);
-                for (int k = 0; k < x128::size; k++) {
-                    accumulators[k] += (float)packed_dout[k];
-                }
-            }
-            __shared__ float sub_results[x128::size][WARP_SIZE][bdy];
-    
-            #pragma unroll
+        for (; idx < B * T; idx += gridDim.y * bt_per_block) {
+            x128 packed_dout = load128(dout + global_oc + idx * OC);
             for (int k = 0; k < x128::size; k++) {
-                float v = accumulators[k];
-                v += __shfl_down_sync(0xffffffff, v, 1, 4);
-                v += __shfl_down_sync(0xffffffff, v, 2, 4);
-                if (warp_d == 0) {
-                    sub_results[k][block_d][warp_c] = v;
-                }
+                accumulators[k] += static_cast<float>(packed_dout[k]);
             }
-            __syncthreads();
+        }
+
+        for (int k = 0; k < x128::size; k++) {
+            float v = accumulators[k];
+            for (int offset = 4 / 2; offset > 0; offset /= 2) {
+                v += __shfl_down_sync(0xffffffff, v, offset);
+            }
+            if (warp_d == 0) {
+                sub_results[k][block_d][warp_c] = v;
+            }
+        }
+    }
+    __syncthreads(); 
     
-            #pragma unroll 8
-            for (int k = block_d; k < x128::size; k += blockDim.z) {
-                float a = 0.f;
-    
-                #pragma unroll
-                for (int r = warp_d; r < blockDim.z; r += bdx) {
-                    float v = sub_results[k][r][warp_c];
-                    v += __shfl_down_sync(0xffffffff, v, 1, 4);
-                    v += __shfl_down_sync(0xffffffff, v, 2, 4);
-                    a += v;
+    if (global_oc < OC) {
+        for (int k = block_d; k < x128::size; k += blockDim.z) {
+            float a = 0.0f;
+            for (int r = warp_d; r < blockDim.z; r += bdx) {
+                float v = sub_results[k][r][warp_c];
+                for (int offset = 4 / 2; offset > 0; offset /= 2) {
+                    v += __shfl_down_sync(0xffffffff, v, offset);
                 }
-                
-                if (warp_d == 0) {
+                a += v;
+            }
+            if (warp_d == 0) {
+                float current_value = static_cast<float>(dbias[global_oc + k]);
+                if (a != current_value || UseAuxBuffer) { // only write if different
                     if constexpr (!UseAuxBuffer) {
-                        dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
+                        dbias[global_oc + k] = static_cast<OutFloat>(a + current_value);
                     } else {
                         dbias[global_oc + k + blockIdx.y * OC] = a;
                     }
@@ -71,7 +72,8 @@ __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout
             }
         }
     }
-                                                
+}
+
 __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, size_t m) {
     const size_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * f128::size;
     assert(n % x128::size == 0);
