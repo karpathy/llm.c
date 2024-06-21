@@ -21,7 +21,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/dataloader.h"
 // defines: manual_seed, normal_ (same as torch.manual_seed and torch.normal)
 #include "llmc/rand.h"
-// defines learning rate schedulers
+// defines: lr_scheduler_init, get_learning_rate
 #include "llmc/schedulers.h"
 // defines: sample_softmax, random_f32
 #include "llmc/sampler.h"

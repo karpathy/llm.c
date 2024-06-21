@@ -59,6 +59,26 @@ float get_learning_rate_constant(LearningRateScheduler *scheduler, int step) {
     return scheduler->learning_rate;
 }
 
+// wsd schedule: warmup linearly, keep constant, last 20% decay using 1 - sqrt decay to final_frac (should be 0.0)
+// https://arxiv.org/abs/2405.18392
+float get_learning_rate_wsd(LearningRateScheduler *scheduler, int step) {
+    int decay_point = (int)(0.8f * scheduler->train_num_batches);
+    float max_lr = scheduler->learning_rate;
+    float lr = max_lr;
+    if (step < scheduler->warmup_iterations) {
+        float decay_ratio = ((float)(step + 1)) / scheduler->warmup_iterations;
+        lr = max_lr * decay_ratio;
+    } else if (step < decay_point) {
+        // noop, keep lr constant
+    } else {
+        float decay_ratio = ((float)(step - decay_point)) / (scheduler->train_num_batches - decay_point);
+        assert(0.0f <= decay_ratio && decay_ratio <= 1.0f);
+        float min_lr = max_lr * scheduler->final_learning_rate_frac;
+        return min_lr + (1.0f - sqrtf(decay_ratio)) * (max_lr - min_lr);
+    }
+    return lr;
+}
+
 // return the learning rate at a given step
 float get_learning_rate(LearningRateScheduler *scheduler, int step) {
     float step_learning_rate;
@@ -68,8 +88,10 @@ float get_learning_rate(LearningRateScheduler *scheduler, int step) {
         step_learning_rate = get_learning_rate_linear(scheduler, step);
     } else if (strcmp(scheduler->type, "constant") == 0) {
         step_learning_rate = get_learning_rate_constant(scheduler, step);
+    } else if (strcmp(scheduler->type, "wsd") == 0) {
+        step_learning_rate = get_learning_rate_wsd(scheduler, step);
     } else {
-        printf("Unknown learning rate scheduler type\n");
+        fprintf(stderr, "Unknown learning rate scheduler type: %s\n", scheduler->type);
         exit(EXIT_FAILURE);
     }
     return step_learning_rate;
