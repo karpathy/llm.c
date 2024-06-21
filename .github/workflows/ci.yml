@@ -219,3 +219,31 @@ jobs:
 
       - name: Build project
         run: make -j4 -C dev/cuda
+
+  run-clang-tidy:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install  Clang-Tidy
+        run: apt-get update && apt-get install -y clang-tidy-15
+
+      - name: C version
+        run: |
+          ls
+          clang-tidy-15 train_gpt2.c
+          clang-tidy-15 test_gpt2.c
+
+      - name: CUDA FP32 version
+        run: |
+          clang-tidy-15 train_gpt2_fp32.cu || true
+          clang-tidy-15 test_gpt2_fp32.cu || true
+
+      - name: CUDA version
+        run: |
+          clang-tidy-15 train_gpt2.cu -- --std=c++17 || true
+          clang-tidy-15 test_gpt2.cu -- --std=c++17 || true

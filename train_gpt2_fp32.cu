@@ -1007,7 +1007,7 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
     size_t C = config.channels;
-    act_sizes[0] = B * T * C; // encoded
+    act_sizes[0] = (size_t)B * T * C; // encoded
     act_sizes[1] = L * B * T * C; // ln1
     act_sizes[2] = L * B * T; // ln1_mean
     act_sizes[3] = L * B * T; // ln1_rstd
@@ -1022,12 +1022,12 @@ void fill_in_activation_sizes(size_t* act_sizes, int B, int T, GPT2Config config
     act_sizes[12] = L * B * T * 4*C; // fch_gelu
     act_sizes[13] = L * B * T * C; // fcproj
     act_sizes[14] = L * B * T * C; // residual3
-    act_sizes[15] = B * T * C; // lnf
-    act_sizes[16] = B * T; // lnf_mean
-    act_sizes[17] = B * T; // lnf_rstd
-    act_sizes[18] = B * T; // losses
+    act_sizes[15] = (size_t)B * T * C; // lnf
+    act_sizes[16] = (size_t)B * T; // lnf_mean
+    act_sizes[17] = (size_t)B * T; // lnf_rstd
+    act_sizes[18] = (size_t)B * T; // losses
     act_sizes[19] = L * B * T * 3*C; // qkvr
-    act_sizes[20] = B * T * max(3*C, max(NH*T, Vp)); // output / scratch
+    act_sizes[20] = (size_t)B * T * std::max(3*C, std::max(NH*T, Vp)); // output / scratch
 }
 
 // Backward pass is conceptually quite different from forward, because we can discard
@@ -1208,9 +1208,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
         printf("allocated %zu MiB for activations\n", (num_activations * sizeof(float)) >> 20); // >> 20 is /(1024*1024)
         // also create memory for caching inputs and targets
-        cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
-        cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
-        cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
+        cudaCheck(cudaMalloc((void**)&model->inputs, (size_t)B * T * sizeof(int)));
+        cudaCheck(cudaMalloc((void**)&model->targets, (size_t)B * T * sizeof(int)));
+        cudaCheck(cudaMallocHost((void**)&model->cpu_losses, (size_t)B * T * sizeof(float)));
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -1221,9 +1221,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     }
 
     // copy inputs/targets to the model
-    cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(model->inputs, inputs, (size_t)B * T * sizeof(int), cudaMemcpyHostToDevice));
     if (targets != NULL) {
-        cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
+        cudaCheck(cudaMemcpy(model->targets, targets, (size_t)B * T * sizeof(int), cudaMemcpyHostToDevice));
     }
 
     // forward pass
@@ -1232,7 +1232,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     float* residual;
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
 
-    for (int l = 0; l < L; l++) {
+    for (ptrdiff_t l = 0; l < L; l++) {
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
@@ -1367,7 +1367,7 @@ void gpt2_backward(GPT2 *model) {
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
 
     // now backward all the layers
-    for (int l = L-1; l >= 0; l--) {
+    for (ptrdiff_t l = L-1; l >= 0; l--) {
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
@@ -1656,7 +1656,7 @@ int main(int argc, char *argv[]) {
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
+    int* gen_tokens = (int*)mallocCheck((size_t)B * T * sizeof(int));
     float* cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
     // train

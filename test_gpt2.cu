@@ -138,14 +138,14 @@ int main(int argc, char *argv[]) {
 
     // read reference information from the file saved from Python/PyTorch side
     // 1) input x and y
-    int* x = (int*)mallocCheck(B * T * sizeof(int));
-    int* y = (int*)mallocCheck(B * T * sizeof(int));
-    freadCheck(x, sizeof(int), B*T, state_file);
-    freadCheck(y, sizeof(int), B*T, state_file);
+    int* x = (int*)mallocCheck((size_t)B * T * sizeof(int));
+    int* y = (int*)mallocCheck((size_t)B * T * sizeof(int));
+    freadCheck(x, sizeof(int), (size_t)B*T, state_file);
+    freadCheck(y, sizeof(int), (size_t)B*T, state_file);
     // 2) results of forward pass (logits and loss)
-    float* expected_logits = (float*) mallocCheck(B * T * V * sizeof(float));
+    float* expected_logits = (float*) mallocCheck((size_t)B * T * V * sizeof(float));
     float* expected_loss = (float*) mallocCheck(1 * sizeof(float));
-    freadCheck(expected_logits, sizeof(float), B*T*V, state_file);
+    freadCheck(expected_logits, sizeof(float), (size_t)B*T*V, state_file);
     freadCheck(expected_loss, sizeof(float), 1, state_file);
     // 3) results of backward pass (parameter gradients)
     FloatParameterTensors expected_grads; // will be read from file. right now: all in fp32
@@ -164,10 +164,10 @@ int main(int argc, char *argv[]) {
     gpt2_forward(&model, x, NULL, B, T);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
-    floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
-    float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
-    cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < B * T * Vp; i++) {
+    floatX* logits_cpu_raw = (floatX*)mallocCheck((size_t)B * T * Vp * sizeof(floatX));
+    float* logits_cpu = (float*)mallocCheck((size_t)B * T * Vp * sizeof(float));
+    cudaCheck(cudaMemcpy(logits_cpu_raw, model.acts.output, (size_t)B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost));
+    for (ptrdiff_t i = 0; i < (ptrdiff_t)B * T * Vp; i++) {
         logits_cpu[i] = (float)logits_cpu_raw[i];
     }
 

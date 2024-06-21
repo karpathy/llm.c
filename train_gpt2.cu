@@ -504,7 +504,7 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     // so that we can match them up and get correctness and exactly the same initial conditions
     size_t L = model->config.num_layers;
     size_t offset = 0;
-    for (int l = 0; l < L; l++) {
+    for (ptrdiff_t l = 0; l < L; l++) {
         offset = 0;
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
             // the layernorm parameters are all initialized to 1
@@ -620,7 +620,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
     // first layernorm isn't fused
     layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
 
-    for (int l = 0; l < L; l++) {
+    for (ptrdiff_t l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
 
         floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
@@ -781,7 +781,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
     floatX* dl_btc = residual;
 
     // now backward all the layers
-    for (int l = L-1; l >= 0; l--) {
+    for (ptrdiff_t l = L-1; l >= 0; l--) {
         NvtxRange layer_range("Layer", l);
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
@@ -1552,7 +1552,7 @@ int main(int argc, char *argv[]) {
                       warmup_iterations, train_num_batches, final_learning_rate_frac);
 
     // some memory for generating samples from the model
-    int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
+    int* gen_tokens = (int*)mallocCheck((size_t)B * T * sizeof(int));
     floatX* cpu_logits_raw = (floatX*)mallocCheck(model.config.vocab_size * sizeof(floatX));
     float*  cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 

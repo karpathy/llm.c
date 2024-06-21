@@ -77,15 +77,15 @@ int main(int argc, char *argv[]) {
     float* calculated_grads_memory = malloc_and_point_parameters(&calculated_grads, model.param_sizes, 0);
 
     // inputs and expected outputs, only used for error checking
-    int* x = (int*)mallocCheck(B * T * sizeof(int));
-    int* y = (int*)mallocCheck(B * T * sizeof(int));
-    float* expected_logits = (float*) mallocCheck(B * T * V * sizeof(float));
+    int* x = (int*)mallocCheck((size_t)B * T * sizeof(int));
+    int* y = (int*)mallocCheck((size_t)B * T * sizeof(int));
+    float* expected_logits = (float*) mallocCheck((size_t)B * T * V * sizeof(float));
     float* expected_loss = (float*) mallocCheck(1 * sizeof(float));
 
     // read reference information from Python
-    freadCheck(x, sizeof(int), B*T, state_file);
-    freadCheck(y, sizeof(int), B*T, state_file);
-    freadCheck(expected_logits, sizeof(float), B*T*V, state_file);
+    freadCheck(x, sizeof(int), (size_t)B*T, state_file);
+    freadCheck(y, sizeof(int), (size_t)B*T, state_file);
+    freadCheck(expected_logits, sizeof(float), (size_t)B*T*V, state_file);
     freadCheck(expected_loss, sizeof(float), 1, state_file);
     freadCheck(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
     fcloseCheck(state_file);
@@ -97,8 +97,8 @@ int main(int argc, char *argv[]) {
     gpt2_forward(&model, x, NULL, B, T);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
-    float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
-    cudaMemcpy(logits_cpu, model.acts.output, B * T * Vp * sizeof(float), cudaMemcpyDeviceToHost);
+    float* logits_cpu = (float*)mallocCheck((size_t)B * T * Vp * sizeof(float));
+    cudaCheck(cudaMemcpy(logits_cpu, model.acts.output, (size_t)B * T * Vp * sizeof(float), cudaMemcpyDeviceToHost));
 
     // compare the output logits from the forward pass
     // also careful that we don't access and compare the padded columns of logits
@@ -195,7 +195,7 @@ int main(int argc, char *argv[]) {
     }
 
     // expected losses are as follows, from Python
-    float expected_losses[10] = {
+    const float expected_losses[10] = {
         5.270007133483887,
         4.059706687927246,
         3.3751230239868164,
