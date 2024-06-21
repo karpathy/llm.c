@@ -1278,6 +1278,12 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     fclose(state_file);
 }
 
+// get environment variable as integer with fallback
+int get_env_int(const char* env_name, int default_value) {
+    const char* value = getenv(env_name);
+    if (!value) return default_value;
+    return atoi(value);
+}
 
 #ifndef TESTING
 // if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
@@ -1334,12 +1340,6 @@ void error_usage() {
     exit(EXIT_FAILURE);
 }
 
-int get_env_value(const char* env_name, int default_value) {
-    const char* value = getenv(env_name);
-    if (!value) return default_value;
-    return atoi(value);
-}
-
 // ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
@@ -1369,9 +1369,9 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
-    int num_processes = get_env_value("OMPI_COMM_WORLD_SIZE", 1);
-    int process_rank = get_env_value("OMPI_COMM_WORLD_RANK", 0);
-    int gpus_per_node = get_env_value("OMPI_COMM_WORLD_LOCAL_SIZE", 1);
+    int num_processes = get_env_int("OMPI_COMM_WORLD_SIZE", 1);
+    int process_rank = get_env_int("OMPI_COMM_WORLD_RANK", 0);
+    int gpus_per_node = get_env_int("OMPI_COMM_WORLD_LOCAL_SIZE", 1);
     char dfs_path[256] = ".";
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
