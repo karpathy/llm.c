@@ -105,9 +105,11 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
 void matmul_forward_cublaslt(floatX* out,
                      floatX* inp, floatX* weight, floatX* bias,
-                     int B, int T, int C, int OC, cudaStream_t stream) {
+                     int B, int T, int C, int OC, cudaStream_t stream,
+                     floatX* post_gelu = NULL) {
     NVTX_RANGE_FN();
-    int has_bias = (bias != NULL);
+    bool has_bias = (bias != NULL);
+    bool has_gelu = (post_gelu != NULL);
 
     // check bias alignment
     if(((uintptr_t)bias % 16) != 0) {
@@ -130,12 +132,25 @@ void matmul_forward_cublaslt(floatX* out,
     // create the operation descriptor
     cublasOperation_t opNoTranspose = CUBLAS_OP_N;
     cublasOperation_t opTranspose = CUBLAS_OP_T;
-    cublasLtEpilogue_t epilogueBias = has_bias ? CUBLASLT_EPILOGUE_BIAS : CUBLASLT_EPILOGUE_DEFAULT;
+    cublasLtEpilogue_t epilogue;
 
     cublasCheck(cublasLtMatmulDescCreate(&operationDesc, cublas_compute, CUDA_R_32F)); // FP16 if CUBLAS_COMPUTE_16F
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opNoTranspose, sizeof(opNoTranspose)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias, sizeof(epilogueBias)));
+
+    if (has_gelu) {
+        int64_t gelu_ld = OC;
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD, &gelu_ld, sizeof(gelu_ld)));
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER, &out, sizeof(out)));
+        out = post_gelu; // AUX is the pre-GELU output,
+
+        epilogue = has_bias ? CUBLASLT_EPILOGUE_GELU_AUX_BIAS : CUBLASLT_EPILOGUE_GELU_AUX;
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+    }
+    if(!has_gelu && has_bias){
+        cublasLtEpilogue_t epilogueBias = CUBLASLT_EPILOGUE_BIAS;
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias, sizeof(epilogueBias)));
+    }
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
 
     // define matrix layouts

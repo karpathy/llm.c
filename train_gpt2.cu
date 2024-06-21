@@ -669,8 +669,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
 
         matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, l_attproj, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream);
-        gelu_forward(l_fch_gelu, l_fch, B*T*4*C, main_stream);
+        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch_gelu); // with GELU
         matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
 
         // OK, fusion across blocks.
