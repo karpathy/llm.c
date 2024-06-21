@@ -163,14 +163,17 @@ int main(int argc, char **argv) {
     }
     printf("Using kernel %d\n", kernel_num);
 
-    // set up block sizes
+    // first check the correctness of the kernel
+    encoder_backward_cpu(dwte, dwpe, dout, inp, B, T, C);
+
+    // time the kernel at different block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
 
-    // first check the correctness of the kernel
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
+        cudaCheck(cudaMemset(d_dwte, 0, V * C * sizeof(float)));
+        cudaCheck(cudaMemset(d_dwpe, 0, T * C * sizeof(float)));
         printf("Checking block size %d.\n", block_size);
-        encoder_backward_cpu(dwte, dwpe, dout, inp, B, T, C);
         encoder_backward(kernel_num, d_dwte, d_dwpe, d_dout, d_inp, B, T, C, block_size);
         validate_result(d_dwte, dwte, "dwte", V * C, 1e-5f);
         validate_result(d_dwpe, dwpe, "dwpe", T * C, 1e-5f);

@@ -22,7 +22,7 @@ else
   CFLAGS = -O3 --use_fast_math --generate-code arch=compute_$(GPU_COMPUTE_CAPABILITY),code=[compute_$(GPU_COMPUTE_CAPABILITY),sm_$(GPU_COMPUTE_CAPABILITY)]
 endif
 
-NVCCFLAGS = -lcublas -lcublasLt
+NVCCFLAGS = -lcublas -lcublasLt -std=c++17
 MPI_PATHS = -I/usr/lib/x86_64-linux-gnu/openmpi/include -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
 
 # Default rule for our CUDA files

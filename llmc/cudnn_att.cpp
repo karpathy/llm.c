@@ -2,57 +2,35 @@
 // we change some unrelated piece of the code.
 // TODO this currently duplicates some of the utilities from the main file
 
+#define NOMINMAX
+#include "cudnn_att.h"
 #include <cudnn_frontend.h>
-#include <cuda_bf16.h>
-#include <nvtx3/nvToolsExt.h>
+
 namespace fe = cudnn_frontend;
 
 // Specific configurations based on the enabled precision
 #if defined(ENABLE_FP32)
-typedef float floatX;
 static_assert(false, "cuDNN is not supported in FP32 mode.")
-
 // use fp16 (note: this may require gradient scaler, currently not implemented!)
 #elif defined(ENABLE_FP16)
-typedef half floatX;
-#define CUBLAS_LOWP CUDA_R_16F
 #define CUDNN_16BIT fe::DataType_t::HALF
-
 #else // Default to bfloat16
-typedef __nv_bfloat16 floatX;
 #define CUDNN_16BIT fe::DataType_t::BFLOAT16
 #endif
-
-// CUDA error checking
-static void cudaCheck(cudaError_t error, const char *file, int line) {
-    if (error != cudaSuccess) {
-        printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
-               cudaGetErrorString(error));
-        exit(EXIT_FAILURE);
-    }
-};
-#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
-
-// Profiler utils
-namespace {
-    class NvtxRange {
-    public:
-        NvtxRange(const char* s) { nvtxRangePush(s); }
-        NvtxRange(const std::string& base_str, int number) {
-            std::string range_string = base_str + " " + std::to_string(number);
-            nvtxRangePush(range_string.c_str());
-        }
-        ~NvtxRange() { nvtxRangePop(); }
-    };
-}
-#define NVTX_RANGE_FN() NvtxRange nvtx_range(__FUNCTION__)
 
 static cudnnHandle_t cudnn_handle;
 static size_t cudnn_workspace_size = 0; // dynamically allocated as needed (up to 256MiB!)
 static void* cudnn_workspace = NULL;
-#define checkCudnnErr(err) assert((int)err == 0);
 
-static void checkCudnnFE(fe::error_object e, const char *file, int line) {
+static void cuDNNCheck(cudnnStatus_t error, const char *file, int line) {
+    if (error != CUDNN_STATUS_SUCCESS) {
+        printf("[CUDNN ERROR] at file %s:%d:\n%s\n", file, line, cudnnGetErrorString(error));
+        exit(EXIT_FAILURE);
+    }
+};
+#define cuDNNCheck(err) (cuDNNCheck(err, __FILE__, __LINE__))
+
+static void checkCudnnFE(const fe::error_object& e, const char *file, int line) {
     if(!e.is_good()) {
         printf("[CUDNN ERROR] at file %s:%d:\n%s\n", file, line, e.err_msg.c_str());
         exit(EXIT_FAILURE);
@@ -88,7 +66,7 @@ auto lookup_cache_or_build_graph_fwd(int B,int H,int T,int HS, int is_inference_
     if (it != user_maintained_cache_fwd.end()) {
         return it->second;
     }
-    
+
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(CUDNN_16BIT)
           .set_intermediate_data_type(fe::DataType_t::FLOAT)
@@ -240,10 +218,12 @@ auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
 void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
                              float* stats, // output for backward pass: (B, NH, T)
                              floatX* inp,  // input: (B, T, 3, NH, HS) QKV
-                             int B, int T, int NH, int C) {
+                             int B, int T, int NH, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     int HS = C / NH; // number of features per head
     bool is_inference_only = (stats == nullptr);
+
+    cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
 
     // Get graph and tensors from cache (or generate it on first use)
     auto graph = lookup_cache_or_build_graph_fwd(B, NH, T, HS, is_inference_only);
@@ -271,7 +251,7 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
 
 void attention_backward_cudnn(floatX* dqkvr,                                       // output
                               floatX* dout, floatX* qkvr, floatX* o, float* stats, // inputs
-                              int B, int T, int NH, int C) {
+                              int B, int T, int NH, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     int HS = C / NH; // number of features per head
 
@@ -298,15 +278,16 @@ void attention_backward_cudnn(floatX* dqkvr,                                    
         {Attn_scale_UID, &attn_scale_cpu}};
 
     // Execute graph
+    cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
     checkCudnnFE(graph->execute(cudnn_handle, variant_pack, cudnn_workspace));
     cudaCheck(cudaGetLastError());
 }
 
 void create_cudnn() {
-    checkCudnnErr(cudnnCreate(&cudnn_handle));
+    cuDNNCheck(cudnnCreate(&cudnn_handle));
 }
 
 void destroy_cudnn() {
     if (cudnn_workspace != NULL) { cudaCheck(cudaFree(cudnn_workspace)); }
-    checkCudnnErr(cudnnDestroy(cudnn_handle));
+    cuDNNCheck(cudnnDestroy(cudnn_handle));
 }

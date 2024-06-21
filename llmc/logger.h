@@ -6,6 +6,7 @@ The Logger object is stateless and uses append mode to write to log files.
 #define LOGGER_H
 
 #include <assert.h>
+#include <stdio.h>
 #include <string.h>
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 #include "utils.h"
@@ -46,10 +47,10 @@ void logger_log_val(Logger *logger, int step, float val_loss) {
     }
 }
 
-void logger_log_train(Logger *logger, int step, float train_loss) {
+void logger_log_train(Logger *logger, int step, float train_loss, float learning_rate, float grad_norm) {
     if (logger->active == 1) {
         FILE *logfile = fopenCheck(logger->output_log_file, "a");
-        fprintf(logfile, "s:%d trl:%.4f\n", step, train_loss);
+        fprintf(logfile, "s:%d trl:%.4f lr:%.6f norm:%.2f\n", step, train_loss, learning_rate, grad_norm);
         fclose(logfile);
     }
 }

@@ -163,8 +163,8 @@ void uniform_(float* data, unsigned int numel, float from, float to, mt19937_sta
     }
 }
 
-// Box�Muller transform
-
+// Box-Muller transform: maps uniform random numbers to Gaussian distributed numbers
+// https://en.wikipedia.org/wiki/Box%E2%80%93Muller_transform
 void normal_fill_16(float* data, float mean, float std, mt19937_state* state) {
     #define EPSILONE 1e-12
     for (unsigned int t = 0; t < 8; t++) {
@@ -217,6 +217,23 @@ void normal_(float* data, unsigned int numel, float mean, float std, mt19937_sta
             has_next_double_normal_sample = 1;
             data[t] = (radius * cosf(theta) * std + mean);
         }
+    }
+}
+
+void init_identity_permutation(int *data, int numel) {
+    for (int i = 0; i < numel; i++) {
+        data[i] = i;
+    }
+}
+
+void random_permutation(int* data, int numel, mt19937_state* state) {
+    for (int i = numel - 1; i > 0; i--) {
+        // pick an index j in [0, i] with equal probability
+        int j = randint32(state) % (i + 1);
+        // swap i <-> j
+        int tmp = data[i];
+        data[i] = data[j];
+        data[j] = tmp;
     }
 }
 

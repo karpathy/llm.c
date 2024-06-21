@@ -33,6 +33,7 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
+    gpt2_init_common(&model);
     gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
 
     int B = 24; // if program OOMs decrease this number, e.g. all the way down to 4 or etc
@@ -54,11 +55,12 @@ int main(int argc, char *argv[]) {
     // do a training step
     gpt2_forward(&model, x, y, B, T);
     gpt2_zero_grad(&model);
-    gpt2_backward(&model, x);
+    gpt2_backward(&model, x, true);
     gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, 1.f, 1, &multi_gpu_config);
     cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
 
     // free
+    gpt2_free(&model);
     common_free(model);
     return 0;
 }
