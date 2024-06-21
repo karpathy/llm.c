@@ -97,7 +97,6 @@ void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t t
             multi_gpu_config->zero_stage = 0;
         }
         else {
-            printf0("| Zero Stage1 is enabled                                                     |\n");
             multi_gpu_config->zero_stage = 1;
             multi_gpu_config->shard_num_parameters = total_parameters / multi_gpu_config->num_processes;
         }
