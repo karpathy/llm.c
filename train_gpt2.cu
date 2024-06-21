@@ -1388,12 +1388,6 @@ int main(int argc, char *argv[]) {
     if (output_log_dir != NULL) {
         assert(strlen(output_log_dir) < 400); // careful bunch of hardcoded snprintf around this
     }
-    // check if output_log_dir does not exist or is a file
-    struct stat info;
-    if (output_log_dir != NULL && (stat(output_log_dir, &info ) != 0 || !(info.st_mode & S_IFDIR))) {
-        fprintf(stderr, "-o \"%s\" does not exist or is a file - are you specifying a file instead of dir?\n", output_log_dir);
-        exit(EXIT_FAILURE);
-    }
     int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
     // calculate sensible default for total batch size as assuming no gradient accumulation
     if (total_batch_size == -1) { total_batch_size = tokens_per_fwdbwd; }
