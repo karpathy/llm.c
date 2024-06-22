@@ -8,8 +8,20 @@ ifeq ($(NVCC),)
 		$(error nvcc not found.)
 endif
 
+ifneq ($(CI),true) # if not in CI, then use the GPU query
+  ifndef GPU_COMPUTE_CAPABILITY # set to defaults if: make GPU_COMPUTE_CAPABILITY= 
+    GPU_COMPUTE_CAPABILITY = $(shell __nvcc_device_query) # assume if NVCC is present, then this likely is too
+    GPU_COMPUTE_CAPABILITY := $(strip $(GPU_COMPUTE_CAPABILITY))
+  endif
+endif
+
 # Compiler flags
-CFLAGS = -O3 --use_fast_math
+ifeq ($(GPU_COMPUTE_CAPABILITY),) # set to defaults if: make GPU_COMPUTE_CAPABILITY= 
+  CFLAGS = -O3 --use_fast_math 
+else
+  CFLAGS = -O3 --use_fast_math --generate-code arch=compute_$(GPU_COMPUTE_CAPABILITY),code=[compute_$(GPU_COMPUTE_CAPABILITY),sm_$(GPU_COMPUTE_CAPABILITY)]
+endif
+
 NVCCFLAGS = -lcublas -lcublasLt -std=c++17
 MPI_PATHS = -I/usr/lib/x86_64-linux-gnu/openmpi/include -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
 
@@ -20,6 +32,8 @@ MPI_PATHS = -I/usr/lib/x86_64-linux-gnu/openmpi/include -L/usr/lib/x86_64-linux-
 # Build all targets
 TARGETS = adamw attention_backward attention_forward classifier_fused crossentropy_forward crossentropy_softmax_backward encoder_backward encoder_forward gelu_backward gelu_forward layernorm_backward layernorm_forward matmul_backward matmul_backward_bias matmul_forward nccl_all_reduce residual_forward softmax_forward trimat_forward fused_residual_forward  global_norm
 all: $(TARGETS)
+all_ptx:  $(TARGETS:%=%.ptx)
+all_sass: $(TARGETS:%=%.sass)
 
 # Individual targets: forward pass
 attention_forward: attention_forward.cu
@@ -54,6 +68,14 @@ global_norm: global_norm.cu
 nccl_all_reduce: nccl_all_reduce.cu
 	$(NVCC) -lmpi -lnccl $(NVCCFLAGS) $(MPI_PATHS) nccl_all_reduce.cu -o nccl_all_reduce
 
+# Generate PTX using cuobjdump
+%.ptx: %
+	cuobjdump --dump-ptx $< > $@
+
+# Generate SASS using cuobjdump
+%.sass: %
+	cuobjdump --dump-sass $< > $@
+
 # Run all targets
 run_all: all
 	@for target in $(TARGETS); do \
@@ -65,4 +87,4 @@ run_all: all
 
 # Clean up
 clean:
-	rm -f $(TARGETS)
+	rm -f $(TARGETS) *.ptx *.sass

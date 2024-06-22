@@ -103,8 +103,8 @@ void prepare_intra_shard_indices_(DataLoader *loader) {
         free(loader->intra_shard_indices);
     }
     loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
-    init_identity_permutation(loader->intra_shard_indices, loader->shard_num_samples);
-    random_permutation(loader->intra_shard_indices, loader->shard_num_samples, &loader->shuffle_rng);
+    init_identity_permutation(loader->intra_shard_indices, (int) loader->shard_num_samples);
+    random_permutation(loader->intra_shard_indices, (int) loader->shard_num_samples, &loader->shuffle_rng);
 }
 
 void dataloader_reset(DataLoader *loader) {
@@ -112,10 +112,10 @@ void dataloader_reset(DataLoader *loader) {
     loader->current_sample_idx = 0;
 
     if (loader->should_shuffle) {  // shuffle the shards
-        random_permutation(loader->shard_indices, loader->glob_result.gl_pathc, &loader->shuffle_rng);
+        random_permutation(loader->shard_indices, (int) loader->glob_result.gl_pathc, &loader->shuffle_rng);
     }
 
-    dataloader_load_shard_(loader, loader->current_shard_idx);
+    dataloader_load_shard_(loader, (int) loader->current_shard_idx);
 
     if (loader->should_shuffle) {
         prepare_intra_shard_indices_(loader);
@@ -132,7 +132,7 @@ void dataloader_advance_(DataLoader *loader) {
     // advance the loader by loading the next data shard and resetting the position
     loader->current_shard_idx = (loader->current_shard_idx + 1) % loader->glob_result.gl_pathc;
     loader->current_sample_idx = 0;
-    dataloader_load_shard_(loader, loader->current_shard_idx);
+    dataloader_load_shard_(loader, (int) loader->current_shard_idx);
 
     if (loader->should_shuffle) {
         prepare_intra_shard_indices_(loader);
@@ -172,7 +172,7 @@ void dataloader_init(DataLoader *loader,
         manual_seed(&shuffle_rng, 42 + process_rank);
         loader->shuffle_rng = shuffle_rng;
         loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
-        init_identity_permutation(loader->shard_indices, loader->glob_result.gl_pathc);
+        init_identity_permutation(loader->shard_indices, (int) loader->glob_result.gl_pathc);
         loader->intra_shard_indices = NULL;  // dynamically allocated allowing different shard sizes
     }
 
@@ -183,7 +183,7 @@ void dataloader_init(DataLoader *loader,
         int64_t shard_ntok = dataloader_load_shard_(loader, shard_index);
         // we need at least one batch/shard, the way things are written right now.
         // can be relaxed a lot later.
-        assert(shard_ntok >= num_processes * B * T + 1);
+        assert(shard_ntok >= (int64_t) (num_processes * B * T + 1));
         ntok_total += shard_ntok;
     }
     // debugging prints
@@ -210,7 +210,7 @@ void dataloader_load_batch(DataLoader* loader) {
     size_t B = loader->B;
     size_t T = loader->T;
     // read B*T+1 uint16_t tokens from the file into buffer
-    fseekCheck(loader->tokens_file, current_offset, SEEK_SET);
+    fseekCheck(loader->tokens_file, (int) current_offset, SEEK_SET);
     freadCheck(loader->buffer, sizeof(uint16_t), B*T+1, loader->tokens_file);
     // decode the buffer into inputs and targets (cast to int)
     for (int i = 0; i < B*T; i++) {
@@ -233,7 +233,7 @@ void dataloader_resume(DataLoader *loader, size_t current_shard_idx, size_t curr
     // used during model resumption (-y 1) flag
     loader->current_shard_idx = current_shard_idx;
     loader->current_sample_idx = current_sample_idx;
-    dataloader_load_shard_(loader, loader->current_shard_idx);
+    dataloader_load_shard_(loader, (int) loader->current_shard_idx);
 }
 
 void dataloader_free(DataLoader *loader) {
@@ -301,7 +301,7 @@ void evalloader_reset(EvalLoader *loader) {
     // then process 0 should start at 0, process 1 at N/4, process 2 at N/2, etc.
     // determine how much work there is for all processes
     int examples_per_process = CEIL_DIV(loader->num_examples, loader->num_processes);
-    int can_fit_examples = loader->B / ASSUMED_NUM_COMPLETIONS;
+    int can_fit_examples = (int) (loader->B / ASSUMED_NUM_COMPLETIONS);
     loader->num_batches = CEIL_DIV(examples_per_process, can_fit_examples);
     // determine the start and end example indices for this process
     loader->start_example_index = examples_per_process * loader->process_rank;
@@ -313,7 +313,7 @@ void evalloader_reset(EvalLoader *loader) {
     // now seek through the file to the start of that example
     // utilize <EXAMPLE_BYTES> for efficiency
     int64_t header_bytes = HEADER_SIZE * sizeof(int);
-    fseekCheck(loader->eval_file, header_bytes, SEEK_SET);
+    fseekCheck(loader->eval_file, (int) header_bytes, SEEK_SET);
     for (int i = 0; i < loader->start_example_index; i++) {
         uint16_t example_header[3];
         // read 3 uint16_t values: <START_EXAMPLE>, <EXAMPLE_BYTES>, <EXAMPLE_INDEX>
@@ -325,7 +325,7 @@ void evalloader_reset(EvalLoader *loader) {
         // skip to the next example, keeping in mind that we already read the header
         size_t remaining_bytes = example_header[1] - sizeof(uint16_t) * 3;
         assert(remaining_bytes > 0); // we expect some bytes in the example
-        fseekCheck(loader->eval_file, remaining_bytes, SEEK_CUR);
+        fseekCheck(loader->eval_file, (int) remaining_bytes, SEEK_CUR);
     }
     // now we are at the start of the example we want to start at, pointing at <START_EXAMPLE>
     loader->current_example_index = loader->start_example_index;
@@ -360,7 +360,7 @@ void evalloader_init(EvalLoader *loader,
     assert(longest_example_bytes > 0 && longest_example_bytes < (1+ASSUMED_NUM_COMPLETIONS)*T*2);
 
     // allocate all the space we'll need
-    int can_fit_examples = B / ASSUMED_NUM_COMPLETIONS;
+    int can_fit_examples = (int) (B / ASSUMED_NUM_COMPLETIONS);
     loader->buffer = (uint16_t*)mallocCheck(longest_example_bytes);
     loader->inputs = (int*)calloc(B * T, sizeof(int));
     loader->targets = (int*)calloc(B * T, sizeof(int));
@@ -393,7 +393,7 @@ void evalloader_next_example_(EvalLoader *loader, int example_batch_index) {
     freadCheck(loader->buffer, sizeof(char), example_bytes, loader->eval_file);
     // process the example label
     int label = (int)loader->buffer[0];
-    int can_fit_examples = loader->B / ASSUMED_NUM_COMPLETIONS;
+    int can_fit_examples = (int) (loader->B / ASSUMED_NUM_COMPLETIONS);
     assert(label >= 0 && label < ASSUMED_NUM_COMPLETIONS); // we expect the label to be in [0, 4) for right now
     assert(example_batch_index >= 0 && example_batch_index < can_fit_examples);
     loader->label[example_batch_index] = label; // store for output
@@ -450,7 +450,7 @@ void evalloader_next_batch(EvalLoader *loader) {
     // we have a batch dimension of B, which we want to take full advantage of
     // each example has some number of completions (usually 4)
     // so we want to pack as many examples into rows of B as we can fit
-    int can_fit_examples = B / ASSUMED_NUM_COMPLETIONS; // how many examples can we fit in the batch?
+    int can_fit_examples = (int) (B / ASSUMED_NUM_COMPLETIONS); // how many examples can we fit in the batch?
     for (int i = 0; i < can_fit_examples; i++) {
         if (loader->current_example_index >= loader->end_example_index) {
             break; // this process has exhausted its work, noop from here on
@@ -469,7 +469,7 @@ int evalloader_stat_losses(EvalLoader *loader, float* losses) {
     size_t B = loader->B;
     size_t T = loader->T;
     // iterate the examples in this batch
-    int can_fit_examples = B / ASSUMED_NUM_COMPLETIONS;
+    int can_fit_examples = (int) (B / ASSUMED_NUM_COMPLETIONS);
     for (int i = 0; i < can_fit_examples; i++) {
         float min_loss = 0.0f;
         int min_loss_index = -1;

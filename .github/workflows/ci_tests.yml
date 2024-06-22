@@ -1,0 +1,60 @@
+name: Unit, Static and other Tests
+
+on:
+  create:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  dataloader_test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: test the dataloader without / with sanitize address
+        run: |
+          cd dev/test
+          make test_dataloader
+          ./test_dataloader   
+          make clean       
+          make test_dataloader TEST_CFLAGS="-fsanitize=address -fno-omit-frame-pointer"
+          ./test_dataloader          
+
+  ptx_and_sass_files:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install OpenMP and OpenMPI
+        run: apt-get update && apt-get install -y libomp-dev libopenmpi-dev
+    
+      - name: Generate ptx/sass files and upload them to persistent storage
+        run: |
+          mkdir -p dev/cuda/ptx_sass_logs
+          make train_gpt2cu
+          cuobjdump --dump-ptx train_gpt2cu > dev/cuda/train_gpt2cu.ptx
+          cuobjdump --dump-sass train_gpt2cu > dev/cuda/train_gpt2cu.sass          
+          cd dev/cuda
+          make -j all_ptx
+          make -j all_sass
+          cp *.ptx ptx_sass_logs/
+          cp *.sass ptx_sass_logs/
+          ls ptx_sass_logs/
+
+      - name: Upload ptx/sass files
+        uses: actions/upload-artifact@v4
+        with:
+          name: ptx_sass_files
+          path: dev/cuda/ptx_sass_logs/
+          retention-days: 30 # days to retain
