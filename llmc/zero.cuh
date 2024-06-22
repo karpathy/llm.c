@@ -50,11 +50,9 @@ void mpi_check(int status, const char *file, int line) {
 #endif // MULTI_GPU
 
 // ----------------------------------------------------------------------------
-// MPI / multi-processing setup
-
 // Parameters specific to training on multiple GPUs.
 typedef struct {
-    int process_rank;      // Rank of this process among all MPI processes. 0 if no multi-GPU.
+    int process_rank;      // Rank of this process among all processes. 0 if no multi-GPU.
     int num_processes;     // Total number of processes. 1 if no multi-GPU.
     int local_device_idx;  // This process GPU index on current machine. 0 if no multi-GPU.
 
@@ -69,6 +67,7 @@ typedef struct {
     ncclComm_t nccl_comm;       // NCCL communication primitive, used for collective multi-GPU work.
     cudaStream_t nccl_stream;   // CUDA Stream to perform NCCL operations.
     cudaEvent_t compute_nccl_sync; // Event used to synchronize NCCL with the compute
+    float* unified_buffer;
 #endif
 } MultiGpuConfig;
 
@@ -77,39 +76,55 @@ typedef struct {
 // Processes on the same machines use different GPU indicies. Processes on other machines don't.
 // Copied from NCCL examples: https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/examples.html#example-2-one-device-per-process-or-thread
 int multi_gpu_get_local_device_idx(int process_rank, int num_processes) {
-  char hostname[1024];
-  hostname[1023] = '\0';
-  // All processes on the same machine will share the same hostname.
-  gethostname(hostname, 1023);
-  for (int i=0; i < 1024; i++) {
-    if (hostname[i] == '.') {
-        hostname[i] = '\0';
-        break;
+    char hostname[1024];
+    hostname[1023] = '\0';
+    // All processes on the same machine will share the same hostname.
+    gethostname(hostname, 1023);
+    for (int i=0; i < 1024; i++) {
+        if (hostname[i] == '.') {
+            hostname[i] = '\0';
+            break;
+        }
     }
-  }
-  uint64_t hostname_hash = 5381u;
-  for (int c = 0; hostname[c] != '\0'; c++){ hostname_hash = ((hostname_hash << 5u) + hostname_hash) ^ hostname[c]; }
+    uint64_t hostname_hash = 5381u;
+    for (int c = 0; hostname[c] != '\0'; c++){ hostname_hash = ((hostname_hash << 5u) + hostname_hash) ^ hostname[c]; }
 
-  // Distribute all hostname hashes to all processes.
-  uint64_t* all_hostsname_hashes = (uint64_t*)malloc(num_processes * sizeof(uint64_t));
-  all_hostsname_hashes[process_rank] = hostname_hash;
-  mpiCheck(MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, all_hostsname_hashes, sizeof(uint64_t), MPI_BYTE, MPI_COMM_WORLD));
+    // Distribute all hostname hashes to all processes.
+    // Allocate memory for hostname hashes on the GPU
+    uint64_t* all_hostsname_hashes;
+    cudaMalloc(&all_hostsname_hashes, num_processes * sizeof(uint64_t));
 
-  // Identify which GPU we need to use.
-  int local_device_idx = 0;
-  for (int current_process = 0; current_process < num_processes; ++current_process) {
-     if (current_process == process_rank) {
-      // Found my gpu, local_device_idx now has my target GPU index.
-      break;
-     }
-     if (all_hostsname_hashes[current_process] == all_hostsname_hashes[process_rank]) {
-      // This process ID runs on the same machine, but it's not me, skip this GPU
-      local_device_idx++;
-     }
-  }
+    // Copy the local hostname hash to the appropriate location in the GPU memory
+    cudaMemcpy(&all_hostsname_hashes[process_rank], &hostname_hash, sizeof(uint64_t), cudaMemcpyHostToDevice);
 
-  free(all_hostsname_hashes);
-  return local_device_idx;
+    // Perform the all-gather operation with NCCL
+    ncclAllGather(&hostname_hash, all_hostsname_hashes, sizeof(uint64_t), ncclUint64, nccl_comm, nccl_stream);
+
+    // Synchronize the stream to ensure the all-gather operation is complete
+    cudaStreamSynchronize(nccl_stream);
+
+    // Allocate CPU memory to copy the gathered results back
+    uint64_t* all_hostsname_hashes_cpu = (uint64_t*)malloc(num_processes * sizeof(uint64_t));
+
+    // Copy the gathered results back to the CPU
+    cudaMemcpy(all_hostsname_hashes_cpu, all_hostsname_hashes, num_processes * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+    // Identify which GPU we need to use.
+    int local_device_idx = 0;
+    for (int current_process = 0; current_process < num_processes; ++current_process) {
+        if (current_process == process_rank) {
+        // Found my gpu, local_device_idx now has my target GPU index.
+        break;
+        }
+        if (all_hostsname_hashes[current_process] == all_hostsname_hashes[process_rank]) {
+        // This process ID runs on the same machine, but it's not me, skip this GPU
+        local_device_idx++;
+        }
+    }
+
+    cudaFree(all_hostsname_hashes);
+    free(all_hostsname_hashes_cpu);
+    return local_device_idx;
 }
 #endif
 
@@ -133,6 +148,7 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
     cudaCheck(cudaEventCreate(&result.compute_nccl_sync, cudaEventDisableTiming));
     nvtxNameCudaStreamA(result.nccl_stream, "nccl stream");
     nvtxNameCudaEventA(result.compute_nccl_sync, "nccl compute sync");
+    cudaCheck(cudaMallocManaged(&result.unified_buffer, sizeof(float)));
     return result;
 #else
     printf("Multi-GPU support is disabled. Using a single GPU.\n");
@@ -157,8 +173,10 @@ void multi_gpu_config_free(MultiGpuConfig* multi_gpu_config) {
 void multi_gpu_barrier(const MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
     if (multi_gpu_config->num_processes > 1) {
-        mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
+        float* unified_buffer = multi_gpu_config->unified_buffer;
+        ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, main_stream));
     }
+    cudaCheck(cudaDeviceSynchronize());
 #endif
 }
 

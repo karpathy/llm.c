@@ -893,12 +893,15 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
 }
 
 // Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
-float multi_gpu_cpu_float_sum(float value) {
+float multi_gpu_cpu_float_sum(float value, MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
-    // note MPI doesn't support all reduce with mean, only sum
-    float result;
-    mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
-    return result;
+    if (multi_gpu_config->num_processes == 1) return value;
+
+    float* unified_buffer = multi_gpu_config->unified_buffer;
+    *unified_buffer = value;
+    ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, main_stream));
+    cudaCheck(cudaDeviceSynchronize());
+    return *unified_buffer;
 #else
     return value;
 #endif
@@ -912,7 +915,7 @@ void gpt2_multi_gpu_loss_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
     // If there's only one process, there is nothing to do
     if (multi_gpu_config->num_processes == 1) { return; }
     // Average all losses.
-    model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss) / multi_gpu_config->num_processes;
+    model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss, multi_gpu_config) / multi_gpu_config->num_processes;
 #endif
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -990,7 +993,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
         cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
         // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
-        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
+        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu, multi_gpu_config);
     } else {
         // in regular DDP, backward has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
@@ -1579,7 +1582,7 @@ int main(int argc, char *argv[]) {
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
-            val_loss = multi_gpu_cpu_float_sum(val_loss) / multi_gpu_config.num_processes;
+            val_loss = multi_gpu_cpu_float_sum(val_loss, &multi_gpu_config) / multi_gpu_config.num_processes;
             printf0("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
         }
@@ -1598,7 +1601,7 @@ int main(int argc, char *argv[]) {
                 eval_acc_norm += (float)correct;
             }
             // careful because not all ranks may have the exact same allocation of number of examples
-            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm);
+            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm, &multi_gpu_config);
             printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
             logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
         }
