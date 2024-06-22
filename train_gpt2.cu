@@ -722,7 +722,7 @@ void gpt2_zero_grad(GPT2 *model) {
     cudaCheck(cudaDeviceSynchronize());
 }
 
-void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
+void gpt2_backward_and_reduce(GPT2 *model, int* inputs, bool last_step) {
     NVTX_RANGE_FN();
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
@@ -1702,7 +1702,7 @@ int main(int argc, char *argv[]) {
             gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, grad_accum_steps);
             lossf += model.mean_loss; // the mean_loss was normalized by grad_accum_steps inside gpt2_forward
             // backward pass. all model params accumulate gradients with += inside this inner loop
-            gpt2_backward(&model, train_loader.inputs, micro_step == grad_accum_steps - 1);
+            gpt2_backward_and_reduce(&model, train_loader.inputs, micro_step == grad_accum_steps - 1);
         }
         // override the mean loss, accounting for the gradient accumulation loop
         // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
