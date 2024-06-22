@@ -9,6 +9,7 @@ namespace gpt {
   do {                             \
     if (v.size() == 0) {           \
       v.resize(X);                 \
+      v.setZero();                 \
     }                              \
     CHECK(v.size() == X);          \
   } while (false)
@@ -17,6 +18,7 @@ namespace gpt {
   do {                                     \
     if (m.size() == 0) {                   \
       m.resize(X, Y);                      \
+      m.setZero();                         \
     }                                      \
     CHECK(m.rows() == X && m.cols() == Y); \
   } while (false)
@@ -25,6 +27,7 @@ namespace gpt {
   do {                                                                        \
     if (t.size() == 0) {                                                      \
       t.resize(X, Y, Z);                                                      \
+      t.setZero();                                                            \
     }                                                                         \
     CHECK(t.dimension(0) == X && t.dimension(1) == Y && t.dimension(2) == Z); \
   } while (false)
@@ -33,6 +36,7 @@ namespace gpt {
   do {                                                                         \
     if (t.size() == 0) {                                                       \
       t.resize(A, B, C, D);                                                    \
+      t.setZero();                                                             \
     }                                                                          \
     CHECK(t.dimension(0) == A && t.dimension(1) == B && t.dimension(2) == C && \
           t.dimension(3) == D);                                                \
@@ -366,9 +370,11 @@ struct Block {
     LAZY_ALLOCATE_VECTOR(ln1_mean_, B * T);
     LAZY_ALLOCATE_VECTOR(ln1_rstd_, B * T);
     LAZY_ALLOCATE_TENSOR3D(att_y_, B, T, C);
+    LAZY_ALLOCATE_TENSOR3D(residual1_, B, T, C);
     LAZY_ALLOCATE_MATRIX(ln2_y_, B * T, C);
     LAZY_ALLOCATE_VECTOR(ln2_mean_, B * T);
     LAZY_ALLOCATE_VECTOR(ln2_rstd_, B * T);
+    LAZY_ALLOCATE_TENSOR3D(mlp_y_, B, T, C);
 
     // LN1
     auto x_2d = Eigen::Map<nn::Matrix>(x.data(), B * T, C);
@@ -384,22 +390,21 @@ struct Block {
 
     // Residual
     auto att_y_2d = Eigen::Map<nn::Matrix>(att_y_.data(), B * T, C);
-    //    att_y_2d.array() += x_2d.array();
-    nn::Residual::Forward(x_2d, att_y_2d, absl::MakeSpan(att_y_2d));
+    nn::Residual::Forward(x_2d, att_y_2d, absl::MakeSpan(residual1_));
 
     // LN2
     auto ln2_y_2d = Eigen::Map<nn::Matrix>(ln2_y_.data(), B * T, C);
     auto ln2_mean_1d = Eigen::Map<Eigen::RowVectorXf>(ln2_mean_.data(), B * T);
     auto ln2_rstd_1d = Eigen::Map<Eigen::RowVectorXf>(ln2_rstd_.data(), B * T);
-    ln2_->Forward(att_y_2d, ln2_y_2d, ln2_mean_1d, ln2_rstd_1d);
+    auto residual1_2d = Eigen::Map<nn::Matrix>(residual1_.data(), B * T, C);
+    ln2_->Forward(residual1_2d, ln2_y_2d, ln2_mean_1d, ln2_rstd_1d);
 
     // MLP
-    auto y_2d = Eigen::Map<nn::Matrix>(y.data(), B * T, C);
-    mlp_->Forward(ln2_y_2d, y_2d);
+    auto mlp_y_2d = Eigen::Map<nn::Matrix>(mlp_y_.data(), B * T, C);
+    mlp_->Forward(ln2_y_2d, mlp_y_2d);
 
     // Residual
-    //    y_2d.array() += att_y_2d.array();
-    nn::Residual::Forward(att_y_2d, y_2d, absl::MakeSpan(y_2d));
+    nn::Residual::Forward(residual1_2d, mlp_y_2d, absl::MakeSpan(y));
   }
 
   void Backward(const Eigen::TensorMap<nn::Tensor3D>& x,
@@ -434,7 +439,7 @@ struct Block {
     auto att_y_2d = Eigen::Map<nn::Matrix>(att_y_.data(), B * T, C);
     auto ln2_mean_1d = Eigen::Map<Eigen::RowVectorXf>(ln2_mean_.data(), B * T);
     auto ln2_rstd_1d = Eigen::Map<Eigen::RowVectorXf>(ln2_rstd_.data(), B * T);
-//    ln2_->Backward(att_y_2d, ln2_y_grad_2d, ln2_mean_1d, ln2_rstd_1d, );
+    //    ln2_->Backward(att_y_2d, ln2_y_grad_2d, ln2_mean_1d, ln2_rstd_1d, );
   }
 
   size_t NumParameters() const {
@@ -448,11 +453,13 @@ struct Block {
   std::unique_ptr<MLP> mlp_;
 
   // activation tensors
-  nn::Matrix ln1_y_, ln1_y_grad_;           // [B*T, C]
-  Eigen::RowVectorXf ln1_mean_, ln1_rstd_;  // [B*T]
-  nn::Tensor3D att_y_, att_y_grad_;         // [B, T, C]
-  nn::Matrix ln2_y_, ln2_y_grad_;           // [B*T, C]
-  Eigen::RowVectorXf ln2_mean_, ln2_rstd_;  // [B*T]
+  nn::Matrix ln1_y_, ln1_y_grad_;            // [B*T, C]
+  Eigen::RowVectorXf ln1_mean_, ln1_rstd_;   // [B*T]
+  nn::Tensor3D att_y_, att_y_grad_;          // [B, T, C]
+  nn::Tensor3D residual1_, residual1_grad_;  // [B, T, C]
+  nn::Matrix ln2_y_, ln2_y_grad_;            // [B*T, C]
+  Eigen::RowVectorXf ln2_mean_, ln2_rstd_;   // [B*T]
+  nn::Tensor3D mlp_y_, mlp_y_grad_;          // [B, T, C]
 };
 
 struct GPT {
