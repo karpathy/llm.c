@@ -54,9 +54,9 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
     }
 
     // Block Max Reduction -> Maths -> Block Sum Reduction
-    float block_maxval = blockReduce<warpReduceMax>(thread_maxval, false, -INFINITY);
+    float block_maxval = blockReduce<float, warpReduceMax>(thread_maxval, false, -INFINITY);
     thread_sumval *= expf(thread_maxval - block_maxval);
-    float block_sumval = blockReduce<warpReduceSum>(thread_sumval);
+    float block_sumval = blockReduce<float, warpReduceSum>(thread_sumval);
 
     // return the softmax parameters
     return SoftmaxParams{1.f / block_sumval, block_maxval};
@@ -144,6 +144,10 @@ void fused_classifier(Type* logits, Type* losses,
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = N;
+
+    generate_analysis(logits, (size_t)N*(size_t)P, "fused_classifier_act_logits");
     fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
+    generate_analysis(logits, (size_t)N*(size_t)P, "fused_classifier_agrad_logits");
+
     cudaCheck(cudaGetLastError());
 }

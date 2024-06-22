@@ -1,0 +1,656 @@
+<!-- This Javascript brought to you by GPT-4o, Opus, and poking both of them with a stick repeatedly -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tensor Data Visualization</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/5.16.0/d3.min.js"></script>
+    <style>
+        #histogram-container {
+            display: flex;
+            justify-content: space-between;
+        }
+        #top-graphs {
+            display: flex;
+            margin-bottom: 20px;
+        }
+        #histogram-maxexp-all, #histogram-maxexp-wb, #histogram-maxexp-act, #histogram-maxexp-agrad, #histogram-maxexp-wgrad,
+        #histogram-exponent-bits-all, #histogram-exponent-bits-wb, #histogram-exponent-bits-act, #histogram-exponent-bits-agrad, #histogram-exponent-bits-wgrad {
+            width: 20%;
+            height: 400px;
+        }
+        #sorted-tensor-list {
+            display: none;
+            margin-top: 20px;
+        }
+        #data-details table {
+            border-collapse: separate;
+            border-spacing: 5px;
+            border: 1px solid black;
+            margin-bottom: 20px;
+        }
+        #data-details td {
+            padding: 3px;
+        }
+        #tensor-name-select {
+            margin-right: 10px;
+        }
+        #layer-details-select {
+            margin-right: 10px;
+        }
+        #step-microstep-select {
+            margin-right: 10px;
+        }
+        #threshold-select {
+            margin-right: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Tensor Data Visualization</h1>
+    <div id="data-details">
+        <!-- Layer data details will be displayed here -->
+    </div>
+
+    <div id="dropdown-container">
+        <label for="tensor-name-select">Select Tensor Name:</label>
+        <select id="tensor-name-select" autocomplete="off">
+            <!-- Tensor names will be dynamically populated -->
+        </select>
+        <label for="layer-details-select">Select Layer:</label>
+        <select id="layer-details-select" autocomplete="off">
+            <!-- Layer details will be dynamically populated -->
+        </select>
+        <label for="step-microstep-select">Select Step:</label>
+        <select id="step-microstep-select" autocomplete="off">
+            <!-- Step / MicroStep options will be dynamically populated -->
+        </select>
+        <button id="toggle-tensor-list">Show/Hide Sorted Tensor List</button>
+    </div>
+
+    <div id="sorted-tensor-list">
+        <h2>Sorted Tensor List (by MaxExp)</h2>
+        <ul id="tensor-list">
+            <!-- Sorted tensor list will be populated here -->
+        </ul>
+    </div>
+
+    <div id="top-graphs">
+        <div id="histogram-2n-bins" style="width:100%;height:400px;"></div>
+        <div id="distribution-chart" style="width:100%;height:400px;"></div>
+    </div>
+
+    <div>
+        <label for="maxexp-zmin">Maximum Exponent Heatmap - Min:</label>
+        <input type="number" id="maxexp-zmin" value="-24" autocomplete="off">
+        <label for="maxexp-zmax">Maximum Exponent Heatmap - Max:</label>
+        <input type="number" id="maxexp-zmax" value="16" autocomplete="off">
+    </div>
+
+    <div id="heatmap-maxexp" style="width:100%;height:500px;"></div>
+    <div id="histogram-container">
+        <div id="histogram-maxexp-all"></div>
+        <div id="histogram-maxexp-wb"></div>
+        <div id="histogram-maxexp-act"></div>
+        <div id="histogram-maxexp-agrad"></div>
+        <div id="histogram-maxexp-wgrad"></div>
+    </div>
+
+    <div>
+        <label for="threshold-select">Select Threshold:</label>
+        <select id="threshold-select" autocomplete="off">
+            <option value="1.01">Everything</option>
+            <option value="0.995">99.5th Percentile</option>
+            <option value="0.99">99th Percentile</option>
+            <option value="0.95" selected>95th Percentile</option>
+            <option value="0.90">90th Percentile</option>
+            <option value="0.75">75th Percentile</option>
+            <option value="0.50">50th Percentile</option>
+            <option value="0.25">25th Percentile</option>
+            <option value="0.10">10th Percentile</option>
+        </select>
+        <label for="exponent-bits-zmin">Exponent Range Heatmap - Min:</label>
+        <input type="number" id="exponent-bits-zmin" value="0" autocomplete="off">
+        <label for="exponent-bits-zmax">Exponent Range Heatmap - Max:</label>
+        <input type="number" id="exponent-bits-zmax" value="16" autocomplete="off">
+    </div>
+
+    <div id="heatmap-exponent-bits" style="width:100%;height:500px;"></div>
+
+    <div id="histogram-container">
+        <div id="histogram-exponent-bits-all"></div>
+        <div id="histogram-exponent-bits-wb"></div>
+        <div id="histogram-exponent-bits-act"></div>
+        <div id="histogram-exponent-bits-agrad"></div>
+        <div id="histogram-exponent-bits-wgrad"></div>
+    </div>
+
+    <div id="worst-outlier-all"></div>
+    <div id="worst-outlier-act"></div>
+    <div id="worst-outlier-wb"></div>
+    <div id="worst-outlier-agrad"></div>
+    <div id="worst-outlier-wgrad"></div>
+
+    <script>
+        // Function to determine the tensor type based on the name
+        function getTensorType(name) {
+            if (name.includes('wgrad')) {
+                return 'wgrad';
+            } else if (name.includes('agrad')) {
+                return 'agrad';
+            } else if (name.includes('_act_')) {
+                return 'activation';
+            } else if (name.includes('_weight') && !name.includes('_bwd')) {
+                return 'weight';
+            } else if (name.includes('_bias') && !name.includes('_bwd')) {
+                return 'bias';
+            } else if (name.includes('_special')) {
+                return 'special';
+            }
+            return 'other';
+        }
+
+        function calculateRequiredExponentBits(data, coverageThreshold = 0.99) {
+            return data.map(d => {
+                const bins = [];
+                let cumulativeCount = 0;
+                const maxExp = parseInt(d.MAXEXP);
+
+                for (let i = maxExp; i >= -126 || i == maxExp; i--) {
+                    const binKey = `2^${i}`;
+                    const binValue = d[binKey];
+                    if (binValue !== undefined && binValue !== null && binValue !== '') {
+                        const count = parseFloat(binValue.replace('%', ''));
+                        cumulativeCount += count;
+                        bins.push({ exponent: i, count });
+                        if (cumulativeCount > coverageThreshold * 100.0) {
+                            break;
+                        }
+                    }
+                }
+
+                return {
+                    ...d,
+                    requiredExponentBits: maxExp - bins[bins.length - 1].exponent + 1
+                };
+            });
+        }
+
+        function updateTensorSelection(tensorName, layerDetails) {
+            // Update the tensor name and layer details dropdowns
+            document.getElementById('tensor-name-select').value = tensorName;
+            document.getElementById('layer-details-select').value = layerDetails;
+
+            // Trigger the change event on the tensor name select element
+            const event = new Event('change');
+            document.getElementById('tensor-name-select').dispatchEvent(event);
+        }
+
+        // Load the CSV data
+        d3.csv('analysis.csv').then(function(data) {
+            // Process the CSV data
+            const processedData = calculateRequiredExponentBits(data, 0.99);
+
+            const allMaxExp = processedData.map(d => +d.MAXEXP);
+            const actMaxExp = processedData.filter(d => getTensorType(d.Name) === 'activation').map(d => +d.MAXEXP);
+            const wbMaxExp = processedData.filter(d => getTensorType(d.Name) === 'weight' || getTensorType(d.Name) === 'bias').map(d => +d.MAXEXP);
+            const agradMaxExp = processedData.filter(d => getTensorType(d.Name) === 'agrad').map(d => +d.MAXEXP);
+            const wgradMaxExp = processedData.filter(d => getTensorType(d.Name) === 'wgrad').map(d => +d.MAXEXP);
+
+            // Get unique tensor names
+            const tensorNames = [...new Set(processedData.map(d => d.Name))];
+            const tensorNameSelect = document.getElementById('tensor-name-select');
+            tensorNames.forEach(name => {
+                const option = document.createElement('option');
+                option.value = name;
+                option.text = name;
+                tensorNameSelect.appendChild(option);
+            });
+
+            // Get unique layers
+            const layers = [...new Set(processedData.map(d => d.Layer))];
+
+            // Get unique step/microstep combinations
+            const stepMicroSteps = [...new Set(processedData.map(d => `Step ${d.Step} / MicroStep ${d.MicroStep}`))];
+
+            const layerSelect = document.getElementById('layer-details-select');
+            layers.forEach(layer => {
+                const option = document.createElement('option');
+                option.value = layer;
+                option.text = `${layer}`;
+                layerSelect.appendChild(option);
+            });
+
+            const stepMicroStepSelect = document.getElementById('step-microstep-select');
+            stepMicroSteps.forEach(stepMicroStep => {
+                const option = document.createElement('option');
+                option.value = stepMicroStep;
+                option.text = stepMicroStep;
+                stepMicroStepSelect.appendChild(option);
+            });
+
+            // Sort tensors by MAXEXP and populate the sorted tensor list
+            const sortedData = [...processedData].sort((a, b) => b.requiredExponentBits - a.requiredExponentBits);
+            const tensorList = document.getElementById('tensor-list');
+            sortedData.forEach(row => {
+                const listItem = document.createElement('li');
+                listItem.textContent = `${row.Name} / Layer ${row.Layer} / Step ${row.Step} / MicroStep ${row.MicroStep} / MaxExp: ${row.MAXEXP} / Required Exponent Bits: ${row.requiredExponentBits}`;
+                tensorList.appendChild(listItem);
+            });
+
+            // Function to find and update the layer details and histogram
+            function updateLayerDetails(name, layer, stepMicroStep="Step 0 / MicroStep 0") {
+                const selectedData = processedData.find(d => d.Name === name && (d.Layer === parseInt(layer) || d.Layer == layer) && `Step ${d.Step} / MicroStep ${d.MicroStep}` === stepMicroStep);
+
+                if (!selectedData) {
+                    console.log('No data found for', name, layer, stepMicroStep);
+
+                    // Print everything in processedData
+                    console.log('Processed Data:', processedData);
+                    for (let i = 0; i < processedData.length && i < 5; i++) {
+                        console.log('Data', i, ':', processedData[i].Name, processedData[i].Layer, processedData[i].Step, processedData[i].MicroStep, `Step ${processedData[i].Step} / MicroStep ${processedData[i].MicroStep}`);
+                    }
+
+                    // If no data matches, find the closest match and update the other dropdown
+                    const closestData = processedData.find(d => d.Name === name);
+
+                    // Is there any match?
+                    if (!closestData) {
+                        console.log('No match found for', name);
+                        return;
+                    }
+
+                    // Get layer/step/microstep
+                    const closestLayer = closestData.Layer;
+                    const closestStep = closestData.Step;
+                    const closestMicroStep = closestData.MicroStep;
+                    const StepMicroStepString = `Step ${closestStep} / MicroStep ${closestMicroStep}`;
+
+                    updateLayerDetails(name, closestLayer, StepMicroStepString);
+                    layerSelect.selectedIndex = closestLayer;
+                    return;
+                }
+                console.log('FOUND for', name, layer, stepMicroStep);
+
+                const detailsDiv = document.getElementById('data-details');
+                // Display all available stats except the 2^n bins and MSB bins
+                let detailsHtml = '<h2>Selected Tensor Details</h2>';
+                detailsHtml += '<table><tr>';
+                let columnCount = 0;
+                const maxColumns = 4; // Adjust the number of columns as needed
+                Object.keys(selectedData).forEach(key => {
+                    if (!key.startsWith('2^') && !key.includes('MSB')) {
+                        detailsHtml += `<td><strong>${key}:</strong></td><td>${selectedData[key]}</td>`;
+                        columnCount++;
+                        if (columnCount === maxColumns) {
+                            detailsHtml += '</tr><tr>';
+                            columnCount = 0;
+                        }
+                    }
+                });
+                if (columnCount > 0) {
+                    detailsHtml += '<td colspan="' + (maxColumns - columnCount) * 2 + '"></td>';
+                }
+                detailsHtml += '</tr></table>';
+                detailsDiv.innerHTML = detailsHtml;
+
+                // Collect 2^n bins data
+                const bins = [];
+                for (let i = -127; i <= 128; i++) {
+                    const binKey = `2^${i}`;
+                    const binValue = selectedData[binKey];
+                    if (binValue !== undefined && binValue !== null && binValue !== '') {
+                        const numericValue = parseFloat(binValue.replace('%', ''));
+                        bins.push({ x: binKey, y: numericValue });
+                    }
+                }
+
+                // Update 2^n bins histogram
+                Plotly.newPlot('histogram-2n-bins', [{
+                    x: bins.map(bin => bin.x),
+                    y: bins.map(bin => bin.y),
+                    type: 'bar'
+                }], {
+                    title: '2^n Bins Histogram',
+                    xaxis: { title: 'Bins' },
+                    yaxis: { title: 'Percentage' }
+                });
+
+                // Prepare data for the distribution chart
+                const msbBins = [];
+                Object.keys(selectedData).forEach(key => {
+                    if (key.includes('MSB') && selectedData[key] !== '' && +selectedData[key] !== 0 && selectedData[key] > 0) {
+                        msbBins.push({ label: key, value: selectedData[key] });
+                    }
+                });
+
+                // Get total number of elements from "ELEMENTS"
+                const totalElements = selectedData.ELEMENTS;
+
+                // Calculate actual value ranges for MSB bins
+                const msbData = msbBins.map(bin => {
+                    const parts = bin.label.split(' ');
+                    const sign = parts[0][0];
+                    const exponent = parseInt(parts[0].slice(3));
+                    const msb = parts[1];
+                    let x0, x1;
+                    if (msb === 'MSB0') {
+                        x0 = Math.pow(2, exponent);
+                        x1 = x0 * 1.5;
+                    } else {
+                        x0 = Math.pow(2, exponent) * 1.5;
+                        x1 = Math.pow(2, exponent+1);
+                    }
+                    if (sign === '-') {
+                        x0 = -x0;
+                        x1 = -x1;
+                    }
+                    // Also include a label corresponding to: 1) parts[0], 2) bin.value, 3) % of total count with 3 decimal points
+                    return { x0, x1, y: bin.value, label: `${bin.label}: ${bin.value} (${(bin.value / totalElements * 100).toFixed(3)}%)` };
+                });
+
+                // Calculate the bin widths and densities
+                // bin width uses absolute value to ensure positive width
+                const binWidths = msbData.map(bin => Math.abs(bin.x1 - bin.x0));
+                const densities = msbData.map((bin, index) => bin.y / binWidths[index]);
+
+                // Calculate 95th percentile density
+                const sortedDensities = densities.slice().sort((a, b) => a - b);
+                const percentileIndex = Math.floor(sortedDensities.length * 0.95);
+                const percentileDensity = sortedDensities[percentileIndex];
+
+                // Cap all densities above the 95th percentile
+                for (let i = 0; i < densities.length; i++) {
+                    if (densities[i] > percentileDensity) {
+                        densities[i] = percentileDensity;
+                    }
+                }
+
+                // Update distribution chart
+                // Also include label
+                Plotly.newPlot('distribution-chart', [{
+                    x: msbData.map(bin => (bin.x0 + bin.x1) / 2),  // Midpoints of x0 and x1
+                    y: densities,  // Density values
+                    text: msbData.map(bin => bin.label),
+                    type: 'bar',  // Use 'bar' for bar chart
+                    width: binWidths  // Set the width of each bar to the range width
+                }], {
+                    title: 'Distribution Chart',
+                    xaxis: { title: 'Range of Values' },
+                    yaxis: { title: 'Density' }  // Change the y-axis title to 'Density'
+                });
+
+            }
+
+            // Event listener for tensor name change
+            tensorNameSelect.addEventListener('change', function() {
+                const layerDetails = document.getElementById('layer-details-select').value;
+                const name = document.getElementById('tensor-name-select').value;
+                updateLayerDetails(name, layerDetails);
+            });
+
+            // Event listener for layer change
+            layerSelect.addEventListener('change', function() {
+                const layer = this.value;
+                const stepMicroStep = document.getElementById('step-microstep-select').value;
+                const name = document.getElementById('tensor-name-select').value;
+                updateLayerDetails(name, layer, stepMicroStep);
+            });
+
+            // Event listener for step/microstep change
+            stepMicroStepSelect.addEventListener('change', function() {
+                const layer = document.getElementById('layer-details-select').value;
+                const stepMicroStep = this.value;
+                const name = document.getElementById('tensor-name-select').value;
+                updateLayerDetails(name, layer, stepMicroStep);
+            });
+
+            // Event listener for toggle tensor list button
+            document.getElementById('toggle-tensor-list').addEventListener('click', function() {
+                const tensorListDiv = document.getElementById('sorted-tensor-list');
+                if (tensorListDiv.style.display !== 'block') {
+                    tensorListDiv.style.display = 'block';
+                } else {
+                    tensorListDiv.style.display = 'none';
+                }
+            });
+
+            // Initial load
+            updateLayerDetails(tensorNames[0], 0);
+
+            // Plot the initial histograms
+            Plotly.newPlot('histogram-maxexp-all', [{
+                x: allMaxExp,
+                type: 'histogram'
+            }], {
+                title: 'MaxExp Across All Tensors'
+            });
+
+            Plotly.newPlot('histogram-maxexp-wb', [{ x: wbMaxExp, type: 'histogram' }], { title: 'MaxExp for Weights/Biases' });
+            Plotly.newPlot('histogram-maxexp-act', [{ x: actMaxExp, type: 'histogram' }], { title: 'MaxExp for Activations' });
+            Plotly.newPlot('histogram-maxexp-agrad', [{ x: agradMaxExp, type: 'histogram' }], { title: 'MaxExp for Gradients of Activations' });
+            Plotly.newPlot('histogram-maxexp-wgrad', [{ x: wgradMaxExp, type: 'histogram' }], { title: 'MaxExp for Gradients of Weights/Biases' });
+
+            // Define the desired order of tensor types
+            const tensorOrder = ['activation', 'weight', 'bias', 'agrad', 'wgrad', 'special', 'other'];
+
+            // Add an index property to each tensor in the data array
+            const indexedData = data.map((d, index) => ({ ...d, index }));
+
+            // Sort the data based on the tensor type order
+            const sortedHeatData = indexedData.sort((a, b) => {
+                const aType = getTensorType(a.Name);
+                const bType = getTensorType(b.Name);
+                const aIndex = tensorOrder.indexOf(aType);
+                const bIndex = tensorOrder.indexOf(bType);
+                if (aIndex !== bIndex) {
+                    return aIndex - bIndex;
+                } else {
+                    return a.index - b.index;
+                }
+            });
+
+            // Generate heatmap data for required exponent bits
+            exponentBitsHeatmapData = {
+                x: [],
+                y: [],
+                z: [],
+                text: [],
+                type: 'heatmap',
+                colorscale: 'Viridis',
+                zmin: 0,
+                zmax: 16,
+                colorbar: {
+                    title: 'Required Exponent Range'
+                }
+            };
+
+            // Insert empty columns between tensor types
+            heatmapData = {
+                x: [],
+                y: [],
+                z: [],
+                text: [],
+                type: 'heatmap',
+                colorscale: 'Viridis',
+                zmin: -24,
+                zmax: 16,
+                colorbar: {
+                    title: 'MaxExp'
+                }
+            };
+
+            // Function to update the processed data and plots based on the selected threshold
+            function updatePlotsWithThreshold(threshold) {
+                const processedData = calculateRequiredExponentBits(data, threshold);
+
+                const allExponentBits = processedData.map(d => d.requiredExponentBits);
+                const actExponentBits = processedData.filter(d => getTensorType(d.Name) === 'activation').map(d => d.requiredExponentBits);
+                const wbExponentBits = processedData.filter(d => getTensorType(d.Name) === 'weight' || getTensorType(d.Name) === 'bias').map(d => d.requiredExponentBits);
+                const agradExponentBits = processedData.filter(d => getTensorType(d.Name) === 'agrad').map(d => d.requiredExponentBits);
+                const wgradExponentBits = processedData.filter(d => getTensorType(d.Name) === 'wgrad').map(d => d.requiredExponentBits);
+
+                // Function to find the worst outlier in a given category
+                function findWorstOutlier(data, category) {
+                    const filteredData = data.filter(d => getTensorType(d.Name) === category);
+                    const exponentBits = filteredData.map(d => d.requiredExponentBits);
+                    const maxExponentBits = Math.max(...exponentBits);
+                    return filteredData.find(d => d.requiredExponentBits === maxExponentBits);
+                }
+
+                // Print the NAME of the worst outlier in each case
+                const worstOutlierAll = processedData.find(d => d.requiredExponentBits === Math.max(...allExponentBits));
+                const worstOutlierAct = findWorstOutlier(processedData, 'activation');
+                const worstOutlierWb = findWorstOutlier(processedData, 'weight') || findWorstOutlier(processedData, 'bias');
+                const worstOutlierAgrad = findWorstOutlier(processedData, 'agrad');
+                const worstOutlierWgrad = findWorstOutlier(processedData, 'wgrad');
+
+                // show these on the page as text too
+                document.getElementById('worst-outlier-all').textContent = `Most exponent bits required (all): ${worstOutlierAll.requiredExponentBits} for ${worstOutlierAll.Name} (Layer ${worstOutlierAll.Layer}, Step ${worstOutlierAll.Step}, MicroStep ${worstOutlierAll.MicroStep})`;
+                document.getElementById('worst-outlier-act').textContent = `Most exponent bits required (activations): ${worstOutlierAct.requiredExponentBits} for ${worstOutlierAct.Name} (Layer ${worstOutlierAct.Layer}, Step ${worstOutlierAct.Step}, MicroStep ${worstOutlierAct.MicroStep})`;
+                document.getElementById('worst-outlier-wb').textContent = `Most exponent bits required (weights/biases): ${worstOutlierWb.requiredExponentBits} for ${worstOutlierWb.Name} (Layer ${worstOutlierWb.Layer}, Step ${worstOutlierWb.Step}, MicroStep ${worstOutlierWb.MicroStep})`;
+                document.getElementById('worst-outlier-agrad').textContent = `Most exponent bits required (gradients of activations): ${worstOutlierAgrad.requiredExponentBits} for ${worstOutlierAgrad.Name} (Layer ${worstOutlierAgrad.Layer}, Step ${worstOutlierAgrad.Step}, MicroStep ${worstOutlierAgrad.MicroStep})`;
+                document.getElementById('worst-outlier-wgrad').textContent = `Most exponent bits required (gradients of weights/biases): ${worstOutlierWgrad.requiredExponentBits} for ${worstOutlierWgrad.Name} (Layer ${worstOutlierWgrad.Layer}, Step ${worstOutlierWgrad.Step}, MicroStep ${worstOutlierWgrad.MicroStep})`;
+
+                const percentile = (threshold * 100).toFixed(0);
+
+                Plotly.react('histogram-exponent-bits-all', [{ x: allExponentBits, type: 'histogram' }], { title: `Range ${percentile}th Percentile (All Tensors)` });
+                Plotly.react('histogram-exponent-bits-wb', [{ x: wbExponentBits, type: 'histogram' }], { title: `Range ${percentile}th Percentile (Weights/Biases)` });
+                Plotly.react('histogram-exponent-bits-act', [{ x: actExponentBits, type: 'histogram' }], { title: `Range ${percentile}th Percentile (Activations)` });
+                Plotly.react('histogram-exponent-bits-agrad', [{ x: agradExponentBits, type: 'histogram' }], { title: `Range ${percentile}th Percentile (Gradients of Activations)` });
+                Plotly.react('histogram-exponent-bits-wgrad', [{ x: wgradExponentBits, type: 'histogram' }], { title: `Range ${percentile}th Percentile (Gradients of Weights)` });
+
+                // Get the zmin and zmax values from the input fields
+                const maxexpZmin = parseInt(document.getElementById('maxexp-zmin').value);
+                const maxexpZmax = parseInt(document.getElementById('maxexp-zmax').value);
+                const exponentBitsZmin = parseInt(document.getElementById('exponent-bits-zmin').value);
+                const exponentBitsZmax = parseInt(document.getElementById('exponent-bits-zmax').value);
+
+                // Update the heatmap data with the new zmin and zmax values
+                heatmapData.zmin = maxexpZmin;
+                heatmapData.zmax = maxexpZmax;
+                exponentBitsHeatmapData.zmin = exponentBitsZmin;
+                exponentBitsHeatmapData.zmax = exponentBitsZmax;
+
+                let prevType = '';
+                sortedHeatData.forEach(d => {
+                    const currentType = getTensorType(d.Name);
+                    if (currentType !== prevType) {
+                        exponentBitsHeatmapData.x.push('[Next Tensor Type] ==> ' + currentType);
+                        exponentBitsHeatmapData.y.push('');
+                        exponentBitsHeatmapData.z.push(null);
+                        exponentBitsHeatmapData.text.push('');
+                        prevType = currentType;
+                    }
+                    const processedTensor = processedData.find(pd => pd.Name === d.Name && pd.Layer === d.Layer);
+                    exponentBitsHeatmapData.x.push(d.Name);
+                    exponentBitsHeatmapData.y.push(d.Layer);
+                    exponentBitsHeatmapData.z.push(processedTensor ? processedTensor.requiredExponentBits : null);
+                    exponentBitsHeatmapData.text.push(processedTensor ? processedTensor.requiredExponentBits : '');
+                });
+
+                // Plot the required exponent bits heatmap
+                Plotly.newPlot('heatmap-exponent-bits', [exponentBitsHeatmapData], {
+                    title: 'Heatmap of Required Exponent Range',
+                    xaxis: {
+                        title: 'Tensor Name',
+                        tickangle: -45,
+                        tickfont: { size: 10 }
+                    },
+                    yaxis: {
+                        title: 'Layer',
+                        autorange: 'reversed'
+                    },
+                    height: 500,
+                    margin: {
+                        b: 150
+                    },
+                    hovermode: 'closest',
+                    hovertemplate: '<b>Tensor Name:</b> %{x}<br><b>Layer:</b> %{y}<br><b>Required Exponent Bits:</b> %{text}<extra></extra>'
+                }).then(function() {
+                    // Add click event listener to the required exponent bits heatmap
+                    document.getElementById('heatmap-exponent-bits').on('plotly_click', function(data) {
+                        const point = data.points[0];
+                        const tensorName = point.x;
+                        const layer = point.y;
+                        const stepMicroStep = "Step 0 / MicroStep 0"; // Assuming default values for simplicity
+                        updateTensorSelection(tensorName, layer, stepMicroStep);
+                        updateLayerDetails(tensorName, layer, stepMicroStep);
+                    });
+                });
+
+                prevType = '';
+                sortedHeatData.forEach(d => {
+                    const currentType = getTensorType(d.Name);
+                    if (currentType !== prevType) {
+                        heatmapData.x.push('[Next Tensor Type] ==> ' + currentType);
+                        heatmapData.y.push('');
+                        heatmapData.z.push('');
+                        prevType = currentType;
+                    }
+                    heatmapData.x.push(d.Name);
+                    heatmapData.y.push(d.Layer);
+                    heatmapData.z.push(+d.MAXEXP);
+                    heatmapData.text.push(d.MAXEXP);
+                });
+
+                // Plot the heatmap
+                Plotly.newPlot('heatmap-maxexp', [heatmapData], {
+                    title: 'Heatmap of Maximum Exponent (MaxExp)',
+                    xaxis: {
+                        title: 'Tensor Name',
+                        tickangle: -45,
+                        tickfont: { size: 10 } // Adjust the font size of x-axis labels
+                    },
+                    yaxis: {
+                        title: 'Layer',
+                        autorange: 'reversed' // Reverse the y-axis to have layers in descending order
+                    },
+                    height: 500, // Increase the height of the graph
+                    margin: {
+                        b: 150 // Increase the bottom margin to create space for text labels
+                    },
+                    hovermode: 'closest',
+                    hovertemplate: '<b>Tensor Name:</b> %{x}<br><b>Layer:</b> %{y}<br><b>MaxExp:</b> %{text}<extra></extra>'
+                }).then(function() {
+                    document.getElementById('heatmap-maxexp').on('plotly_click', function(data) {
+                        const point = data.points[0];
+                        const tensorName = point.x;
+                        const layer = point.y;
+                        const stepMicroStep = "Step 0 / MicroStep 0"; // Assuming default values for simplicity
+                        updateTensorSelection(tensorName, layer, stepMicroStep);
+                        updateLayerDetails(tensorName, layer, stepMicroStep);
+                    });
+                });
+            }
+
+            // Event listener for threshold change
+            document.getElementById('threshold-select').addEventListener('change', function() {
+                const threshold = parseFloat(this.value);
+                updatePlotsWithThreshold(threshold);
+            });
+
+            document.getElementById('maxexp-zmin').addEventListener('input', () => {
+                updatePlotsWithThreshold(parseFloat(document.getElementById('threshold-select').value));
+            });
+
+            document.getElementById('maxexp-zmax').addEventListener('input', () => {
+                updatePlotsWithThreshold(parseFloat(document.getElementById('threshold-select').value));
+            });
+
+            document.getElementById('exponent-bits-zmin').addEventListener('input', () => {
+                updatePlotsWithThreshold(parseFloat(document.getElementById('threshold-select').value));
+            });
+
+            document.getElementById('exponent-bits-zmax').addEventListener('input', () => {
+                updatePlotsWithThreshold(parseFloat(document.getElementById('threshold-select').value));
+            });
+
+            // Initial load with default threshold (0.95)
+            updatePlotsWithThreshold(0.95);
+    });
+    </script>
+</body>
+</html>

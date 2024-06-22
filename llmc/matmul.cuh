@@ -158,11 +158,19 @@ void matmul_forward_cublaslt(floatX* out,
         exit(EXIT_FAILURE);
     }
 
+    generate_analysis(weight, C*OC, "matmul_fwd_weight");
+    generate_analysis(inp, C*B*T, "matmul_fwd_inp");
+    if (has_bias) {
+        generate_analysis(bias, OC, "matmul_fwd_bias");
+    }
+
     // call the matmul
     cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
         &alpha, weight, weightLayout, inp, inputLayout, &beta,
         out, outputLayout, out, outputLayout, &heuristic.algo,
         cublaslt_workspace, cublaslt_workspace_size, stream));
+
+    generate_analysis(out, (size_t)OC*(size_t)B*(size_t)T, "matmul_fwd_act_out");
 
     // cleanups
     cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
@@ -179,6 +187,9 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
                      int B, int T, int C, int OC, cudaStream_t stream) {
     NVTX_RANGE_FN();
     float one = 1.0f, zero = 0.0f;
+
+    generate_analysis(dout, (size_t)B*(size_t)T*(size_t)OC, "matmul_bwd_in_dout");
+    generate_analysis(weight, C*OC, "matmul_bwd1_in_w");
 
     // backward to bias, if given, does a +=
     if (dbias != NULL) {
@@ -204,6 +215,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
             reduce_add_sum_kernel<<<CEIL_DIV(OC, 256 * f128::size), 256, 0, stream>>>(dbias, dbias_buffer, OC, grid_size_y);
             cudaCheck(cudaGetLastError());
         }
+        generate_analysis(dbias, OC, "matmul_bwd_wgrad_bias");
     }
 
     // backward to input, uses = in the backward pass (set the gradient)
@@ -212,9 +224,15 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
     cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &one,
                              weight, CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &zero,
                              dinp, CUBLAS_LOWP, C, cublas_compute, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    generate_analysis(dinp, (size_t)C*(size_t)B*(size_t)T, "matmul_bwd1_agrad_dinp");
+    generate_analysis(inp, (size_t)C*(size_t)B*(size_t)T, "matmul_bwd2_in_inp");
+
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
     cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &one,
                              inp, CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &one,
                              dweight, CUBLAS_LOWP, C, cublas_compute, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     cudaCheck(cudaGetLastError());
+
+    generate_analysis(dweight, (size_t)C*(size_t)OC, "matmul_bwd2_wgrad_dweight");
 }
