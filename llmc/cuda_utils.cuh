@@ -385,7 +385,10 @@ __host__ void write_analysis() {
     cudaMemcpy(analysis_data_cpu, analysis_memory, ANALYSIS_MEMORY_SIZE, cudaMemcpyDeviceToHost);
 
     // Let's open a new CSV file and write the headers on the first line
-    FILE* f = fopen("analysis.csv", "wt");
+    char filename[256];
+    sprintf(filename, "analysis_Step%d_MicroStep%d_GPU%d.csv", global_current_step, global_current_micro_step, global_process_rank);
+    FILE* f = fopen(filename, "wt");
+
     fprintf(f, "Name,Layer,Step,MicroStep,ABSMIN,ABSMAX,MAXEXP,MINEXP,ZEROS,NEGVAL,POSVAL,INF,NAN,AVG,VAR,STD,ELEMENTS");
     // All 256 bins
     for (int i = 0; i < STATS_NUM_HISTOGRAM_BINS; i++) {
@@ -473,7 +476,6 @@ __host__ void write_analysis() {
 
     free(analysis_data_cpu);
     reset_analysis();
-    exit(1);
 }
 
 template<typename T>
@@ -493,7 +495,9 @@ __host__ void generate_analysis(const T* tensor, size_t count, const char* name)
         analysis_names[current_analysis] = (char*)malloc(strlen(name) + 7);
         int i = 2;
         do {
-            assert(i < 100);
+            if (i >= 100) {
+                return;
+            }
             sprintf(analysis_names[current_analysis], "%s [%d]", name, i++);
         } while (analysis_tensor_names.find(std::make_pair(analysis_names[current_analysis], global_current_layer)) != analysis_tensor_names.end());
     } else {

@@ -22,6 +22,7 @@ std::set<std::pair<std::string, uint>> analysis_tensor_names;
 uint global_current_layer = 0;
 uint global_current_step = 0;
 uint global_current_micro_step = 0;
+uint global_process_rank = 0; // sigh
 
 
 #include <unistd.h>
@@ -1369,6 +1370,7 @@ void error_usage() {
 // main training loop
 int main(int argc, char *argv[]) {
     multi_gpu_config = multi_gpu_config_init(&argc, &argv);
+    global_process_rank = multi_gpu_config.process_rank; // hack to make this visible to visualiser
 
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
@@ -1763,7 +1765,6 @@ int main(int argc, char *argv[]) {
         cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
         // --------------- TRAINING SECTION END -------------------
         // everything that follows now is just diagnostics, prints, logging, etc.
-        write_analysis();
 
         // todo - move or double-buffer all of this timing logic to avoid idling the GPU at this point!
         float time_elapsed_ms;
