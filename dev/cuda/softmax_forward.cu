@@ -29,6 +29,9 @@ version 7 is softmax optimized for very large C.
 version 8 is a cooperative groups free implementation (compares to version 6) of online softmax.
 Which has close performance to version 6 but better code readability.
 ./softmax_forward 8
+
+version 9 is online softmax that similar to version 8, plus using float4 to acclerate memory accessing.
+./softmax_forward 9
 */
 
 #include <stdio.h>
