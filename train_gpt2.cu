@@ -43,6 +43,8 @@ uint global_current_micro_step = 0;
 #include "llmc/dataloader.h"
 // defines: manual_seed, normal_ (same as torch.manual_seed and torch.normal)
 #include "llmc/rand.h"
+// defines: lr_scheduler_init, get_learning_rate
+#include "llmc/schedulers.h"
 // defines: sample_softmax, random_f32
 #include "llmc/sampler.h"
 // defines: logger_init, logger_log_eval, logger_log_val, logger_log_train
@@ -1322,7 +1324,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
 
 // ----------------------------------------------------------------------------
 // CLI, poor man's argparse
-// unclaimed flags lol: k,p
+// unclaimed flags lol: p
 
 void error_usage() {
     fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
@@ -1341,6 +1343,7 @@ void error_usage() {
     // workload (number of steps)
     fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
     // optimization
+    fprintf(stderr, "  -k <string> learning rate scheduler (default = cosine)\n");
     fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
     fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
     fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
@@ -1371,6 +1374,7 @@ int main(int argc, char *argv[]) {
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
+    const char* lr_scheduler_type = "cosine";
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write optimization checkpoints every how many steps?
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
@@ -1421,18 +1425,13 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else { error_usage(); }
     }
     // should do a bit more error checking here
     assert(warmup_iterations >= 0);
     if (output_log_dir != NULL) {
         assert(strlen(output_log_dir) < 400); // careful bunch of hardcoded snprintf around this
-    }
-    // check if output_log_dir does not exist or is a file
-    struct stat info;
-    if (output_log_dir != NULL && (stat(output_log_dir, &info ) != 0 || !(info.st_mode & S_IFDIR))) {
-        fprintf(stderr, "-o \"%s\" does not exist or is a file - are you specifying a file instead of dir?\n", output_log_dir);
-        exit(EXIT_FAILURE);
     }
     int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
     // calculate sensible default for total batch size as assuming no gradient accumulation
@@ -1454,6 +1453,7 @@ int main(int argc, char *argv[]) {
     printf0("| micro batch size B    | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
+    printf0("| LR scheduler          | %-50s |\n", lr_scheduler_type);
     printf0("| learning rate (LR)    | %-50e |\n", learning_rate);
     printf0("| warmup iterations     | %-50d |\n", warmup_iterations);
     printf0("| final LR fraction     | %-50e |\n", final_learning_rate_frac);
@@ -1585,6 +1585,11 @@ int main(int argc, char *argv[]) {
     // set up the Tokenizer
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+
+    // set up learning rate scheduler
+    LearningRateScheduler lr_scheduler;
+    lr_scheduler_init(&lr_scheduler, lr_scheduler_type, learning_rate,
+                      warmup_iterations, train_num_batches, final_learning_rate_frac);
 
     // some memory for generating samples from the model
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
@@ -1748,18 +1753,8 @@ int main(int argc, char *argv[]) {
         model.mean_loss = lossf;
         // average the loss and the gradients between all processes
         gpt2_multi_gpu_loss_reduce(&model, &multi_gpu_config);
-        // learning rate schedule: warmup linearly to max LR, then cosine decay to LR * final_learning_rate_frac
-        float step_learning_rate = learning_rate;
-        if (step < warmup_iterations) {
-            step_learning_rate = learning_rate * ((float)(step + 1)) / warmup_iterations;
-        } else {
-            float decay_ratio = ((float)(step - warmup_iterations)) / (train_num_batches - warmup_iterations);
-            assert(0.0f <= decay_ratio && decay_ratio <= 1.0f);
-            float coeff = 0.5f * (1.0f + cosf(M_PI * decay_ratio)); // coeff starts at 1 and goes to 0
-            assert(0.0f <= coeff && coeff <= 1.0f);
-            float min_lr = learning_rate * final_learning_rate_frac;
-            step_learning_rate = min_lr + coeff * (learning_rate - min_lr);
-        }
+        // fetch the next learning rate
+        float step_learning_rate = get_learning_rate(&lr_scheduler, step);
         // update the model parameters
         float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
         // zero out the gradients for the next iteration
