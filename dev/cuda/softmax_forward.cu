@@ -561,6 +561,56 @@ __global__ void softmax_forward_online_kernel8(float* out, const float* inp, int
     }
 }
 
+__global__ void softmax_forward_online_kernel9(float* __restrict__ output, float* __restrict__ input,
+                                               const int N, const int C) {
+    // On the base of softmax_forward_online_kernel8, plus using float4 to acclerate memory access.
+    const int warpId = threadIdx.y;
+    const int laneId = threadIdx.x;
+    const int warpsPerBlock = blockDim.y;
+    int row = warpsPerBlock * blockIdx.x + warpId;
+    if (row < N) {
+        float* x = input + row * C;
+        float* y = output + row * C;
+        float laneMax = -INFINITY, laneSum = 0.0f;
+        for (int i = laneId * x128::size; i < C; i += warpSize * x128::size) {
+            x128 xi = load128cs(x + i);
+            float packMax = -INFINITY, packSum = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < x128::size; ++k) {
+                float newPackMax = fmaxf(packMax, xi[k]);
+                packSum = expf(packMax - newPackMax) * packSum +
+                          expf(xi[k] - newPackMax);
+                packMax = newPackMax;
+            }
+            float newLaneMax = fmaxf(laneMax, packMax);
+            laneSum = laneSum * expf(laneMax - newLaneMax) +
+                      packSum * expf(packMax - newLaneMax);
+            laneMax = newLaneMax;
+        }
+
+        float maxVal = laneMax, sumVal = laneSum;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+            float offsetMax = __shfl_xor_sync(0xFFFFFFFF, maxVal, offset);
+            float offsetSum = __shfl_xor_sync(0xFFFFFFFF, sumVal, offset);
+            if (maxVal > offsetMax) {
+                sumVal += expf(offsetMax - maxVal) * offsetSum;
+            } else {
+                sumVal = sumVal * expf(maxVal - offsetMax) + offsetSum;
+                maxVal = offsetMax;
+            }
+        }
+        for (int i = laneId * x128::size; i < C; i += warpSize * x128::size) {
+            x128 out;
+            x128 xi = load128cs(x + i);
+            #pragma unroll
+            for (int k = 0; k < x128::size; ++k) {
+                out[k] = expf(xi[k] - maxVal) / sumVal;
+            }
+            store128cs(y + i, out);
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -614,6 +664,13 @@ void softmax_forward_online8(float* out, const float* inp, int N, int C, int blo
     cudaCheck(cudaGetLastError());
 }
 
+void softmax_forward_online9(float* out, const float* inp, int N, int C, int block_size) {
+    const dim3 block(32, block_size / 32);
+    const int grid_size = ceil_div(N * 32, block_size);
+    softmax_forward_online_kernel8<<<grid_size, block>>>(out, inp, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void softmax_forward(int kernel_num, float* out, const float* inp, int N, int C, const int block_size) {
     switch (kernel_num) {
@@ -640,6 +697,9 @@ void softmax_forward(int kernel_num, float* out, const float* inp, int N, int C,
             break;
         case 8:
             softmax_forward_online8(out, inp, N, C, block_size);
+            break;
+        case 9:
+            softmax_forward_online9(out, inp, N, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
