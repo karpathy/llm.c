@@ -105,6 +105,23 @@ void *malloc_check(size_t size, const char *file, int line) {
 
 #define mallocCheck(size) malloc_check(size, __FILE__, __LINE__)
 
+void *aligned_alloc_check(size_t alignment, size_t size, const char *file, int line)
+{
+    void *ptr = aligned_alloc(alignment, size);
+    if (ptr == NULL)
+    {
+        fprintf(stderr, "Error: Aligned Memory allocation failed at %s:%d\n", file, line);
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        fprintf(stderr, "  Size: %zu bytes\n", size);
+        exit(EXIT_FAILURE);
+    }
+    return ptr;
+}
+
+#define alignedAllocCheck(alignment, size) aligned_alloc_check(alignment, size, __FILE__, __LINE__);
+
 // ----------------------------------------------------------------------------
 // I/O ops
 
