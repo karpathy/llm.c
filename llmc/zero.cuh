@@ -90,24 +90,9 @@ int multi_gpu_get_local_device_idx(int process_rank, int num_processes) {
     for (int c = 0; hostname[c] != '\0'; c++){ hostname_hash = ((hostname_hash << 5u) + hostname_hash) ^ hostname[c]; }
 
     // Distribute all hostname hashes to all processes.
-    // Allocate memory for hostname hashes on the GPU
-    uint64_t* all_hostsname_hashes;
-    cudaMalloc(&all_hostsname_hashes, num_processes * sizeof(uint64_t));
-
-    // Copy the local hostname hash to the appropriate location in the GPU memory
-    cudaMemcpy(&all_hostsname_hashes[process_rank], &hostname_hash, sizeof(uint64_t), cudaMemcpyHostToDevice);
-
-    // Perform the all-gather operation with NCCL
-    ncclAllGather(&hostname_hash, all_hostsname_hashes, sizeof(uint64_t), ncclUint64, nccl_comm, nccl_stream);
-
-    // Synchronize the stream to ensure the all-gather operation is complete
-    cudaStreamSynchronize(nccl_stream);
-
-    // Allocate CPU memory to copy the gathered results back
-    uint64_t* all_hostsname_hashes_cpu = (uint64_t*)malloc(num_processes * sizeof(uint64_t));
-
-    // Copy the gathered results back to the CPU
-    cudaMemcpy(all_hostsname_hashes_cpu, all_hostsname_hashes, num_processes * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    uint64_t* all_hostsname_hashes = (uint64_t*)malloc(num_processes * sizeof(uint64_t));
+    all_hostsname_hashes[process_rank] = hostname_hash;
+    mpiCheck(MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, all_hostsname_hashes, sizeof(uint64_t), MPI_BYTE, MPI_COMM_WORLD));
 
     // Identify which GPU we need to use.
     int local_device_idx = 0;
@@ -122,8 +107,7 @@ int multi_gpu_get_local_device_idx(int process_rank, int num_processes) {
         }
     }
 
-    cudaFree(all_hostsname_hashes);
-    free(all_hostsname_hashes_cpu);
+    free(all_hostsname_hashes);
     return local_device_idx;
 }
 #endif
@@ -174,7 +158,7 @@ void multi_gpu_barrier(const MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
     if (multi_gpu_config->num_processes > 1) {
         float* unified_buffer = multi_gpu_config->unified_buffer;
-        ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, main_stream));
+        ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
     }
     cudaCheck(cudaDeviceSynchronize());
 #endif
