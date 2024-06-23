@@ -73,6 +73,8 @@ cudaDeviceProp deviceProp; // fills in common_start()
 cudaStream_t main_stream;
 // one global variable to hold the multi-GPU configuration for this process
 MultiGpuConfig multi_gpu_config;
+// buffer size to use for device <-> disk io
+constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 
 // convenience function that only prints if the rank of process is zero
 void printf0(const char *format, ...) {
@@ -97,7 +99,6 @@ void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t t
             multi_gpu_config->zero_stage = 0;
         }
         else {
-            printf0("| Zero Stage1 is enabled                                                     |\n");
             multi_gpu_config->zero_stage = 1;
             multi_gpu_config->shard_num_parameters = total_parameters / multi_gpu_config->num_processes;
         }
@@ -383,12 +384,10 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model_header[5] = model->config.num_heads;
     model_header[6] = model->config.channels;
     model_header[7] = model->config.padded_vocab_size;
-    fwrite(model_header, sizeof(int), 256, model_file);
+    fwriteCheck(model_header, sizeof(int), 256, model_file);
     // write the parameters
-    void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
-    cudaCheck(cudaMemcpy(params_memory_cpu, model->params_memory, model->num_parameters_bytes, cudaMemcpyDeviceToHost));
-    fwrite(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
-    free(params_memory_cpu);
+    device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
+                   IO_BUF_SIZE, main_stream);
     // close file, we're done
     fcloseCheck(model_file);
 }
@@ -451,10 +450,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 
     // read in all the parameters from file and copy them to device
-    void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
-    freadCheck(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
-    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
-    free(params_memory_cpu);
+    file_to_device(model->params_memory, model_file, model->num_parameters_bytes,
+                   IO_BUF_SIZE, main_stream);
     fcloseCheck(model_file);
 
     // only return from this function once we are certain the params are ready on the GPU
@@ -1180,30 +1177,25 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     // dataloader state, start at 30 to leave some padding
     *((size_t*)&state_header[30]) = loader->current_shard_idx; // shard of the dataset
     *((size_t*)&state_header[32]) = loader->current_sample_idx; // position in shard
-    fwrite(state_header, sizeof(int), 256, state_file);
+    fwriteCheck(state_header, sizeof(int), 256, state_file);
 
     // write AdamW m, v, and master_weights here (they are all float)
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
-    float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
-    cudaCheck(cudaMemcpy(cpu_buffer, model->m_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
-    fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    cudaCheck(cudaMemcpy(cpu_buffer, model->v_memory, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
-    fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    if (model->use_master_weights == 1) {
-        cudaCheck(cudaMemcpy(cpu_buffer, model->master_weights, shard_num_parameters * sizeof(float), cudaMemcpyDeviceToHost));
-        fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    if(model->use_master_weights) {
+        device_to_file(state_file, model->master_weights, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     }
-    free(cpu_buffer);
 
     // write dataloader state if we are using the Permuted version of it
     if (loader->should_shuffle) {
-        fwrite(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);  // number of shards
-        fwrite(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
-        fwrite(&loader->shard_num_samples, sizeof(size_t), 1, state_file);
-        fwrite(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
-        fwrite(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
+        fwriteCheck(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);  // number of shards
+        fwriteCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
+        fwriteCheck(&loader->shard_num_samples, sizeof(size_t), 1, state_file);
+        fwriteCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
+        fwriteCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
     }
-    fclose(state_file);
+    fcloseCheck(state_file);
 }
 
 void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename) {
@@ -1232,20 +1224,21 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
         cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
     }
+    if(use_master_weights == 1 && !model->use_master_weights) {
+        printf0("Warning: Master weights are present in state, but not enabled for current run.");
+    } else if (use_master_weights == 0 && model->use_master_weights) {
+        printf0("Error: Master weights requested, but not present in state file.");
+        exit(EXIT_FAILURE);
+    }
     if (model->master_weights == NULL && use_master_weights == 1) {
         printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
         cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
     }
-    float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
-    freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    cudaCheck(cudaMemcpy(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
-    freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    cudaCheck(cudaMemcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
-    if (use_master_weights == 1) {
-        freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-        cudaCheck(cudaMemcpy(model->master_weights, cpu_buffer, shard_num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+    file_to_device(model->m_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    file_to_device(model->v_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    if(model->use_master_weights) {
+        file_to_device(model->master_weights, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     }
-    free(cpu_buffer);
 
     // revive the DataLoader object and its state
     loader->should_shuffle = should_shuffle;
@@ -1270,7 +1263,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     dataloader_resume(loader, current_shard_idx, current_sample_idx);
 
     // all done, close state file
-    fclose(state_file);
+    fcloseCheck(state_file);
 }
 
 

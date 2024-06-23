@@ -166,7 +166,7 @@ int main(int argc, char *argv[]) {
     // copy logits to CPU so we can compare them
     floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
     float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
-    cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost);
+    cudaCheck(cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B * T * Vp; i++) {
         logits_cpu[i] = (float)logits_cpu_raw[i];
     }
