@@ -159,8 +159,22 @@ loss.backward()
   }
 
   // backward
-  std::vector<float> x_grad(B*T*C), y_grad(B*T*C, 1.0f);
+  std::vector<float> x_grad(B * T * C, 0.0), y_grad(B * T * C, 1.0f);
+  auto x_grad_3d = Eigen::TensorMap<nn::Tensor3D>(x_grad.data(), B, T, C);
+  auto y_grad_3d = Eigen::TensorMap<nn::Tensor3D>(y_grad.data(), B, T, C);
+  block.Backward(xt, y_grad_3d, x_grad_3d);
 
+  std::vector<float> expected_x_grad = {
+      1.226099, 0.810447, 0.295263, 0.956450, 1.194399,  1.517342, 1.408440,
+      1.329727, 0.766482, 0.535780, 0.735261, 1.224310,  1.032075, 1.120100,
+      1.104306, 1.070927, 0.915230, 0.757362, 0.889456,  0.844044, 0.743556,
+      1.444354, 1.488363, 0.590226, 1.685244, 0.941806,  0.423899, 0.210837,
+      1.328500, 1.409714, 2.011978, 1.126987, -0.052393, 0.161476, 1.464273,
+      1.287678, 0.967238, 1.173121, 0.719205, 1.138348,  1.343792, 0.658296,
+      1.138839, 0.948495, 0.854385, 0.838419, 1.305177,  0.914685};
+  for (size_t i = 0; i < expected_x_grad.size(); ++i) {
+    EXPECT_NEAR(expected_x_grad[i], x_grad[i], 1e-5);
+  }
 }
 
 TEST(GPT, Forward) {

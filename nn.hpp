@@ -101,7 +101,7 @@ struct Residual {
 
     for (int i = 0; i < N; ++i) {
       x_grad[i] += Hx_grad[i];
-      Fx_grad[i] = Hx_grad[i];
+      Fx_grad[i] += Hx_grad[i];
     }
   }
 };
@@ -307,7 +307,7 @@ struct LayerNorm {
     Eigen::RowVectorXf dnorm_mean = dnorm.rowwise().mean();         // [B,]
     Eigen::RowVectorXf dnorm_norm_mean =
         (dnorm.array() * norm.array()).rowwise().mean();  // [B,]
-    x_grad =
+    x_grad.array() +=
         ((dnorm.array().colwise() - dnorm_mean.transpose().array()).array() -
          (norm.array().colwise() * dnorm_norm_mean.transpose().array()))
             .array()

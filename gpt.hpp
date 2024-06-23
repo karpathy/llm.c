@@ -423,23 +423,51 @@ struct Block {
 
     LAZY_ALLOCATE_MATRIX(ln1_y_grad_, B * T, C);
     LAZY_ALLOCATE_TENSOR3D(att_y_grad_, B, T, C);
+    LAZY_ALLOCATE_TENSOR3D(residual1_grad_, B, T, C);
     LAZY_ALLOCATE_MATRIX(ln2_y_grad_, B * T, C);
+    LAZY_ALLOCATE_TENSOR3D(mlp_y_grad_, B, T, C);
 
     // backward residual
-    nn::Residual::Backward(y_grad, absl::MakeSpan(att_y_grad_),
-                           absl::MakeSpan(att_y_grad_));
+    nn::Residual::Backward(y_grad, absl::MakeSpan(residual1_grad_),
+                           absl::MakeSpan(mlp_y_grad_));
+    //    std::cout << "mlp_y grad:\n" << mlp_y_grad_ << std::endl;
 
     // backward MLP
     auto ln2_y_2d = Eigen::Map<nn::Matrix>(ln2_y_.data(), B * T, C);
     auto ln2_y_grad_2d = Eigen::Map<nn::Matrix>(ln2_y_grad_.data(), B * T, C);
-    auto att_grad_2d = Eigen::Map<nn::Matrix>(att_y_grad_.data(), B * T, C);
-    mlp_->Backward(ln2_y_2d, att_grad_2d, ln2_y_grad_2d);
+    auto mlp_y_grad_2d = Eigen::Map<nn::Matrix>(mlp_y_grad_.data(), B * T, C);
+    mlp_->Backward(ln2_y_2d, mlp_y_grad_2d, ln2_y_grad_2d);
+    //    std::cout << "ln2_y grad:\n" << ln2_y_grad_2d << std::endl;
 
     // backward LN2
-    auto att_y_2d = Eigen::Map<nn::Matrix>(att_y_.data(), B * T, C);
     auto ln2_mean_1d = Eigen::Map<Eigen::RowVectorXf>(ln2_mean_.data(), B * T);
     auto ln2_rstd_1d = Eigen::Map<Eigen::RowVectorXf>(ln2_rstd_.data(), B * T);
-    //    ln2_->Backward(att_y_2d, ln2_y_grad_2d, ln2_mean_1d, ln2_rstd_1d, );
+    auto residual1_2d = Eigen::Map<nn::Matrix>(residual1_.data(), B * T, C);
+    auto residual1_grad_2d =
+        Eigen::Map<nn::Matrix>(residual1_grad_.data(), B * T, C);
+    ln2_->Backward(residual1_2d, ln2_y_grad_2d, ln2_mean_1d, ln2_rstd_1d,
+                   residual1_grad_2d);
+    //    std::cout << "residual grad:\n" << residual1_grad_2d << std::endl;
+
+    // backward residual
+    nn::Residual::Backward(residual1_grad_2d, absl::MakeSpan(x_grad),
+                           absl::MakeSpan(att_y_grad_));
+
+    // backward attention
+    auto ln1_y_3d = Eigen::TensorMap<nn::Tensor3D>(ln1_y_.data(), B, T, C);
+    auto ln1_y_grad_3d =
+        Eigen::TensorMap<nn::Tensor3D>(ln1_y_grad_.data(), B, T, C);
+    auto att_y_grad_3d =
+        Eigen::TensorMap<nn::Tensor3D>(att_y_grad_.data(), B, T, C);
+    attn_->Backward(ln1_y_3d, att_y_grad_3d, ln1_y_grad_3d);
+
+    // backward LN1
+    auto x_2d = Eigen::Map<nn::Matrix>(x.data(), B * T, C);
+    auto ln1_mean_1d = Eigen::Map<Eigen::RowVectorXf>(ln1_mean_.data(), B * T);
+    auto ln1_rstd_1d = Eigen::Map<Eigen::RowVectorXf>(ln1_rstd_.data(), B * T);
+    auto ln1_y_grad_2d = Eigen::Map<nn::Matrix>(ln1_y_grad_.data(), B * T, C);
+    auto x_grad_2d = Eigen::Map<nn::Matrix>(x_grad.data(), B * T, C);
+    ln1_->Backward(x_2d, ln1_y_grad_2d, ln1_mean_1d, ln1_rstd_1d, x_grad_2d);
   }
 
   size_t NumParameters() const {
