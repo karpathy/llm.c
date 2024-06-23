@@ -795,7 +795,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
         // also create memory for caching inputs and targets
         model->inputs = (int*)mallocCheck(B * T * sizeof(int));
-        model->targets = (int *)mallocCheck(B * T * sizeof(int)); // might be unused if we never have targets but it's small
+        model->targets = (int*)mallocCheck(B * T * sizeof(int)); // might be unused if we never have targets but it's small
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -1002,7 +1002,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 
     // lazily allocate the memory for m_memory and v_memory
     if (model->m_memory == NULL) {
-        model->m_memory = (float *)calloc(model->num_parameters, sizeof(float));
+        model->m_memory = (float*)calloc(model->num_parameters, sizeof(float));
         model->v_memory = (float*)calloc(model->num_parameters, sizeof(float));
     }
 
