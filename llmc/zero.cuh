@@ -16,6 +16,10 @@ Utilities for ZeRO sharding
 #include <nccl.h>
 #endif
 
+#ifdef USE_MPI
+#include <mpi.h>
+#endif
+
 // ----------------------------------------------------------------------------
 // Multi-GPU related
 #ifdef MULTI_GPU
@@ -35,6 +39,19 @@ void nccl_check(ncclResult_t status, const char *file, int line) {
     }
 }
 #define ncclCheck(err) (nccl_check(err, __FILE__, __LINE__))
+
+#ifdef USE_MPI
+void mpi_check(int status, const char *file, int line) {
+    if (status != MPI_SUCCESS) {
+        char mpi_error[4096];
+        int mpi_error_len = 0;
+        assert(MPI_Error_string(status, &mpi_error[0], &mpi_error_len) == MPI_SUCCESS);
+        printf("[MPI ERROR] at file %s:%d:\n%.*s\n", file, line, mpi_error_len, mpi_error);
+        exit(EXIT_FAILURE);
+    }
+}
+#define mpiCheck(err) (mpi_check(err, __FILE__, __LINE__))
+#endif
 
 #endif // MULTI_GPU
 
@@ -70,23 +87,15 @@ void send_nccl_id_to_clients(ncclUniqueId *nccl_id, int client_sockets[], int nu
         close(client_sockets[i]);
     }
 }
-#endif
 
-MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank) {
-#ifdef MULTI_GPU
-    MultiGpuConfig result;
-    result.process_rank = process_rank;
-    result.num_processes = num_processes;
-    result.local_device_idx = process_rank % 8;
-    cudaCheck(cudaSetDevice(result.local_device_idx));
+ncclUniqueId get_nccl_id_via_tcp(MultiGpuConfig* result, const char* server_ip) {
     ncclUniqueId nccl_id;
-
+    // hardcode an arbitrary port number between 1024 and 49151 (registered ports)
     int SERVER_PORT = 12345;
-    const char* SERVER_IP = "10.0.1.220";
-    if (result.process_rank == 0) {
+    if (result->process_rank == 0) {
         ncclCheck(ncclGetUniqueId(&nccl_id));
 
-        int MAX_CLIENTS = num_processes - 1;
+        int MAX_CLIENTS = result->num_processes - 1;
         int client_sockets[MAX_CLIENTS];
         int num_clients = 0;
         int server_socket, new_socket;
@@ -110,7 +119,7 @@ MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank) {
         }
 
         address.sin_family = AF_INET;  // IPv4
-        address.sin_addr.s_addr = inet_addr(SERVER_IP); // alternatively use INADDR_ANY to bind to all interfaces, currently we only allow ethernet
+        address.sin_addr.s_addr = inet_addr(server_ip); // alternatively use INADDR_ANY to bind to all interfaces, currently we only allow ethernet
         address.sin_port = htons(SERVER_PORT);
 
         // Bind the socket to the address and port
@@ -155,14 +164,14 @@ MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank) {
         // Set the server address and port
         serv_addr.sin_family = AF_INET;
         serv_addr.sin_port = htons(SERVER_PORT);
-        if (inet_pton(AF_INET, SERVER_IP, &serv_addr.sin_addr) <= 0) {
+        if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
             printf("Invalid address or address not supported");
             exit(EXIT_FAILURE);
         }
 
         // Try to connect to the server - retry if connection fails
         while (connect(client_socket, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-            printf("%d Connection failed, retrying in %d seconds\n", process_rank, time_to_sleep);
+            printf("%d Connection failed, retrying in %d seconds\n", result->process_rank, time_to_sleep);
             if (--num_attempts == 0) {
                 printf("Failed to connect to the server\n");
                 exit(EXIT_FAILURE);
@@ -178,6 +187,112 @@ MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank) {
         printf("Received NCCL ID\n");
         close(client_socket);
     }
+
+    return nccl_id;
+}
+
+ncclUniqueId get_nccl_id_via_fs(MultiGpuConfig* result, char* fs_path) {
+    // Works assuming that the filesystem is shared among all processes
+    ncclUniqueId nccl_id;
+    FILE* idFile;
+    static char filename[1024];
+    snprintf(filename, sizeof(filename), "%s/ncclUniqueId.sync", fs_path);
+
+    if (result->process_rank == 0) {
+        ncclCheck(ncclGetUniqueId(&nccl_id));
+        idFile = fopen(filename, "wb");
+        assert(idFile != NULL);
+        fwrite(&nccl_id, sizeof(nccl_id), 1, idFile);
+        fclose(idFile);
+    } else {
+        // Other ranks wait until the file is available and read the unique ID
+        do {
+            usleep(1000000);  // 1 second
+            idFile = fopen(filename, "rb");
+            if (idFile != NULL) break;
+        } while (idFile == NULL);
+        freadCheck(&nccl_id, sizeof(nccl_id), 1, idFile);
+        fclose(idFile);
+    }
+
+    return nccl_id;
+}
+
+#ifdef USE_MPI
+// Determine which GPU this process should use.
+// Processes on the same machines use different GPU indicies. Processes on other machines don't.
+// Copied from NCCL examples: https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/examples.html#example-2-one-device-per-process-or-thread
+int multi_gpu_get_local_device_idx(int process_rank, int num_processes) {
+    char hostname[1024];
+    hostname[1023] = '\0';
+    // All processes on the same machine will share the same hostname.
+    gethostname(hostname, 1023);
+    for (int i=0; i < 1024; i++) {
+        if (hostname[i] == '.') {
+            hostname[i] = '\0';
+            break;
+        }
+    }
+    uint64_t hostname_hash = 5381u;
+    for (int c = 0; hostname[c] != '\0'; c++){ hostname_hash = ((hostname_hash << 5u) + hostname_hash) ^ hostname[c]; }
+
+    // Distribute all hostname hashes to all processes.
+    uint64_t* all_hostsname_hashes = (uint64_t*)malloc(num_processes * sizeof(uint64_t));
+    all_hostsname_hashes[process_rank] = hostname_hash;
+    mpiCheck(MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, all_hostsname_hashes, sizeof(uint64_t), MPI_BYTE, MPI_COMM_WORLD));
+
+    // Identify which GPU we need to use.
+    int local_device_idx = 0;
+    for (int current_process = 0; current_process < num_processes; ++current_process) {
+        if (current_process == process_rank) {
+        // Found my gpu, local_device_idx now has my target GPU index.
+        break;
+        }
+        if (all_hostsname_hashes[current_process] == all_hostsname_hashes[process_rank]) {
+        // This process ID runs on the same machine, but it's not me, skip this GPU
+        local_device_idx++;
+        }
+    }
+
+    free(all_hostsname_hashes);
+    return local_device_idx;
+}
+#endif
+
+#endif
+
+MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank, char* server_ip, char* fs_path, char* init_method) {
+#ifdef MULTI_GPU
+    MultiGpuConfig result;
+    ncclUniqueId nccl_id;
+    if (strcmp(init_method, "mpi") != 0) {
+        result.process_rank = process_rank;
+        result.num_processes = num_processes;
+        result.local_device_idx = process_rank % 8;
+        if (strcmp(init_method, "tcp") == 0) {
+            nccl_id = get_nccl_id_via_tcp(&result, server_ip);
+        } else if (strcmp(init_method, "fs") == 0) {
+            nccl_id = get_nccl_id_via_fs(&result, fs_path);
+        } else {
+            printf("Invalid init method\n");
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        #ifdef USE_MPI
+        mpiCheck(MPI_Init(NULL, NULL));
+        mpiCheck(MPI_Comm_rank(MPI_COMM_WORLD, &result.process_rank));
+        mpiCheck(MPI_Comm_size(MPI_COMM_WORLD, &result.num_processes));
+        result.local_device_idx = multi_gpu_get_local_device_idx(result.process_rank, result.num_processes);
+        if (result.process_rank == 0) {
+            ncclCheck(ncclGetUniqueId(&nccl_id));
+        }
+        mpiCheck(MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD));
+        #else
+        printf("MPI support is disabled. Please enable MPI support to use MPI init method.\n");
+        exit(EXIT_FAILURE);
+        #endif
+    }
+    cudaCheck(cudaSetDevice(result.local_device_idx));
     ncclCheck(ncclCommInitRank(&result.nccl_comm, result.num_processes, nccl_id, result.process_rank));
     cudaCheck(cudaStreamCreate(&result.nccl_stream));
     // event without timing for maximum performance
@@ -203,6 +318,9 @@ void multi_gpu_config_free(MultiGpuConfig* multi_gpu_config) {
     cudaCheck(cudaStreamDestroy(multi_gpu_config->nccl_stream));
     cudaCheck(cudaEventDestroy(multi_gpu_config->compute_nccl_sync));
     cudaCheck(cudaFree(multi_gpu_config->unified_buffer));
+    #ifdef USE_MPI
+    mpiCheck(MPI_Finalize());
+    #endif
 #endif
 }
 
