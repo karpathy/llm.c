@@ -157,8 +157,7 @@ void multi_gpu_config_free(MultiGpuConfig* multi_gpu_config) {
 void multi_gpu_barrier(const MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
     if (multi_gpu_config->num_processes > 1) {
-        float* unified_buffer = multi_gpu_config->unified_buffer;
-        ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
+        ncclCheck(ncclAllReduce(multi_gpu_config->unified_buffer, multi_gpu_config->unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
     }
     cudaCheck(cudaDeviceSynchronize());
 #endif
