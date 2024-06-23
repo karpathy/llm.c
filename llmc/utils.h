@@ -130,7 +130,7 @@ extern inline void *malloc_check(size_t size, const char *file, int line) {
 
 #define mallocCheck(size) malloc_check(size, __FILE__, __LINE__)
 
-extern inline void *_aligned_malloc_check(size_t alignment, size_t size, const char *file, int line)
+extern inline void *aligned_malloc_check(size_t alignment, size_t size, const char *file, int line)
 {
 #ifdef _WIN32
     void *ptr = _aligned_malloc(size, alignment);
@@ -149,7 +149,7 @@ extern inline void *_aligned_malloc_check(size_t alignment, size_t size, const c
     return ptr;
 }
 
-#define alignedMallocCheck(alignment, size) _aligned_malloc_check(alignment, size, __FILE__, __LINE__);
+#define alignedMallocCheck(alignment, size) aligned_malloc_check(alignment, size, __FILE__, __LINE__);
 
 extern inline void free_check(void *ptr)
 {

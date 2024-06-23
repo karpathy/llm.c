@@ -1002,11 +1002,6 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 
     // lazily allocate the memory for m_memory and v_memory
     if (model->m_memory == NULL) {
-        // model->m_memory = (float*)alignedMallocCheck(64, model->num_parameters * sizeof(float));
-        // model->v_memory = (float*)alignedMallocCheck(64, model->num_parameters * sizeof(float));
-        // memset(model->m_memory, 0, model->num_parameters * sizeof(float));
-        // memset(model->v_memory, 0, model->num_parameters * sizeof(float));
-
         model->m_memory = (float *)calloc(model->num_parameters, sizeof(float));
         model->v_memory = (float*)calloc(model->num_parameters, sizeof(float));
     }
