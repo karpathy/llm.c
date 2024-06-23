@@ -899,7 +899,7 @@ float multi_gpu_cpu_float_sum(float value, MultiGpuConfig* multi_gpu_config) {
 
     float* unified_buffer = multi_gpu_config->unified_buffer;
     *unified_buffer = value;
-    ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, main_stream));
+    ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
     cudaCheck(cudaDeviceSynchronize());
     return *unified_buffer;
 #else
