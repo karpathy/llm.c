@@ -15,7 +15,10 @@
 #ifndef _WIN32
 #include <dirent.h>
 #endif
-
+// implementation of _aligned_malloc for Windows
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 // ----------------------------------------------------------------------------
 // fread convenience utils, with nice handling of error checking using macros
 // simple replace fopen, fread, fclose, fseek
@@ -105,9 +108,13 @@ void *malloc_check(size_t size, const char *file, int line) {
 
 #define mallocCheck(size) malloc_check(size, __FILE__, __LINE__)
 
-void *aligned_alloc_check(size_t alignment, size_t size, const char *file, int line)
+void *aligned_malloc_check(size_t alignment, size_t size, const char *file, int line)
 {
+#ifdef _WIN32
+    void *ptr = _aligned_malloc(size, alignment);
+#else
     void *ptr = aligned_alloc(alignment, size);
+#endif
     if (ptr == NULL)
     {
         fprintf(stderr, "Error: Aligned Memory allocation failed at %s:%d\n", file, line);
@@ -120,7 +127,21 @@ void *aligned_alloc_check(size_t alignment, size_t size, const char *file, int l
     return ptr;
 }
 
-#define alignedAllocCheck(alignment, size) aligned_alloc_check(alignment, size, __FILE__, __LINE__);
+#define alignedMallocCheck(alignment, size) aligned_malloc_check(alignment, size, __FILE__, __LINE__);
+
+static void free_check(void *ptr) 
+{
+    if (ptr == NULL)
+        return;
+    
+#ifdef _WIN32
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
+
+#define freeCheck(ptr) free_check(ptr);
 
 // ----------------------------------------------------------------------------
 // I/O ops
