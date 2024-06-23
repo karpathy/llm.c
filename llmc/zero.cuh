@@ -150,6 +150,7 @@ void multi_gpu_config_free(MultiGpuConfig* multi_gpu_config) {
     ncclCheck(ncclCommDestroy(multi_gpu_config->nccl_comm));
     cudaCheck(cudaStreamDestroy(multi_gpu_config->nccl_stream));
     cudaCheck(cudaEventDestroy(multi_gpu_config->compute_nccl_sync));
+    cudaCheck(cudaFree(multi_gpu_config->unified_buffer));
     mpiCheck(MPI_Finalize());
 #endif
 }
