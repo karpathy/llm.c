@@ -21,7 +21,7 @@
 // simple replace fopen, fread, fclose, fseek
 // with fopenCheck, freadCheck, fcloseCheck, fseekCheck
 
-FILE *fopen_check(const char *path, const char *mode, const char *file, int line) {
+extern inline FILE *fopen_check(const char *path, const char *mode, const char *file, int line) {
     FILE *fp = fopen(path, mode);
     if (fp == NULL) {
         fprintf(stderr, "Error: Failed to open file '%s' at %s:%d\n", path, file, line);
@@ -39,7 +39,7 @@ FILE *fopen_check(const char *path, const char *mode, const char *file, int line
 
 #define fopenCheck(path, mode) fopen_check(path, mode, __FILE__, __LINE__)
 
-void fread_check(void *ptr, size_t size, size_t nmemb, FILE *stream, const char *file, int line) {
+extern inline void fread_check(void *ptr, size_t size, size_t nmemb, FILE *stream, const char *file, int line) {
     size_t result = fread(ptr, size, nmemb, stream);
     if (result != nmemb) {
         if (feof(stream)) {
@@ -61,7 +61,7 @@ void fread_check(void *ptr, size_t size, size_t nmemb, FILE *stream, const char 
 
 #define freadCheck(ptr, size, nmemb, stream) fread_check(ptr, size, nmemb, stream, __FILE__, __LINE__)
 
-void fclose_check(FILE *fp, const char *file, int line) {
+extern inline void fclose_check(FILE *fp, const char *file, int line) {
     if (fclose(fp) != 0) {
         fprintf(stderr, "Error: Failed to close file at %s:%d\n", file, line);
         fprintf(stderr, "Error details:\n");
@@ -73,7 +73,7 @@ void fclose_check(FILE *fp, const char *file, int line) {
 
 #define fcloseCheck(fp) fclose_check(fp, __FILE__, __LINE__)
 
-void fseek_check(FILE *fp, long off, int whence, const char *file, int line) {
+extern inline void fseek_check(FILE *fp, long off, int whence, const char *file, int line) {
     if (fseek(fp, off, whence) != 0) {
         fprintf(stderr, "Error: Failed to seek in file at %s:%d\n", file, line);
         fprintf(stderr, "Error details:\n");
@@ -87,10 +87,32 @@ void fseek_check(FILE *fp, long off, int whence, const char *file, int line) {
 
 #define fseekCheck(fp, off, whence) fseek_check(fp, off, whence, __FILE__, __LINE__)
 
+extern inline void fwrite_check(void *ptr, size_t size, size_t nmemb, FILE *stream, const char *file, int line) {
+    size_t result = fwrite(ptr, size, nmemb, stream);
+    if (result != nmemb) {
+        if (feof(stream)) {
+            fprintf(stderr, "Error: Unexpected end of file at %s:%d\n", file, line);
+        } else if (ferror(stream)) {
+            fprintf(stderr, "Error: File write error at %s:%d\n", file, line);
+        } else {
+            fprintf(stderr, "Error: Partial write at %s:%d. Expected %zu elements, wrote %zu\n",
+                    file, line, nmemb, result);
+        }
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        fprintf(stderr, "  Expected elements: %zu\n", nmemb);
+        fprintf(stderr, "  Written elements: %zu\n", result);
+        exit(EXIT_FAILURE);
+    }
+}
+
+#define fwriteCheck(ptr, size, nmemb, stream) fwrite_check(ptr, size, nmemb, stream, __FILE__, __LINE__)
+
 // ----------------------------------------------------------------------------
 // malloc error-handling wrapper util
 
-void *malloc_check(size_t size, const char *file, int line) {
+extern inline void *malloc_check(size_t size, const char *file, int line) {
     void *ptr = malloc(size);
     if (ptr == NULL) {
         fprintf(stderr, "Error: Memory allocation failed at %s:%d\n", file, line);
@@ -108,7 +130,7 @@ void *malloc_check(size_t size, const char *file, int line) {
 // ----------------------------------------------------------------------------
 // I/O ops
 
-void create_dir_if_not_exists(const char *dir) {
+extern inline void create_dir_if_not_exists(const char *dir) {
     if (dir == NULL) { return; }
     struct stat st = {0};
     if (stat(dir, &st) == -1) {
@@ -120,7 +142,7 @@ void create_dir_if_not_exists(const char *dir) {
     }
 }
 
-int find_max_step(const char* output_log_dir) {
+extern inline int find_max_step(const char* output_log_dir) {
     // find the DONE file in the log dir with highest step count
     if (output_log_dir == NULL) { return -1; }
     DIR* dir;
