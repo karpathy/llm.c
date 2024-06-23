@@ -189,7 +189,7 @@ int main(int argc, char *argv[]) {
     free(y);
     free(expected_logits);
     free(expected_loss);
-    free(expected_grads_memory);
+    freeCheck(expected_grads_memory);
     gpt2_free(&model);
     return 0;
 }
