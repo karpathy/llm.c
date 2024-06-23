@@ -118,6 +118,9 @@ class NvtxRange {
 };
 #define NVTX_RANGE_FN() NvtxRange nvtx_range(__FUNCTION__)
 
+// ----------------------------------------------------------------------------
+// Utilities to Read & Write between CUDA memory <-> files
+
 // copy num_bytes from device pointer src into file dest, using double buffering running on the given stream.
 inline void device_to_file(FILE* dest, void* src, size_t num_bytes, size_t buffer_size, cudaStream_t stream) {
     // allocate pinned buffer for faster, async transfer

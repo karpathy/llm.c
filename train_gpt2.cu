@@ -387,7 +387,7 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     fwriteCheck(model_header, sizeof(int), 256, model_file);
     // write the parameters
     device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
-                   1024*1024*32, main_stream);
+                   IO_BUF_SIZE, main_stream);
     // close file, we're done
     fcloseCheck(model_file);
 }
@@ -1224,19 +1224,16 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
         cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
     }
-
     if(use_master_weights == 1 && !model->use_master_weights) {
         printf0("Warning: Master weights are present in state, but not enabled for current run.");
     } else if (use_master_weights == 0 && model->use_master_weights) {
         printf0("Error: Master weights requested, but not present in state file.");
         exit(EXIT_FAILURE);
     }
-
     if (model->master_weights == NULL && use_master_weights == 1) {
         printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
         cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
     }
-
     file_to_device(model->m_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     file_to_device(model->v_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     if(model->use_master_weights) {
