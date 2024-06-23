@@ -1324,8 +1324,6 @@ void error_usage() {
 // ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
-    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
-
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
@@ -1352,10 +1350,12 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    int num_processes = 1;
+    int process_rank = 0;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
-        if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
+        if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x (one dash, one or two letters)
         // read in the args
         if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
@@ -1382,8 +1382,13 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'n') { num_processes = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'r') { process_rank = atoi(argv[i+1]); }
         else { error_usage(); }
     }
+    printf("num_processes = %d, process_rank = %d\n", num_processes, process_rank);
+    multi_gpu_config = multi_gpu_config_init(num_processes, process_rank);
+
     // should do a bit more error checking here
     assert(warmup_iterations >= 0);
     if (output_log_dir != NULL) {
