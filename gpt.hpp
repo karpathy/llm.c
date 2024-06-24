@@ -203,10 +203,6 @@ struct CausalSelfAttention {
         }
 
         // softmax
-        //        preatt2d = preatt2d.array().exp();
-        //        preatt2d =
-        //            preatt2d.array().colwise() /
-        //            preatt2d.rowwise().sum().array();
         softmax_->Forward(preatt2d, preatt_softmax2d);
 
         // att * v
@@ -497,7 +493,9 @@ struct GPT {
         vocab_size_(vocab_size),
         padded_vocab_size_(padded_vocab_size),
         n_layer_(n_layer),
-        n_embed_(n_embed) {
+        n_embed_(n_embed),
+        lm_head_(nullptr),
+        lm_head_grad_(nullptr) {
     CHECK_GT(n_layer, 0);
 
     wte_ = std::make_unique<nn::Embedding>(padded_vocab_size, n_embed);
@@ -512,7 +510,7 @@ struct GPT {
     std::memcpy(wte_->weight_.get(), lm_head_unused_->weight_.data(),
                 sizeof(float) * vocab_size * n_embed);
     lm_head_ = wte_->weight_.get();
-    cross_entropy_ = std::make_unique<nn::SoftmaxCrossEntropy>(
+    softmax_cross_entropy_ = std::make_unique<nn::SoftmaxCrossEntropy>(
         nn::SoftmaxCrossEntropy::MEAN, true);
   }
 
@@ -558,9 +556,91 @@ struct GPT {
     auto lm_head = Eigen::Map<nn::Matrix>(lm_head_, vocab_size_, n_embed_);
     auto logits_2d = Eigen::Map<nn::Matrix>(logits.data(), BT, vocab_size_);
     auto probs_2d = Eigen::Map<nn::Matrix>(probs_.data(), BT, vocab_size_);
-    //    nn::MatMul::Forward(lnf_y, lm_head, logits_2d);
+
+    // [BT, C] x [C, vocab_size] -> [BT, vocab_size]
     logits_2d.noalias() = lnf_y * lm_head.transpose();
-    cross_entropy_->Forward(logits_2d, targets, probs_2d, loss);
+    softmax_cross_entropy_->Forward(logits_2d, targets, probs_2d, loss);
+  }
+
+  void Backward(const Eigen::Map<nn::MatrixInt>& idx,
+                const Eigen::Map<nn::MatrixInt>& targets) {
+    // idx: [B, T], targets: [B, T]
+    const int B = idx.rows(), T = idx.cols(), C = n_embed_, L = n_layer_;
+    const int BT = B * T, TC = T * C;
+    const int BTC = BT * C;
+    const int LBTC = L * BTC;
+    CHECK(targets.rows() == B && targets.cols() == T);
+
+    LAZY_ALLOCATE_MATRIX(logits_grad_, BT, vocab_size_);
+    if (lnf_y_grad_.size() < BTC) {
+      lnf_y_grad_.resize(BTC);
+    }
+    wte_->LazilyAllocateGradMemory();
+    if (lm_head_grad_ == nullptr) {
+      lm_head_grad_ = wte_->weight_grad_.get();
+    }
+    if (block_y_grad_.size() < LBTC) {
+      block_y_grad_.resize(LBTC);
+    }
+    if (tok_emb_grad_.size() < BTC) {
+      tok_emb_grad_.resize(BTC);
+    }
+    if (pos_emb_grad_.size() < TC) {
+      pos_emb_grad_.resize(TC);
+    }
+
+    // backward cross entropy
+    auto probs_2d = Eigen::Map<nn::Matrix>(probs_.data(), BT, vocab_size_);
+    auto logits_grad_2d =
+        Eigen::Map<nn::Matrix>(logits_grad_.data(), BT, vocab_size_);
+    softmax_cross_entropy_->Backward(probs_2d, targets, logits_grad_2d);
+
+    // backward lm_head
+    auto lnf_y = Eigen::Map<nn::Matrix>(lnf_y_.data(), BT, C);
+    auto lnf_y_grad = Eigen::Map<nn::Matrix>(lnf_y_grad_.data(), BT, C);
+    auto lm_head = Eigen::Map<nn::Matrix>(lm_head_, vocab_size_, C);
+    auto lm_head_grad = Eigen::Map<nn::Matrix>(lm_head_grad_, vocab_size_, C);
+    lnf_y_grad +=
+        logits_grad_2d * lm_head;  // [BT, vocab_size] x [vocab_size, C]
+    lm_head_grad.array() += (logits_grad_2d.transpose() * lnf_y)
+                                .array();  // [vocab_size, BT] x [BT, C]
+
+    // backward LNF
+    auto block_out_2d =
+        Eigen::Map<nn::Matrix>(block_y_.data() + (L - 1) * BTC, BT, C);
+    auto block_out_grad_2d =
+        Eigen::Map<nn::Matrix>(block_y_grad_.data() + (L - 1) * BTC, BT, C);
+    auto lnf_mean = Eigen::Map<Eigen::RowVectorXf>(lnf_mean_.data(), BT);
+    auto lnf_rstd = Eigen::Map<Eigen::RowVectorXf>(lnf_rstd_.data(), BT);
+    lnf_->Backward(block_out_2d, lnf_y_grad, lnf_mean, lnf_rstd,
+                   block_out_grad_2d);
+
+    // backward blocks
+    for (int l = n_layer_ - 1; l >= 0; --l) {
+      const auto& block = h_[l];
+      float* x = l == 0 ? tok_emb_.data() : block_y_.data() + (l - 1) * BTC;
+      float* x_grad =
+          l == 0 ? tok_emb_grad_.data() : block_y_grad_.data() + (l - 1) * BTC;
+      float* y_grad = block_y_grad_.data() + l * BTC;
+      auto block_x_3d = Eigen::TensorMap<nn::Tensor3D>(x, B, T, C);
+      auto block_x_grad_3d = Eigen::TensorMap<nn::Tensor3D>(x_grad, B, T, C);
+      auto block_y_grad_3d = Eigen::TensorMap<nn::Tensor3D>(y_grad, B, T, C);
+      block->Backward(block_x_3d, block_y_grad_3d, block_x_grad_3d);
+    }
+
+    // backward tok_emb, pos_emb
+    auto tok_emb_grad = Eigen::Map<nn::Matrix>(tok_emb_grad_.data(), B, TC);
+    auto pos_emb_grad =
+        Eigen::Map<Eigen::RowVectorXf>(pos_emb_grad_.data(), TC);
+    for (int b = 0; b < B; ++b) {
+      pos_emb_grad += tok_emb_grad.row(b);
+    }
+
+    // backward wte, wpe
+    std::vector<int> pos(T);
+    std::iota(pos.begin(), pos.end(), 0);
+    wte_->Backward(idx, tok_emb_grad);
+    wpe_->Backward(pos, pos_emb_grad);
   }
 
   size_t NumParameters() const {
@@ -644,19 +724,20 @@ struct GPT {
   std::unique_ptr<nn::Embedding> wpe_;
   std::vector<std::unique_ptr<Block>> h_;
   std::unique_ptr<nn::LayerNorm> lnf_;
-  std::unique_ptr<nn::SoftmaxCrossEntropy> cross_entropy_;
+  std::unique_ptr<nn::SoftmaxCrossEntropy> softmax_cross_entropy_;
 
   // head
   std::unique_ptr<nn::Linear> lm_head_unused_;
-  float* lm_head_;  // [vocal_size, C]
+  float *lm_head_, *lm_head_grad_;  // [vocal_size, C]
 
-  // activation tensors
-  std::vector<float> tok_emb_;              // [B, T, C]
-  std::vector<float> pos_emb_;              // [T, C]
-  std::vector<float> block_y_;              // [L, B, T, C]
-  std::vector<float> lnf_y_;                // [B*T, C]
-  std::vector<float> lnf_mean_, lnf_rstd_;  // [B*T]
-  std::vector<float> probs_;                // [B*T, vocab_size]
+  // activation tensors and gradients
+  std::vector<float> tok_emb_, tok_emb_grad_;  // [B, T, C]
+  std::vector<float> pos_emb_, pos_emb_grad_;  // [T, C]
+  std::vector<float> block_y_, block_y_grad_;  // [L, B, T, C]
+  std::vector<float> lnf_y_, lnf_y_grad_;      // [B*T, C]
+  std::vector<float> lnf_mean_, lnf_rstd_;     // [B*T]
+  std::vector<float> probs_;                   // [B*T, vocab_size]
+  nn::Matrix logits_grad_;                     // [B*T, vocab_size]
 };
 
 }  // namespace gpt

@@ -223,6 +223,8 @@ struct Embedding {
     if (weight_grad_ == nullptr) {
       weight_grad_ =
           std::make_unique<float[]>(num_embeddings_ * embedding_dim_);
+      std::memset(weight_grad_.get(), 0,
+                  sizeof(float) * num_embeddings_ * embedding_dim_);
     }
   }
 
@@ -435,9 +437,9 @@ struct SoftmaxCrossEntropy {
   enum Reduction { MEAN, SUM };
 
   SoftmaxCrossEntropy(Reduction reduction = Reduction::MEAN,
-                      bool softmax_subtract_max_value = false)
+                      bool stable_softmax = false)
       : reduction_(reduction) {
-    softmax_ = std::make_unique<Softmax>(softmax_subtract_max_value);
+    softmax_ = std::make_unique<Softmax>(stable_softmax);
   }
 
   void Forward(const Eigen::Map<Matrix>& logits, absl::Span<const int> targets,
