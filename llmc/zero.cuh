@@ -198,6 +198,12 @@ ncclUniqueId get_nccl_id_via_fs(MultiGpuConfig* result, char* fs_path) {
     static char filename[1024];
     snprintf(filename, sizeof(filename), "%s/ncclUniqueId.sync", fs_path);
 
+    if (result->process_rank != 0) {
+        // Wait for the server to write the file
+        // This is a naive way to synchronize the processes
+        sleep(2);
+    }
+
     if (result->process_rank == 0) {
         ncclCheck(ncclGetUniqueId(&nccl_id));
         idFile = fopen(filename, "wb");
@@ -207,7 +213,7 @@ ncclUniqueId get_nccl_id_via_fs(MultiGpuConfig* result, char* fs_path) {
     } else {
         // Other ranks wait until the file is available and read the unique ID
         do {
-            usleep(1000000);  // 1 second
+            sleep(1);  // 1 second
             idFile = fopen(filename, "rb");
             if (idFile != NULL) break;
         } while (idFile == NULL);

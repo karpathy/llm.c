@@ -188,25 +188,33 @@ else
   endif
 endif
 
-# Check if OpenMPI and NCCL are available, include them if so, for multi-GPU training
+# Check if NCCL is available, include if so, for multi-GPU training
 ifeq ($(NO_MULTI_GPU), 1)
-  $(info → Multi-GPU (OpenMPI + NCCL) is manually disabled)
+  $(info → Multi-GPU (NCCL) is manually disabled)
 else
   ifneq ($(OS), Windows_NT)
     # Detect if running on macOS or Linux
     ifeq ($(SHELL_UNAME), Darwin)
-      $(info ✗ Multi-GPU on CUDA on Darwin is not supported, skipping OpenMPI + NCCL support)
-    else ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && [ -d /usr/lib/x86_64-linux-gnu/openmpi/include/ ] && echo "exists"), exists)
-      $(info ✓ OpenMPI found, OK to train with multiple GPUs)
-      NVCC_INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
-      NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
-      NVCC_LDLIBS += -lmpi -lnccl
+      $(info ✗ Multi-GPU on CUDA on Darwin is not supported, skipping NCCL support)
+    else ifeq ($(shell dpkg -l | grep -q nccl && echo "exists"), exists)
+      $(info ✓ NCCL found, OK to train with multiple GPUs)
+      NVCC_LDLIBS += -lnccl
       NVCC_FLAGS += -DMULTI_GPU
     else
-      $(info ✗ OpenMPI is not found, disabling multi-GPU support)
-      $(info ---> On Linux you can try install OpenMPI with `sudo apt install openmpi-bin openmpi-doc libopenmpi-dev`)
+      $(info ✗ NCCL is not found, disabling multi-GPU support)
+      $(info ---> On Linux you can try install NCCL with `sudo apt install libnccl2 libnccl-dev`)
     endif
   endif
+endif
+
+ifeq ($(USE_MPI), 1)
+  $(info → MPI is manually enabled)
+  NVCC_INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
+  NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
+  NVCC_FLAGS += -DUSE_MPI
+  NVCC_LDLIBS += -lmpi
+else
+  $(info → MPI is manually disabled)
 endif
 
 # Precision settings, default to bf16 but ability to override
