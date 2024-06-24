@@ -1318,6 +1318,12 @@ void error_usage() {
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
+    // multi-node settings
+    fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
+    fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
+    fprintf(stderr, "  -pm <string> nccl_init_method: tcp,fs,mpi (default = mpi)\n");
+    fprintf(stderr, "  -ps <string> server_ip - used only when nccl_init_method is tcp (default = -1)\n");
+    fprintf(stderr, "  -pp <string> fs_path - used only when nccl_init_method is fs (default = /tmp)\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1353,7 +1359,7 @@ int main(int argc, char *argv[]) {
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
-    char nccl_init_method[256] = "tcp";  // "tcp" or "fs" or "mpi"
+    char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
     char server_ip[256] = "-1";  // used if init_method set to "tcp" -> set to your server ip address
     char fs_path[256] = "/tmp";  // used if init_method set to "fs" -> set to a shared filesystem path
     for (int i = 1; i < argc; i+=2) {
