@@ -78,6 +78,7 @@ srun -l -u bash -c "
     -e d12 \
     -pn \$SLURM_NTASKS \
     -pr \$SLURM_PROCID \
+    -pg \$SLURM_NTASKS_PER_NODE \
     -ps $server_ip \
     -pi "tcp" \
 "

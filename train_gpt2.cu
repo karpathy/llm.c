@@ -1321,6 +1321,7 @@ void error_usage() {
     // multi-node settings
     fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
     fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
+    fprintf(stderr, "  -pg <int>    gpus_per_node (default = 8)\n");
     fprintf(stderr, "  -pm <string> nccl_init_method: tcp,fs,mpi (default = mpi)\n");
     fprintf(stderr, "  -ps <string> server_ip - used only when nccl_init_method is tcp (default = -1)\n");
     fprintf(stderr, "  -pp <string> fs_path - used only when nccl_init_method is fs (default = /tmp)\n");
@@ -1359,6 +1360,7 @@ int main(int argc, char *argv[]) {
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
+    int gpus_per_node = 8;  // this should be set by the slurm environment
     char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
     char server_ip[256] = "-1";  // used if init_method set to "tcp" -> set to your server ip address
     char fs_path[256] = "/tmp";  // used if init_method set to "fs" -> set to a shared filesystem path
@@ -1397,9 +1399,10 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'p' && argv[i][2] == 's') { strcpy(server_ip, argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'n') { num_processes = atoi(argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'r') { process_rank = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'g') { gpus_per_node = atoi(argv[i+1]); }
         else { error_usage(); }
     }
-    multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, server_ip, fs_path, nccl_init_method);
+    multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
 
     // should do a bit more error checking here
     assert(warmup_iterations >= 0);

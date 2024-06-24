@@ -90,8 +90,8 @@ void send_nccl_id_to_clients(ncclUniqueId *nccl_id, int client_sockets[], int nu
 
 ncclUniqueId get_nccl_id_via_tcp(MultiGpuConfig* result, const char* server_ip) {
     ncclUniqueId nccl_id;
-    // hardcode an arbitrary port number between 1024 and 49151 (registered ports)
-    int SERVER_PORT = 12345;
+
+    int SERVER_PORT = 12345;  // hardcoded an arbitrary port number between 1024 and 49151 (registered ports)
     if (result->process_rank == 0) {
         ncclCheck(ncclGetUniqueId(&nccl_id));
 
@@ -103,13 +103,13 @@ ncclUniqueId get_nccl_id_via_tcp(MultiGpuConfig* result, const char* server_ip) 
         int addrlen = sizeof(address);
         int opt = 1;
 
-        // Create a TCP socket
+        // Step 1) create a server TCP socket
         if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
             printf("Socket failed");
             exit(EXIT_FAILURE);
         }
 
-        // set socket options
+        // Step 2) set socket options
         // SOL_SOCKET - means that option is configured at socket level
         // SO_REUSEADDR - allows to bind to an address which is in a TIME_WAIT state (already used by another socket) - useful when restarting the server
         // SO_REUSEPORT - allows to bind to the same port multiple times
@@ -118,22 +118,24 @@ ncclUniqueId get_nccl_id_via_tcp(MultiGpuConfig* result, const char* server_ip) 
             exit(EXIT_FAILURE);
         }
 
+        // Step 3) set the server address and port
         address.sin_family = AF_INET;  // IPv4
         address.sin_addr.s_addr = inet_addr(server_ip); // alternatively use INADDR_ANY to bind to all interfaces, currently we only allow ethernet
         address.sin_port = htons(SERVER_PORT);
 
-        // Bind the socket to the address and port
+        // Step 4) bind the socket to the address and port
         if (bind(server_socket, (struct sockaddr *)&address, sizeof(address)) < 0) {
             printf("Bind failed");
             exit(EXIT_FAILURE);
         }
 
-        // MAX_CLIENTS specifies the maximum number of clients that can be queued for this server
+        // Step 5) MAX_CLIENTS specifies the maximum number of clients that can be queued for this server
         if (listen(server_socket, MAX_CLIENTS) < 0) {
             printf("Listen failed");
             exit(EXIT_FAILURE);
         }
 
+        // Step 6) accept connections from clients
         printf("Waiting for clients to connect...\n");
         while (num_clients < MAX_CLIENTS) {
             if ((new_socket = accept(server_socket, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
@@ -144,24 +146,24 @@ ncclUniqueId get_nccl_id_via_tcp(MultiGpuConfig* result, const char* server_ip) 
             printf("Client %d connected\n", num_clients);
         }
 
+        // Step 7) send the NCCL ID to all clients
         send_nccl_id_to_clients(&nccl_id, client_sockets, num_clients);
         printf("NCCL ID sent to all clients\n");
 
         close(server_socket);
     } else {
-        int num_attempts = 5;
+        int num_connection_attempts = 5;
         int time_to_sleep = 2;
-
         int client_socket;
         struct sockaddr_in serv_addr;
 
-        // Create a TCP socket
+        // Step 1) create a client TCP socket
         if ((client_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
             printf("Socket creation error");
             exit(EXIT_FAILURE);
         }
 
-        // Set the server address and port
+        // Step 2) set the server address and port
         serv_addr.sin_family = AF_INET;
         serv_addr.sin_port = htons(SERVER_PORT);
         if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
@@ -169,16 +171,17 @@ ncclUniqueId get_nccl_id_via_tcp(MultiGpuConfig* result, const char* server_ip) 
             exit(EXIT_FAILURE);
         }
 
-        // Try to connect to the server - retry if connection fails
+        // Step 3) Try to connect to the server - retry up to `num_connection_attempts` times if the connection fails
         while (connect(client_socket, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
             printf("%d Connection failed, retrying in %d seconds\n", result->process_rank, time_to_sleep);
-            if (--num_attempts == 0) {
+            if (--num_connection_attempts == 0) {
                 printf("Failed to connect to the server\n");
                 exit(EXIT_FAILURE);
             }
             sleep(time_to_sleep);
         }
 
+        // Step 4) receive the NCCL ID from the server
         if (recv(client_socket, &nccl_id, sizeof(nccl_id), 0) <= 0) {
             printf("Failed to receive nccl_id");
             exit(EXIT_FAILURE);
@@ -198,9 +201,8 @@ ncclUniqueId get_nccl_id_via_fs(MultiGpuConfig* result, char* fs_path) {
     static char filename[1024];
     snprintf(filename, sizeof(filename), "%s/ncclUniqueId.sync", fs_path);
 
-    if (result->process_rank != 0) {
-        // Wait for the server to write the file
-        // This is a naive way to synchronize the processes
+    if (result->process_rank != 0) {  // client processse should wait for the server to write to the file
+        // This is a naive and not 100% robust way to synchronize the processes but it should work almost always
         sleep(2);
     }
 
@@ -267,23 +269,13 @@ int multi_gpu_get_local_device_idx(int process_rank, int num_processes) {
 
 #endif
 
-MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank, char* server_ip, char* fs_path, char* init_method) {
+MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank, int gpus_per_node, char* server_ip, char* fs_path, char* init_method) {
 #ifdef MULTI_GPU
     MultiGpuConfig result;
     ncclUniqueId nccl_id;
-    if (strcmp(init_method, "mpi") != 0) {
-        result.process_rank = process_rank;
-        result.num_processes = num_processes;
-        result.local_device_idx = process_rank % 8;
-        if (strcmp(init_method, "tcp") == 0) {
-            nccl_id = get_nccl_id_via_tcp(&result, server_ip);
-        } else if (strcmp(init_method, "fs") == 0) {
-            nccl_id = get_nccl_id_via_fs(&result, fs_path);
-        } else {
-            printf("Invalid init method\n");
-            exit(EXIT_FAILURE);
-        }
-    } else {
+    // Get nccl_id using MPI, TCP, or FS (file system synchronization) methods
+    // On newer slurm versions (slurm-wlm package) PMIx is disabled so we can not use MPI for NCCL init in multi node setup
+    if (strcmp(init_method, "mpi") == 0) {
         #ifdef USE_MPI
         mpiCheck(MPI_Init(NULL, NULL));
         mpiCheck(MPI_Comm_rank(MPI_COMM_WORLD, &result.process_rank));
@@ -294,9 +286,21 @@ MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank, char* 
         }
         mpiCheck(MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD));
         #else
-        printf("MPI support is disabled. Please enable MPI support to use MPI init method.\n");
+        printf("MPI support is disabled. Please enable MPI support to use MPI-based NCCL-init method.\n");
         exit(EXIT_FAILURE);
         #endif
+    } else {
+        result.process_rank = process_rank;
+        result.num_processes = num_processes;
+        result.local_device_idx = process_rank % gpus_per_node;
+        if (strcmp(init_method, "tcp") == 0) {
+            nccl_id = get_nccl_id_via_tcp(&result, server_ip);
+        } else if (strcmp(init_method, "fs") == 0) {
+            nccl_id = get_nccl_id_via_fs(&result, fs_path);
+        } else {
+            printf("Invalid NCCL-init method\n");
+            exit(EXIT_FAILURE);
+        }
     }
     cudaCheck(cudaSetDevice(result.local_device_idx));
     ncclCheck(ncclCommInitRank(&result.nccl_comm, result.num_processes, nccl_id, result.process_rank));
