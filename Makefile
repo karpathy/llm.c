@@ -210,7 +210,7 @@ endif
 ifeq ($(NO_USE_MPI), 1)
   $(info → MPI is manually disabled)
 else
-  $(info → MPI is manually enabled)
+  $(info ✓ MPI enabled)
   NVCC_INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
   NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
   NVCC_FLAGS += -DUSE_MPI
