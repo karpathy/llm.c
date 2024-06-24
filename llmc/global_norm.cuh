@@ -87,10 +87,3 @@ void global_norm_squared(float* out, const T* values, size_t count, ptrdiff_t st
     global_norm_squared_kernel<<<dim3(gx, gy), block_size, 0, stream>>>(out, values, count, stride);
     cudaCheck(cudaGetLastError());
 }
-
-void global_norm_squared_aggregate(float* out, int max_num_block_sums, cudaStream_t stream) {
-    assert(max_num_block_sums > 0 && max_num_block_sums < 1024);  // we need to accumulate the block sums in a single block
-    // important to use 1024 here for determinism, otherwise blockreduce might introduce errors
-    global_norm_aggregate_kernel<<<1, 1024, 0, stream>>>(out, max_num_block_sums);
-    cudaCheck(cudaGetLastError());
-}

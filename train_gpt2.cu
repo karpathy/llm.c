@@ -1015,18 +1015,19 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
                                     max_num_block_sums, is_first_pass, main_stream);
             }
         }
-        global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
-        cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
-        // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
-        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu, multi_gpu_config);
+        global_sum_deterministic(grad_norm_squared, grad_norm_squared, max_num_block_sums, main_stream);
+#if MULTI_GPU
+        // further sum the (partial) squared norm across all GPUs
+        ncclCheck(ncclAllReduce(grad_norm_squared, grad_norm_squared, sizeof(float), ncclFloat, ncclAvg, multi_gpu_config->nccl_comm, main_stream));
+#endif
     } else {
         // in regular DDP, backward has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
         global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, 0, 1, max_num_block_sums, true, main_stream);
-        global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
-        cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
+        global_sum_deterministic(grad_norm_squared, grad_norm_squared, max_num_block_sums, main_stream);
     }
 
+    cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
     if(!isfinite(grad_norm_squared_cpu)) {
         // may happen due to some issue (e.g. overflow?)
         // TODO: later may want to keep a global counter of instabilities like this
