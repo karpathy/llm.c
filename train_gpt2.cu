@@ -709,6 +709,7 @@ float gpt2_validate(GPT2 *model) {
         // fused classifier: does the forward pass and first part of the backward pass
         const float dloss = 1.0f / (B * T); // results in the uniform average loss over all elements
         // note: we don't need to generate dlogits here
+        cudaCheck(cudaMemset(acts.losses, 0, B*T*sizeof(floatX)));
         fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, FALSE, main_stream);
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost));
         for (int i = 0; i < B*T; i++) {

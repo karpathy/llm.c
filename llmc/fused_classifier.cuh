@@ -82,7 +82,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     // calculate the probability needed for the loss and update (single-threaded)
     if(threadIdx.x == 0) {
         float prob = expf((float)logits[idx * P + ix] - sp.Offset) * sp.Scale;
-        losses[idx] = (floatX)(-logf(prob));
+        losses[idx] = (floatX)((float)losses[idx] - logf(prob));
     }
 
     // without this synchronization point we have a race condition:
