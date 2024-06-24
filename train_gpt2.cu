@@ -710,7 +710,7 @@ float gpt2_validate(GPT2 *model) {
         const float dloss = 1.0f / (B * T); // results in the uniform average loss over all elements
         // note: we don't need to generate dlogits here
         cudaCheck(cudaMemset(acts.losses, 0, B*T*sizeof(floatX)));
-        fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, FALSE, main_stream);
+        fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, False, main_stream);
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost));
         for (int i = 0; i < B*T; i++) {
             float loss = (float)(model->cpu_losses[i]);
@@ -778,7 +778,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, int grad_accum_steps, bo
     NvtxRange classifier_and_loss_range("classifier_and_loss");
     // fused classifier: does the forward pass and first part of the backward pass
     const float dloss = 1.0f / (float)(B * T * grad_accum_steps); // results in the uniform average loss over all elements
-    fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, TRUE, main_stream);
+    fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, True, main_stream);
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
 

@@ -42,8 +42,8 @@ extern cudaDeviceProp deviceProp;
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
 // short-cuts for compile-time boolean values that can be used as function arguments
-constexpr std::bool_constant<true> TRUE;
-constexpr std::bool_constant<true> FALSE;
+constexpr std::bool_constant<true> True;
+constexpr std::bool_constant<true> False;
 
 // ----------------------------------------------------------------------------
 // Error checking
