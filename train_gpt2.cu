@@ -2,6 +2,10 @@
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#endif
+
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -893,12 +897,15 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
 }
 
 // Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
-float multi_gpu_cpu_float_sum(float value) {
+float multi_gpu_cpu_float_sum(float value, MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
-    // note MPI doesn't support all reduce with mean, only sum
-    float result;
-    mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
-    return result;
+    if (multi_gpu_config->num_processes == 1) return value;
+
+    float* unified_buffer = multi_gpu_config->unified_buffer;
+    *unified_buffer = value;
+    ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
+    cudaCheck(cudaDeviceSynchronize());
+    return *unified_buffer;
 #else
     return value;
 #endif
@@ -912,7 +919,7 @@ void gpt2_multi_gpu_loss_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
     // If there's only one process, there is nothing to do
     if (multi_gpu_config->num_processes == 1) { return; }
     // Average all losses.
-    model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss) / multi_gpu_config->num_processes;
+    model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss, multi_gpu_config) / multi_gpu_config->num_processes;
 #endif
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -990,7 +997,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
         cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
         // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
-        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
+        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu, multi_gpu_config);
     } else {
         // in regular DDP, backward has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
@@ -1315,14 +1322,19 @@ void error_usage() {
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
+    // multi-node settings
+    fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
+    fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
+    fprintf(stderr, "  -pg <int>    gpus_per_node (default = 8)\n");
+    fprintf(stderr, "  -pm <string> nccl_init_method: tcp,fs,mpi (default = mpi)\n");
+    fprintf(stderr, "  -ps <string> server_ip - used only when nccl_init_method is tcp (default = -1)\n");
+    fprintf(stderr, "  -pp <string> fs_path - used only when nccl_init_method is fs (default = /tmp)\n");
     exit(EXIT_FAILURE);
 }
 
 // ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
-    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
-
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
@@ -1349,10 +1361,17 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    // multi-node settings
+    int num_processes = 1;  // this should be set by the slurm environment
+    int process_rank = 0;  // this should be set by the slurm environment
+    int gpus_per_node = 8;  // this should be set by the slurm environment
+    char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
+    char server_ip[256] = "";  // used if init_method set to "tcp" -> set to your server ip address
+    char fs_path[256] = "";  // used if init_method set to "fs" -> set to a shared filesystem path
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
-        if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
+        if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x[y] (one dash, one or two letters)
         // read in the args
         if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
@@ -1379,8 +1398,16 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 's') { strcpy(server_ip, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'n') { num_processes = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'r') { process_rank = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'g') { gpus_per_node = atoi(argv[i+1]); }
         else { error_usage(); }
     }
+    multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
+
     // should do a bit more error checking here
     assert(warmup_iterations >= 0);
     if (output_log_dir != NULL) {
@@ -1579,7 +1606,7 @@ int main(int argc, char *argv[]) {
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
-            val_loss = multi_gpu_cpu_float_sum(val_loss) / multi_gpu_config.num_processes;
+            val_loss = multi_gpu_cpu_float_sum(val_loss, &multi_gpu_config) / multi_gpu_config.num_processes;
             printf0("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
         }
@@ -1598,7 +1625,7 @@ int main(int argc, char *argv[]) {
                 eval_acc_norm += (float)correct;
             }
             // careful because not all ranks may have the exact same allocation of number of examples
-            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm);
+            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm, &multi_gpu_config);
             printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
             logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
         }
