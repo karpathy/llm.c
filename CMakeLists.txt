@@ -17,8 +17,8 @@ set(ABSL_PROPAGATE_CXX_STD ON)
 add_subdirectory(third_party/abseil-cpp)
 
 # Glog
-add_subdirectory(third_party/glog)
-include_directories(third_party/glog)
+#add_subdirectory(third_party/glog)
+#include_directories(third_party/glog)
 
 # GoogleTest
 add_subdirectory(third_party/googletest)
@@ -36,10 +36,10 @@ target_link_libraries(test_gpt2 m OpenMP::OpenMP_CXX)
 
 # llm.cpp
 add_executable(test_gpt2_cpp test_gpt2.cpp)
-target_link_libraries(test_gpt2_cpp absl::strings glog::glog)
+target_link_libraries(test_gpt2_cpp absl::strings absl::log absl::check)
 
 add_executable(nn_test nn_test.cpp)
-target_link_libraries(nn_test absl::strings glog::glog GTest::gtest_main)
+target_link_libraries(nn_test absl::strings absl::log absl::check GTest::gtest_main)
 
 add_executable(gpt_test gpt_test.cpp)
-target_link_libraries(gpt_test absl::strings glog::glog GTest::gtest_main)
+target_link_libraries(gpt_test absl::strings absl::log absl::check GTest::gtest_main)

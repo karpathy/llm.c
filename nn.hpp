@@ -4,9 +4,10 @@
 #include <random>
 
 #include "Eigen/Core"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "glog/logging.h"
 #include "llmc/rand.h"
 #include "unsupported/Eigen/CXX11/Tensor"
 
@@ -192,7 +193,7 @@ struct Embedding {
     NormalFill(absl::MakeSpan(weight_.get(), num_embeddings * embedding_dim));
   }
 
-  void Forward(absl::Span<const int> idx, absl::Span<float> embedding) {
+  void Forward(absl::Span<const int> idx, absl::Span<float> embedding) const {
     CHECK_EQ(embedding.size(), idx.size() * embedding_dim_);
     for (size_t i = 0; i < idx.size(); ++i) {
       CHECK_LT(idx[i], num_embeddings_);
