@@ -160,14 +160,14 @@ __device__ inline float blockReduce(float val, bool final_sync=false, float out_
 // This gives us a random number from threadIdx/blockIdx + a single seed for the entire GPU
 // todo - possibly overkill and we don't need such high quality random numbers? (tbd)
 // http://eiserloh.net/noise/SquirrelNoise5.hpp
-__device__ __host__ constexpr unsigned int SquirrelNoise5(int positionX, unsigned int seed)
+__device__ __host__ constexpr unsigned int SquirrelNoise5(unsigned int positionX, unsigned int seed)
 {
     constexpr unsigned int SQ5_BIT_NOISE1 = 0xd2a80a3f;	// 11010010101010000000101000111111
     constexpr unsigned int SQ5_BIT_NOISE2 = 0xa884f197;	// 10101000100001001111000110010111
     constexpr unsigned int SQ5_BIT_NOISE3 = 0x6C736F4B; // 01101100011100110110111101001011
     constexpr unsigned int SQ5_BIT_NOISE4 = 0xB79F3ABB;	// 10110111100111110011101010111011
     constexpr unsigned int SQ5_BIT_NOISE5 = 0x1b56c4f5;	// 00011011010101101100010011110101
-    unsigned int mangledBits = (unsigned int) positionX;
+    unsigned int mangledBits = positionX;
     mangledBits *= SQ5_BIT_NOISE1;
     mangledBits += seed;
     mangledBits ^= (mangledBits >> 9);
@@ -183,8 +183,11 @@ __device__ __host__ constexpr unsigned int SquirrelNoise5(int positionX, unsigne
 }
 __device__ __host__ constexpr unsigned int Get2dNoiseUint(int indexX, int indexY, unsigned int seed)
 {
-    constexpr int PRIME_NUMBER = 198491317; // Large prime number with non-boring bits
-    return SquirrelNoise5(indexX + (PRIME_NUMBER * indexY), seed);
+    constexpr unsigned int PRIME_NUMBER = 198491317u; // Large prime number with non-boring bits
+    unsigned int x = static_cast<unsigned int>(indexX);
+    unsigned int y = static_cast<unsigned int>(indexY);
+
+    return SquirrelNoise5(x + (PRIME_NUMBER * y), seed);
 }
 
 // stochastic rounding built on top of Squirel Noise above (with seed updated per step via xorshift)
