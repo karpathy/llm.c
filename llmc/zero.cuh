@@ -14,10 +14,9 @@ Utilities for ZeRO sharding
 
 #ifdef MULTI_GPU
 #include <nccl.h>
-#endif
-
 #ifdef USE_MPI
 #include <mpi.h>
+#endif
 #endif
 
 // ----------------------------------------------------------------------------
