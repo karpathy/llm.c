@@ -5,7 +5,13 @@ Utilities for ZeRO sharding
 #ifndef LLMC_ZERO_CUH
 #define LLMC_ZERO_CUH
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
+#endif
+
 #include <cuda_runtime_api.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -86,6 +92,19 @@ void send_nccl_id_to_clients(ncclUniqueId *nccl_id, int client_sockets[], int nu
         close(client_sockets[i]);
     }
 }
+
+#ifdef _WIN32
+void send_nccl_id_to_clients_windows(ncclUniqueId *nccl_id, SOCKET client_sockets[], int num_clients) {
+    for (int i = 0; i < num_clients; ++i) {
+        if (send(client_sockets[i], (const char *)nccl_id, sizeof(*nccl_id), 0) == SOCKET_ERROR) {
+            printf("Failed to send nccl_id");
+            WSACleanup();
+            exit(EXIT_FAILURE);
+        }
+        closesocket(client_sockets[i]);
+    }
+}
+#endif
 
 ncclUniqueId get_nccl_id_via_tcp(MultiGpuConfig* result, const char* server_ip) {
     ncclUniqueId nccl_id;
@@ -193,6 +212,126 @@ ncclUniqueId get_nccl_id_via_tcp(MultiGpuConfig* result, const char* server_ip) 
     return nccl_id;
 }
 
+#ifdef _WIN32
+// Same as get_nccl_id_via_tcp but for Windows
+ncclUniqueId get_nccl_id_via_tcp_windows(MultiGpuConfig* result, const char* server_ip) {
+    ncclUniqueId nccl_id;
+
+    int SERVER_PORT = 12345;  // hardcoded an arbitrary port number between 1024 and 49151 (registered ports)
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        printf("WSAStartup failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (result->process_rank == 0) {
+        ncclCheck(ncclGetUniqueId(&nccl_id));
+
+        int MAX_CLIENTS = result->num_processes - 1;
+        SOCKET client_sockets[MAX_CLIENTS];
+        int num_clients = 0;
+        SOCKET server_socket, new_socket;
+        struct sockaddr_in address;
+        int addrlen = sizeof(address);
+
+        // Step 1) create a server TCP socket
+        if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) {
+            printf("Socket failed");
+            WSACleanup();
+            exit(EXIT_FAILURE);
+        }
+
+        // Step 2) set the server address and port
+        address.sin_family = AF_INET;  // IPv4
+        address.sin_addr.s_addr = inet_addr(server_ip);
+        address.sin_port = htons(SERVER_PORT);
+
+        // Step 3) bind the socket to the address and port
+        if (bind(server_socket, (struct sockaddr *)&address, sizeof(address)) == SOCKET_ERROR) {
+            printf("Bind failed");
+            closesocket(server_socket);
+            WSACleanup();
+            exit(EXIT_FAILURE);
+        }
+
+        // Step 4) MAX_CLIENTS specifies the maximum number of clients that can be queued for this server
+        if (listen(server_socket, MAX_CLIENTS) == SOCKET_ERROR) {
+            printf("Listen failed");
+            closesocket(server_socket);
+            WSACleanup();
+            exit(EXIT_FAILURE);
+        }
+
+        // Step 5) accept connections from clients
+        printf("Waiting for clients to connect...\n");
+        while (num_clients < MAX_CLIENTS) {
+            if ((new_socket = accept(server_socket, (struct sockaddr *)&address, &addrlen)) == INVALID_SOCKET) {
+                printf("Accept failed");
+                closesocket(server_socket);
+                WSACleanup();
+                exit(EXIT_FAILURE);
+            }
+            client_sockets[num_clients++] = new_socket;
+            printf("Client %d connected\n", num_clients);
+        }
+
+        // Step 6) send the NCCL ID to all clients
+        send_nccl_id_to_clients_windows(&nccl_id, client_sockets, num_clients);
+        printf("NCCL ID sent to all clients\n");
+
+        closesocket(server_socket);
+    } else {
+        int num_connection_attempts = 5;
+        int time_to_sleep = 2;
+        SOCKET client_socket;
+        struct sockaddr_in serv_addr;
+
+        // Step 1) create a client TCP socket
+        if ((client_socket = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) {
+            printf("Socket creation error");
+            WSACleanup();
+            exit(EXIT_FAILURE);
+        }
+
+        // Step 2) set the server address and port
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(SERVER_PORT);
+        if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
+            printf("Invalid address or address not supported");
+            closesocket(client_socket);
+            WSACleanup();
+            exit(EXIT_FAILURE);
+        }
+
+        // Step 3) Try to connect to the server - retry up to `num_connection_attempts` times if the connection fails
+        while (connect(client_socket, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == SOCKET_ERROR) {
+            printf("%d Connection failed, retrying in %d seconds\n", result->process_rank, time_to_sleep);
+            if (--num_connection_attempts == 0) {
+                printf("Failed to connect to the server\n");
+                closesocket(client_socket);
+                WSACleanup();
+                exit(EXIT_FAILURE);
+            }
+            Sleep(time_to_sleep * 1000);
+        }
+
+        // Step 4) receive the NCCL ID from the server
+        if (recv(client_socket, (char *)&nccl_id, sizeof(nccl_id), 0) <= 0) {
+            printf("Failed to receive nccl_id");
+            closesocket(client_socket);
+            WSACleanup();
+            exit(EXIT_FAILURE);
+        }
+
+        printf("Received NCCL ID\n");
+        closesocket(client_socket);
+    }
+
+    WSACleanup();
+    return nccl_id;
+}
+#endif
+
 ncclUniqueId get_nccl_id_via_fs(MultiGpuConfig* result, char* fs_path) {
     // Works assuming that the filesystem is shared among all processes
     ncclUniqueId nccl_id;
@@ -293,7 +432,11 @@ MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank, int gp
         result.num_processes = num_processes;
         result.local_device_idx = process_rank % gpus_per_node;
         if (strcmp(init_method, "tcp") == 0) {
+            #ifdef _WIN32
+            nccl_id = get_nccl_id_via_tcp_windows(&result, server_ip);
+            #else
             nccl_id = get_nccl_id_via_tcp(&result, server_ip);
+            #endif
         } else if (strcmp(init_method, "fs") == 0) {
             nccl_id = get_nccl_id_via_fs(&result, fs_path);
         } else {

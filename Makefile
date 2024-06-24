@@ -88,7 +88,7 @@ else
   LDFLAGS :=
   LDLIBS :=
   INCLUDES :=
-  NVCC_FLAGS += -I"dev"
+  NVCC_FLAGS += -I"dev" -lWs2_32
   ifeq ($(WIN_CI_BUILD),1)
     $(info Windows CI build)
     OUTPUT_FILE = /link /OUT:$@
