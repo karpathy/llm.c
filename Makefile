@@ -199,7 +199,6 @@ else
     else ifeq ($(shell dpkg -l | grep -q nccl && echo "exists"), exists)
       $(info ✓ NCCL found, OK to train with multiple GPUs)
       NVCC_LDLIBS += -lnccl
-      NVCC_FLAGS += -DMULTI_GPU
     else
       $(info ✗ NCCL is not found, disabling multi-GPU support)
       $(info ---> On Linux you can try install NCCL with `sudo apt install libnccl2 libnccl-dev`)
@@ -209,12 +208,15 @@ endif
 
 ifeq ($(NO_USE_MPI), 1)
   $(info → MPI is manually disabled)
-else
+else ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && [ -d /usr/lib/x86_64-linux-gnu/openmpi/include/ ] && echo "exists"), exists)
   $(info ✓ MPI enabled)
   NVCC_INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
   NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
-  NVCC_FLAGS += -DUSE_MPI
   NVCC_LDLIBS += -lmpi
+  NVCC_FLAGS += -DUSE_MPI
+  NVCC_FLAGS += -DMULTI_GPU
+else
+  $(info ✗ MPI not found)
 endif
 
 # Precision settings, default to bf16 but ability to override
