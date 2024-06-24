@@ -1019,7 +1019,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         global_sum_deterministic(grad_norm_squared, grad_norm_squared, max_num_block_sums, main_stream);
 #if MULTI_GPU
         // further sum the (partial) squared norm across all GPUs
-        ncclCheck(ncclAllReduce(grad_norm_squared, grad_norm_squared, sizeof(float), ncclFloat, ncclAvg, multi_gpu_config->nccl_comm, main_stream));
+        ncclCheck(ncclAllReduce(grad_norm_squared, grad_norm_squared, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, main_stream));
 #endif
     } else {
         // in regular DDP, backward has averaged the gradients across all GPUs
