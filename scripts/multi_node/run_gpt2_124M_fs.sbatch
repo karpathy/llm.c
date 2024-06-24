@@ -11,7 +11,7 @@
 # NOTE: change the above slurm arguments to match your system!
 # Run with `sbatch <path_to_this_script.sh>`
 
-make train_gpt2cu USE_CUDNN=1 USE_MPI=0
+make train_gpt2cu USE_CUDNN=1 NO_USE_MPI=1
 
 # NOTE: change the following to match your system
 binary_path="/home/ubuntu/llm.c/train_gpt2cu"

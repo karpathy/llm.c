@@ -89,7 +89,13 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
 }
 
 int main(int argc, char *argv[]) {
-    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
+    char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
+    int num_processes = -1;  // doesn't matter when using MPI
+    int process_rank = -1;  // doesn't matter when using MPI
+    int gpus_per_node = -1;  // doesn't matter when using MPI
+    char server_ip[256] = "";  // doesn't matter when using MPI
+    char fs_path[256] = "";  // doesn't matter when using MPI
+    multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, nccl_init_method, server_ip, fs_path);
     common_start(false, true);
 
     // set the right paths

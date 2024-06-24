@@ -1,5 +1,5 @@
 
-make train_gpt2cu USE_CUDNN=1 USE_MPI=1
+make train_gpt2cu USE_CUDNN=1
 
 # NOTE: change the following to match your system
 binary_path="/home/ubuntu/llm.c/train_gpt2cu"
