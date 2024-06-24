@@ -1140,6 +1140,7 @@ void gpt2_free(GPT2 *model) {
     cudaFreeCheck(&model->acts_memory);
     cudaFreeCheck(&model->inputs);
     cudaFreeCheck(&model->targets);
+    cudaFreeCheck(&model->accumulated_mean_loss);
     cudaCheck(cudaFreeHost(model->cpu_losses));
     cudaCheck(cudaFreeHost(model->cpu_losses_fp32));
     free(model->workload_indices);
