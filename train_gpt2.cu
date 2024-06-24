@@ -1284,7 +1284,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
 
 // ----------------------------------------------------------------------------
 // CLI, poor man's argparse
-// unclaimed flags lol: p
+// (all single letters have been claimed now)
 
 void error_usage() {
     fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
@@ -1295,6 +1295,8 @@ void error_usage() {
     fprintf(stderr, "  -e <string> input from model at this filename (default = gpt2_124M_bf16.bin)\n");
     fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
     fprintf(stderr, "  -n <int>    write optimization checkpoints every how many steps? (default 0, don't)\n");
+    fprintf(stderr, "  -nk <int>   max number of checkpoints to keep in the directory, removing old ones (0 = disable, default)\n");
+    fprintf(stderr, "  -nm <int>   every how many step checkpoints are considered major? major checkpoints never get deleted.\n");
     fprintf(stderr, "  -y <int>    resume optimization found inside output log dir? (0=restart/overwrite, 1=resume/append)\n");
     // token layout for each step of the optimization
     fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
@@ -1341,7 +1343,9 @@ int main(int argc, char *argv[]) {
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* lr_scheduler_type = "cosine";
     const char* output_log_dir = NULL;
-    int checkpoint_every = 0; // write optimization checkpoints every how many steps?
+    int checkpoint_every = 0; // write checkpoints every how many steps?
+    int checkpoints_keep = 0; // how long checkpoint history do we keep? (in units of checkpoints)
+    int major_checkpoint_every = 0; // major checkpoints never get deleted when maintaining history
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
     int B = 4; // batch size
     int T = 1024; // sequence length max
@@ -1377,7 +1381,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
         else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
-        else if (argv[i][1] == 'n') { checkpoint_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == '\0') { checkpoint_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'y') { resume = atoi(argv[i+1]); }
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
@@ -1404,6 +1408,8 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'p' && argv[i][2] == 'n') { num_processes = atoi(argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'r') { process_rank = atoi(argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'g') { gpus_per_node = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
         else { error_usage(); }
     }
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
@@ -1695,6 +1701,26 @@ int main(int argc, char *argv[]) {
                 snprintf(filename_buffer, 512, "%s/DONE_%08d", output_log_dir, step);
                 FILE* done_file = fopenCheck(filename_buffer, "w");
                 fclose(done_file);
+            }
+            multi_gpu_barrier(&multi_gpu_config);
+            // we only keep checkpoints_keep checkpoints on disk to save space
+            // so now that we wrote a new checkpoint, delete one old one (unless it is a "major" checkpoint)
+            // we only do this is checkpoint keeping is turned on (checkpoints_keep > 0)
+            int step_delete = step - checkpoints_keep * checkpoint_every;
+            if (checkpoints_keep > 0 && step_delete > 0 &&
+               (major_checkpoint_every == 0 || step_delete % major_checkpoint_every != 0)
+                ) {
+                printf0("deleting minor checkpoint %d\n", step_delete);
+                if (multi_gpu_config.process_rank == 0) {
+                    snprintf(filename_buffer, 512, "%s/model_%08d.bin", output_log_dir, step_delete);
+                    remove(filename_buffer);
+                }
+                snprintf(filename_buffer, 512, "%s/state_%08d_%05d.bin", output_log_dir, step_delete, multi_gpu_config.process_rank);
+                remove(filename_buffer);
+                if (multi_gpu_config.process_rank == 0) {
+                    snprintf(filename_buffer, 512, "%s/DONE_%08d", output_log_dir, step_delete);
+                    remove(filename_buffer);
+                }
             }
             multi_gpu_barrier(&multi_gpu_config);
         }
