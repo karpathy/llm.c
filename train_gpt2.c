@@ -583,7 +583,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
         num_parameters += param_sizes[i];
     }
     // malloc all parameters all at once
-    float* params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
+    float* params_memory = (float*)alignedMallocCheck(64, num_parameters * sizeof(float));
     // assign all the tensors
     float** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
@@ -630,7 +630,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         num_activations += act_sizes[i];
     }
-    float* acts_memory = (float*)mallocCheck(num_activations * sizeof(float));
+    float* acts_memory = (float*)alignedMallocCheck(64, num_activations * sizeof(float));
     float** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
         &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
@@ -1026,12 +1026,12 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 }
 
 void gpt2_free(GPT2 *model) {
-    free(model->params_memory);
-    free(model->grads_memory);
+    freeCheck(model->params_memory);
+    freeCheck(model->grads_memory);
     free(model->m_memory);
     free(model->v_memory);
-    free(model->acts_memory);
-    free(model->grads_acts_memory);
+    freeCheck(model->acts_memory);
+    freeCheck(model->grads_acts_memory);
     free(model->inputs);
     free(model->targets);
 }
@@ -1095,7 +1095,7 @@ int main() {
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
+    int* gen_tokens = (int*)alignedMallocCheck(64, B * T * sizeof(int));
     const int genT = 64; // number of steps of inference we will do
 
     // train
@@ -1169,7 +1169,7 @@ int main() {
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
-    free(gen_tokens);
+    freeCheck(gen_tokens);
     return 0;
 }
 #endif
