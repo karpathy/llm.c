@@ -1366,8 +1366,8 @@ int main(int argc, char *argv[]) {
     int process_rank = 0;  // this should be set by the slurm environment
     int gpus_per_node = 8;  // this should be set by the slurm environment
     char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
-    char server_ip[256] = "-1";  // used if init_method set to "tcp" -> set to your server ip address
-    char fs_path[256] = "/tmp";  // used if init_method set to "fs" -> set to a shared filesystem path
+    char server_ip[256] = "";  // used if init_method set to "tcp" -> set to your server ip address
+    char fs_path[256] = "";  // used if init_method set to "fs" -> set to a shared filesystem path
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
