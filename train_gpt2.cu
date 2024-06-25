@@ -928,6 +928,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, int grad_accum_steps, bo
     cudaCheck(cudaDeviceSynchronize());
     if(last_step) {
         model->mean_loss /= B*T*grad_accum_steps;
+    } else {
+        model->mean_loss = -1.f;        // no loss available yet
     }
 }
 
