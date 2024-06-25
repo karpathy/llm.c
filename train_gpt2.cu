@@ -1304,6 +1304,8 @@ void error_usage() {
     fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
     fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
     fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
+    fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes above this in zscore (0.0f=off, default=3.0f)\n");
+    fprintf(stderr, "  -sg <float> outlier stability: skip update if grad_norm goes above this in zscore (0.0f=off, default=3.0f)\n");
     // evaluation
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
     fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
@@ -1346,6 +1348,8 @@ int main(int argc, char *argv[]) {
     int warmup_iterations = 0;
     float final_learning_rate_frac = 1.0f; // final fraction of learning rate, at end of training
     float weight_decay = 0.0f;
+    float skip_update_lossz = 0.0f; // skip update if loss goes above this in zscore
+    float skip_update_gradz = 0.0f; // skip update if grad_norm goes above this in zscore
     int val_loss_every = 20; // every how many steps do we eval validation loss?
     int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
@@ -1385,7 +1389,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
-        else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
         else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
@@ -1400,6 +1404,8 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'p' && argv[i][2] == 'n') { num_processes = atoi(argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'r') { process_rank = atoi(argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'g') { gpus_per_node = atoi(argv[i+1]); }
+        else if (argv[i][1] == 's' && argv[i][2] == 'l') { skip_update_lossz = atof(argv[i+1]); }
+        else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); }
         else { error_usage(); }
     }
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
@@ -1434,6 +1440,8 @@ int main(int argc, char *argv[]) {
     printf0("| warmup iterations     | %-50d |\n", warmup_iterations);
     printf0("| final LR fraction     | %-50e |\n", final_learning_rate_frac);
     printf0("| weight decay          | %-50e |\n", weight_decay);
+    printf0("| skip update lossz     | %-50f |\n", skip_update_lossz);
+    printf0("| skip update gradz     | %-50f |\n", skip_update_gradz);
     printf0("| max_steps             | %-50d |\n", max_steps);
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
     printf0("| val_max_steps         | %-50d |\n", val_max_steps);
@@ -1738,9 +1746,16 @@ int main(int argc, char *argv[]) {
         float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
         float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
         // update the model parameters
-        float grad_clip = 1.0f;
-        float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
-        gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
+        if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) {
+            printf0("skipping update due to loss z-score of %f\n", zloss);
+        } else if (isfinite(zgrad) && skip_update_gradz != 0.0f && zgrad > skip_update_gradz) {
+            printf0("skipping update due to grad z-score of %f\n", zgrad);
+        } else {
+            // clip the gradient norm to a maximum value
+            float grad_clip = 1.0f;
+            float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
+            gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
+        }
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
         cudaCheck(cudaEventRecord(end));
