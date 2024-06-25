@@ -549,11 +549,10 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
 }
 
 // propagate inputs through the network to produce logits.
+// right now, this function is fully synchronous with the host
 void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
-    // right now, this function is fully synchronous with the host
     NVTX_RANGE_FN();
-    // targets are optional and could be NULL
-    // in this function we must be careful and use size_t instead of int, otherwise
+    // we must be careful and use size_t instead of int, otherwise
     // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
 
     // ensure the model was initialized or error out
@@ -601,7 +600,6 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
     // copy inputs/targets to the model
     cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
-
     // validate inputs, all indices must be in the range [0, V)
     // we can do this while the copies are already underway
     tokenCheck(inputs, B*T, V);
@@ -688,25 +686,26 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 }
 
 
-// This function evaluates inputs and targets, i.e., it populates cpu_losses with the loss
-// of each individual target token.
+// Forwards both the model and the loss and is used for validation splits and evals.
+// In particular it populates cpu_losses with loss at each token.
+// Some of the evals (e.g. HellaSwag) require the per-token losses, which are produced here.
 float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B, size_t T) {
     assert(targets != NULL);
+    // forward the model itself
     gpt2_forward(model, inputs, B, T);
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
     const size_t V = model->config.vocab_size;
     const size_t Vp = model->config.padded_vocab_size;
 
-    ActivationTensors acts = model->acts;
-
-    float mean_loss = 0.0f;
     NvtxRange classifier_and_loss_range("classifier_and_loss");
+    ActivationTensors acts = model->acts;
+    float mean_loss = 0.0f;
     // fused classifier: does the forward pass and first part of the backward pass
     const float dloss = 1.0f / (B * T); // results in the uniform average loss over all elements
     // note: we don't need to generate dlogits here
     cudaCheck(cudaMemset(acts.losses, 0, B*T*sizeof(floatX)));
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
-    tokenCheck(targets, B*T, V);
+    tokenCheck(targets, B*T, V); // while the memcpy is underway, validate the targets
     fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, False, main_stream);
     cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B*T; i++) {
@@ -722,6 +721,7 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
 
 void gpt2_zero_grad(GPT2 *model) {
     NVTX_RANGE_FN();
+    // the losses accumulate over the duration of gradient accumulation micro steps, also reset here
     cudaCheck(cudaMemset(model->acts.losses, 0, model->batch_size * model->seq_len * sizeof(floatX)));
     if (model->grads_memory != NULL) {
         cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(floatX)));
@@ -760,9 +760,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     ParameterTensors grads = model->grads;
     ActivationTensors acts = model->acts;
 
-    // also forward the cross-entropy loss function if we have the targets
+    // accumulate the losses inside acts.losses, and kick off the backward pass inside the fused classifier
     NvtxRange classifier_and_loss_range("classifier_and_loss");
-    // fused classifier: does the forward pass and first part of the backward pass
     const float dloss = 1.0f / (float)(B * T * grad_accum_steps); // results in the uniform average loss over all elements
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B*T, V);
@@ -899,15 +898,14 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
     // Aggregate all gradients that are not part of the transformer blocks
     if(last_step) {
-        // reduce loss within the current GPU
+        // reduce all the losses within the current GPU (across all microsteps)
         global_sum_deterministic(model->accumulated_mean_loss, acts.losses, B*T, main_stream);
-
-        // reduce loss across GPUs
+        // reduce loss across GPUs to a single, final float across all microsteps and GPUs
         #if MULTI_GPU
         ncclCheck(ncclAllReduce(model->accumulated_mean_loss, model->accumulated_mean_loss, sizeof(float), ncclFloat, ncclAvg, multi_gpu_config.nccl_comm, main_stream));
         #endif
         cudaCheck(cudaMemcpyAsync(&model->mean_loss, model->accumulated_mean_loss, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
-
+        // reduce the gradients for non-transformer block parameters
         floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
         const size_t nelem[] = {Vp * C, T * C, C, C};
         multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
@@ -917,7 +915,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     if(last_step) {
         model->mean_loss /= B*T*grad_accum_steps;
     } else {
-        model->mean_loss = -1.f;        // no loss available yet
+        model->mean_loss = -1.f; // no loss available yet
     }
 }
 
