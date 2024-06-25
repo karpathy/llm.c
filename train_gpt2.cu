@@ -234,7 +234,31 @@ typedef struct {
     floatX* scratch_btc;    // (B, T, C)
 } ActivationTensors;
 
-void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config, int recompute) {
+enum class DType : uint8_t {
+    FP32, FP16, BF16
+};
+
+size_t sizeof_dtype(DType type) {
+    switch (type) {
+        case DType::FP32:
+            return sizeof(float);
+        case DType::FP16:
+            return sizeof(half);
+        case DType::BF16:
+            return sizeof(nv_bfloat16);
+    }
+}
+
+template<class T>
+DType dtype_of;
+template<>
+DType dtype_of<float> = DType::FP32;
+template<>
+DType dtype_of<half> = DType::FP16;
+template<>
+DType dtype_of<nv_bfloat16> = DType::BF16;
+
+void fill_in_activation_sizes(size_t* act_sizes, DType* act_dtypes, size_t B, size_t T, GPT2Config config, int recompute) {
     size_t Vp = config.padded_vocab_size;
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
@@ -273,35 +297,51 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     act_sizes[22] = B * T * C;      // scratch_btc
 }
 
-void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n) {
-    size_t num_activations = 0;
-    for (size_t i = 0; i < n; i++) {
-        num_activations += act_sizes[i];
+// Given a list of pointers, fills in target with corresponding void* pointers, and dtypes with their dtypes.
+template<class... T>
+void fill_in_types_and_pointers(DType* dtypes, void*** target, T**... pointers) {
+    constexpr const int n = sizeof...(T);
+    // we cannot iterate over a parameter pack directly, so we extract the quantities we want (i.e., the data type, and
+    // the pointer cast to void), and put those into local arrays, which *can* be filled from a paramter pack.
+    // Good ol' for then just copies the data into the arrays that we actually want.
+    DType dtype_helper[n] = {dtype_of<T>...};
+    void** ptr_helper[n] = {(void**)pointers...};
+    for(int i = 0; i < n; ++i) {
+        dtypes[i] = dtype_helper[i];
+        target[i] = ptr_helper[i];
     }
-    void* acts_memory;
-    cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(floatX)));
-    char* acts_memory_iterator = (char*)acts_memory;
-    for (size_t i = 0; i < n; i++) {
-        // extra protection so we don't accidentally use an empty buffer
-        if(act_sizes[i] == 0) {
-            *(targets[i]) = NULL;
-        }else {
-            *(targets[i]) = (floatX*) acts_memory_iterator;
-            acts_memory_iterator += act_sizes[i] * sizeof(floatX);
-        }
-    }
-    return acts_memory;
 }
 
-void* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
-    floatX** ptrs[] = {
+void* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes, DType* act_types) {
+    void** ptrs[NUM_ACTIVATION_TENSORS];
+    fill_in_types_and_pointers(act_types, ptrs,
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->atty,
         &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
         &acts->lnf_mean, &acts->lnf_rstd, &acts->losses, &acts->qkvr, &acts->output,
         &acts->scratch_bt4c, &acts->scratch_btc
-    };
-    return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
+    );
+
+    size_t bytes = 0;
+    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+        bytes += act_sizes[i] * sizeof_dtype(act_types[i]);
+    }
+
+    printf0("allocating %d MiB for activations\n", (int)round(bytes / (1024 * 1024)));
+
+    void* acts_memory;
+    cudaCheck(cudaMalloc((void**)&acts_memory, bytes));
+    char* acts_memory_iterator = (char*)acts_memory;
+    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+        // extra protection so we don't accidentally use an empty buffer
+        if(act_sizes[i] == 0) {
+            *(ptrs[i]) = NULL;
+        }else {
+            *(ptrs[i]) = acts_memory_iterator;
+            acts_memory_iterator += act_sizes[i] * sizeof_dtype(act_types[i]);
+        }
+    }
+    return acts_memory;
 }
 
 typedef struct {
@@ -323,6 +363,7 @@ typedef struct {
     // the activations of the model, and their sizes
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
+    DType act_types[NUM_ACTIVATION_TENSORS];
     void* acts_memory;
     size_t num_activations;
     // other run state configuration
@@ -577,14 +618,13 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         model->batch_size = B;
         model->seq_len = T;
         // allocate the space
-        fill_in_activation_sizes(model->act_sizes, B, T, model->config, model->recompute);
+        fill_in_activation_sizes(model->act_sizes, model->act_types, B, T, model->config, model->recompute);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
         }
         model->num_activations = num_activations;
-        printf0("allocating %d MiB for activations\n", (int)round(num_activations * sizeof(floatX) / (1024 * 1024)));
-        model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
+        model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes, model->act_types);
         // also create memory for caching inputs and targets
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
