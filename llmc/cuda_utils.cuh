@@ -153,6 +153,28 @@ __device__ inline float blockReduce(float val, bool final_sync=false, float out_
     return block_val;
 }
 
+// Performs a _deterministic_ sum reduction. determinism is achieved by requiring that only
+// a single block be used.
+template<class Float>
+__global__ void global_sum_single_block_kernel(float* result, const Float* values, size_t count) {
+    assert(gridDim.x == 1);     // only a single block!
+    float thread_sum = 0;
+    for(size_t index = threadIdx.x; index < count; index += blockDim.x) {
+        thread_sum += (float)values[index];
+    }
+
+    float reduction = blockReduce<warpReduceSum>(thread_sum, true);
+    if(threadIdx.x == 0) {
+        *result = reduction;
+    }
+}
+
+template<class Float>
+void global_sum_deterministic(float* result, const Float* values, int count, cudaStream_t stream) {
+    global_sum_single_block_kernel<<<1, 1024, 0, stream>>>(result, values, count);
+    cudaCheck(cudaGetLastError());
+}
+
 // ----------------------------------------------------------------------------
 // Random Number Generation used in Stochastic Rounding
 

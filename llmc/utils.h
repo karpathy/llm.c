@@ -128,6 +128,25 @@ extern inline void *malloc_check(size_t size, const char *file, int line) {
 
 #define mallocCheck(size) malloc_check(size, __FILE__, __LINE__)
 
+
+// ----------------------------------------------------------------------------
+// check that all tokens are within range
+extern inline void token_check(const int* tokens, int token_count, int vocab_size, const char *file, int line) {
+    for(int i = 0; i < token_count; i++) {
+        if(!(0 <= tokens[i] && tokens[i] < vocab_size)) {
+            fprintf(stderr, "Error: Token out of vocabulary at %s:%d\n", file, line);
+            fprintf(stderr, "Error details:\n");
+            fprintf(stderr, "  File: %s\n", file);
+            fprintf(stderr, "  Line: %d\n", line);
+            fprintf(stderr, "  Token: %d\n", tokens[i]);
+            fprintf(stderr, "  Position: %d\n", i);
+            fprintf(stderr, "  Vocab: %d\n", vocab_size);
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+#define tokenCheck(tokens, count, vocab) token_check(tokens, count, vocab, __FILE__, __LINE__)
+
 // ----------------------------------------------------------------------------
 // I/O ops
 
