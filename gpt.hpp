@@ -507,9 +507,9 @@ struct GPT {
 
     lm_head_unused_ = std::make_unique<nn::Linear>(n_embed, vocab_size);
     // https://paperswithcode.com/method/weight-tying
-    std::memcpy(wte_->weight_.get(), lm_head_unused_->weight_.data(),
+    std::memcpy(wte_->weight_->data(), lm_head_unused_->weight_->data(),
                 sizeof(float) * vocab_size * n_embed);
-    lm_head_ = wte_->weight_.get();
+    lm_head_ = wte_->weight_->data();
     softmax_cross_entropy_ = std::make_unique<nn::SoftmaxCrossEntropy>(
         nn::SoftmaxCrossEntropy::MEAN, true);
   }
@@ -575,9 +575,9 @@ struct GPT {
     if (lnf_y_grad_.size() < BTC) {
       lnf_y_grad_.resize(BTC);
     }
-    wte_->LazilyAllocateGradMemory();
+    wte_->weight_->AllocateGradient();
     if (lm_head_grad_ == nullptr) {
-      lm_head_grad_ = wte_->weight_grad_.get();
+      lm_head_grad_ = wte_->weight_->grad();
     }
     if (block_y_grad_.size() < LBTC) {
       block_y_grad_.resize(LBTC);
@@ -689,8 +689,6 @@ struct GPT {
     wte_->Forward(idx, absl::MakeSpan(tok_emb_));
     wpe_->Forward(pos, absl::MakeSpan(pos_emb_));
 
-    auto tok_w = Eigen::Map<nn::Matrix>(wte_->weight_.get(), vocab_size_, C);
-    auto pos_w = Eigen::Map<nn::Matrix>(wpe_->weight_.get(), block_size_, C);
     auto tok_emb = Eigen::Map<nn::Matrix>(tok_emb_.data(), B, TC);
     auto pos_emb = Eigen::Map<Eigen::RowVectorXf>(pos_emb_.data(), TC);
     tok_emb.rowwise() += pos_emb;

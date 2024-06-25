@@ -11,6 +11,7 @@ add_compile_definitions(OMP)
 add_compile_options(-Ofast -march=native)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fopenmp")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fopenmp")
+set(BUILD_SHARED_LIBS OFF)
 
 # Abseil
 set(ABSL_PROPAGATE_CXX_STD ON)

@@ -58,14 +58,14 @@ struct GPT2 {
     printf("num_parameters: %zu\n", gpt2_->NumParameters());
 
     // read in all the parameters from file
-    freadCheck(gpt2_->wte_->weight_.get(), sizeof(float),
+    freadCheck(gpt2_->wte_->weight_->data(), sizeof(float),
                gpt2_->wte_->NumParameters(), model_file);
-    freadCheck(gpt2_->wpe_->weight_.get(), sizeof(float),
+    freadCheck(gpt2_->wpe_->weight_->data(), sizeof(float),
                gpt2_->wpe_->NumParameters(), model_file);
     // ln1w
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->ln1_->weight_.data();
+      float* p = block->ln1_->weight_->data();
       int num = block->ln1_->normalized_shape_;
       freadCheck(p, sizeof(float), num, model_file);
     }
@@ -73,7 +73,7 @@ struct GPT2 {
     // ln1b
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->ln1_->bias_.data();
+      float* p = block->ln1_->bias_->data();
       int num = block->ln1_->normalized_shape_;
       freadCheck(p, sizeof(float), num, model_file);
     }
@@ -81,7 +81,7 @@ struct GPT2 {
     // qkvw
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->attn_->c_attn_->weight_.data();
+      float* p = block->attn_->c_attn_->weight_->data();
       int num = block->attn_->c_attn_->out_features_ *
                 block->attn_->c_attn_->in_features_;
       freadCheck(p, sizeof(float), num, model_file);
@@ -90,7 +90,7 @@ struct GPT2 {
     // qkvb
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->attn_->c_attn_->bias_.data();
+      float* p = block->attn_->c_attn_->bias_->data();
       int num = block->attn_->c_attn_->out_features_;
       freadCheck(p, sizeof(float), num, model_file);
     }
@@ -98,7 +98,7 @@ struct GPT2 {
     // attprojw
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->attn_->c_proj_->weight_.data();
+      float* p = block->attn_->c_proj_->weight_->data();
       int num = block->attn_->c_proj_->out_features_ *
                 block->attn_->c_proj_->in_features_;
       freadCheck(p, sizeof(float), num, model_file);
@@ -107,7 +107,7 @@ struct GPT2 {
     // attprojb
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->attn_->c_proj_->bias_.data();
+      float* p = block->attn_->c_proj_->bias_->data();
       int num = block->attn_->c_proj_->out_features_;
       freadCheck(p, sizeof(float), num, model_file);
     }
@@ -115,7 +115,7 @@ struct GPT2 {
     // ln2w
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->ln2_->weight_.data();
+      float* p = block->ln2_->weight_->data();
       int num = block->ln2_->normalized_shape_;
       freadCheck(p, sizeof(float), num, model_file);
     }
@@ -123,7 +123,7 @@ struct GPT2 {
     // ln2b
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->ln2_->bias_.data();
+      float* p = block->ln2_->bias_->data();
       int num = block->ln2_->normalized_shape_;
       freadCheck(p, sizeof(float), num, model_file);
     }
@@ -131,7 +131,7 @@ struct GPT2 {
     // fcw
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->mlp_->c_fc_->weight_.data();
+      float* p = block->mlp_->c_fc_->weight_->data();
       int num =
           block->mlp_->c_fc_->out_features_ * block->mlp_->c_fc_->in_features_;
       freadCheck(p, sizeof(float), num, model_file);
@@ -140,7 +140,7 @@ struct GPT2 {
     // fcb
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->mlp_->c_fc_->bias_.data();
+      float* p = block->mlp_->c_fc_->bias_->data();
       int num = block->mlp_->c_fc_->out_features_;
       freadCheck(p, sizeof(float), num, model_file);
     }
@@ -148,7 +148,7 @@ struct GPT2 {
     // fcprojw
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->mlp_->c_proj_->weight_.data();
+      float* p = block->mlp_->c_proj_->weight_->data();
       int num = block->mlp_->c_proj_->out_features_ *
                 block->mlp_->c_proj_->in_features_;
       freadCheck(p, sizeof(float), num, model_file);
@@ -157,16 +157,16 @@ struct GPT2 {
     // fcprojb
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->mlp_->c_proj_->bias_.data();
+      float* p = block->mlp_->c_proj_->bias_->data();
       int num = block->mlp_->c_proj_->out_features_;
       freadCheck(p, sizeof(float), num, model_file);
     }
 
     // lnfw
-    freadCheck(gpt2_->lnf_->weight_.data(), sizeof(float),
+    freadCheck(gpt2_->lnf_->weight_->data(), sizeof(float),
                gpt2_->lnf_->normalized_shape_, model_file);
     // lnfb
-    freadCheck(gpt2_->lnf_->bias_.data(), sizeof(float),
+    freadCheck(gpt2_->lnf_->bias_->data(), sizeof(float),
                gpt2_->lnf_->normalized_shape_, model_file);
 
     fcloseCheck(model_file);

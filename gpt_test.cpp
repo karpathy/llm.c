@@ -243,8 +243,8 @@ logits, loss = gpt2(idx)
 
   // Backward
   gpt.Backward(idx_m, target_m);
-  auto wte_grad = absl::MakeSpan(gpt.wte_->weight_grad_.get(), vocab_size * C);
-  auto wpe_grad = absl::MakeSpan(gpt.wpe_->weight_grad_.get(), block_size * C);
+  auto wte_grad = gpt.wte_->weight_->View(nn::Parameter::kGrad);
+  auto wpe_grad = gpt.wpe_->weight_->View(nn::Parameter::kGrad);
 
   std::vector<float> expected_wte_grad = {
       -0.071291, -0.008528, 0.145227,  0.131039,  -0.004713, -0.191734,

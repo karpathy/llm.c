@@ -4,6 +4,7 @@
 #include <random>
 
 #include "Eigen/Core"
+#include "absl/algorithm/container.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/strings/string_view.h"
@@ -42,6 +43,59 @@ using Tensor4D = Eigen::Tensor<float, 4, Eigen::RowMajor>;
 inline Eigen::Map<Matrix> GetMatrixMap(Matrix& m) {
   return Eigen::Map<Matrix>(m.data(), m.rows(), m.cols());
 }
+
+// Parameter weight and its corresponding gradient
+struct Parameter {
+  enum DataType { kValue, kGrad };
+
+  Parameter(size_t length) : length_(length) {
+    value_ = std::make_unique<float[]>(length);
+    grad_ = nullptr;
+  }
+
+  float* data() const { return value_.get(); }
+  float* grad() const { return grad_.get(); }
+
+  void AllocateGradient() {
+    if (grad_ == nullptr) {
+      grad_ = std::make_unique<float[]>(length_);
+    }
+  }
+
+  void ZeroGrad() {
+    if (grad_ != nullptr) {
+      std::memset(grad_.get(), 0, sizeof(float) * length_);
+    }
+  }
+
+  absl::Span<float> View(DataType type = DataType::kValue) const {
+    LOG_IF(FATAL, type == kGrad && grad_ == nullptr)
+        << "Gradient memory has not been allocated!";
+    return {type == kValue ? value_.get() : grad_.get(), length_};
+  }
+
+  Eigen::Map<Eigen::RowVectorXf> View(int length,
+                                      DataType type = DataType::kValue) const {
+    LOG_IF(FATAL, type == kGrad && grad_ == nullptr)
+        << "Gradient memory has not been allocated!";
+    CHECK_EQ(length, length_);
+    return {type == kValue ? value_.get() : grad_.get(),
+            static_cast<Eigen::Index>(length_)};
+  }
+
+  Eigen::Map<nn::Matrix> View(int rows, int cols,
+                              DataType type = DataType::kValue) const {
+    LOG_IF(FATAL, type == kGrad && grad_ == nullptr)
+        << "Gradient memory has not been allocated!";
+    CHECK_EQ(rows * cols, length_);
+    return {type == kValue ? value_.get() : grad_.get(), rows, cols};
+  }
+
+ private:
+  std::unique_ptr<float[]> value_;
+  std::unique_ptr<float[]> grad_;
+  size_t length_;
+};
 
 struct MatMul {
   static void Forward(const Eigen::Map<Matrix>& x1,
@@ -112,13 +166,12 @@ struct Linear {
       : in_features_(in_features),
         out_features_(out_features),
         has_bias_(bias) {
-    weight_ = Matrix::Zero(out_features, in_features);
-    bias_ = Eigen::RowVectorXf::Zero(out_features);
-    KaimingUniformFill(absl::MakeSpan(weight_.data(), weight_.size()),
-                       in_features);
+    weight_ = std::make_unique<Parameter>(out_features * in_features);
+    bias_ = std::make_unique<Parameter>(out_features);
+    KaimingUniformFill(weight_->View(), in_features);
     if (bias) {
       const float bound = 1.f / std::sqrt(in_features);
-      UniformFill(absl::MakeSpan(bias_.data(), bias_.size()), -bound, bound);
+      UniformFill(bias_->View(), -bound, bound);
     }
   }
 
@@ -128,8 +181,11 @@ struct Linear {
     CHECK_EQ(y.cols(), out_features_);
     CHECK_EQ(x.rows(), y.rows());
 
+    auto weight = weight_->View(out_features_, in_features_);
+    auto bias = bias_->View(out_features_);
+
     // y = x * w^T + b
-    y.noalias() = (x * weight_.transpose()).rowwise() + bias_;
+    y.noalias() = (x * weight.transpose()).rowwise() + bias;
   }
 
   void Backward(const Eigen::Map<Matrix>& x, const Eigen::Map<Matrix>& y_grad,
@@ -141,32 +197,29 @@ struct Linear {
     CHECK_EQ(x.rows(), x_grad.rows());
 
     // Lazily allocate the memory for gradients
-    LazilyAllocateGradMemory();
+    weight_->AllocateGradient();
+    bias_->AllocateGradient();
+    auto weight = weight_->View(out_features_, in_features_);
+    auto bias = bias_->View(out_features_);
+    auto weight_grad =
+        weight_->View(out_features_, in_features_, Parameter::kGrad);
+    auto bias_grad = bias_->View(out_features_, Parameter::kGrad);
 
     // x_grad = dL/dy * dy/dx
     //        = y_grad(B, out_features) * W(out_features, in_features)
     //        = [B, in_features]
-    x_grad.noalias() += y_grad * weight_;
+    x_grad.noalias() += y_grad * weight;
 
     // w_grad = dL/dy * dy/dw
     //        = y_grad^T(out_features, B) * x(B, in_features)
     //        = [out_features, in_features]
-    weight_grad_.noalias() += y_grad.transpose() * x;
+    weight_grad.noalias() += y_grad.transpose() * x;
 
     if (has_bias_) {
       // b_grad = dL/dy * dy/db
       //        = \sum_i^(B)(y_grad(B, out_features))
       //        = [out_features,]
-      bias_grad_.noalias() += y_grad.colwise().sum();
-    }
-  }
-
-  void LazilyAllocateGradMemory() {
-    if (weight_grad_.size() == 0) {
-      weight_grad_ = Matrix::Zero(out_features_, in_features_);
-    }
-    if (bias_grad_.size() == 0) {
-      bias_grad_ = Eigen::RowVectorXf::Zero(out_features_);
+      bias_grad.noalias() += y_grad.colwise().sum();
     }
   }
 
@@ -182,15 +235,15 @@ struct Linear {
   bool has_bias_;
   int in_features_;
   int out_features_;
-  Matrix weight_, weight_grad_;          // out_features x in_features
-  Eigen::RowVectorXf bias_, bias_grad_;  // out_features
+  std::unique_ptr<Parameter> weight_;  // out_features x in_features
+  std::unique_ptr<Parameter> bias_;    // out_features
 };
 
 struct Embedding {
   Embedding(int num_embeddings, int embedding_dim)
       : num_embeddings_(num_embeddings), embedding_dim_(embedding_dim) {
-    weight_ = std::make_unique<float[]>(num_embeddings * embedding_dim);
-    NormalFill(absl::MakeSpan(weight_.get(), num_embeddings * embedding_dim));
+    weight_ = std::make_unique<Parameter>(num_embeddings * embedding_dim);
+    NormalFill(weight_->View());
   }
 
   void Forward(absl::Span<const int> idx, absl::Span<float> embedding) const {
@@ -198,7 +251,7 @@ struct Embedding {
     for (size_t i = 0; i < idx.size(); ++i) {
       CHECK_LT(idx[i], num_embeddings_);
       void* dst = embedding.data() + i * embedding_dim_;
-      void* src = weight_.get() + idx[i] * embedding_dim_;
+      void* src = weight_->data() + idx[i] * embedding_dim_;
       std::memcpy(dst, src, sizeof(float) * embedding_dim_);
     }
   }
@@ -208,24 +261,15 @@ struct Embedding {
     CHECK_EQ(grad_embedding.size(), idx.size() * embedding_dim_);
 
     // Lazily allocate the memory for gradients
-    LazilyAllocateGradMemory();
+    weight_->AllocateGradient();
 
     for (size_t i = 0; i < idx.size(); ++i) {
       CHECK_LT(idx[i], num_embeddings_);
       const float* g = grad_embedding.data() + i * embedding_dim_;
-      float* grad = weight_grad_.get() + idx[i] * embedding_dim_;
+      float* grad = weight_->grad() + idx[i] * embedding_dim_;
       for (int j = 0; j < embedding_dim_; ++j) {
         grad[j] += g[j];
       }
-    }
-  }
-
-  void LazilyAllocateGradMemory() {
-    if (weight_grad_ == nullptr) {
-      weight_grad_ =
-          std::make_unique<float[]>(num_embeddings_ * embedding_dim_);
-      std::memset(weight_grad_.get(), 0,
-                  sizeof(float) * num_embeddings_ * embedding_dim_);
     }
   }
 
@@ -233,15 +277,16 @@ struct Embedding {
 
   int num_embeddings_;
   int embedding_dim_;
-  std::unique_ptr<float[]> weight_;
-  std::unique_ptr<float[]> weight_grad_;
+  std::unique_ptr<Parameter> weight_;
 };
 
 struct LayerNorm {
   LayerNorm(int normalized_shape)
       : normalized_shape_(normalized_shape), eps_(1e-5) {
-    weight_ = Eigen::RowVectorXf::Ones(normalized_shape);
-    bias_ = Eigen::RowVectorXf::Zero(normalized_shape);
+    weight_ = std::make_unique<Parameter>(normalized_shape);
+    auto w = weight_->View();
+    absl::c_fill(w, 1.0f);
+    bias_ = std::make_unique<Parameter>(normalized_shape);
   }
 
   void Forward(const Eigen::Map<Matrix>& x, Eigen::Map<Matrix>& y,
@@ -267,6 +312,9 @@ struct LayerNorm {
            ((x.colwise() - mean.transpose()).array().square().rowwise().mean() +
             eps_)
                .sqrt();
+
+    auto weight = weight_->View(normalized_shape_);
+    auto bias = bias_->View(normalized_shape_);
     // normalize: (x - mean) / std
     // && scale:  (x - mean) / std * weight
     // && shift:  (x - mean) / std * weight + bias
@@ -274,10 +322,10 @@ struct LayerNorm {
           rstd.transpose().array())
              .array()
              .rowwise() *
-         weight_.array())
+         weight.array())
             .array()
             .rowwise() +
-        bias_.array();
+        bias.array();
   }
 
   void Backward(const Eigen::Map<Matrix>& x, const Eigen::Map<Matrix>& y_grad,
@@ -297,7 +345,12 @@ struct LayerNorm {
     CHECK_EQ(rstd.size(), B);
 
     // Lazily allocate the memory for gradients
-    LazilyAllocateGradMemory();
+    weight_->AllocateGradient();
+    bias_->AllocateGradient();
+    auto weight = weight_->View(normalized_shape_);
+    auto weight_grad = weight_->View(normalized_shape_, Parameter::kGrad);
+    auto bias = bias_->View(normalized_shape_);
+    auto bias_grad = bias_->View(normalized_shape_, Parameter::kGrad);
 
     // x_grad = dL/dy * dy/dnorm
     //                * [dnorm/dxmean * dxmean/dx
@@ -305,9 +358,9 @@ struct LayerNorm {
     //                  + dnorm/dstd * dstd/dx
     //                  ]
     nn::Matrix norm = (x.colwise() - mean.transpose()).array().colwise() *
-                      rstd.transpose().array();                     // [B, D]
-    nn::Matrix dnorm = y_grad.array().rowwise() * weight_.array();  // [B, D]
-    Eigen::RowVectorXf dnorm_mean = dnorm.rowwise().mean();         // [B,]
+                      rstd.transpose().array();                    // [B, D]
+    nn::Matrix dnorm = y_grad.array().rowwise() * weight.array();  // [B, D]
+    Eigen::RowVectorXf dnorm_mean = dnorm.rowwise().mean();        // [B,]
     Eigen::RowVectorXf dnorm_norm_mean =
         (dnorm.array() * norm.array()).rowwise().mean();  // [B,]
     x_grad.array() +=
@@ -321,7 +374,7 @@ struct LayerNorm {
     // w_grad = dL/dy * dy/dw
     //        = dL/dy * x_norm(B,D)
     //        = \sum_i^B [y_grad(B, D) \elewise_dot x_norm(B, D)]
-    weight_grad_.array() +=
+    weight_grad.array() +=
         (y_grad.array() * ((x.colwise() - mean.transpose()).array().colwise() *
                            rstd.transpose().array())
                               .array())
@@ -332,24 +385,15 @@ struct LayerNorm {
     // b_grad = dL/dy * dy/db
     //        = \sum_i^(B)(y_grad(B, D))
     //        = [D,]
-    bias_grad_.noalias() += y_grad.colwise().sum();
-  }
-
-  void LazilyAllocateGradMemory() {
-    if (weight_grad_.size() == 0) {
-      weight_grad_ = Eigen::RowVectorXf::Zero(normalized_shape_);
-    }
-    if (bias_grad_.size() == 0) {
-      bias_grad_ = Eigen::RowVectorXf::Zero(normalized_shape_);
-    }
+    bias_grad.noalias() += y_grad.colwise().sum();
   }
 
   size_t NumParameters() const { return normalized_shape_ * 2; }
 
   int normalized_shape_;
   float eps_;
-  Eigen::RowVectorXf weight_, weight_grad_;
-  Eigen::RowVectorXf bias_, bias_grad_;
+  std::unique_ptr<Parameter> weight_;
+  std::unique_ptr<Parameter> bias_;
 };
 
 // Careful there are a few versions of GeLU, this one is the exact one used by
