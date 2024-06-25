@@ -943,36 +943,10 @@ ShardInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_te
     return {offset, size};
 }
 
-float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_clip, int t, MultiGpuConfig* multi_gpu_config) {
-    // update the model parameters using the AdamW optimizer
-    // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
-    // so we may not be responsible for the entire parameter tensor
-    // also, this function was very simple a while back but become very complex, only because we want to
-    // selectively weight decay some, but not all tensors :(
-    // TODO: revisit and probably refactor this entire function
+float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
-    size_t shard_num_parameters = multi_gpu_config->shard_num_parameters; // num parameters we are responsible for
     floatX* grads_memory = (floatX*)model->grads_memory;
 
-    // lazily allocate m,v memory and master weights (usually on the first iteration)
-    if (model->m_memory == NULL) {
-        NvtxRange rng("InitOpt");
-        printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
-        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
-        cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
-        cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->m_memory, 0, shard_num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, shard_num_parameters * sizeof(float)));
-    }
-
-    bool init_master_weights = false;
-    if (model->use_master_weights == 1 && model->master_weights == NULL) {
-        printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
-        cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
-        init_master_weights = true;
-    }
-
-    // gradient clipping
     // repurposing this buffer (which isn't needed now) to write grad norm into it
     float* grad_norm_squared = (float*)model->acts.output;
     float grad_norm_squared_cpu = 0.0f;
@@ -1007,18 +981,39 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
         cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
     }
-
-    if(!isfinite(grad_norm_squared_cpu)) {
-        // may happen due to some issue (e.g. overflow?)
-        // TODO: later may want to keep a global counter of instabilities like this
-        printf0("[WARNING]: grad norm is not finite, skipping AdamW update\n");
-        return -1.0f;
-    }
     float grad_norm_cpu = sqrtf(grad_norm_squared_cpu);
-    float grad_scale = (grad_norm_cpu > grad_clip) ? grad_clip / grad_norm_cpu : 1.0f;
+    return grad_norm_cpu;
+}
+
+void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_scale, int t, MultiGpuConfig* multi_gpu_config) {
+    // update the model parameters using the AdamW optimizer
+    // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
+    // so we may not be responsible for the entire parameter tensor
+    // also, this function was very simple a while back but become very complex, only because we want to
+    // selectively weight decay some, but not all tensors :(
+    // TODO: revisit and probably refactor this entire function
+    NVTX_RANGE_FN();
+    size_t shard_num_parameters = multi_gpu_config->shard_num_parameters; // num parameters we are responsible for
+
+    // lazily allocate m,v memory and master weights (usually on the first iteration)
+    if (model->m_memory == NULL) {
+        NvtxRange rng("InitOpt");
+        printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
+        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
+        cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->m_memory, 0, shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->v_memory, 0, shard_num_parameters * sizeof(float)));
+    }
+
+    bool init_master_weights = false;
+    if (model->use_master_weights == 1 && model->master_weights == NULL) {
+        printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
+        cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
+        init_master_weights = true;
+    }
 
     // AdamW update
-
     // handle adamw for all the transformer blocks
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         // generate a unique seed for each tensor
@@ -1078,7 +1073,6 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     }
 
     cudaCheck(cudaDeviceSynchronize());
-    return grad_norm_cpu;
 }
 
 float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
@@ -1586,8 +1580,9 @@ int main(int argc, char *argv[]) {
     }
 
     // init an OutlierDetector the training loss
-    OutlierDetector loss_outlier_detector;
+    OutlierDetector loss_outlier_detector, grad_norm_outlier_detector;
     init_detector(&loss_outlier_detector);
+    init_detector(&grad_norm_outlier_detector);
 
     // train
     cudaEvent_t start, end;
@@ -1739,8 +1734,13 @@ int main(int argc, char *argv[]) {
         float zloss = (float)(update_detector(&loss_outlier_detector, (double)accumulated_loss)); // loss z-score
         // fetch the next learning rate
         float step_learning_rate = get_learning_rate(&lr_scheduler, step);
+        // calculate the gradient norm and how much we wish to scale the gradient
+        float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
+        float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
         // update the model parameters
-        float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
+        float grad_clip = 1.0f;
+        float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
+        gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
         cudaCheck(cudaEventRecord(end));
@@ -1761,8 +1761,8 @@ int main(int argc, char *argv[]) {
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
         float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
-        printf0("step %4d/%d | loss %7.6f (z %+.2f)| norm %6.4f | lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
-                step + 1, train_num_batches, accumulated_loss, zloss, grad_norm, step_learning_rate,
+        printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
+                step + 1, train_num_batches, accumulated_loss, zloss, grad_norm, zgrad, step_learning_rate,
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss, step_learning_rate, grad_norm);
 
