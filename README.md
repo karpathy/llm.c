@@ -134,7 +134,9 @@ sudo apt-get -y install libcudnn9-dev-cuda-12
 
 On top of this you need the [cuDNN frontend](https://github.com/NVIDIA/cudnn-frontend/tree/main), but this is just header files. Simply clone the repo to your disk. The Makefile currently looks for it in either your home directory or the current directory. If you have put it elsewhere, add `CUDNN_FRONTEND_PATH=/path/to/your/cudnn-frontend/include` to the `make` command-line.
 
-**multi-GPU training using MPI and NCCL**. Make sure you install MPI and NCCL, e.g. on Linux:
+## multi-GPU training
+
+Make sure you install MPI and NCCL, e.g. on Linux:
 
 ```bash
 sudo apt install openmpi-bin openmpi-doc libopenmpi-dev
@@ -148,6 +150,23 @@ and then:
 make train_gpt2cu
 mpirun -np <number of GPUs> ./train_gpt2cu
 ```
+
+or simply run one of our scripts under `./scripts/`.
+
+## multi-node training
+
+Make sure you've installed `NCCL` following instructions from [multi-GPU](#multi-gpu-training) section.
+
+There are 3 ways we currently support that allow you to run multi-node training:
+1) Use OpenMPI to exchange nccl id and initialize NCCL. See e.g. `./scripts/multi_node/run_gpt2_124M_mpi.sh` script for details.
+2) Use shared file system to init NCCL. See `./scripts/multi_node/run_gpt2_124M_fs.sbatch` script for details.
+3) Use TCP sockets to init NCCL. See `./scripts/multi_node/run_gpt2_124M_tcp.sbatch` script for details.
+
+Note:
+* If you're running in a slurm environment and your slurm doesn't support PMIx (which we assume will be a common situation given that `slurm-wlm` dropped PMIx support) you will have to use FS (2) or TCP (3) approach. To test whether your slurm supports PMIx run: `srun --mpi=list` and see whether you get `pmix` in the output.
+* If you don't have slurm set up, you can kick off a multi-node run using `mpirun` - MPI (1).
+
+None of these 3 methods is superior, we just offer you options so that you can run in your specific environment.
 
 ## experiments / sweeps
 

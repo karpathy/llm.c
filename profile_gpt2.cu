@@ -28,7 +28,13 @@ the profile.ncu-rep from a cloud box to local to pretty view.
 #include "train_gpt2.cu"
 
 int main(int argc, char *argv[]) {
-    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
+    char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
+    int num_processes = -1;  // doesn't matter when using MPI
+    int process_rank = -1;  // doesn't matter when using MPI
+    int gpus_per_node = -1;  // doesn't matter when using MPI
+    char server_ip[256] = "";  // doesn't matter when using MPI
+    char fs_path[256] = "";  // doesn't matter when using MPI
+    multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
     common_start(true, true);
 
     // build the GPT-2 model from a checkpoint
@@ -55,7 +61,7 @@ int main(int argc, char *argv[]) {
     // do a training step
     gpt2_forward(&model, x, y, B, T);
     gpt2_zero_grad(&model);
-    gpt2_backward(&model, x, true);
+    gpt2_backward_and_reduce(&model, x, true);
     gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, 1.f, 1, &multi_gpu_config);
     cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
 

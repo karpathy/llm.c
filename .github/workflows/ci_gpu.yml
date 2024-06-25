@@ -110,3 +110,13 @@ jobs:
 
       - name: Execute testing program fp32 with cuDNN
         run: ./test_gpt2fp32cu
+
+  unit-tests-gpu:
+    runs-on: ubicloud-gpu-standard-1-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Test Device<->File IO
+        run: cd dev/test && nvcc -o device_file_io device_file_io.cu && ./device_file_io

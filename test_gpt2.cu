@@ -89,7 +89,13 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
 }
 
 int main(int argc, char *argv[]) {
-    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
+    char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
+    int num_processes = -1;  // doesn't matter when using MPI
+    int process_rank = -1;  // doesn't matter when using MPI
+    int gpus_per_node = -1;  // doesn't matter when using MPI
+    char server_ip[256] = "";  // doesn't matter when using MPI
+    char fs_path[256] = "";  // doesn't matter when using MPI
+    multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
     common_start(false, true);
 
     // set the right paths
@@ -166,7 +172,7 @@ int main(int argc, char *argv[]) {
     // copy logits to CPU so we can compare them
     floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
     float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
-    cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost);
+    cudaCheck(cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B * T * Vp; i++) {
         logits_cpu[i] = (float)logits_cpu_raw[i];
     }
@@ -212,7 +218,7 @@ int main(int argc, char *argv[]) {
         clock_gettime(CLOCK_MONOTONIC, &start);
         gpt2_forward(&model, x, y, B, T);
         gpt2_zero_grad(&model);
-        gpt2_backward(&model, x, true);
+        gpt2_backward_and_reduce(&model, x, true);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
@@ -328,7 +334,7 @@ int main(int argc, char *argv[]) {
         dataloader_next_batch(&loader);
         gpt2_forward(&model, loader.inputs, loader.targets, B, T);
         gpt2_zero_grad(&model);
-        gpt2_backward(&model, loader.inputs, true);
+        gpt2_backward_and_reduce(&model, loader.inputs, true);
         gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
         losses[step] = model.mean_loss;
         tokens[step] = loader.inputs[0];
@@ -343,7 +349,7 @@ int main(int argc, char *argv[]) {
         dataloader_next_batch(&loader);
         gpt2_forward(&model, loader.inputs, loader.targets, B, T);
         gpt2_zero_grad(&model);
-        gpt2_backward(&model, loader.inputs, true);
+        gpt2_backward_and_reduce(&model, loader.inputs, true);
         gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
 
         if(loader.inputs[0] != tokens[step]) {
