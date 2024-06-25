@@ -217,7 +217,7 @@ typedef struct {
     floatX* lnf; // (B, T, C);   if LN recomputation is enabled (-r 2 and above), will be used for _all_ layernorms
     floatX* lnf_mean; // (B, T)
     floatX* lnf_rstd; // (B, T)
-    floatX* losses; // (B, T)
+    floatX* losses; // (B, T), will be accumulated in micro-steps
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
     floatX* qkvr; // (L, B, T, 3*C)
     // in inference mode, this buffer will store the logits
@@ -328,8 +328,9 @@ typedef struct {
     int seq_len; // the sequence length (T) of current forward pass
     int* inputs; // the input tokens for the current forward pass
     int* targets; // the target tokens for the current forward pass
-    float mean_loss; // after a forward pass with targets, will be populated with the mean loss
-    float accumulated_mean_loss; // Mean loss after aggregating it on all GPUs
+    bool has_targets; // has the targets buffer been populated during the forward pass
+    float mean_loss; // after the last backward micro-batch, will be populated with mean loss across all GPUs and micro-steps
+    float* accumulated_mean_loss; // GPU buffer used to accumulate loss across micro-steps
     floatX* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
     float* cpu_losses_fp32; // same but fp32
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
@@ -349,6 +350,7 @@ void gpt2_init_common(GPT2 *model) {
     model->acts_memory = NULL;
     model->inputs = NULL;
     model->targets = NULL;
+    model->accumulated_mean_loss = NULL;
     model->cpu_losses = NULL;
     model->cpu_losses_fp32 = NULL;
     // the B,T params are determined and set, fixed on first batch in forward()
@@ -547,7 +549,7 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     free(params_memory_cpu);
 }
 
-void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, size_t T, int grad_accum_steps=1) {
+void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, size_t T) {
     // right now, this function is fully synchronous with the host
     NVTX_RANGE_FN();
     // targets are optional and could be NULL
@@ -585,6 +587,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
         // also create memory for caching inputs and targets
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
+        cudaCheck(cudaMalloc(((void**)&model->accumulated_mean_loss), sizeof(float)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(floatX)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses_fp32, B * T * sizeof(float)));
     } else {
@@ -601,6 +604,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
     if (targets != NULL) {
         cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     }
+    model->has_targets = (targets != NULL);
 
     // validate inputs, all indices must be in the range [0, V)
     // we can do this while the copies are already underway
@@ -689,45 +693,61 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
     }
 
     matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    cudaCheck(cudaDeviceSynchronize());
+}
 
-    // also forward the cross-entropy loss function if we have the targets
-    if (targets != NULL) {
+
+float gpt2_validate(GPT2 *model) {
+    // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
+    const size_t B = model->batch_size;
+    const size_t T = model->seq_len;
+    const size_t V = model->config.vocab_size;
+    const size_t Vp = model->config.padded_vocab_size;
+
+    ActivationTensors acts = model->acts;
+
+    float mean_loss = 0.0f;
+    if (model->has_targets) {
         NvtxRange classifier_and_loss_range("classifier_and_loss");
         // fused classifier: does the forward pass and first part of the backward pass
-        const float dloss = 1.0f / (B * T * grad_accum_steps); // results in the uniform average loss over all elements
-        fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, main_stream);
-        // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
+        const float dloss = 1.0f / (B * T); // results in the uniform average loss over all elements
+        // note: we don't need to generate dlogits here
+        cudaCheck(cudaMemset(acts.losses, 0, B*T*sizeof(floatX)));
+        fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, False, main_stream);
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost));
-        float mean_loss = 0.0f;
         for (int i = 0; i < B*T; i++) {
             float loss = (float)(model->cpu_losses[i]);
             model->cpu_losses_fp32[i] = loss;
             mean_loss += loss;
         }
-        mean_loss /= B*T*grad_accum_steps;
-        model->mean_loss = mean_loss;
+        mean_loss /= B*T;
     } else {
-        // if we don't have targets, we don't have loss
-        model->mean_loss = -1.0f;
+        printf("Error: must forward with targets before validate\n");
+        exit(EXIT_FAILURE);
     }
     cudaCheck(cudaDeviceSynchronize());
+    return mean_loss;
 }
+
 
 void gpt2_zero_grad(GPT2 *model) {
     NVTX_RANGE_FN();
+    cudaCheck(cudaMemset(model->acts.losses, 0, model->batch_size * model->seq_len * sizeof(floatX)));
     if (model->grads_memory != NULL) {
         cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(floatX)));
     }
     cudaCheck(cudaDeviceSynchronize());
 }
 
-void gpt2_backward_and_reduce(GPT2 *model, int* inputs, bool last_step) {
+void gpt2_backward_and_reduce(GPT2 *model, int* inputs, int grad_accum_steps, bool last_step) {
     NVTX_RANGE_FN();
+
     // double check we forwarded previously, with targets
-    if (model->mean_loss == -1.0f) {
+    if (!model->has_targets) {
         printf("Error: must forward with targets before backward\n");
         exit(EXIT_FAILURE);
     }
+    model->has_targets = false; // reset check for next call
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
@@ -747,15 +767,23 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, bool last_step) {
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
     const size_t B = model->batch_size;
     const size_t T = model->seq_len;
+    const size_t V = model->config.vocab_size;
     const size_t Vp = model->config.padded_vocab_size;
     const size_t L = model->config.num_layers;
     const size_t NH = model->config.num_heads;
     const size_t C = model->config.channels;
 
-    // backward pass: go in the reverse order of the forward pass, and call backward() functions
     ParameterTensors params = model->params; // for brevity
     ParameterTensors grads = model->grads;
     ActivationTensors acts = model->acts;
+
+    // also forward the cross-entropy loss function if we have the targets
+    NvtxRange classifier_and_loss_range("classifier_and_loss");
+    // fused classifier: does the forward pass and first part of the backward pass
+    const float dloss = 1.0f / (float)(B * T * grad_accum_steps); // results in the uniform average loss over all elements
+    fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, True, main_stream);
+
+    // backward pass: go in the reverse order of the forward pass, and call backward() functions
 
     // reset residual stream gradients (put here to work with gradient accumulation)
     floatX* dresidual = (floatX*)model->acts.scratch_btc; // the main buffer holding the gradient in the backward pass
@@ -886,12 +914,24 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, bool last_step) {
 
     // Aggregate all gradients that are not part of the transformer blocks
     if(last_step) {
+        // reduce loss within the current GPU
+        global_sum_deterministic(model->accumulated_mean_loss, acts.losses, B*T, main_stream);
+
+        // reduce loss across GPUs
+        #if MULTI_GPU
+        ncclCheck(ncclAllReduce(model->accumulated_mean_loss, model->accumulated_mean_loss, sizeof(float), ncclFloat, ncclAvg, multi_gpu_config.nccl_comm, main_stream));
+        #endif
+        cudaCheck(cudaMemcpyAsync(&model->mean_loss, model->accumulated_mean_loss, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
+
         floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
         const size_t nelem[] = {Vp * C, T * C, C, C};
         multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
     }
 
     cudaCheck(cudaDeviceSynchronize());
+    if(last_step) {
+        model->mean_loss /= B*T*grad_accum_steps;
+    }
 }
 
 // Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
@@ -907,19 +947,6 @@ float multi_gpu_cpu_float_sum(float value, MultiGpuConfig* multi_gpu_config) {
 #else
     return value;
 #endif
-}
-
-// Averages out the loss and gradients across all GPUs. No-op when multi-GPU is disabled.
-// todo - this version only works if all the parameters are the same size (floatX)
-void gpt2_multi_gpu_loss_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
-#ifdef MULTI_GPU
-    NVTX_RANGE_FN();
-    // If there's only one process, there is nothing to do
-    if (multi_gpu_config->num_processes == 1) { return; }
-    // Average all losses.
-    model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss, multi_gpu_config) / multi_gpu_config->num_processes;
-#endif
-    cudaCheck(cudaDeviceSynchronize());
 }
 
 // Gets the offset of a specific tensor for a specific layer in the GPT2 model
@@ -992,18 +1019,19 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
                                     max_num_block_sums, is_first_pass, main_stream);
             }
         }
-        global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
-        cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
-        // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
-        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu, multi_gpu_config);
+        global_sum_deterministic(grad_norm_squared, grad_norm_squared, max_num_block_sums, main_stream);
+#if MULTI_GPU
+        // further sum the (partial) squared norm across all GPUs
+        ncclCheck(ncclAllReduce(grad_norm_squared, grad_norm_squared, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, main_stream));
+#endif
     } else {
         // in regular DDP, backward has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
         global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, 0, 1, max_num_block_sums, true, main_stream);
-        global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
-        cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
+        global_sum_deterministic(grad_norm_squared, grad_norm_squared, max_num_block_sums, main_stream);
     }
 
+    cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
     if(!isfinite(grad_norm_squared_cpu)) {
         // may happen due to some issue (e.g. overflow?)
         // TODO: later may want to keep a global counter of instabilities like this
@@ -1115,6 +1143,7 @@ void gpt2_free(GPT2 *model) {
     cudaFreeCheck(&model->acts_memory);
     cudaFreeCheck(&model->inputs);
     cudaFreeCheck(&model->targets);
+    cudaFreeCheck(&model->accumulated_mean_loss);
     cudaCheck(cudaFreeHost(model->cpu_losses));
     cudaCheck(cudaFreeHost(model->cpu_losses_fp32));
     free(model->workload_indices);
@@ -1642,7 +1671,7 @@ int main(int argc, char *argv[]) {
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
                 gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
-                val_loss += model.mean_loss;
+                val_loss += gpt2_validate(&model);
             }
             val_loss /= val_num_batches;
             val_loss = multi_gpu_cpu_float_sum(val_loss, &multi_gpu_config) / multi_gpu_config.num_processes;
@@ -1660,6 +1689,7 @@ int main(int argc, char *argv[]) {
                 if (i % 10 == 0) { printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches); }
                 evalloader_next_batch(&eval_loader);
                 gpt2_forward(&model, eval_loader.inputs, eval_loader.targets, B, T);
+                gpt2_validate(&model);
                 int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses_fp32);
                 eval_acc_norm += (float)correct;
             }
@@ -1742,8 +1772,7 @@ int main(int argc, char *argv[]) {
         // --------------- TRAINING SECTION BEGIN -----------------
         // do one training step, doing forward/backward/update on total_batch_size tokens
         cudaEventRecord(start);
-        // gradient accumulation loop over micro-batches
-        float lossf = 0.0f; // for getting the mean loss over the accumulation steps
+        // gradient and loss accumulation loop over micro-batches
         for (int micro_step = 0; micro_step < grad_accum_steps; micro_step++) {
             // fetch the next data batch
             // and if we're overfitting a single batch, we'll only call this a single time
@@ -1752,16 +1781,10 @@ int main(int argc, char *argv[]) {
                 dataloader_next_batch(&train_loader);
             }
             // forward pass. note that we pass in grad_accum_steps, which scales down the loss
-            gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, grad_accum_steps);
-            lossf += model.mean_loss; // the mean_loss was normalized by grad_accum_steps inside gpt2_forward
+            gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
             // backward pass. all model params accumulate gradients with += inside this inner loop
-            gpt2_backward_and_reduce(&model, train_loader.inputs, micro_step == grad_accum_steps - 1);
+            gpt2_backward_and_reduce(&model, train_loader.inputs, grad_accum_steps, micro_step == grad_accum_steps - 1);
         }
-        // override the mean loss, accounting for the gradient accumulation loop
-        // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
-        model.mean_loss = lossf;
-        // average the loss and the gradients between all processes
-        gpt2_multi_gpu_loss_reduce(&model, &multi_gpu_config);
         // fetch the next learning rate
         float step_learning_rate = get_learning_rate(&lr_scheduler, step);
         // update the model parameters
@@ -1785,10 +1808,9 @@ int main(int argc, char *argv[]) {
             ema_tokens_per_second = 0.95f * ema_tokens_per_second + 0.05f * tokens_per_second;
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
-        float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
         float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
         printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
-                step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
+                step + 1, train_num_batches, model.mean_loss, grad_norm, step_learning_rate,
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss, step_learning_rate, grad_norm);
 
