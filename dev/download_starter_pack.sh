@@ -49,7 +49,6 @@ download_file() {
     curl -s -L -o "$FILE_PATH" "$FILE_URL"
     move_cursor $((ORDER)) 0
     echo "Downloaded $FILE_NAME to $FILE_PATH   "
-    pids+=($!)
 }
 
 # Export the function so it's available in subshells
