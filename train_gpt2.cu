@@ -219,7 +219,7 @@ typedef struct {
     floatX* lnf; // (B, T, C);   if LN recomputation is enabled (-r 2 and above), will be used for _all_ layernorms
     floatX* lnf_mean; // (B, T)
     floatX* lnf_rstd; // (B, T)
-    floatX* losses; // (B, T), will be accumulated in micro-steps
+    float* losses; // (B, T), will be accumulated in micro-steps
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
     floatX* qkvr; // (L, B, T, 3*C)
     // in inference mode, this buffer will store the logits
@@ -373,8 +373,7 @@ typedef struct {
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after the last backward micro-batch, will be populated with mean loss across all GPUs and micro-steps
     float* accumulated_mean_loss; // GPU buffer used to accumulate loss across micro-steps
-    floatX* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
-    float* cpu_losses_fp32; // same but fp32
+    float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
     int use_master_weights; // keep master weights copy in float for optim update? 0|1
     int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
@@ -394,7 +393,6 @@ void gpt2_init_common(GPT2 *model) {
     model->targets = NULL;
     model->accumulated_mean_loss = NULL;
     model->cpu_losses = NULL;
-    model->cpu_losses_fp32 = NULL;
     // the B,T params are determined and set, fixed on first batch in forward()
     model->batch_size = 0;
     model->seq_len = 0;
@@ -629,8 +627,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
         cudaCheck(cudaMalloc(((void**)&model->accumulated_mean_loss), sizeof(float)));
-        cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(floatX)));
-        cudaCheck(cudaMallocHost((void**)&model->cpu_losses_fp32, B * T * sizeof(float)));
+        cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -745,15 +742,13 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
     // fused classifier: does the forward pass and first part of the backward pass
     const float dloss = 1.0f / (B * T); // results in the uniform average loss over all elements
     // note: we don't need to generate dlogits here
-    cudaCheck(cudaMemset(acts.losses, 0, B*T*sizeof(floatX)));
+    cudaCheck(cudaMemset(acts.losses, 0, B*T*sizeof(float)));
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B*T, V); // while the memcpy is underway, validate the targets
     fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, False, main_stream);
-    cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX), cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B*T; i++) {
-        float loss = (float)(model->cpu_losses[i]);
-        model->cpu_losses_fp32[i] = loss;
-        mean_loss += loss;
+        mean_loss += model->cpu_losses[i];
     }
     mean_loss /= B*T;
     cudaCheck(cudaDeviceSynchronize());
@@ -764,7 +759,7 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
 void gpt2_zero_grad(GPT2 *model) {
     NVTX_RANGE_FN();
     // the losses accumulate over the duration of gradient accumulation micro steps, also reset here
-    cudaCheck(cudaMemset(model->acts.losses, 0, model->batch_size * model->seq_len * sizeof(floatX)));
+    cudaCheck(cudaMemset(model->acts.losses, 0, model->batch_size * model->seq_len * sizeof(float)));
     if (model->grads_memory != NULL) {
         cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(floatX)));
     }
@@ -1166,7 +1161,6 @@ void gpt2_free(GPT2 *model) {
     cudaFreeCheck(&model->targets);
     cudaFreeCheck(&model->accumulated_mean_loss);
     cudaCheck(cudaFreeHost(model->cpu_losses));
-    cudaCheck(cudaFreeHost(model->cpu_losses_fp32));
     free(model->workload_indices);
     free(model->bucket_info);
 }
@@ -1722,7 +1716,7 @@ int main(int argc, char *argv[]) {
                 if (i % 10 == 0) { printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches); }
                 evalloader_next_batch(&eval_loader);
                 gpt2_validate(&model, eval_loader.inputs, eval_loader.targets, B, T);
-                int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses_fp32);
+                int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses);
                 eval_acc_norm += (float)correct;
             }
             // careful because not all ranks may have the exact same allocation of number of examples
