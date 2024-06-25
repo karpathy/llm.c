@@ -33,6 +33,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/logger.h"
 // defines: get_flops_promised
 #include "llmc/mfu.h"
+// defines: OutlierDetector, init_detector, update_detector
+#include "llmc/outlier_detector.h"
 // ----------- GPU utilities -----------
 // defines:
 // WARP_SIZE, MAX_1024_THREADS_BLOCKS, CEIL_DIV, cudaCheck, PRECISION_MODE
@@ -1583,6 +1585,10 @@ int main(int argc, char *argv[]) {
         load_state(&step, &model, &train_loader, filename_buffer);
     }
 
+    // init an OutlierDetector the training loss
+    OutlierDetector loss_outlier_detector;
+    init_detector(&loss_outlier_detector);
+
     // train
     cudaEvent_t start, end;
     cudaCheck(cudaEventCreate(&start));
@@ -1729,6 +1735,8 @@ int main(int argc, char *argv[]) {
         model.mean_loss = lossf;
         // average the loss and the gradients between all processes
         gpt2_multi_gpu_loss_reduce(&model, &multi_gpu_config);
+        float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
+        float zloss = (float)(update_detector(&loss_outlier_detector, (double)accumulated_loss)); // loss z-score
         // fetch the next learning rate
         float step_learning_rate = get_learning_rate(&lr_scheduler, step);
         // update the model parameters
@@ -1752,10 +1760,9 @@ int main(int argc, char *argv[]) {
             ema_tokens_per_second = 0.95f * ema_tokens_per_second + 0.05f * tokens_per_second;
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
-        float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
         float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
-        printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
-                step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
+        printf0("step %4d/%d | loss %7.6f (z %+.2f)| norm %6.4f | lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
+                step + 1, train_num_batches, accumulated_loss, zloss, grad_norm, step_learning_rate,
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss, step_learning_rate, grad_norm);
 
