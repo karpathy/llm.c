@@ -13,7 +13,7 @@ reconsider this choice in the future, as the compute cost here is minimal.
 #include <math.h>
 
 // use compile-time constant for window size to avoid dynamic memory allocations
-#define OUTLIER_DETECTOR_WINDOW_SIZE 16
+#define OUTLIER_DETECTOR_WINDOW_SIZE 128
 
 typedef struct {
     double buffer[OUTLIER_DETECTOR_WINDOW_SIZE];
