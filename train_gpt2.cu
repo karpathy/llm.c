@@ -1304,8 +1304,8 @@ void error_usage() {
     fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
     fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
     fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
-    fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes above this in zscore (0.0f=off, default=3.0f)\n");
-    fprintf(stderr, "  -sg <float> outlier stability: skip update if grad_norm goes above this in zscore (0.0f=off, default=3.0f)\n");
+    fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes above this in zscore (0.0f=off)\n");
+    fprintf(stderr, "  -sg <float> outlier stability: skip update if grad_norm goes above this in zscore (0.0f=off)\n");
     // evaluation
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
     fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
