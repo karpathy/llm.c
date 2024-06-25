@@ -74,6 +74,32 @@ extern inline void fclose_check(FILE *fp, const char *file, int line) {
 
 #define fcloseCheck(fp) fclose_check(fp, __FILE__, __LINE__)
 
+extern inline void sclose_check(int sockfd, const char *file, int line) {
+    if (close(sockfd) != 0) {
+        fprintf(stderr, "Error: Failed to close socket at %s:%d\n", file, line);
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        exit(EXIT_FAILURE);
+    }
+}
+
+#define scloseCheck(sockfd) sclose_check(sockfd, __FILE__, __LINE__)
+
+#ifdef _WIN32
+extern inline void closesocket_check(int sockfd, const char *file, int line) {
+    if (closesocket(sockfd) != 0) {
+        fprintf(stderr, "Error: Failed to close socket at %s:%d\n", file, line);
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        exit(EXIT_FAILURE);
+    }
+}
+
+#define closesocketCheck(sockfd) closesocket_check(sockfd, __FILE__, __LINE__)
+#endif
+
 extern inline void fseek_check(FILE *fp, long off, int whence, const char *file, int line) {
     if (fseek(fp, off, whence) != 0) {
         fprintf(stderr, "Error: Failed to seek in file at %s:%d\n", file, line);
