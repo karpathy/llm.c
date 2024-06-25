@@ -23,9 +23,16 @@ FILES=(
     "tiny_shakespeare_val.bin"
 )
 
+move_cursor() {
+    local row=$1
+    local col=$2
+    echo -ne "\033[${row};${col}H"
+}
+
 # Function to download files to the appropriate directory
 download_file() {
     local FILE_NAME=$1
+    local ORDER=$2
     local FILE_URL="${BASE_URL}${FILE_NAME}?download=true"
     local FILE_PATH
 
@@ -37,17 +44,39 @@ download_file() {
     fi
 
     # Download the file
+    move_cursor $((ORDER)) 0
+    echo "Downloading $FILE_NAME..."
     curl -s -L -o "$FILE_PATH" "$FILE_URL"
-    echo "Downloaded $FILE_NAME to $FILE_PATH"
+    move_cursor $((ORDER)) 0
+    echo "Downloaded $FILE_NAME to $FILE_PATH   "
+    pids+=($!)
 }
 
 # Export the function so it's available in subshells
 export -f download_file
 
+# Function to handle SIGINT
+declare -a pids
+cleanup() {
+    for pid in "${pids[@]}"; do
+        pkill -P "$pid" &>/dev/null
+        kill -9 "$pid" &>/dev/null
+    done
+    exit 1
+}
+
+# Function to clear the screen
+clear_screen() {
+    echo -ne "\033[2J"
+}
+
 # Generate download commands
 download_commands=()
+order=1
+clear_screen
 for FILE in "${FILES[@]}"; do
-    download_commands+=("download_file \"$FILE\"")
+    download_commands+=("download_file \"$FILE\" $((order))")
+    order=$((order+1))
 done
 
 # Function to manage parallel jobs in increments of a given size
@@ -55,11 +84,14 @@ run_in_parallel() {
     local batch_size=$1
     shift
     local i=0
+    local q=0
     local command
 
     for command; do
         eval "$command" &
+        pids[$q]=$!
         ((i = (i + 1) % batch_size))
+        q=$((q + 1))
         if [ "$i" -eq 0 ]; then
             wait
         fi
@@ -68,6 +100,9 @@ run_in_parallel() {
     # Wait for any remaining jobs to finish
     wait
 }
+
+trap cleanup SIGINT
+
 
 # Run the download commands in parallel in batches of 2
 run_in_parallel 6 "${download_commands[@]}"
