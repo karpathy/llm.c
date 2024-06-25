@@ -203,22 +203,22 @@ constexpr int NUM_ACTIVATION_TENSORS = 23;
 typedef struct {
     floatX* encoded; // (B, T, C)
     floatX* ln1; // (L, B, T, C)
-    floatX* ln1_mean; // (L, B, T)
-    floatX* ln1_rstd; // (L, B, T)
+    float* ln1_mean; // (L, B, T)
+    float* ln1_rstd; // (L, B, T)
     floatX* atty; // (L, B, T, C)
     floatX* att; // (L, B, NH, T, T) (smaller with cuDNN)
     floatX* attproj; // (L, B, T, C)
     floatX* residual2; // (L, B, T, C)
     floatX* ln2; // (L, B, T, C)
-    floatX* ln2_mean; // (L, B, T)
-    floatX* ln2_rstd; // (L, B, T)
+    float* ln2_mean; // (L, B, T)
+    float* ln2_rstd; // (L, B, T)
     floatX* fch; // (L, B, T, 4*C)
     floatX* fch_gelu; // (L, B, T, 4*C)
     floatX* fcproj; // (L, B, T, C)
     floatX* residual3; // (L, B, T, C)
     floatX* lnf; // (B, T, C);   if LN recomputation is enabled (-r 2 and above), will be used for _all_ layernorms
-    floatX* lnf_mean; // (B, T)
-    floatX* lnf_rstd; // (B, T)
+    float* lnf_mean; // (B, T)
+    float* lnf_rstd; // (B, T)
     float* losses; // (B, T), will be accumulated in micro-steps
     // adding these two compared to the CPU .c code, needed for attention kernel as buffers
     floatX* qkvr; // (L, B, T, 3*C)
@@ -675,8 +675,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_attproj = acts.attproj + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
-        floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
-        floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
+        float* l_ln2_mean = acts.ln2_mean + l * B * T;
+        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
         // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
@@ -707,8 +707,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
-            floatX* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
-            floatX* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
+            float* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
+            float* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
             const floatX* l_ln1b = params.ln1b + (l + 1) * C;
             fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, l_fcproj, l_ln1w, l_ln1b,
@@ -858,14 +858,14 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* dl_fcprojb = grads.fcprojb + l * C;
         // get the pointers of the activations for this layer
         floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
-        floatX* l_ln1_mean = acts.ln1_mean + l * B * T;
-        floatX* l_ln1_rstd = acts.ln1_rstd + l * B * T;
+        float* l_ln1_mean = acts.ln1_mean + l * B * T;
+        float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
-        floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
-        floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
+        float* l_ln2_mean = acts.ln2_mean + l * B * T;
+        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
         floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         // get the pointers of the gradients of the activations for this layer
