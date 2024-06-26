@@ -208,7 +208,7 @@ else
 endif
 
 # Attempt to find and include OpenMPI on the system
-OPENMPI_DIR = /usr/lib/x86_64-linux-gnu/openmpi
+OPENMPI_DIR ?= /usr/lib/x86_64-linux-gnu/openmpi
 OPENMPI_LIB_PATH = $(OPENMPI_DIR)/lib/
 OPENMPI_INCLUDE_PATH = $(OPENMPI_DIR)/include/
 ifeq ($(NO_USE_MPI), 1)
