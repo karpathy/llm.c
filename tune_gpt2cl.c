@@ -89,6 +89,12 @@ int main(int argc, char *argv[]) {
     int do_preload_lst[] = {0, 1};
     int use_mad_lst[] = {0, 1};
 
+    int len_tile_size_lst = sizeof(tile_size_lst)/sizeof(tile_size_lst[0]);
+    int len_lmp_size_lst = sizeof(lmp_size_lst)/sizeof(lmp_size_lst[0]);
+    int len_vload_size_lst = sizeof(vload_size_lst)/sizeof(vload_size_lst[0]);
+    int len_do_preload_lst = sizeof(do_preload_lst)/sizeof(do_preload_lst[0]);
+    int len_use_mad_lst = sizeof(use_mad_lst)/sizeof(use_mad_lst[0]);
+
     double best_time_taken = 1e10;
     int best_tile_size = 0;
     int best_lmp_size = 0;
@@ -96,34 +102,37 @@ int main(int argc, char *argv[]) {
     int best_do_preload = 0;
     int best_use_mad = 0;
 
-    for(int ti=0; ti<sizeof(tile_size_lst)/sizeof(tile_size_lst[0]); ti++) {
+    int total_count = len_tile_size_lst * len_lmp_size_lst * len_vload_size_lst * len_do_preload_lst * len_use_mad_lst;
+    int count = 0;
+
+    for(int ti=0; ti<len_tile_size_lst; ti++) {
         int tile_size = tile_size_lst[ti];
         snprintf(str, sizeof(str), "%d", tile_size);
         setenv("MATMUL_TILE_SIZE", str, 1);
 
-        for(int lmpi=0; lmpi<sizeof(lmp_size_lst)/sizeof(lmp_size_lst[0]); lmpi++) {
+        for(int lmpi=0; lmpi<len_lmp_size_lst; lmpi++) {
             int lmp_size = lmp_size_lst[lmpi];
             snprintf(str, sizeof(str), "%d", lmp_size);
             setenv("MATMUL_LOCAL_MEM_PADDING_SIZE", str, 1);
 
-            for(int vli=0; vli<sizeof(vload_size_lst)/sizeof(vload_size_lst[0]); vli++) {
+            for(int vli=0; vli<len_vload_size_lst; vli++) {
                 int vload_size = vload_size_lst[vli];
                 snprintf(str, sizeof(str), "%d", vload_size);
                 setenv("MATMUL_VLOAD_SIZE", str, 1);
 
-                for(int dpli=0; dpli<sizeof(do_preload_lst)/sizeof(do_preload_lst[0]); dpli++) {
+                for(int dpli=0; dpli<len_do_preload_lst; dpli++) {
                     int do_preload = do_preload_lst[dpli];
                     snprintf(str, sizeof(str), "%d", do_preload);
                     setenv("MATMUL_DO_PRELOAD", str, 1);
 
-                    for(int umadi=0; umadi<sizeof(use_mad_lst)/sizeof(use_mad_lst[0]); umadi++) {
+                    for(int umadi=0; umadi<len_use_mad_lst; umadi++) {
                         int use_mad = use_mad_lst[umadi];
                         snprintf(str, sizeof(str), "%d", use_mad);
                         setenv("MATMUL_USE_MAD", str, 1);
 
                         printf("MATMUL_TILE_SIZE=%d MATMUL_LOCAL_MEM_PADDING_SIZE=%d MATMUL_VLOAD_SIZE=%d MATMUL_DO_PRELOAD=%d MATMUL_USE_MAD=%d\n",
                                 tile_size, lmp_size, vload_size, do_preload, use_mad);
-                        printf("---------------------------------------------\n");
+                        printf("--------------------------------------------- (%d/%d)\n", count+1, total_count);
 
                         int ret = do_run(&time_taken);
                         if (ret == 0) {
@@ -141,6 +150,7 @@ int main(int argc, char *argv[]) {
                             printf("skipping\n");
                         }
                         printf("---------------------------------------------\n");
+                        count++;
                     }
                 }
             }
