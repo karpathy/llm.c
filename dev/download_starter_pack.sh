@@ -46,8 +46,7 @@ get_cursor_position() {
     cursor_col=$((${pos[1]}))
 }
 
-get_cursor_position
-# Allocate space in the terminal
+# Allocate space in the terminal for the messages
 cursor_start_pos=0
 for file in "${FILES[@]}"; do
   echo ""
@@ -134,4 +133,5 @@ get_cursor_position
 # Run the download commands in parallel in batches of 2
 run_in_parallel 6 "${download_commands[@]}"
 
+move_cursor $((files_to_download+cursor_start_pos)) 0
 echo "All files downloaded and saved in their respective directories"
