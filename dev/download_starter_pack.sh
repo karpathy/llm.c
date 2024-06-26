@@ -23,6 +23,18 @@ FILES=(
     "tiny_shakespeare_val.bin"
 )
 
+# Sanity check
+REQUIREMENTS=(
+    "curl"
+)
+for requirement in ${REQUIREMENTS[@]}; do
+  if ! command -v "$requirement" &> /dev/null
+  then
+      echo "Error: \"$requirement\" is required but not installed or not found in your PATH. Please install it and try again."
+      exit 1
+  fi
+done
+
 # Function to get the current cursor position
 cursor_row=0
 cursor_col=0
