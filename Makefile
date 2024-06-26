@@ -215,7 +215,6 @@ else ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && [ -d /usr/li
   NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
   NVCC_LDLIBS += -lmpi
   NVCC_FLAGS += -DUSE_MPI
-  NVCC_FLAGS += -DMULTI_GPU
 else
   $(info ✗ MPI not found)
 endif
