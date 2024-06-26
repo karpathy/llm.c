@@ -15,6 +15,8 @@
 // implementation of dirent for Windows is in dev/unistd.h
 #ifndef _WIN32
 #include <dirent.h>
+#else
+#include <winsock2.h>
 #endif
 
 // ----------------------------------------------------------------------------
