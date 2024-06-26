@@ -53,6 +53,7 @@ struct Parameter {
     grad_ = nullptr;
   }
 
+  size_t size() const { return length_; }
   float* data() const { return value_.get(); }
   float* grad() const { return grad_.get(); }
 
@@ -232,6 +233,13 @@ struct Linear {
     return num_parameters;
   }
 
+  void Parameters(std::vector<Parameter*>* parameters) const {
+    parameters->push_back(weight_.get());
+    if (has_bias_) {
+      parameters->push_back(bias_.get());
+    }
+  }
+
   bool has_bias_;
   int in_features_;
   int out_features_;
@@ -274,6 +282,10 @@ struct Embedding {
   }
 
   size_t NumParameters() const { return num_embeddings_ * embedding_dim_; }
+
+  void Parameters(std::vector<Parameter*>* parameters) const {
+    parameters->push_back(weight_.get());
+  }
 
   int num_embeddings_;
   int embedding_dim_;
@@ -389,6 +401,11 @@ struct LayerNorm {
   }
 
   size_t NumParameters() const { return normalized_shape_ * 2; }
+
+  void Parameters(std::vector<Parameter*>* parameters) const {
+    parameters->push_back(weight_.get());
+    parameters->push_back(bias_.get());
+  }
 
   int normalized_shape_;
   float eps_;

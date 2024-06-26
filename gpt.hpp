@@ -81,14 +81,10 @@ struct MLP {
     CHECK_EQ(x.cols(), x_grad.cols());
 
     // Lazily allocate the memory for activation
-    if (fch_grad_.size() == 0) {
-      fch_grad_ = nn::Matrix::Zero(x.rows(), 4 * n_embed_);
-    }
-    if (fch_gelu_grad_.size() == 0) {
-      fch_gelu_grad_ = nn::Matrix::Zero(x.rows(), 4 * n_embed_);
-    }
-    CHECK_EQ(x.rows(), fch_grad_.rows());
-    CHECK_EQ(x.rows(), fch_gelu_grad_.rows());
+    LAZY_ALLOCATE_MATRIX(fch_grad_, x.rows(), 4 * n_embed_);
+    LAZY_ALLOCATE_MATRIX(fch_gelu_grad_, x.rows(), 4 * n_embed_);
+    fch_grad_.setZero();
+    fch_gelu_grad_.setZero();
 
     Eigen::Map<nn::Matrix> fch_gelu = nn::GetMatrixMap(fch_gelu_);
     Eigen::Map<nn::Matrix> fch_gelu_grad = nn::GetMatrixMap(fch_gelu_grad_);
@@ -103,6 +99,11 @@ struct MLP {
 
   size_t NumParameters() const {
     return c_fc_->NumParameters() + c_proj_->NumParameters();
+  }
+
+  void Parameters(std::vector<nn::Parameter*>* parameters) const {
+    c_fc_->Parameters(parameters);
+    c_proj_->Parameters(parameters);
   }
 
   int n_embed_;
@@ -238,6 +239,14 @@ struct CausalSelfAttention {
     LAZY_ALLOCATE_TENSOR4D(preatt_softmax_grad_, B, NH, T, T);
     LAZY_ALLOCATE_TENSOR4D(att_grad_, B, NH, T, HS);
     LAZY_ALLOCATE_TENSOR4D(att2_grad_, B, T, NH, HS);
+    qkv_grad_.setZero();
+    q_grad_.setZero();
+    k_grad_.setZero();
+    v_grad_.setZero();
+    preatt_grad_.setZero();
+    preatt_softmax_grad_.setZero();
+    att_grad_.setZero();
+    att2_grad_.setZero();
 
     // attproj backward
     auto att2_2d = Eigen::Map<nn::Matrix>(att2_.data(), B * T, C);
@@ -321,6 +330,11 @@ struct CausalSelfAttention {
 
   size_t NumParameters() const {
     return c_attn_->NumParameters() + c_proj_->NumParameters();
+  }
+
+  void Parameters(std::vector<nn::Parameter*>* parameters) const {
+    c_attn_->Parameters(parameters);
+    c_proj_->Parameters(parameters);
   }
 
   int n_head_;
@@ -422,6 +436,11 @@ struct Block {
     LAZY_ALLOCATE_TENSOR3D(residual1_grad_, B, T, C);
     LAZY_ALLOCATE_MATRIX(ln2_y_grad_, B * T, C);
     LAZY_ALLOCATE_TENSOR3D(mlp_y_grad_, B, T, C);
+    ln1_y_grad_.setZero();
+    att_y_grad_.setZero();
+    residual1_grad_.setZero();
+    ln2_y_grad_.setZero();
+    mlp_y_grad_.setZero();
 
     // backward residual
     nn::Residual::Backward(y_grad, absl::MakeSpan(residual1_grad_),
@@ -469,6 +488,13 @@ struct Block {
   size_t NumParameters() const {
     return ln1_->NumParameters() + attn_->NumParameters() +
            ln2_->NumParameters() + mlp_->NumParameters();
+  }
+
+  void Parameters(std::vector<nn::Parameter*>* parameters) const {
+    ln1_->Parameters(parameters);
+    attn_->Parameters(parameters);
+    ln2_->Parameters(parameters);
+    mlp_->Parameters(parameters);
   }
 
   std::unique_ptr<nn::LayerNorm> ln1_;
@@ -548,9 +574,7 @@ struct GPT {
         << "B: " << B << ", T: " << T << ", vocab_size: " << vocab_size_;
     DoForward(idx);
 
-    if (probs_.size() < BT * vocab_size_) {
-      probs_.resize(BT * vocab_size_);
-    }
+    LAZY_ALLOCATE_MATRIX(probs_, BT, vocab_size_);
 
     auto lnf_y = Eigen::Map<nn::Matrix>(lnf_y_.data(), BT, C);
     auto lm_head = Eigen::Map<nn::Matrix>(lm_head_, vocab_size_, n_embed_);
@@ -571,23 +595,20 @@ struct GPT {
     const int LBTC = L * BTC;
     CHECK(targets.rows() == B && targets.cols() == T);
 
-    LAZY_ALLOCATE_MATRIX(logits_grad_, BT, vocab_size_);
-    if (lnf_y_grad_.size() < BTC) {
-      lnf_y_grad_.resize(BTC);
-    }
     wte_->weight_->AllocateGradient();
     if (lm_head_grad_ == nullptr) {
       lm_head_grad_ = wte_->weight_->grad();
     }
-    if (block_y_grad_.size() < LBTC) {
-      block_y_grad_.resize(LBTC);
-    }
-    if (tok_emb_grad_.size() < BTC) {
-      tok_emb_grad_.resize(BTC);
-    }
-    if (pos_emb_grad_.size() < TC) {
-      pos_emb_grad_.resize(TC);
-    }
+    LAZY_ALLOCATE_TENSOR3D(tok_emb_grad_, B, T, C);
+    LAZY_ALLOCATE_MATRIX(pos_emb_grad_, T, C);
+    LAZY_ALLOCATE_TENSOR4D(block_y_grad_, L, B, T, C);
+    LAZY_ALLOCATE_MATRIX(lnf_y_grad_, BT, C);
+    LAZY_ALLOCATE_MATRIX(logits_grad_, BT, vocab_size_);
+    tok_emb_grad_.setZero();
+    pos_emb_grad_.setZero();
+    block_y_grad_.setZero();
+    lnf_y_grad_.setZero();
+    logits_grad_.setZero();
 
     // backward cross entropy
     auto probs_2d = Eigen::Map<nn::Matrix>(probs_.data(), BT, vocab_size_);
@@ -654,6 +675,15 @@ struct GPT {
     return num_parameters;
   }
 
+  void Parameters(std::vector<nn::Parameter*>* parameters) const {
+    wte_->Parameters(parameters);
+    wpe_->Parameters(parameters);
+    for (const auto& b : h_) {
+      b->Parameters(parameters);
+    }
+    lnf_->Parameters(parameters);
+  }
+
  private:
   void DoForward(const Eigen::Map<nn::MatrixInt>& idx) {
     const int B = idx.rows(), T = idx.cols(), C = n_embed_, L = n_layer_;
@@ -667,24 +697,12 @@ struct GPT {
     std::iota(pos.begin(), pos.end(), 0);
 
     // Lazily allocate memory
-    if (tok_emb_.size() < BTC) {
-      tok_emb_.resize(BTC);
-    }
-    if (pos_emb_.size() < TC) {
-      pos_emb_.resize(TC);
-    }
-    if (block_y_.size() < LBTC) {
-      block_y_.resize(LBTC);
-    }
-    if (lnf_y_.size() < BTC) {
-      lnf_y_.resize(BTC);
-    }
-    if (lnf_mean_.size() < BT) {
-      lnf_mean_.resize(BT);
-    }
-    if (lnf_rstd_.size() < BT) {
-      lnf_rstd_.resize(BT);
-    }
+    LAZY_ALLOCATE_TENSOR3D(tok_emb_, B, T, C);
+    LAZY_ALLOCATE_MATRIX(pos_emb_, T, C);
+    LAZY_ALLOCATE_TENSOR4D(block_y_, L, B, T, C);
+    LAZY_ALLOCATE_MATRIX(lnf_y_, BT, C);
+    LAZY_ALLOCATE_VECTOR(lnf_mean_, BT);
+    LAZY_ALLOCATE_VECTOR(lnf_rstd_, BT);
 
     wte_->Forward(idx, absl::MakeSpan(tok_emb_));
     wpe_->Forward(pos, absl::MakeSpan(pos_emb_));
@@ -729,13 +747,13 @@ struct GPT {
   float *lm_head_, *lm_head_grad_;  // [vocal_size, C]
 
   // activation tensors and gradients
-  std::vector<float> tok_emb_, tok_emb_grad_;  // [B, T, C]
-  std::vector<float> pos_emb_, pos_emb_grad_;  // [T, C]
-  std::vector<float> block_y_, block_y_grad_;  // [L, B, T, C]
-  std::vector<float> lnf_y_, lnf_y_grad_;      // [B*T, C]
-  std::vector<float> lnf_mean_, lnf_rstd_;     // [B*T]
-  std::vector<float> probs_;                   // [B*T, vocab_size]
-  nn::Matrix logits_grad_;                     // [B*T, vocab_size]
+  nn::Tensor3D tok_emb_, tok_emb_grad_;     // [B, T, C]
+  nn::Matrix pos_emb_, pos_emb_grad_;       // [T, C]
+  nn::Tensor4D block_y_, block_y_grad_;     // [L, B, T, C]
+  nn::Matrix lnf_y_, lnf_y_grad_;           // [B*T, C]
+  Eigen::RowVectorXf lnf_mean_, lnf_rstd_;  // [B*T]
+  nn::Matrix probs_;                        // [B*T, vocab_size]
+  nn::Matrix logits_grad_;                  // [B*T, vocab_size]
 };
 
 }  // namespace gpt
