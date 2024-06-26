@@ -65,11 +65,11 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
 // will _update_ logits to logit gradients
 // uses template to decide whether to write logits and probs
 // split both loops in "multiple-of-x128-size" and "bounds-checked remainder" parts
-template <bool WriteLogits = true, bool WriteProbs = false>
+template <bool WriteDLogits = true, bool WriteProbs = false>
 __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     fused_classifier_kernel5(floatX* logits, floatX* losses, floatX* probs,
                                 const float dloss, const int* targets,
-                                int B, int T, int V, int P) {
+                                int B, int T, int V, int P, std::bool_constant<WriteDLogits>) {
     // note: idx is small enough that it easily fits into 32 bit;
     // by making it a long here, we ensure that any offsets calculated with it (e.g., idx * P)
     // are done is 64 bit
@@ -82,7 +82,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     // calculate the probability needed for the loss and update (single-threaded)
     if(threadIdx.x == 0) {
         float prob = expf((float)logits[idx * P + ix] - sp.Offset) * sp.Scale;
-        losses[idx] = (floatX)(-logf(prob));
+        losses[idx] = (floatX)((float)losses[idx] - logf(prob));
     }
 
     // without this synchronization point we have a race condition:
@@ -106,7 +106,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
             float indicator = (element == ix) ? 1.0f : 0.0f;
             packed_logits_vec[k] = (floatX)((prob - indicator) * dloss);
         }
-        if (WriteLogits){
+        if (WriteDLogits){
             // reduce cache persistence for the overwritten logits
             // to maximise probability that logits remain in cache between prepare_softmax and here
             store128cs(logits + idx * P + i * x128::size, packed_logits_vec);
@@ -123,7 +123,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
         float prob = expf((float)logits_vec[i] - sp.Offset) * sp.Scale;
         float indicator = (i == ix) ? 1.0f : 0.0f;
         float dlogit = (prob - indicator) * dloss;
-        if (WriteLogits){
+        if (WriteDLogits){
             __stcs(logits + idx * P + i, (floatX)dlogit);
         }
         if (WriteProbs) {
@@ -136,14 +136,14 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
 // kernel launchers
 
 // replaces logits with logit gradients
-template <typename Type>
+template <typename Type, bool WriteDLogits>
 void fused_classifier(Type* logits, Type* losses,
                       const float dloss, const int* targets,
-                      int B, int T, int V, int P, cudaStream_t stream) {
+                      int B, int T, int V, int P, std::bool_constant<WriteDLogits> write_dlogits, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = N;
-    fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
+    fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P, write_dlogits);
     cudaCheck(cudaGetLastError());
 }
