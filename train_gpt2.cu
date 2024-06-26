@@ -234,10 +234,13 @@ typedef struct {
     floatX* scratch_btc;    // (B, T, C)
 } ActivationTensors;
 
+// enumerator to indentify the datatype of a tensor.
 enum class DType : uint8_t {
     FP32, FP16, BF16
 };
 
+// Given a datatype enum, returns the underlying number of bytes
+// for a scalar of that type
 size_t sizeof_dtype(DType type) {
     switch (type) {
         case DType::FP32:
@@ -249,14 +252,25 @@ size_t sizeof_dtype(DType type) {
     }
 }
 
+// Translating from types to the corresponding data type enum.
+// Technically, we are defining variable templates, i.e., variables
+// where there is one instance for each argument type.
+// The better way to think of this might be that dtype_of is a function,
+// but because you cannot pass types as arguments, your "function call"
+// uses angle brackets, i.e., it looks like dtype_of<float> instead of dtype_of(float).
+
+// declare the base template, but don't define it.
+// only types that explicitly opt-in below are supported
 template<class T>
 DType dtype_of;
+
+// explicitly specify the enum value for each data type.
 template<>
-DType dtype_of<float> = DType::FP32;
+constexpr const DType dtype_of<float> = DType::FP32;
 template<>
-DType dtype_of<half> = DType::FP16;
+constexpr const DType dtype_of<half> = DType::FP16;
 template<>
-DType dtype_of<nv_bfloat16> = DType::BF16;
+constexpr const DType dtype_of<nv_bfloat16> = DType::BF16;
 
 void fill_in_activation_sizes(size_t* act_sizes, DType* act_dtypes, size_t B, size_t T, GPT2Config config, int recompute) {
     size_t Vp = config.padded_vocab_size;
