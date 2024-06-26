@@ -300,16 +300,17 @@ void evalloader_reset(EvalLoader *loader) {
     // For example if there are N examples in the file and 4 processes,
     // then process 0 should start at 0, process 1 at N/4, process 2 at N/2, etc.
     // determine how much work there is for all processes
-    int examples_per_process = CEIL_DIV(loader->num_examples, loader->num_processes);
-    int can_fit_examples = loader->B / ASSUMED_NUM_COMPLETIONS;
-    loader->num_batches = CEIL_DIV(examples_per_process, can_fit_examples);
+    int examples_per_process = loader->num_examples / loader->num_processes;
     // determine the start and end example indices for this process
     loader->start_example_index = examples_per_process * loader->process_rank;
     loader->end_example_index = examples_per_process * (loader->process_rank + 1);
-    // crop the end example index to the total number of examples
-    if (loader->end_example_index > loader->num_examples) {
+    // extend the end example index to the total number of examples
+    if (loader->process_rank == loader->num_processes - 1) {
         loader->end_example_index = loader->num_examples;
+        examples_per_process = loader->end_example_index - loader->start_example_index;
     }
+    int can_fit_examples = loader->B / ASSUMED_NUM_COMPLETIONS;
+    loader->num_batches = CEIL_DIV(examples_per_process, can_fit_examples);
     // now seek through the file to the start of that example
     // utilize <EXAMPLE_BYTES> for efficiency
     int64_t header_bytes = HEADER_SIZE * sizeof(int);
