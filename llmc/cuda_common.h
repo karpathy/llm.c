@@ -8,6 +8,7 @@ Common utilities for CUDA code.
 #include <stdio.h>
 #include <math.h>
 #include <string>
+#include <type_traits>      // std::bool_constant
 #include <cuda_runtime.h>
 #include <nvtx3/nvToolsExt.h>
 #include <nvtx3/nvToolsExtCudaRt.h>
@@ -39,6 +40,10 @@ extern cudaDeviceProp deviceProp;
 
 // convenience macro for calculating grid/block dimensions for kernels
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+
+// short-cuts for compile-time boolean values that can be used as function arguments
+constexpr std::bool_constant<true> True;
+constexpr std::bool_constant<true> False;
 
 // ----------------------------------------------------------------------------
 // Error checking
