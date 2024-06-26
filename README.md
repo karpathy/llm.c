@@ -8,6 +8,56 @@ The best introduction to the llm.c repo today is reproducing the GPT-2 (124M) mo
 
 debugging tip: when you run the `make` command to build the binary, modify it by replacing `-O3` with `-g` so you can step through the code in your favorite IDE (e.g. vscode).
 
+## quick start (OpenCL, 1 GPU, fp32 only)
+
+This port is a reference implementation using OpenCL. Only matmul routine is ported to OpenCL for now. The kernels have some tuneable parameters, and the default values won't perform well on most devices. So, a separate tuner is implemented which finds the most efficient kernel parameters for your device.
+
+```bash
+pip install -r requirements.txt
+python dev/data/tinyshakespeare.py
+python train_gpt2.py
+make train_gpt2cl
+./train_gpt2cl
+```
+
+Check the correctness of the kernels by running the unit tests:
+
+```bash
+make test_gpt2cl
+./test_gpt2cl
+```
+
+All the executables accept parameters via environment variables.
+
+* CL_PLATFORM_IDX - Select the OpenCL platform index. Default is 0.
+* CL_DEVICE_IDX - Select the OpenCL device index. Default is 0.
+
+Tuneable prameters:
+
+* MATMUL_TILE_SIZE - The tile size for the matmul kernel.
+* MATMUL_LOCAL_MEM_PADDING_SIZE - The local memory padding size for the matmul kernel.
+* MATMUL_VLOAD_SIZE - The vload size for the matmul kernel.
+* MATMUL_DO_PRELOAD - Set it to 1 to enable preload.
+* MATMUL_USE_MAD - Set it to 1 to use mad instruction.
+
+### Tuner
+Tuner goes through a combination of above parameters and finds the best combination for the device. It takes a while to run.
+
+```bash
+make tune_gpt2cl
+./tune_gpt2cl
+```
+
+Prints out the best combination of parameters for the device, for example:
+
+```MATMUL_TILE_SIZE=16 MATMUL_LOCAL_MEM_PADDING_SIZE=1 MATMUL_VLOAD_SIZE=8 MATMUL_DO_PRELOAD=1 MATMUL_USE_MAD=1```
+
+It can be used to launch the subsequent run:
+
+```bash
+MATMUL_TILE_SIZE=16 MATMUL_LOCAL_MEM_PADDING_SIZE=1 MATMUL_VLOAD_SIZE=8 MATMUL_DO_PRELOAD=1 MATMUL_USE_MAD=1 ./train_gpt2cl
+```
+
 ## quick start (1 GPU, fp32 only)
 
 If you won't be training on multiple nodes, aren't interested in mixed precision, and are interested in learning CUDA, the fp32 (legacy) files might be of interest to you. These are files that were "checkpointed" early in the history of llm.c and frozen in time. They are simpler, more portable, and possibly easier to understand. Run the 1 GPU, fp32 code like this:
