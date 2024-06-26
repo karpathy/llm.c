@@ -23,6 +23,38 @@ FILES=(
     "tiny_shakespeare_val.bin"
 )
 
+# Function to get the current cursor position
+cursor_row=0
+cursor_col=0
+files_to_download=${#FILES[@]}
+get_cursor_position() {
+    local pos
+    # Send escape sequence to get the cursor position
+    exec < /dev/tty
+    oldstty=$(stty -g)
+    stty raw -echo min 0
+    echo -en "\033[6n" > /dev/tty
+
+    # Read the response
+    IFS=';' read -r -d R -a pos
+
+    # Restore terminal settings
+    stty $oldstty
+
+    # Extract row and column
+    cursor_row=$((${pos[0]:2}))
+    cursor_col=$((${pos[1]}))
+}
+
+get_cursor_position
+# Allocate space in the terminal
+cursor_start_pos=0
+for file in "${FILES[@]}"; do
+  echo ""
+  get_cursor_position
+done
+cursor_start_pos=$cursor_row
+
 move_cursor() {
     local row=$1
     local col=$2
@@ -44,10 +76,10 @@ download_file() {
     fi
 
     # Download the file
-    move_cursor $((ORDER)) 0
+    move_cursor $((ORDER+cursor_start_pos-files_to_download-1)) 0
     echo "Downloading $FILE_NAME..."
     curl -s -L -o "$FILE_PATH" "$FILE_URL"
-    move_cursor $((ORDER)) 0
+    move_cursor $((ORDER+cursor_start_pos-files_to_download-1)) 0
     echo "Downloaded $FILE_NAME to $FILE_PATH   "
 }
 
@@ -64,15 +96,9 @@ cleanup() {
     exit 1
 }
 
-# Function to clear the screen
-clear_screen() {
-    echo -ne "\033[2J"
-}
-
 # Generate download commands
 download_commands=()
 order=1
-clear_screen
 for FILE in "${FILES[@]}"; do
     download_commands+=("download_file \"$FILE\" $((order))")
     order=$((order+1))
@@ -102,6 +128,8 @@ run_in_parallel() {
 
 trap cleanup SIGINT
 
+# Get the starting cursor row position
+get_cursor_position
 
 # Run the download commands in parallel in batches of 2
 run_in_parallel 6 "${download_commands[@]}"
