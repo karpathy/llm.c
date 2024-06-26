@@ -5,12 +5,6 @@ Utilities for ZeRO sharding
 #ifndef LLMC_ZERO_CUH
 #define LLMC_ZERO_CUH
 
-#ifdef _WIN32
-#include <winsock2.h>
-#else
-#include <arpa/inet.h>
-#endif
-
 #include <cuda_runtime_api.h>
 #include <stdint.h>
 #include <stdlib.h>
