@@ -23,6 +23,12 @@ FILES=(
     "tiny_shakespeare_val.bin"
 )
 
+# Some colors
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+
 # Sanity check
 REQUIREMENTS=(
     "curl"
@@ -30,7 +36,7 @@ REQUIREMENTS=(
 for requirement in ${REQUIREMENTS[@]}; do
   if ! command -v "$requirement" &> /dev/null
   then
-      echo "Error: \"$requirement\" is required but not installed or not found in your PATH. Please install it and try again."
+      echo -e "${RED}Error: \"$requirement\" is required but not installed or not found in your PATH. Please install it and try again.${NC}"
       exit 1
   fi
 done
@@ -59,12 +65,12 @@ get_cursor_position() {
 }
 
 # Allocate space in the terminal for the messages
-cursor_start_pos=0
+cursor_bottom_row=0
 for file in "${FILES[@]}"; do
   echo ""
   get_cursor_position
 done
-cursor_start_pos=$cursor_row
+cursor_bottom_row=$cursor_row
 
 move_cursor() {
     local row=$1
@@ -87,11 +93,15 @@ download_file() {
     fi
 
     # Download the file
-    move_cursor $((ORDER+cursor_start_pos-files_to_download-1)) 0
-    echo "Downloading $FILE_NAME..."
-    curl -s -L -o "$FILE_PATH" "$FILE_URL"
-    move_cursor $((ORDER+cursor_start_pos-files_to_download-1)) 0
-    echo "Downloaded $FILE_NAME to $FILE_PATH   "
+    move_cursor $((ORDER+cursor_bottom_row-files_to_download-1)) 0
+    echo -e "${YELLOW}Downloading $FILE_NAME...${NC}"
+    if curl -s -L -o "$FILE_PATH" "$FILE_URL"; then
+        move_cursor $((ORDER+cursor_bottom_row-files_to_download-1)) 0
+        echo -e "${GREEN}Downloaded $FILE_NAME to $FILE_PATH${NC}   "
+    else
+        move_cursor $((ORDER+cursor_bottom_row-files_to_download-1)) 0
+        echo -e "${RED}Failed to download $FILE_NAME${NC}   "
+    fi
 }
 
 # Export the function so it's available in subshells
@@ -100,6 +110,7 @@ export -f download_file
 # Function to handle SIGINT
 declare -a pids
 cleanup() {
+    echo -e "${RED}Caught SIGINT signal! Terminating background processes...${NC}"
     for pid in "${pids[@]}"; do
         pkill -P "$pid" &>/dev/null
         kill -9 "$pid" &>/dev/null
@@ -145,5 +156,5 @@ get_cursor_position
 # Run the download commands in parallel in batches of 2
 run_in_parallel 6 "${download_commands[@]}"
 
-move_cursor $((files_to_download+cursor_start_pos)) 0
+move_cursor $((cursor_bottom_row)) 0
 echo "All files downloaded and saved in their respective directories"
