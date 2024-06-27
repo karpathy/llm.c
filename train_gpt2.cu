@@ -9,6 +9,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <string_view>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <pthread.h>
 // ----------- CPU utilities -----------
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 // defines: create_dir_if_not_exists, find_max_step
@@ -70,6 +71,23 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // ----------------------------------------------------------------------------
 // global vars for I/O
 char filename_buffer[512];
+pthread_t writer_threads[2] = {0};
+int writer_threads_started = 0;
+
+typedef struct {
+    char* buffer;
+    size_t size;
+    FILE* file;
+} FileWriteTask;
+
+void* file_write_async(void* arg) {
+    FileWriteTask* task = (FileWriteTask*)arg;
+    fwriteCheck(task->buffer, 1, task->size, task->file);
+    fcloseCheck(task->file);
+    cudaCheck(cudaFreeHost(task->buffer));
+    free(task);
+    return NULL;
+}
 
 // ----------------------------------------------------------------------------
 // global vars containing information about the GPU this process is running on
