@@ -183,6 +183,9 @@ auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
                             .set_uid(Attn_scale_UID)
                             .set_data_type(fe::DataType_t::FLOAT));
     auto sdpa_backward_options = fe::graph::SDPA_backward_attributes().set_name("flash_attention_backward")
+#if CUDNN_FRONTEND_MAJOR_VERSION > 1 || CUDNN_FRONTEND_MINOR_VERSION >= 5
+                            .set_deterministic_algorithm(true) // 1.5+ needs this for determinism
+#endif
                             .set_causal_mask(true)
                             .set_attn_scale(attn_scale);
 
