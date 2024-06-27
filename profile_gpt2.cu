@@ -59,10 +59,12 @@ int main(int argc, char *argv[]) {
     set_zero_configs(&multi_gpu_config, 0, model.num_parameters);
 
     // do a training step
-    gpt2_forward(&model, x, y, B, T);
+    gpt2_forward(&model, x, B, T);
     gpt2_zero_grad(&model);
-    gpt2_backward_and_reduce(&model, x, true);
-    gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, 1.f, 1, &multi_gpu_config);
+    gpt2_backward_and_reduce(&model, x, y, 1, true);
+    float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
+    float grad_scale = (grad_norm > 1.0f) ? 1.0f / grad_norm : 1.0f;
+    gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, grad_scale, 1, &multi_gpu_config);
     cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
 
     // free

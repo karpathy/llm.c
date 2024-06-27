@@ -167,7 +167,7 @@ int main(int argc, char *argv[]) {
     int allok = 1;
 
     // First, do target-free forward pass to validate logits
-    gpt2_forward(&model, x, NULL, B, T);
+    gpt2_forward(&model, x, B, T);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
     floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
@@ -216,9 +216,9 @@ int main(int argc, char *argv[]) {
     for (int step = 0; step < 10; step++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
-        gpt2_forward(&model, x, y, B, T);
+        gpt2_forward(&model, x, B, T);
         gpt2_zero_grad(&model);
-        gpt2_backward_and_reduce(&model, x, true);
+        gpt2_backward_and_reduce(&model, x, y, 1, true);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
@@ -289,7 +289,9 @@ int main(int argc, char *argv[]) {
             allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", grad_thresholds[15]);
         }
 
-        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+1, &multi_gpu_config);
+        float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
+        float grad_scale = (grad_norm > 1.0f) ? 1.0f / grad_norm : 1.0f;
+        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, grad_scale, step+1, &multi_gpu_config);
 
         // print the timing information at the end
         printf("step %d: loss %f (took %f ms)\n", step+1, model.mean_loss, time_elapsed_s * 1000);
@@ -332,9 +334,9 @@ int main(int argc, char *argv[]) {
     int tokens[10];
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
-        gpt2_forward(&model, loader.inputs, loader.targets, B, T);
+        gpt2_forward(&model, loader.inputs, B, T);
         gpt2_zero_grad(&model);
-        gpt2_backward_and_reduce(&model, loader.inputs, true);
+        gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, true);
         gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
         losses[step] = model.mean_loss;
         tokens[step] = loader.inputs[0];
@@ -347,9 +349,9 @@ int main(int argc, char *argv[]) {
     load_state(&ld_step, &model, &loader, "test_gpt2cu_state.ckpt");
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
-        gpt2_forward(&model, loader.inputs, loader.targets, B, T);
+        gpt2_forward(&model, loader.inputs, B, T);
         gpt2_zero_grad(&model);
-        gpt2_backward_and_reduce(&model, loader.inputs, true);
+        gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, true);
         gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
 
         if(loader.inputs[0] != tokens[step]) {

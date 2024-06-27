@@ -198,6 +198,7 @@ else
       $(info ✗ Multi-GPU on CUDA on Darwin is not supported, skipping NCCL support)
     else ifeq ($(shell dpkg -l | grep -q nccl && echo "exists"), exists)
       $(info ✓ NCCL found, OK to train with multiple GPUs)
+      NVCC_FLAGS += -DMULTI_GPU
       NVCC_LDLIBS += -lnccl
     else
       $(info ✗ NCCL is not found, disabling multi-GPU support)
@@ -206,15 +207,18 @@ else
   endif
 endif
 
+# Attempt to find and include OpenMPI on the system
+OPENMPI_DIR ?= /usr/lib/x86_64-linux-gnu/openmpi
+OPENMPI_LIB_PATH = $(OPENMPI_DIR)/lib/
+OPENMPI_INCLUDE_PATH = $(OPENMPI_DIR)/include/
 ifeq ($(NO_USE_MPI), 1)
   $(info → MPI is manually disabled)
-else ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && [ -d /usr/lib/x86_64-linux-gnu/openmpi/include/ ] && echo "exists"), exists)
+else ifeq ($(shell [ -d $(OPENMPI_LIB_PATH) ] && [ -d $(OPENMPI_INCLUDE_PATH) ] && echo "exists"), exists)
   $(info ✓ MPI enabled)
-  NVCC_INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
-  NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
+  NVCC_INCLUDES += -I$(OPENMPI_INCLUDE_PATH)
+  NVCC_LDFLAGS += -L$(OPENMPI_LIB_PATH)
   NVCC_LDLIBS += -lmpi
   NVCC_FLAGS += -DUSE_MPI
-  NVCC_FLAGS += -DMULTI_GPU
 else
   $(info ✗ MPI not found)
 endif
@@ -276,5 +280,5 @@ profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE)
 
 clean:
-	$(REMOVE_FILES) $(TARGETS) 
+	$(REMOVE_FILES) $(TARGETS)
 	$(REMOVE_BUILD_OBJECT_FILES)
