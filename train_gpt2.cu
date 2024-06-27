@@ -1209,7 +1209,7 @@ void common_free(GPT2 &model) {
 }
 
 
-void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
+void save_state(const char* filename, int step, GPT2* model, DataLoader* loader, int async_write) {
     printf("Writing state to %s\n", filename);
     FILE *state_file = fopenCheck(filename, "wb");
     int state_header[256];
@@ -1230,14 +1230,6 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     *((size_t*)&state_header[32]) = loader->current_sample_idx; // position in shard
     fwriteCheck(state_header, sizeof(int), 256, state_file);
 
-    // write AdamW m, v, and master_weights here (they are all float)
-    size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
-    device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-    device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-    if(model->use_master_weights) {
-        device_to_file(state_file, model->master_weights, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-    }
-
     // write dataloader state if we are using the Permuted version of it
     if (loader->should_shuffle) {
         fwriteCheck(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);  // number of shards
@@ -1246,7 +1238,38 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
         fwriteCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
         fwriteCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
     }
-    fcloseCheck(state_file);
+
+    if (async_write == 0){
+        // write AdamW m, v, and master_weights here (they are all float)
+        size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
+        device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+        if(model->use_master_weights) {
+            device_to_file(state_file, model->master_weights, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+        }
+        fcloseCheck(state_file);
+    }
+    else {
+        // determine the size of the buffer based on whether we're using master weights
+        size_t shard_num_parameters = multi_gpu_config.shard_num_parameters * sizeof(float);
+        size_t buffer_size = shard_num_parameters * (model->use_master_weights ? 3 : 2);
+        // transfer device data to host memory
+        char* buffer_space;
+        cudaCheck(cudaMallocHost(&buffer_space, buffer_size));
+        cudaCheck(cudaMemcpyAsync(buffer_space, model->m_memory, shard_num_parameters, cudaMemcpyDeviceToHost, main_stream));
+        cudaCheck(cudaMemcpyAsync(buffer_space + shard_num_parameters, model->v_memory, shard_num_parameters, cudaMemcpyDeviceToHost, main_stream));
+        if (model->use_master_weights) {
+            cudaCheck(cudaMemcpyAsync(buffer_space + shard_num_parameters * 2, model->master_weights, shard_num_parameters, cudaMemcpyDeviceToHost, main_stream));
+        }
+        cudaCheck(cudaStreamSynchronize(main_stream));
+
+        FileWriteTask* task = (FileWriteTask*)malloc(sizeof(FileWriteTask));
+        task->buffer = buffer_space;
+        task->size = buffer_size;
+        task->file = state_file;
+        // create a new thread to handle the write task asynchronously
+        pthread_create(&writer_threads[1], NULL, file_write_async, (void*)task);
+    }
 }
 
 void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename) {
@@ -1263,6 +1286,28 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
     size_t current_shard_idx = *((size_t*)&state_header[30]); // shard index
     size_t current_sample_idx = *((size_t*)&state_header[32]); // position in shard
+
+    // revive the DataLoader object and its state
+    loader->should_shuffle = should_shuffle;
+    if (should_shuffle == 1) {
+        // ensure the number of shards matches
+        size_t glob_result_gl_pathc;
+        freadCheck(&glob_result_gl_pathc, sizeof(size_t), 1, state_file);
+        assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
+        // read the shard indices
+        loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
+        freadCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
+        // ensure the number of samples matches
+        size_t shard_num_samples;
+        freadCheck(&shard_num_samples, sizeof(size_t), 1, state_file);
+        assert(shard_num_samples == loader->shard_num_samples);
+        // read the intra-shard indices
+        loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
+        freadCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
+        // read the shuffle rng state
+        freadCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
+    }
+    dataloader_resume(loader, current_shard_idx, current_sample_idx);
 
     // read AdamW m, v, master_weights (they are all float)
     // allocate all the needed memory as necessary
@@ -1290,28 +1335,6 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     if(model->use_master_weights) {
         file_to_device(model->master_weights, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     }
-
-    // revive the DataLoader object and its state
-    loader->should_shuffle = should_shuffle;
-    if (should_shuffle == 1) {
-        // ensure the number of shards matches
-        size_t glob_result_gl_pathc;
-        freadCheck(&glob_result_gl_pathc, sizeof(size_t), 1, state_file);
-        assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
-        // read the shard indices
-        loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
-        freadCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
-        // ensure the number of samples matches
-        size_t shard_num_samples;
-        freadCheck(&shard_num_samples, sizeof(size_t), 1, state_file);
-        assert(shard_num_samples == loader->shard_num_samples);
-        // read the intra-shard indices
-        loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
-        freadCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
-        // read the shuffle rng state
-        freadCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
-    }
-    dataloader_resume(loader, current_shard_idx, current_sample_idx);
 
     // all done, close state file
     fcloseCheck(state_file);
