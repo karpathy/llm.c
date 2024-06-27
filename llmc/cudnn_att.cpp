@@ -235,7 +235,7 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
     void* devPtrQ = inp;
     void* devPtrK = (inp + C);
     void* devPtrV = (inp + 2 * C);
-    float attn_scale_cpu = use_mup ? 1.0f / HS : 1.f / sqrtf((float)HS);
+    float attn_scale_cpu = use_mup ? 1.f / (float)HS : 1.f / sqrtf((float)HS);
     void* devPtrO = out;
 
     // Build variant pack
@@ -268,7 +268,7 @@ void attention_backward_cudnn(floatX* dqkvr,                                    
     void* devPtrO = o;
     void* devPtrdO = dout;
     void* devPtrStats = stats;
-    float attn_scale_cpu = use_mup ? 1.0f / HS : 1.f / sqrtf((float)HS);
+    float attn_scale_cpu = use_mup ? 1.f / (float)HS : 1.f / sqrtf((float)HS);
 
     void* devPtrdQ = dqkvr;
     void* devPtrdK = (dqkvr + NH * HS);

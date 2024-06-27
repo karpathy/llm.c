@@ -218,7 +218,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     matmul_cublaslt(preatt, k, q, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
 
     // multiply all elements of preatt elementwise by scale
-    float scale = use_mup ? 1.0f / HS : 1.f / sqrtf((float)HS);
+    float scale = use_mup ? 1.f / (float)HS : 1.f / sqrtf((float)HS);
     int grid_size = CEIL_DIV(B * NH * T * WARP_SIZE, block_size);
     softmax_forward_kernel5<<<grid_size, block_size, 0, stream>>>(att, scale, preatt, B * NH, T);
 
@@ -261,7 +261,7 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     matmul_cublaslt(datt, v, scratch, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
     // backward into dv
     matmul_cublaslt(dv, scratch, att, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
-    const float scale = use_mup ? 1.0f / HS : 1.f / sqrtf((float)HS);
+    const float scale = use_mup ? 1.f / (float)HS : 1.f / sqrtf((float)HS);
     // backward into preatt. this is an in-place operation; datt turns into dpreatt here
     softmax_autoregressive_backward_inplace_kernel<<<dim3(T / 4, B * NH), 256>>>(datt, att, B, T, C, scale);
     const floatX* dpreatt = datt;
