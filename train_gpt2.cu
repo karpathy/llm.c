@@ -533,7 +533,8 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     // so that we can match them up and get correctness and exactly the same initial conditions
     size_t L = model->config.num_layers;
     size_t offset = 0;
-    float mup_scale = 1.0f / sqrtf(model->mup_width_mult);
+    float mup_scale = sqrtf(model->mup_width_mult);
+    float mup_scale_inv = 1.0f / mup_scale;
     for (int l = 0; l < L; l++) {
         offset = 0;
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -562,7 +563,7 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
                 // scaled by 1/sqrt(2*L) for training stability
                 float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
                 // --- muP ---
-                scale = (model->use_mup && i != 0 && i != 1) ? mup_scale*scale : scale;
+                scale = (model->use_mup && i != 0 && i != 1) ? mup_scale_inv*scale : scale;
 
                 // okay let's draw the random numbers and write them
                 float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
@@ -576,6 +577,12 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
                     n = n / 3;
                     for (size_t j = 0; j < n; j++) {
                         params_memory_cpu[offset + layer_offset + j] = 0.0f;
+                    }
+                }
+                // --- muP ---
+                if (model->use_mup && i == 0) {  // rescale readout/embedding parameters
+                    for (size_t j = 0; j < n; j++) {
+                        params_memory_cpu[offset + layer_offset + j] = (floatX)((float)params_memory_cpu[offset + layer_offset + j] * mup_scale);
                     }
                 }
                 free(fp32_buffer);
