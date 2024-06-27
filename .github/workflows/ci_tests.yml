@@ -52,9 +52,49 @@ jobs:
           cp *.sass ptx_sass_logs/
           ls ptx_sass_logs/
 
+      - name: Generate ptx/sass files for A100 and upload them to persistent storage
+        run: |
+            mkdir -p dev/cuda/ptx_sass_logs_A100
+            make train_gpt2cu GPU_COMPUTE_CAPABILITY=80
+            cuobjdump --dump-ptx train_gpt2cu > dev/cuda/train_gpt2cu.ptx
+            cuobjdump --dump-sass train_gpt2cu > dev/cuda/train_gpt2cu.sass          
+            cd dev/cuda
+            make -j GPU_COMPUTE_CAPABILITY=80 all_ptx
+            make -j GPU_COMPUTE_CAPABILITY=80 all_sass
+            cp *.ptx ptx_sass_logs_A100/
+            cp *.sass ptx_sass_logs_A100/
+            ls ptx_sass_logs_A100/
+
+      - name: Generate ptx/sass files for H100 and upload them to persistent storage
+        run: |
+            mkdir -p dev/cuda/ptx_sass_logs_H100
+            make train_gpt2cu GPU_COMPUTE_CAPABILITY=90
+            cuobjdump --dump-ptx train_gpt2cu > dev/cuda/train_gpt2cu.ptx
+            cuobjdump --dump-sass train_gpt2cu > dev/cuda/train_gpt2cu.sass          
+            cd dev/cuda
+            make -j GPU_COMPUTE_CAPABILITY=90 all_ptx
+            make -j GPU_COMPUTE_CAPABILITY=90 all_sass
+            cp *.ptx ptx_sass_logs_H100/
+            cp *.sass ptx_sass_logs_H100/
+            ls ptx_sass_logs_H100/
+
       - name: Upload ptx/sass files
         uses: actions/upload-artifact@v4
         with:
           name: ptx_sass_files
           path: dev/cuda/ptx_sass_logs/
           retention-days: 30 # days to retain
+
+      - name: Upload ptx/sass files for A100
+        uses: actions/upload-artifact@v4
+        with:
+          name: ptx_sass_files_A100
+          path: dev/cuda/ptx_sass_logs_A100/
+          retention-days: 30 # days to retain          
+
+      - name: Upload ptx/sass files for H100
+        uses: actions/upload-artifact@v4
+        with:
+          name: ptx_sass_files_H100
+          path: dev/cuda/ptx_sass_logs_H100/
+          retention-days: 30 # days to retain                    
