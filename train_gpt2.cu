@@ -366,6 +366,7 @@ typedef struct {
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
     int use_mup;  // use muP (maximum update) [1] or SP (standard) parametrization [0]
+    float mup_width_mult; // muP width multiplier
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -532,6 +533,7 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     // so that we can match them up and get correctness and exactly the same initial conditions
     size_t L = model->config.num_layers;
     size_t offset = 0;
+    float mup_scale = 1.0f / sqrtf(model->mup_width_mult);
     for (int l = 0; l < L; l++) {
         offset = 0;
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -559,6 +561,9 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
                 // in GPT-2, the projections back into the residual stream are additionally
                 // scaled by 1/sqrt(2*L) for training stability
                 float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
+                // --- muP ---
+                scale = (model->use_mup && i != 0 && i != 1) ? mup_scale*scale : scale;
+
                 // okay let's draw the random numbers and write them
                 float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
                 normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
@@ -1371,6 +1376,7 @@ void error_usage() {
     fprintf(stderr, "  -sg <float> outlier stability: skip update if grad_norm goes above this in zscore (0.0f=off)\n");
     // wi - weight initialization
     fprintf(stderr, "  -wi <string> weight init method (default = mup)\n");
+    fprintf(stderr, "  -wm <float> weight init multiplier (default = 1.0f)\n");
     // evaluation
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
     fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
@@ -1430,7 +1436,9 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    // muP settings
     int use_mup = 1;  // muP or SP
+    float mup_width_mult = 1.0f;  // muP width multiplier
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1480,6 +1488,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'm') { use_mup = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'w') { mup_width_mult = atof(argv[i+1]); }
         else { error_usage(); }
     }
 
@@ -1555,6 +1564,7 @@ int main(int argc, char *argv[]) {
     GPT2 model;
     gpt2_init_common(&model);
     model.use_mup = use_mup;
+    model.mup_width_mult = mup_width_mult;
     // if load_filename is of the form "dX" where X is an integer (e.g. d12), then we build
     // a random model with the depth of the model specified by X (e.g. 12). otherwise interpret
     // this variable as a checkpoint filename, and load that checkpoint
