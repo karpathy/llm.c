@@ -391,7 +391,7 @@ void gpt2_init_common(GPT2 *model) {
     model->recompute = 1; // good default: recompute gelu but not layernorm
 }
 
-void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
+void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path, int async_write) {
     // write the model to a checkpoint file
     printf0("Writing model to %s\n", checkpoint_path);
     FILE *model_file = fopenCheck(checkpoint_path, "wb");
@@ -408,11 +408,29 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model_header[6] = model->config.channels;
     model_header[7] = model->config.padded_vocab_size;
     fwriteCheck(model_header, sizeof(int), 256, model_file);
-    // write the parameters
-    device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
-                   IO_BUF_SIZE, main_stream);
-    // close file, we're done
-    fcloseCheck(model_file);
+
+    if (async_write == 0) {
+        // write the parameters
+        device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
+                    IO_BUF_SIZE, main_stream);
+        // close file, we're done
+        fcloseCheck(model_file);
+    }
+    else {
+        // transfer device data to host memory
+        char* buffer_space;
+        cudaCheck(cudaMallocHost(&buffer_space, model->num_parameters_bytes));
+        cudaCheck(cudaMemcpyAsync(buffer_space, model->params_memory, model->num_parameters_bytes,
+                  cudaMemcpyDeviceToHost, main_stream));
+        cudaCheck(cudaStreamSynchronize(main_stream));
+
+        FileWriteTask* task = (FileWriteTask*)malloc(sizeof(FileWriteTask));
+        task->buffer = buffer_space;
+        task->size = model->num_parameters_bytes;
+        task->file = model_file;
+        // create a new thread to handle the write task asynchronously
+        pthread_create(&writer_threads[0], NULL, file_write_async, (void*)task);
+    }
 }
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
