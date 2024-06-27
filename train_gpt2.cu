@@ -1340,25 +1340,18 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     fcloseCheck(state_file);
 }
 
-void write_checkpoint(const char* output_log_dir, int step, GPT2* model, DataLoader* train_loader, MultiGpuConfig* multi_gpu_config) {
+void write_checkpoint(const char* output_log_dir, int step, GPT2* model, DataLoader* train_loader, MultiGpuConfig* multi_gpu_config, int async_write) {
     // a checkpoint contains: model weights, optimizer/dataloader state, and a DONE file
     printf0("Writing checkpoint at step %d\n", step);
     int rank = multi_gpu_config->process_rank;
     // only rank 0 writes the model file because it is the same across all ranks
     if (rank == 0) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/model_%08d.bin", output_log_dir, step);
-        gpt2_write_to_checkpoint(model, filename_buffer);
+        gpt2_write_to_checkpoint(model, filename_buffer, async_write);
     }
     // all ranks write their state file
     snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, step, rank);
-    save_state(filename_buffer, step, model, train_loader);
-    // DONE file is a signal that this checkpoint as a whole is complete
-    multi_gpu_barrier(multi_gpu_config);
-    if (rank == 0) {
-        snprintf(filename_buffer, sizeof(filename_buffer), "%s/DONE_%08d", output_log_dir, step);
-        FILE* done_file = fopenCheck(filename_buffer, "w");
-        fcloseCheck(done_file);
-    }
+    save_state(filename_buffer, step, model, train_loader, async_write);
 }
 
 void delete_checkpoint(const char* output_log_dir, int step, MultiGpuConfig* multi_gpu_config) {
@@ -1451,6 +1444,7 @@ int main(int argc, char *argv[]) {
     int checkpoint_every = 0; // write checkpoints every how many steps?
     int checkpoints_keep = 0; // how long checkpoint history do we keep? (in units of checkpoints)
     int major_checkpoint_every = 0; // major checkpoints never get deleted when maintaining history
+    int async_checkpointing = 0; // write checkpoints asynchronously using a background thread
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
     int B = 4; // batch size
     int T = 1024; // sequence length max
@@ -1519,6 +1513,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'a') { async_checkpointing = atoi(argv[i+1]); }
         else { error_usage(); }
     }
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
@@ -1800,8 +1795,26 @@ int main(int argc, char *argv[]) {
         // once in a while checkpoint the optimization state (all ranks)
         if ((checkpoint_every > 0 && output_log_dir != NULL && resuming == 0) &&
             ((step > 0 && step % checkpoint_every == 0) || last_step)) {
+            if (async_checkpointing == 1) {
+                // finish the previous file writer threads
+                if (writer_threads_started == 1){
+                    pthread_join(writer_threads[0], NULL);
+                    pthread_join(writer_threads[1], NULL);
+                    writer_threads[0] = 0;
+                    writer_threads[1] = 0;
+
+                    // DONE file is a signal that this checkpoint as a whole is complete
+                    multi_gpu_barrier(&multi_gpu_config);
+                    if (multi_gpu_config.process_rank == 0) {
+                        snprintf(filename_buffer, sizeof(filename_buffer), "%s/DONE_%08d", output_log_dir, step - checkpoint_every);
+                        FILE* done_file = fopenCheck(filename_buffer, "w");
+                        fcloseCheck(done_file);
+                    }
+                }
+            }
             // writes model .bin file, state .bin files, and DONE file for step
-            write_checkpoint(output_log_dir, step, &model, &train_loader, &multi_gpu_config);
+            write_checkpoint(output_log_dir, step, &model, &train_loader, &multi_gpu_config, async_checkpointing);
+            writer_threads_started = 1;
             // we only keep checkpoints_keep checkpoints on disk to save space
             // so now that we wrote a new checkpoint, delete one old one (unless it is a "major" checkpoint)
             // we only do this is checkpoint keeping is turned on (checkpoints_keep > 0)
