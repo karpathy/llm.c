@@ -255,6 +255,9 @@ size_t sizeof_dtype(DType type) {
             return sizeof(half);
         case DType::BF16:
             return sizeof(nv_bfloat16);
+        default: // handle or get compiler warning
+            fprintf(stderr, "Unknown datatype\n");
+            exit(EXIT_FAILURE);
     }
 }
 
