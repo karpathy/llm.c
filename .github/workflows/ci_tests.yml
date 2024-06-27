@@ -21,10 +21,10 @@ jobs:
       - name: test the dataloader without / with sanitize address
         run: |
           cd dev/test
-          make test_dataloader
+          make PRECISION=BF16 test_dataloader
           ./test_dataloader   
           make clean       
-          make test_dataloader TEST_CFLAGS="-fsanitize=address -fno-omit-frame-pointer"
+          make PRECISION=BF16 TEST_CFLAGS="-fsanitize=address -fno-omit-frame-pointer" test_dataloader 
           ./test_dataloader          
 
   ptx_and_sass_files:

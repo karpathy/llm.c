@@ -19,7 +19,6 @@ NVCC_FLAGS = -O3 -t=0 --use_fast_math -std=c++17
 NVCC_LDFLAGS = -lcublas -lcublasLt
 NVCC_INCLUDES =
 NVCC_LDLIBS =
-NCLL_INCUDES =
 NVCC_CUDNN =
 # By default we don't build with cudnn because it blows up compile time from a few seconds to ~minute
 USE_CUDNN ?= 0
@@ -114,7 +113,10 @@ else
 endif
 
 # Precision settings, default to bf16 but ability to override
-PRECISION ?= BF16
+ifeq ($(MAKECMDGOALS), clean)
+  PRECISION=BF16 
+endif
+
 VALID_PRECISIONS := FP32 FP16 BF16
 ifeq ($(filter $(PRECISION),$(VALID_PRECISIONS)),)
   $(error Invalid precision $(PRECISION), valid precisions are $(VALID_PRECISIONS))
