@@ -342,7 +342,7 @@ typedef struct {
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
 } GPT2;
 
-void gpt2_init_common(GPT2 *model) {
+void gpt2_init_common(GPT2 *model, unsigned int seed=13371337) {
     // common inits outside of the model weights
     // the weights are initialized either in:
     // - gpt2_build_from_checkpoint() if loading from a checkpoint
@@ -368,7 +368,7 @@ void gpt2_init_common(GPT2 *model) {
     model->v_memory = NULL;
     model->master_weights = NULL;
     // other default settings
-    model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
+    model->rng_state = seed + multi_gpu_config.process_rank; // used in stochastic rounding
     model->use_master_weights = 1; // safe default: do keep master weights in fp32
     model->recompute = 1; // good default: recompute gelu but not layernorm
 }
@@ -463,7 +463,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     cudaCheck(cudaDeviceSynchronize());
 }
 
-void gpt2_build_from_random(GPT2 *model, int depth) {
+void gpt2_build_from_random(GPT2 *model, int depth, unsigned int seed) {
     // init random (training from scratch)
 
     // parameterize the size of gpt2 based only on the depth of the model (num_layers)
@@ -497,7 +497,7 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
     // NOTE: assuming all parameters are of the type floatX, could be relaxed later
     mt19937_state init_rng;
-    manual_seed(&init_rng, 42);
+    manual_seed(&init_rng, seed);
     floatX* params_memory_cpu = (floatX*)mallocCheck(model->num_parameters_bytes);
     memset(params_memory_cpu, 0, model->num_parameters_bytes);
     // fill in all the weights with random values
@@ -1364,6 +1364,7 @@ void error_usage() {
     fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
     // debugging
     fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
+    fprintf(stderr, "  -rg <int>  seed for random number generator (when not loading from state)\n");
     // numerics
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
@@ -1413,6 +1414,7 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    int rng_seed = 13371337;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1447,7 +1449,8 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'r' && argv[i][2] == 'g') { rng_seed = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'r' && argv[i][2] == '\0') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
@@ -1530,7 +1533,7 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model
     GPT2 model;
-    gpt2_init_common(&model);
+    gpt2_init_common(&model, (unsigned int)rng_seed);
     // if load_filename is of the form "dX" where X is an integer (e.g. d12), then we build
     // a random model with the depth of the model specified by X (e.g. 12). otherwise interpret
     // this variable as a checkpoint filename, and load that checkpoint
@@ -1540,7 +1543,7 @@ int main(int argc, char *argv[]) {
     } else if (load_filename[0] == 'd') {
         int depth = atoi(load_filename + 1);
         if (depth > 1 && depth <= 1000) { // we're not going to train models this big right? heh
-            gpt2_build_from_random(&model, depth);
+            gpt2_build_from_random(&model, depth, (unsigned int)rng_seed);
         } else {
             exit(EXIT_FAILURE);
         }
