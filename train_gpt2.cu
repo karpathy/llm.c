@@ -1074,6 +1074,14 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         // - the token embeddings are weight shared and participate in the final projection to logits
         // - the position embeddings actively participate at every forward/backward pass
         float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
+        float lr = learning_rate;
+
+        // --- mup ---
+        if (model->use_mup && (i == 4 || i == 6 || i == 10 || i == 12)) {
+            wd *= model->mup_width_mult;
+            lr /= model->mup_width_mult;
+        }
+
         floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
         floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
 
@@ -1093,7 +1101,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         adamw_update(param_ptr, master_ptr, grad_ptr,
                      m_ptr, v_ptr,
                      shard.size, tensor.size, tensor.size, shard.size, num_layers,
-                     learning_rate,
+                     lr,
                      beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
         cudaCheck(cudaGetLastError());
 
