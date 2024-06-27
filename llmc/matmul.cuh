@@ -7,7 +7,7 @@ Matrix Multiplication, with help from cuBLASLt
 #include "cuda_common.h"
 #include "cuda_utils.cuh"
 #include "cublas_common.h"
-// GELU forward can be either fused (cublasLt) or non-fused (gelu.h)
+// GELU can be either fused (cublasLt) or non-fused (gelu.h)
 #include "gelu.cuh"
 
 // ----------------------------------------------------------------------------

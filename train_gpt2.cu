@@ -399,7 +399,7 @@ void gpt2_init_common(GPT2 *model) {
     model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
     model->use_master_weights = 1; // safe default: do keep master weights in fp32
     model->recompute = 1; // good default: recompute gelu but not layernorm
-    model->gelu_fusion = deviceProp.major >= 9 ? 1 : 0; // default: fuse gelu forward on H100+
+    model->gelu_fusion = deviceProp.major >= 9 ? 2 : 0; // default: fuse on H100+ (if changed, also update main())
 }
 
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -1492,7 +1492,7 @@ int main(int argc, char *argv[]) {
     // calculate sensible default for total batch size as assuming no gradient accumulation
     if (total_batch_size == -1) { total_batch_size = tokens_per_fwdbwd; }
     // if unspecified, set gelu fusion to 2 for SM90+ and 0 for other GPUs
-    if (gelu_fusion == -1) { gelu_fusion = (deviceProp.major >= 9) ? 2 : 0; }
+    if (gelu_fusion == -1) { gelu_fusion = (deviceProp.major >= 9) ? 2 : 0; } // in gpt2_init_common for test_gpt2cu...
     // calculate the number of gradient accumulation steps from the desired total batch size
     assert(total_batch_size % tokens_per_fwdbwd == 0);
     int grad_accum_steps = total_batch_size / tokens_per_fwdbwd;
