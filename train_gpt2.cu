@@ -47,8 +47,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/encoder.cuh"
 // defines: layernorm_forward, residual_forward, fused_residual_forward5, layernorm_backward
 #include "llmc/layernorm.cuh"
-// defines: gelu_forward, gelu_backward_inplace
-#include "llmc/gelu.cuh"
+// defines: matmul_cublaslt, matmul_forward, matmul_backward, gelu_forward, gelu_backward_inplace
+#include "llmc/matmul.cuh"
 #ifdef ENABLE_CUDNN
 // defines: create_cudnn, destroy_cudnn, attention_forward_cudnn, attention_backward_cudnn
 #include "llmc/cudnn_att.h"
@@ -56,8 +56,6 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines: attention_forward, attention_backward
 #include "llmc/attention.cuh"
 #endif
-// defines: matmul_forward, matmul_backward
-#include "llmc/matmul.cuh"
 // defines: fused_classifier
 #include "llmc/fused_classifier.cuh"
 // defines: adamw_kernel3
@@ -366,6 +364,7 @@ typedef struct {
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
     int use_master_weights; // keep master weights copy in float for optim update? 0|1
+    int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
     int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
@@ -685,8 +684,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
         matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, l_attproj, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream);
-        gelu_forward(l_fch_gelu, l_fch, B*T*4*C, main_stream);
+        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
         matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
 
         // OK, fusion across blocks.
@@ -863,10 +861,9 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         if(model->recompute >= 1) {
             // recompute >= 1 means we recompute gelu. in this case,
             // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
-            gelu_forward(l_fch_gelu, l_fch, B*T*4*C, main_stream);
+            gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream);
         }
-        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream);
-        gelu_backward_inplace(dl_bt4c, l_fch, B*T*4*C, main_stream);
+        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
         if(model->recompute >= 2) {
             // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
             layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
@@ -883,7 +880,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* l_att = acts.att + l * B * NH * T * T;
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
-        floatX* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
+        floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         #endif
         if(model->recompute >= 2) {
@@ -1167,13 +1164,11 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
     nvtxNameCudaStreamA(main_stream, "main stream");
 
     // set up cuBLAS and cuBLASLt
-    cublasCheck(cublasCreate(&cublas_handle));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     bool enable_tf32 = PRECISION_MODE == PRECISION_FP32 && deviceProp.major >= 8 && override_enable_tf32;
-    cublasCheck(cublasSetMathMode(cublas_handle, enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
     cublas_compute = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
     #ifdef ENABLE_CUDNN
@@ -1184,7 +1179,6 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
 void common_free(GPT2 &model) {
     cudaCheck(cudaStreamDestroy(main_stream));
     cudaCheck(cudaFree(cublaslt_workspace));
-    cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
     #ifdef ENABLE_CUDNN
     destroy_cudnn();
@@ -1386,6 +1380,7 @@ void error_usage() {
     // numerics
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
+    fprintf(stderr, "  -ge <int>   gelu fusion: 0=none, 1=forward, 2=forward+backward (default: 1 for >=SM90, 0 for older GPUs)\n");
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
@@ -1429,6 +1424,7 @@ int main(int argc, char *argv[]) {
     int max_steps = -1;
     int override_enable_tf32 = 1;
     int use_master_weights = 1;
+    int gelu_fusion = 1; // 0 = none, 1 = forward, 2 = forward+backward
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
@@ -1461,6 +1457,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'g' && argv[i][2] == 'e') { gelu_fusion = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
         else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
@@ -1522,6 +1519,7 @@ int main(int argc, char *argv[]) {
     printf0("| genT                  | %-50d |\n", genT);
     printf0("| overfit_single_batch  | %-50d |\n", overfit_single_batch);
     printf0("| use_master_weights    | %-50s |\n", use_master_weights ? "enabled" : "disabled");
+    printf0("| gelu_fusion           | %-50d |\n", gelu_fusion);
     printf0("| recompute             | %-50d |\n", recompute);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
@@ -1568,6 +1566,7 @@ int main(int argc, char *argv[]) {
     }
 
     model.use_master_weights = use_master_weights;
+    model.gelu_fusion = gelu_fusion;
     model.recompute = recompute;
     printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : (load_filename[0] == 'd' ? "random" : "OpenAI's GPT-2 checkpoint"));
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);

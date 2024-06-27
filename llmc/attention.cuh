@@ -199,7 +199,6 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
     // Its contents will be overwritten by this function.
     const int block_size = 256;
-    const float alpha = 1.0f, beta = 0.0f;
 
     // inp is (B, T, 3C) QKV
     // preatt, att are (B, NH, T, T)
@@ -215,16 +214,8 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     int num_blocks = CEIL_DIV(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, B, T, NH, HS);
 
-    floatX* preatt = inp;
-    cublasCheck(cublasSetStream(cublas_handle, stream));
-    cublasCheck(cublasSetWorkspace(cublas_handle, cublaslt_workspace, cublaslt_workspace_size));
-    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
-                                     CUBLAS_OP_T, CUBLAS_OP_N,
-                                     T, T, HS, &alpha,
-                                     k, CUBLAS_LOWP, HS, T * HS,
-                                     q, CUBLAS_LOWP, HS, T * HS,
-                                     &beta, preatt, CUBLAS_LOWP, T, T * T,
-                                     B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
+    floatX* preatt = inp; // reuse inp as scratch buffer
+    matmul_cublaslt(preatt, k, q, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
 
     // multiply all elements of preatt elementwise by scale
     float scale = 1.f / sqrtf(HS);
@@ -234,13 +225,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // new approach: first cuBLAS another batched matmul
     floatX* vaccum = inp;
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle,
-                                     CUBLAS_OP_N, CUBLAS_OP_N,
-                                     HS, T, T, &alpha,
-                                     v, CUBLAS_LOWP, HS, T * HS,
-                                     att, CUBLAS_LOWP, T, T * T,
-                                     &beta, vaccum, CUBLAS_LOWP, HS, T * HS,
-                                     B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
+    matmul_cublaslt(vaccum, v, att, nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -258,7 +243,6 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int HS = C / NH; // head size
-    const float alpha = 1.0f, beta = 0.0f;
 
     // unpack convenience pointers into q, k, v
     const floatX *q, *k, *v;
@@ -274,27 +258,17 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     int num_blocks = CEIL_DIV(B * T * C, block_size);
     unpermute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(scratch, dout, B, T, NH, HS);
     // backward into datt
-    cublasCheck(cublasSetStream(cublas_handle, stream));
-    cublasCheck(cublasSetWorkspace(cublas_handle, cublaslt_workspace, cublaslt_workspace_size));
-    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha,
-                                           v, CUBLAS_LOWP, HS, T * HS, scratch, CUBLAS_LOWP, HS, T * HS, &beta,
-                                           datt, CUBLAS_LOWP, T, T * T, B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
+    matmul_cublaslt(datt, v, scratch, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
     // backward into dv
-    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &alpha,
-                                           scratch, CUBLAS_LOWP, HS, T * HS, att, CUBLAS_LOWP, T, T * T, &beta,
-                                           dv, CUBLAS_LOWP, HS, T * HS, B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
+    matmul_cublaslt(dv, scratch, att, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
     const float scale = 1.0f / sqrtf((float)HS);
     // backward into preatt. this is an in-place operation; datt turns into dpreatt here
     softmax_autoregressive_backward_inplace_kernel<<<dim3(T / 4, B * NH), 256>>>(datt, att, B, T, C, scale);
     const floatX* dpreatt = datt;
     // backward into q
-    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha,
-                                           k, CUBLAS_LOWP, HS, T * HS, dpreatt, CUBLAS_LOWP, T, T * T, &beta,
-                                           dq, CUBLAS_LOWP, HS, T * HS, B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
+    matmul_cublaslt(dq, k, dpreatt, nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
     // backward into k
-    cublasCheck(cublasGemmStridedBatchedEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &alpha,
-                                           q, CUBLAS_LOWP, HS, T * HS, dpreatt, CUBLAS_LOWP, T, T * T, &beta,
-                                           dk, CUBLAS_LOWP, HS, T * HS, B * NH, cublas_compute, CUBLAS_GEMM_DEFAULT));
+    matmul_cublaslt(dk, q, dpreatt, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
     // backward into inp
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
     permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dinp, dq, dk, dv, B, T, NH, HS);

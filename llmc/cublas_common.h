@@ -14,13 +14,10 @@ cuBLAS related utils
 // cuBLAS Precision settings
 
 #if defined(ENABLE_FP32)
-typedef float floatX;
 #define CUBLAS_LOWP CUDA_R_32F
 #elif defined(ENABLE_FP16)
-typedef half floatX;
 #define CUBLAS_LOWP CUDA_R_16F
 #else // default to bfloat16
-typedef __nv_bfloat16 floatX;
 #define CUBLAS_LOWP CUDA_R_16BF
 #endif
 
@@ -32,7 +29,6 @@ const size_t cublaslt_workspace_size = 32 * 1024 * 1024;
 void* cublaslt_workspace = NULL;
 cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F;
 cublasLtHandle_t cublaslt_handle;
-cublasHandle_t cublas_handle;
 
 // ----------------------------------------------------------------------------
 // Error checking
