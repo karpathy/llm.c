@@ -5,8 +5,6 @@ AdamW kernel
 // llmc internal imports
 #include "cuda_common.h"
 #include "cuda_utils.cuh"
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
 
 // ----------------------------------------------------------------------------
 // CUDA kernels
@@ -21,10 +19,10 @@ template <typename Tp, typename Tg>
 __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                              float grad_scale, unsigned int seed) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    namespace cg = cooperative_groups;
-    cg::thread_block_tile<512> block = cg::tiled_partition<512>(cg::this_thread_block());
-    if (idx >= num_parameters) { return; }  // guard
+    int raw_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float num = blockReduce<warpReduceSum>(raw_idx < num_parameters ? 1.f : 0.f, true);
+
+    int idx = min(idx, (int)num_parameters - 1);
 
     // get the gradient, m, and v for this parameter
     float grad = grad_scale * (float)grads_memory[idx];
@@ -43,9 +41,13 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
 
     // stable adamW modification
     float r = grad*grad / v;
-    float num = cg::reduce(block, 1.0, cg::plus<float>{});
-    float rms = sqrtf(cg::reduce(block, r, cg::plus<float>{}) / num);
+    if(raw_idx >= num_parameters)
+        r = 0.f;
+    float s_r = blockReduce<warpReduceSum>(r);
+    float rms = sqrtf(s_r / num);
     learning_rate = learning_rate / max(1.f, rms);
+
+    if(raw_idx >= num_parameters) return;
 
     // update this parameter
     float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * old_param));
