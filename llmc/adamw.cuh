@@ -39,7 +39,7 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
 
     // stable adamW modification
     float r = grad*grad / v;
-    float num = blockReduce<warpReduceSum>(1.f);
+    float num = blockReduce<warpReduceSum>(1.f, true);
     float rms = sqrtf(blockReduce<warpReduceSum>(r) / num);
     learning_rate = learning_rate / max(1.f, rms);
 
