@@ -23,7 +23,7 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
                              float grad_scale, unsigned int seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<512> block = cg::tiled_partition<512>(cg::this_thread_block());
     if (idx >= num_parameters) { return; }  // guard
 
     // get the gradient, m, and v for this parameter
