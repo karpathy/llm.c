@@ -5,6 +5,8 @@ AdamW kernel
 // llmc internal imports
 #include "cuda_common.h"
 #include "cuda_utils.cuh"
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 
 // ----------------------------------------------------------------------------
 // CUDA kernels
@@ -20,6 +22,8 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                              float grad_scale, unsigned int seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
     if (idx >= num_parameters) { return; }  // guard
 
     // get the gradient, m, and v for this parameter
@@ -39,8 +43,8 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
 
     // stable adamW modification
     float r = grad*grad / v;
-    float num = blockReduce<warpReduceSum>(1.f, true);
-    float rms = sqrtf(blockReduce<warpReduceSum>(r) / num);
+    float num = cg::reduce(block, 1.0, cg::plus<float>{});
+    float rms = sqrtf(cg::reduce(block, r, cg::plus<float>{}) / num);
     learning_rate = learning_rate / max(1.f, rms);
 
     // update this parameter
