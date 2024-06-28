@@ -36,6 +36,13 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
     v /= beta2_correction;  // v_hat
     // fetch the old value of this parameter as a float, from either source
     float old_param = (master_params_memory != NULL) ? master_params_memory[idx] : (float)params_memory[idx];
+
+    // stable adamW modification
+    float r = grad*grad / v;
+    float num = blockReduce<warpReduceSum>(1.f);
+    float rms = sqrtf(blockReduce<warpReduceSum>(r) / num);
+    learning_rate = learning_rate / max(1.f, rms);
+
     // update this parameter
     float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * old_param));
     // update our low precision version of the parameters using stochastic rounding
