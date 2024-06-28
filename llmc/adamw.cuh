@@ -22,7 +22,7 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
     int raw_idx = blockIdx.x * blockDim.x + threadIdx.x;
     float num = blockReduce<warpReduceSum>(raw_idx < num_parameters ? 1.f : 0.f, true);
 
-    int idx = min(idx, (int)num_parameters - 1);
+    int idx = min(raw_idx, (int)num_parameters - 1);
 
     // get the gradient, m, and v for this parameter
     float grad = grad_scale * (float)grads_memory[idx];
