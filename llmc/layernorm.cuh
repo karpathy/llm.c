@@ -464,6 +464,7 @@ void layernorm_forward(floatX* out, float* mean, float* rstd,
         double sum = 0.0;
         double* sum_d;
         cudaMalloc(&sum_d, sizeof(double));
+        cudaCheck(cudaMemsetAsync(sum_d, 0, sizeof(double), stream));
         abs_sum_kernel<<<B*T, WARP_SIZE, 0, stream>>>(out, B*T, C, sum_d);
         cudaCheck(cudaGetLastError());
         cudaCheck(cudaMemcpy(&sum, sum_d, sizeof(double), cudaMemcpyDeviceToHost));
@@ -511,6 +512,7 @@ void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, floa
         double sum = 0.0;
         double* sum_d;
         cudaMalloc(&sum_d, sizeof(double));
+        cudaCheck(cudaMemsetAsync(sum_d, 0, sizeof(double), stream));
         abs_sum_kernel<<<N, WARP_SIZE, 0, stream>>>(residual, N, C, sum_d);
         cudaCheck(cudaGetLastError());
         cudaCheck(cudaMemcpy(&sum, sum_d, sizeof(double), cudaMemcpyDeviceToHost));

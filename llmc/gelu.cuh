@@ -59,6 +59,7 @@ void gelu_forward(floatX* out, const floatX* inp, int N, float* coord_check_data
         double sum = 0.0;
         double* sum_d;
         cudaMalloc(&sum_d, sizeof(double));
+        cudaCheck(cudaMemsetAsync(sum_d, 0, sizeof(double), stream));
         assert(N % WARP_SIZE == 0);
         int grid_size = CEIL_DIV(N, WARP_SIZE);
         abs_sum_kernel<<<grid_size, WARP_SIZE, 0, stream>>>(out, grid_size, WARP_SIZE, sum_d);

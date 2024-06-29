@@ -168,6 +168,7 @@ void encoder_forward(floatX* out,
         double sum = 0.0;
         double* sum_d;
         cudaMalloc(&sum_d, sizeof(double));
+        cudaCheck(cudaMemsetAsync(sum_d, 0, sizeof(double), stream));
         abs_sum_kernel<<<B*T, WARP_SIZE, 0, stream>>>(out, B*T, C, sum_d);
         cudaCheck(cudaGetLastError());
         cudaCheck(cudaMemcpy(&sum, sum_d, sizeof(double), cudaMemcpyDeviceToHost));
