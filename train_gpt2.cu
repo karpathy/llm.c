@@ -657,7 +657,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T, int step, 
     tokenCheck(inputs, B*T, V);
 
     int cc_cnt = step * (3 + model->config.num_layers * 8);
-    if (coord_check_data != NULL && step >= 3) {
+    if (coord_check_data != NULL && step >= 4) {
         char filename[100];
         sprintf(filename, "usemup=%d_width=%d_coord_check_data.bin", model->use_mup, model->config.channels);
         FILE *f = fopen(filename, "wb");
@@ -1744,7 +1744,7 @@ int main(int argc, char *argv[]) {
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
 
-    int cc_buffer_size = 3 * (3 + model.config.num_layers * 8);  // we collect 3 steps of stats
+    int cc_buffer_size = 4 * (3 + model.config.num_layers * 8);  // we collect 3 steps of stats
     float coord_check_data[cc_buffer_size];
     for (int i = 0; i < cc_buffer_size; i++) {
         coord_check_data[i] = 0.0f;

@@ -15,7 +15,7 @@ for me in 0 1; do  # 0 - SP; 1 - muP
             -d -1 \
             -r 0 \
             -z 0 \
-            -l 0.0006 \
+            -l 0.006 \
             -y 0 \
             -me $me \
             -mm $mm \
