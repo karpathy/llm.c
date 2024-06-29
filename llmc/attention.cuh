@@ -194,7 +194,7 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
 
 void attention_forward(floatX* out, floatX* qkvr, floatX* att,
                        floatX* inp,
-                       int B, int T, int C, int NH, int use_mup, float mup_attn_mult, cudaStream_t stream) {
+                       int B, int T, int C, int NH, int use_mup, float mup_attn_mult, float* coord_check_data, int cc_cnt, cudaStream_t stream) {
     NVTX_RANGE_FN();
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
     // Its contents will be overwritten by this function.
@@ -232,6 +232,10 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     num_blocks = CEIL_DIV(B * T * C, block_size);
     unpermute_kernel<<<num_blocks, block_size, 0, stream>>>(vaccum, out, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
+    // data collection
+    if (coord_check_data != NULL) {
+        coord_check_data[cc_cnt] = get_mean_l1_summary(out, B*T*C);
+    }
 }
 
 // the sequence of transformations in this compound op is:
