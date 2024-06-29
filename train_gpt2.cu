@@ -663,7 +663,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T, int step, 
 
     int should_coord_check = (step != -1);
     int cnt = step * 18;
-    assert(model->recompute == 0); // coord check
+    assert(!model->use_mup || (model->use_mup && model->recompute == 0)); // coord check
     if (step >= 3) {
         assert(cnt == 3*18);
         // save data & exit as we are collecting only 3 steps
