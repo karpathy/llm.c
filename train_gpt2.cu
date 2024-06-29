@@ -726,7 +726,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T, int step, 
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
         matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, model->use_mup, main_stream);
+        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, model->use_mup, sqrt(128.f), main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // these are only needed as scratchpads for the forward pass, but
@@ -735,7 +735,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T, int step, 
         if (should_coord_check) {
             coord_check_data[cnt++] = get_mean_l1_summary(scratch, B*T*3*C);
         }
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, model->use_mup, main_stream);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, model->use_mup, sqrt(128.f), main_stream);
         if (should_coord_check) {
             coord_check_data[cnt++] = get_mean_l1_summary(l_atty, B*T*C);
         }
@@ -934,13 +934,13 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C, model->use_mup, main_stream);
+        attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C, model->use_mup, sqrtf(128.f), main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
-        attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, model->use_mup, main_stream);
+        attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, model->use_mup, sqrtf(128.f), main_stream);
         #endif
         if(model->recompute >= 2) {
             layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);

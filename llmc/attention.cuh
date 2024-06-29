@@ -194,7 +194,7 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
 
 void attention_forward(floatX* out, floatX* qkvr, floatX* att,
                        floatX* inp,
-                       int B, int T, int C, int NH, int use_mup, cudaStream_t stream) {
+                       int B, int T, int C, int NH, int use_mup, float mup_attn_mult, cudaStream_t stream) {
     NVTX_RANGE_FN();
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
     // Its contents will be overwritten by this function.
@@ -218,7 +218,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     matmul_cublaslt(preatt, k, q, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
 
     // multiply all elements of preatt elementwise by scale
-    float scale = use_mup ? sqrtf(128.f) / (float)HS : 1.f / sqrtf((float)HS);  // 128 comes from (self.hidden_size / self.num_attention_heads)**0.5 for the base model which has width=256 (arbitrarily chosen as the base)
+    float scale = use_mup ? mup_attn_mult / (float)HS : 1.f / sqrtf((float)HS);
     int grid_size = CEIL_DIV(B * NH * T * WARP_SIZE, block_size);
     softmax_forward_kernel5<<<grid_size, block_size, 0, stream>>>(att, scale, preatt, B * NH, T);
 
@@ -239,7 +239,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
                         const floatX* dout,
                         const floatX* qkvr, const floatX* att,
-                        int B, int T, int C, int NH, int use_mup, cudaStream_t stream) {
+                        int B, int T, int C, int NH, int use_mup, float mup_attn_mult, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int HS = C / NH; // head size
@@ -261,7 +261,7 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     matmul_cublaslt(datt, v, scratch, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
     // backward into dv
     matmul_cublaslt(dv, scratch, att, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
-    const float scale = use_mup ? sqrtf(128.f) / (float)HS : 1.f / sqrtf((float)HS);
+    const float scale = use_mup ? mup_attn_mult / (float)HS : 1.f / sqrtf((float)HS);
     // backward into preatt. this is an in-place operation; datt turns into dpreatt here
     softmax_autoregressive_backward_inplace_kernel<<<dim3(T / 4, B * NH), 256>>>(datt, att, B, T, C, scale);
     const floatX* dpreatt = datt;
