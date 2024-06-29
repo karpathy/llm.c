@@ -1413,6 +1413,7 @@ void error_usage() {
     // muP (maximum update parametrization)
     fprintf(stderr, "  -me <int> should enable muP? (default 0)\n");
     fprintf(stderr, "  -mm <float> width multiplier - ratio of width to base model width (default = 1.0f)\n");
+    fprintf(stderr, "  -ma <float> base attn multiplier - sqrt(d) of base model, where d is dim of single attn head (default = 1.0f)\n");
     fprintf(stderr, "  -mc <int> should do muP coordinate check test? (default 0)\n");
     fprintf(stderr, "  -mw <int> muP coordinate check current width (default 256)\n");
     // evaluation
