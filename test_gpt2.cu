@@ -169,7 +169,7 @@ int main(int argc, char *argv[]) {
     int allok = 1;
 
     // First, do target-free forward pass to validate logits
-    gpt2_forward(&model, x, B, T, -1, NULL);
+    gpt2_forward(&model, x, B, T, 0, NULL);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
     floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
@@ -218,7 +218,7 @@ int main(int argc, char *argv[]) {
     for (int step = 0; step < 10; step++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
-        gpt2_forward(&model, x, B, T, -1, NULL);
+        gpt2_forward(&model, x, B, T, step, NULL);
         gpt2_backward_and_reduce(&model, x, y, 1, 0);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
@@ -335,12 +335,7 @@ int main(int argc, char *argv[]) {
     int tokens[10];
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
-<<<<<<< HEAD
-        gpt2_forward(&model, loader.inputs, B, T);
-=======
-        gpt2_forward(&model, loader.inputs, B, T, -1, NULL);
-        gpt2_zero_grad(&model);
->>>>>>> b00f419 (Fix test script)
+        gpt2_forward(&model, loader.inputs, B, T, step, NULL);
         gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, 0);
         gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
         losses[step] = model.mean_loss;
@@ -354,12 +349,7 @@ int main(int argc, char *argv[]) {
     load_state(&ld_step, &model, &loader, "test_gpt2cu_state.ckpt");
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
-<<<<<<< HEAD
-        gpt2_forward(&model, loader.inputs, B, T);
-=======
-        gpt2_forward(&model, loader.inputs, B, T, -1, NULL);
-        gpt2_zero_grad(&model);
->>>>>>> b00f419 (Fix test script)
+        gpt2_forward(&model, loader.inputs, B, T, step, NULL);
         gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, 0);
         gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
 
