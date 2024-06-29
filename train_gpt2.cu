@@ -607,17 +607,6 @@ void gpt2_build_from_random(GPT2 *model, int depth, int mup_width, int mup_coord
     free(params_memory_cpu);
 }
 
-float get_mean_l1_summary(floatX* tensor, size_t size) {
-    // copy tensor over to CPU from GPU
-    floatX* tensor_cpu = (floatX*)mallocCheck(size * sizeof(floatX));
-    cudaCheck(cudaMemcpy(tensor_cpu, tensor, size * sizeof(floatX), cudaMemcpyDeviceToHost));
-    double sum = 0.0f;
-    for (size_t i = 0; i < size; i++) {
-        sum += fabsf(tensor_cpu[i]);
-    }
-    return (float)(sum / (double)size);
-}
-
 // propagate inputs through the network to produce logits.
 // right now, this function is fully synchronous with the host
 void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T, int step, float* coord_check_data) {
@@ -667,34 +656,23 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T, int step, 
     // we can do this while the copies are already underway
     tokenCheck(inputs, B*T, V);
 
-    int should_coord_check = (step != -1);
-    int cnt = step * 18;
-    assert(!model->use_mup || (model->use_mup && model->recompute == 0)); // coord check
-    if (step >= 3) {
-        assert(cnt == 3*18);
-        // save data & exit as we are collecting only 3 steps
-        // create a string alike to Python's f"{model->width}coord_check_data.bin"
+    int cc_cnt = step * (3 + model->config.num_layers * 8);
+    if (coord_check_data != NULL && step >= 3) {
         char filename[100];
         sprintf(filename, "usemup=%d_width=%d_coord_check_data.bin", model->use_mup, model->config.channels);
         FILE *f = fopen(filename, "wb");
-        fwrite(coord_check_data, sizeof(float), cnt, f);
+        fwrite(coord_check_data, sizeof(float), cc_cnt, f);
         fclose(f);
-        exit(0);
+        exit(EXIT_SUCCESS);
     }
 
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
-    if (should_coord_check) {
-        coord_check_data[cnt++] = get_mean_l1_summary(acts.encoded, B*T*C);
-    }
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, coord_check_data, cc_cnt++, main_stream); // encoding goes into residual[0]
 
     // first layernorm isn't fused
-    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
-    if (should_coord_check) {
-        coord_check_data[cnt++] = get_mean_l1_summary(acts.ln1, B*T*C);
-    }
+    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, coord_check_data, cc_cnt++, main_stream);
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
@@ -731,24 +709,18 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T, int step, 
         // now do the forward pass
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, NULL, 0., main_stream);
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, model->use_mup, model->mup_base_attn_mult, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        if (should_coord_check) {
-            coord_check_data[cnt++] = get_mean_l1_summary(scratch, B*T*3*C);
-        }
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, model->use_mup, model->mup_base_attn_mult, main_stream);
-        if (should_coord_check) {
-            coord_check_data[cnt++] = get_mean_l1_summary(l_atty, B*T*C);
-        }
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, model->use_mup, model->mup_base_attn_mult, coord_check_data, cc_cnt++, main_stream);
         #endif
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
-        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, 0., 0., main_stream);
+        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, 0., 0., coord_check_data, cc_cnt++, main_stream);
         matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
         // OK, fusion across blocks.
@@ -759,15 +731,11 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T, int step, 
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
             const floatX* l_ln1b = params.ln1b + (l + 1) * C;
             fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
-                                    B * T, C, 0., 0., main_stream);
+                                    B * T, C, 0., 0., coord_check_data, cc_cnt++, main_stream);
         } else {
             fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
                                     params.lnfw, params.lnfb,
-                                    B * T, C, model->use_mup, 1. / model->mup_width_mult, main_stream);
-        }
-
-        if (should_coord_check) {
-            coord_check_data[cnt++] = get_mean_l1_summary(l_residual3, B*T*C);
+                                    B * T, C, model->use_mup, 1. / model->mup_width_mult, coord_check_data, cc_cnt++, main_stream);
         }
     }
 
@@ -926,12 +894,12 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         if(model->recompute >= 1) {
             // recompute >= 1 means we recompute gelu. in this case,
             // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
-            gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream);
+            gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, NULL, 0, main_stream);
         }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
         if(model->recompute >= 2) {
             // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
-            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
+            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, NULL, 0, main_stream);
         }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
@@ -949,7 +917,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, model->use_mup, model->mup_base_attn_mult, main_stream);
         #endif
         if(model->recompute >= 2) {
-            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
+            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, NULL, 0, main_stream);
         }
         // QKV parameter gradients
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
@@ -1570,6 +1538,10 @@ int main(int argc, char *argv[]) {
     if (mup_coord_check) {
         load_filename = "d2";
         recompute = 0;
+        #ifdef ENABLE_CUDNN
+        printf("cuDNN is enabled, muP coordinate check is not supported with cuDNN\n");
+        exit(EXIT_FAILURE);
+        #endif
     }
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
     common_start(override_enable_tf32, false); // common init code for train/test/profile
@@ -1772,8 +1744,9 @@ int main(int argc, char *argv[]) {
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
 
-    float coord_check_data[54];
-    for (int i = 0; i < 54; i++) {
+    int cc_buffer_size = 3 * (3 + model.config.num_layers * 8);  // we collect 3 steps of stats
+    float coord_check_data[cc_buffer_size];
+    for (int i = 0; i < cc_buffer_size; i++) {
         coord_check_data[i] = 0.0f;
     }
 
@@ -1898,7 +1871,7 @@ int main(int argc, char *argv[]) {
             // fetch the next data batch
             dataloader_next_batch(&train_loader);
             // forward pass. note that we pass in grad_accum_steps, which scales down the loss
-            gpt2_forward(&model, train_loader.inputs, B, T, step, coord_check_data);
+            gpt2_forward(&model, train_loader.inputs, B, T, step, mup_coord_check ? coord_check_data : NULL);
             // backward pass. all model params accumulate gradients with += inside this inner loop
             gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
         }

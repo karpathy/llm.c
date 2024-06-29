@@ -438,7 +438,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
 // similar to `fused_residual_forward5`
 void layernorm_forward(floatX* out, float* mean, float* rstd,
                        floatX* inp, const floatX* weight, const floatX* bias,
-                       int B, int T, int C, cudaStream_t stream) {
+                       int B, int T, int C, float* coord_check_data, int cc_cnt, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
@@ -459,6 +459,10 @@ void layernorm_forward(floatX* out, float* mean, float* rstd,
         layernorm_forward_kernel3<<<grid_size_fb, block_size, 0, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
     }
     cudaCheck(cudaGetLastError());
+    // data collection
+    if (coord_check_data != NULL) {
+        coord_check_data[cc_cnt] = get_mean_l1_summary(out, B*T*C);
+    }
 }
 
 void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N, cudaStream_t stream) {
@@ -473,7 +477,7 @@ void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N
 void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, float* rstd,
                              const floatX* inp1, const floatX* inp2,
                              const floatX* weight, const floatX* bias,
-                             int N, int C, int use_mup, float mup_scale, cudaStream_t stream) {
+                             int N, int C, int use_mup, float mup_scale, float* coord_check_data, int cc_cnt, cudaStream_t stream) {
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
     const int grid_size = CEIL_DIV(N, block_y);
@@ -491,9 +495,13 @@ void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, floa
     } else {
         assert(false); // this should never happen
         residual_forward(residual, inp1, inp2, N*C, stream);
-        layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C, stream);
+        layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C, NULL, 0, stream);
     }
     cudaCheck(cudaGetLastError());
+
+    if (coord_check_data != NULL) {
+        coord_check_data[cc_cnt] = get_mean_l1_summary(residual, N*C);
+    }
 }
 
 void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
