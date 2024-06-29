@@ -230,14 +230,17 @@ __device__ __forceinline__ void stochastic_rounding(float in, float *out, unsign
     *out = in; // dummy function for when floatX is float (FP32 mode)
 }
 
-float get_mean_l1_summary(floatX* tensor, size_t size) {
-    floatX* tensor_cpu = (floatX*)mallocCheck(size * sizeof(floatX));
-    cudaCheck(cudaMemcpy(tensor_cpu, tensor, size * sizeof(floatX), cudaMemcpyDeviceToHost));
-    double sum = 0.0f;
-    for (size_t i = 0; i < size; i++) {
-        sum += fabsf(tensor_cpu[i]);
+__global__ void abs_sum_kernel(floatX* data, int N, int C, double* sum) {
+    float accumulator = 0.f;
+    for(size_t i = threadIdx.x; i < C; i += WARP_SIZE) {
+        int idx = blockIdx.x * C + i;
+        accumulator += fabsf((float)data[idx]);
     }
-    return (float)(sum / (double)size);
+    accumulator = warpReduceSum(accumulator);
+    if(threadIdx.x == 0) {
+        // This is just used for data collection so no need for deterministic reduction
+        atomicAdd(sum, (double)accumulator);
+    }
 }
 
 #endif

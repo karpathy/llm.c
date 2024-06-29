@@ -461,7 +461,14 @@ void layernorm_forward(floatX* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
     // data collection
     if (coord_check_data != NULL) {
-        coord_check_data[cc_cnt] = get_mean_l1_summary(out, B*T*C);
+        double sum = 0.0;
+        double* sum_d;
+        cudaMalloc(&sum_d, sizeof(double));
+        abs_sum_kernel<<<B*T, WARP_SIZE, 0, stream>>>(out, B*T, C, sum_d);
+        cudaCheck(cudaGetLastError());
+        cudaCheck(cudaMemcpy(&sum, sum_d, sizeof(double), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaFree(sum_d));
+        coord_check_data[cc_cnt] = (float)(sum / (B*T*C));
     }
 }
 
@@ -499,8 +506,16 @@ void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, floa
     }
     cudaCheck(cudaGetLastError());
 
+    // data collection
     if (coord_check_data != NULL) {
-        coord_check_data[cc_cnt] = get_mean_l1_summary(residual, N*C);
+        double sum = 0.0;
+        double* sum_d;
+        cudaMalloc(&sum_d, sizeof(double));
+        abs_sum_kernel<<<N, WARP_SIZE, 0, stream>>>(residual, N, C, sum_d);
+        cudaCheck(cudaGetLastError());
+        cudaCheck(cudaMemcpy(&sum, sum_d, sizeof(double), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaFree(sum_d));
+        coord_check_data[cc_cnt] = (float)(sum / (N*C));
     }
 }
 
