@@ -28,9 +28,6 @@ verstion 5 allocates blocks per row instead of warps per row, same alg as 4 othe
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include "common.h"
-
-#define WARP_SIZE 32
-
 // ----------------------------------------------------------------------------
 // CPU code reference
 

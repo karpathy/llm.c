@@ -165,13 +165,13 @@ void uniform_(float* data, unsigned int numel, float from, float to, mt19937_sta
 
 // Box-Muller transform: maps uniform random numbers to Gaussian distributed numbers
 // https://en.wikipedia.org/wiki/Box%E2%80%93Muller_transform
-void normal_fill_16(float* data, float mean, float std, mt19937_state* state) {
-    #define EPSILONE 1e-12
+void normal_fill_16(float* data, float mean, float std) {
+    #define EPSILONE 1e-12f
     for (unsigned int t = 0; t < 8; t++) {
         float u1 = 1 - data[t];
         float u2 = data[t + 8];
         float radius = sqrtf(-2 * logf(u1 + EPSILONE));
-        float theta = 2.0 * M_PI * u2;
+        float theta = (float) (2.0 * M_PI * u2);
         data[t] = (radius * cosf(theta) * std + mean);
         data[t + 8] = (radius * sinf(theta) * std + mean);
     }
@@ -182,7 +182,7 @@ void normal_fill(float* data, unsigned int numel, float mean, float std, mt19937
         data[t] = randfloat32(state);
     }
     for (unsigned int i = 0; i < numel - 15; i += 16) {
-        normal_fill_16(data + i, mean, std, state);
+        normal_fill_16(data + i, mean, std);
     }
     if (numel % 16 != 0) {
         // recompute the last 16 values
@@ -190,12 +190,12 @@ void normal_fill(float* data, unsigned int numel, float mean, float std, mt19937
         for (unsigned int i = 0; i < 16; i++) {
             data[i] = randfloat32(state);
         }
-        normal_fill_16(data, mean, std, state);
+        normal_fill_16(data, mean, std);
     }
 }
 
 void normal_(float* data, unsigned int numel, float mean, float std, mt19937_state* state) {
-    #define EPSILONE 1e-12
+    #define EPSILONE 1e-12f
     if (numel >= 16) {
         normal_fill(data, numel, mean, std, state);
     }
@@ -209,10 +209,10 @@ void normal_(float* data, unsigned int numel, float mean, float std, mt19937_sta
                 continue;
             }
             // for numel < 16 we draw a double (float64)
-            float u1 = randfloat64(state);
-            float u2 = randfloat64(state);
+            float u1 = (float) randfloat64(state);
+            float u2 = (float) randfloat64(state);
             float radius = sqrtf(-2 * logf(1 - u2 + EPSILONE));
-            float theta = 2.0 * M_PI * u1;
+            float theta = (float) (2.0 * M_PI * u1);
             next_double_normal_sample = radius * sinf(theta);
             has_next_double_normal_sample = 1;
             data[t] = (radius * cosf(theta) * std + mean);
