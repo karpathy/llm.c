@@ -56,7 +56,16 @@ void gelu_forward(floatX* out, const floatX* inp, int N, float* coord_check_data
     cudaCheck(cudaGetLastError());
     // data collection
     if (coord_check_data != NULL) {
-        coord_check_data[cc_cnt] = get_mean_l1_summary(out, N);
+        double sum = 0.0;
+        double* sum_d;
+        cudaMalloc(&sum_d, sizeof(double));
+        assert(N % WARP_SIZE == 0);
+        int grid_size = CEIL_DIV(N, WARP_SIZE);
+        abs_sum_kernel<<<grid_size, WARP_SIZE, 0, stream>>>(out, grid_size, WARP_SIZE, sum_d);
+        cudaCheck(cudaGetLastError());
+        cudaCheck(cudaMemcpy(&sum, sum_d, sizeof(double), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaFree(sum_d));
+        coord_check_data[cc_cnt] = (float)(sum / N);
     }
 }
 
