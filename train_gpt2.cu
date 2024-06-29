@@ -365,9 +365,8 @@ typedef struct {
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
-    int use_mup;  // use muP (maximum update) [1] or SP (standard) parametrization [0]
+    int use_mup; // use muP (maximum update) [1] or SP (standard) parametrization [0]
     float mup_width_mult; // muP width multiplier
-    int width; // width of the model
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -399,6 +398,8 @@ void gpt2_init_common(GPT2 *model) {
     model->use_master_weights = 1; // safe default: do keep master weights in fp32
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+    model->use_mup = 0; // default: use standard parametrization
+    model->mup_width_mult = 1.0f; // default: no width multiplier
 }
 
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -491,28 +492,31 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     cudaCheck(cudaDeviceSynchronize());
 }
 
-void gpt2_build_from_random(GPT2 *model, int depth, int width) {
+void gpt2_build_from_random(GPT2 *model, int depth, int mup_width, int mup_coord_check) {
     // init random (training from scratch)
 
-    depth = 2;
+    int channels, num_heads;
+    if (mup_coord_check) {
+        // for the mup_coord_check, we use a small model
+        depth = 2;
+        num_heads = 2;
+        channels = mup_width;
+    } else {
+        // follows GPT-2 sizes
+        if      (depth == 6)  { channels = 384; num_heads = 6; } // gpt2-tiny (30M)
+        else if (depth == 12) { channels = 768; num_heads = 12; } // gpt2 (124M)
+        else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
+        else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
+        else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
+        else { fprintf(stderr, "Unsupported depth for now\n"); exit(EXIT_FAILURE); }
+    }
     // parameterize the size of gpt2 based only on the depth of the model (num_layers)
     model->config.num_layers = depth;
-    // follows GPT-2 sizes
-    int channels, num_heads;
-    channels = width;
-    num_heads = 2;
-    // if      (depth == 6)  { channels = 384; num_heads = 6; } // gpt2-tiny (30M)
-    // else if (depth == 12) { channels = 768; num_heads = 12; } // gpt2 (124M)
-    // else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
-    // else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
-    // else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
-    // else { fprintf(stderr, "Unsupported depth for now\n"); exit(EXIT_FAILURE); }
     model->config.channels = channels;
     model->config.num_heads = num_heads;
     model->config.max_seq_len = 1024;
     model->config.vocab_size = 50257;
     model->config.padded_vocab_size = 50304; // padded to 128
-    model->width = width;
 
     // fill in all the parameter tensor dimensions and types
     fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
@@ -585,9 +589,9 @@ void gpt2_build_from_random(GPT2 *model, int depth, int width) {
                     }
                 }
                 // --- muP ---
-                if (model->use_mup && i == 0) {  // rescale readout/embedding parameters
+                if (model->use_mup && i == 0) {  // set readout/embedding to all 0.
                     for (size_t j = 0; j < n; j++) {
-                        params_memory_cpu[offset + layer_offset + j] = 0.f; //(floatX)((float)params_memory_cpu[offset + layer_offset + j] * mup_scale);
+                        params_memory_cpu[offset + layer_offset + j] = 0.f;
                     }
                 }
                 free(fp32_buffer);
@@ -669,7 +673,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T, int step, 
         // save data & exit as we are collecting only 3 steps
         // create a string alike to Python's f"{model->width}coord_check_data.bin"
         char filename[100];
-        sprintf(filename, "usemup=%d_width=%d_coord_check_data.bin", model->use_mup, model->width);
+        sprintf(filename, "usemup=%d_width=%d_coord_check_data.bin", model->use_mup, model->config.channels);
         FILE *f = fopen(filename, "wb");
         fwrite(coord_check_data, sizeof(float), cnt, f);
         fclose(f);
@@ -1470,7 +1474,7 @@ int main(int argc, char *argv[]) {
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
-    const char* load_filename = "d12"; // bf16 weights of the model
+    const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* lr_scheduler_type = "cosine";
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write checkpoints every how many steps?
@@ -1500,8 +1504,9 @@ int main(int argc, char *argv[]) {
     int hellaswag_eval = 0;
     // muP settings
     int use_mup = 1;  // muP or SP
+    int mup_coord_check = 1;  // muP coordinate check
     float mup_width_mult = 768.f / 256.f;  // muP width multiplier
-    int model_width = 768;
+    int mup_width = 768;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1552,13 +1557,13 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'u') { use_mup = atoi(argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'w') { mup_width_mult = atof(argv[i+1]); }
-        else if (argv[i][1] == 'p' && argv[i][2] == 'o') { model_width = atof(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'o') { mup_width = atof(argv[i+1]); }
         else { error_usage(); }
     }
-    // TODO(gordicaleksa): have nice flags here...
-    assert(recompute == 0);  // coord check
-
-    printf("Using mup %d with width mult %.3f and model width is %d\n", use_mup, mup_width_mult, model_width);
+    if (mup_coord_check) {
+        load_filename = "d2";
+        recompute = 0;
+    }
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
     common_start(override_enable_tf32, false); // common init code for train/test/profile
 
@@ -1638,16 +1643,14 @@ int main(int argc, char *argv[]) {
     assert(strlen(load_filename) >= 2);
     if (resuming == 1) {
         gpt2_build_from_checkpoint(&model, filename_buffer);
-        assert(false);
     } else if (load_filename[0] == 'd') {
         int depth = atoi(load_filename + 1);
         if (depth > 1 && depth <= 1000) { // we're not going to train models this big right? heh
-            gpt2_build_from_random(&model, depth, model_width);
+            gpt2_build_from_random(&model, depth, mup_width, mup_coord_check);
         } else {
             exit(EXIT_FAILURE);
         }
     } else {
-        assert(false);
         gpt2_build_from_checkpoint(&model, load_filename);
     }
 

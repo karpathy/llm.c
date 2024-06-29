@@ -108,8 +108,6 @@ int main(int argc, char *argv[]) {
     // build the GPT-2 model from a checkpoint
     GPT2 model;
     gpt2_init_common(&model);
-    model.use_mup = 0;
-    model.mup_width_mult = 1.f;
 
     gpt2_build_from_checkpoint(&model, load_filename);
     size_t V = model.config.vocab_size;
