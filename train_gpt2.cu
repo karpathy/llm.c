@@ -367,6 +367,7 @@ typedef struct {
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
     int use_mup;  // use muP (maximum update) [1] or SP (standard) parametrization [0]
     float mup_width_mult; // muP width multiplier
+    int width; // width of the model
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -490,24 +491,28 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     cudaCheck(cudaDeviceSynchronize());
 }
 
-void gpt2_build_from_random(GPT2 *model, int depth) {
+void gpt2_build_from_random(GPT2 *model, int depth, int width) {
     // init random (training from scratch)
 
+    depth = 2;
     // parameterize the size of gpt2 based only on the depth of the model (num_layers)
     model->config.num_layers = depth;
     // follows GPT-2 sizes
     int channels, num_heads;
-    if      (depth == 6)  { channels = 384; num_heads = 6; } // gpt2-tiny (30M)
-    else if (depth == 12) { channels = 768; num_heads = 12; } // gpt2 (124M)
-    else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
-    else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
-    else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
-    else { fprintf(stderr, "Unsupported depth for now\n"); exit(EXIT_FAILURE); }
+    channels = width;
+    num_heads = 2;
+    // if      (depth == 6)  { channels = 384; num_heads = 6; } // gpt2-tiny (30M)
+    // else if (depth == 12) { channels = 768; num_heads = 12; } // gpt2 (124M)
+    // else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
+    // else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
+    // else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
+    // else { fprintf(stderr, "Unsupported depth for now\n"); exit(EXIT_FAILURE); }
     model->config.channels = channels;
     model->config.num_heads = num_heads;
     model->config.max_seq_len = 1024;
     model->config.vocab_size = 50257;
     model->config.padded_vocab_size = 50304; // padded to 128
+    model->width = width;
 
     // fill in all the parameter tensor dimensions and types
     fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
@@ -582,7 +587,7 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
                 // --- muP ---
                 if (model->use_mup && i == 0) {  // rescale readout/embedding parameters
                     for (size_t j = 0; j < n; j++) {
-                        params_memory_cpu[offset + layer_offset + j] = (floatX)((float)params_memory_cpu[offset + layer_offset + j] * mup_scale);
+                        params_memory_cpu[offset + layer_offset + j] = 0.f; //(floatX)((float)params_memory_cpu[offset + layer_offset + j] * mup_scale);
                     }
                 }
                 free(fp32_buffer);
@@ -596,9 +601,20 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     free(params_memory_cpu);
 }
 
+float get_mean_l1_summary(floatX* tensor, size_t size) {
+    // copy tensor over to CPU from GPU
+    floatX* tensor_cpu = (floatX*)mallocCheck(size * sizeof(floatX));
+    cudaCheck(cudaMemcpy(tensor_cpu, tensor, size * sizeof(floatX), cudaMemcpyDeviceToHost));
+    double sum = 0.0f;
+    for (size_t i = 0; i < size; i++) {
+        sum += fabsf(tensor_cpu[i]);
+    }
+    return (float)(sum / (double)size);
+}
+
 // propagate inputs through the network to produce logits.
 // right now, this function is fully synchronous with the host
-void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
+void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T, int step, float* coord_check_data) {
     NVTX_RANGE_FN();
     // we must be careful and use size_t instead of int, otherwise
     // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
@@ -645,13 +661,34 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // we can do this while the copies are already underway
     tokenCheck(inputs, B*T, V);
 
+    int should_coord_check = (step != -1);
+    int cnt = step * 18;
+    assert(model->recompute == 0); // coord check
+    if (step >= 3) {
+        assert(cnt == 3*18);
+        // save data & exit as we are collecting only 3 steps
+        // create a string alike to Python's f"{model->width}coord_check_data.bin"
+        char filename[100];
+        sprintf(filename, "usemup=%d_width=%d_coord_check_data.bin", model->use_mup, model->width);
+        FILE *f = fopen(filename, "wb");
+        fwrite(coord_check_data, sizeof(float), cnt, f);
+        fclose(f);
+        exit(0);
+    }
+
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    if (should_coord_check) {
+        coord_check_data[cnt++] = get_mean_l1_summary(acts.encoded, B*T*C);
+    }
 
     // first layernorm isn't fused
     layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
+    if (should_coord_check) {
+        coord_check_data[cnt++] = get_mean_l1_summary(acts.ln1, B*T*C);
+    }
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
@@ -695,7 +732,13 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        if (should_coord_check) {
+            coord_check_data[cnt++] = get_mean_l1_summary(scratch, B*T*3*C);
+        }
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, model->use_mup, main_stream);
+        if (should_coord_check) {
+            coord_check_data[cnt++] = get_mean_l1_summary(l_atty, B*T*C);
+        }
         #endif
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
@@ -714,7 +757,11 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         } else {
             fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
                                     params.lnfw, params.lnfb,
-                                    B * T, C, model->use_mup, 1.f / model->mup_width_mult, main_stream);
+                                    B * T, C, model->use_mup, 1. / model->mup_width_mult, main_stream);
+        }
+
+        if (should_coord_check) {
+            coord_check_data[cnt++] = get_mean_l1_summary(l_residual3, B*T*C);
         }
     }
 
@@ -729,7 +776,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B, size_t T) {
     assert(targets != NULL);
     // forward the model itself
-    gpt2_forward(model, inputs, B, T);
+    gpt2_forward(model, inputs, B, T, -1, NULL);
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
     const size_t V = model->config.vocab_size;
     const size_t Vp = model->config.padded_vocab_size;
@@ -1423,7 +1470,7 @@ int main(int argc, char *argv[]) {
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
-    const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
+    const char* load_filename = "d12"; // bf16 weights of the model
     const char* lr_scheduler_type = "cosine";
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write checkpoints every how many steps?
@@ -1453,7 +1500,8 @@ int main(int argc, char *argv[]) {
     int hellaswag_eval = 0;
     // muP settings
     int use_mup = 1;  // muP or SP
-    float mup_width_mult = 1.0f;  // muP width multiplier
+    float mup_width_mult = 768.f / 256.f;  // muP width multiplier
+    int model_width = 768;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1502,11 +1550,15 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'w' && argv[i][2] == 'i') { use_mup = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'w' && argv[i][2] == 'm') { mup_width_mult = atof(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'u') { use_mup = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'w') { mup_width_mult = atof(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'o') { model_width = atof(argv[i+1]); }
         else { error_usage(); }
     }
+    // TODO(gordicaleksa): have nice flags here...
+    assert(recompute == 0);  // coord check
 
+    printf("Using mup %d with width mult %.3f and model width is %d\n", use_mup, mup_width_mult, model_width);
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
     common_start(override_enable_tf32, false); // common init code for train/test/profile
 
@@ -1586,14 +1638,16 @@ int main(int argc, char *argv[]) {
     assert(strlen(load_filename) >= 2);
     if (resuming == 1) {
         gpt2_build_from_checkpoint(&model, filename_buffer);
+        assert(false);
     } else if (load_filename[0] == 'd') {
         int depth = atoi(load_filename + 1);
         if (depth > 1 && depth <= 1000) { // we're not going to train models this big right? heh
-            gpt2_build_from_random(&model, depth);
+            gpt2_build_from_random(&model, depth, model_width);
         } else {
             exit(EXIT_FAILURE);
         }
     } else {
+        assert(false);
         gpt2_build_from_checkpoint(&model, load_filename);
     }
 
@@ -1703,6 +1757,12 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaProfilerStart());
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
+
+    float coord_check_data[54];
+    for (int i = 0; i < 54; i++) {
+        coord_check_data[i] = 0.0f;
+    }
+
     for (; step <= train_num_batches; step++) {
         NvtxRange step_range("Train step", step);
 
@@ -1760,7 +1820,7 @@ int main(int argc, char *argv[]) {
                 // we re-calculate the forward pass for all of (B,T) positions from scratch
                 // but the inference here is just for sanity checking anyway
                 // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, B, T);
+                gpt2_forward(&model, gen_tokens, B, T, -1, NULL);
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
@@ -1824,7 +1884,8 @@ int main(int argc, char *argv[]) {
             // fetch the next data batch
             dataloader_next_batch(&train_loader);
             // forward pass. note that we pass in grad_accum_steps, which scales down the loss
-            gpt2_forward(&model, train_loader.inputs, B, T);
+            assert(micro_step ==0);  // TMP
+            gpt2_forward(&model, train_loader.inputs, B, T, step, coord_check_data);
             // backward pass. all model params accumulate gradients with += inside this inner loop
             gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
         }
