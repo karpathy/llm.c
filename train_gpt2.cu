@@ -1744,7 +1744,8 @@ int main(int argc, char *argv[]) {
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
 
-    int cc_buffer_size = 4 * (3 + model.config.num_layers * 8);  // we collect 3 steps of stats
+    // 4 * (3 + model.config.num_layers * 8) <- we collect 4 steps of stats
+    const int cc_buffer_size = 76;  // windows CI requires a constant here
     float coord_check_data[cc_buffer_size];
     for (int i = 0; i < cc_buffer_size; i++) {
         coord_check_data[i] = 0.0f;
