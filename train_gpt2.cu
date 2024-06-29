@@ -1440,9 +1440,11 @@ void error_usage() {
     fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
     fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes above this in zscore (0.0f=off)\n");
     fprintf(stderr, "  -sg <float> outlier stability: skip update if grad_norm goes above this in zscore (0.0f=off)\n");
-    // wi - weight initialization
-    fprintf(stderr, "  -wi <string> weight init method (default = mup)\n");
-    fprintf(stderr, "  -wm <float> weight init multiplier (default = 1.0f)\n");
+    // muP (maximum update parametrization)
+    fprintf(stderr, "  -me <int> should enable muP? (default 0)\n");
+    fprintf(stderr, "  -mm <float> width multiplier - ratio of width to base model width (default = 1.0f)\n");
+    fprintf(stderr, "  -mc <int> should do muP coordinate check test? (default 0)\n");
+    fprintf(stderr, "  -mw <int> muP coordinate check current width (default 256)\n");
     // evaluation
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
     fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
@@ -1503,10 +1505,10 @@ int main(int argc, char *argv[]) {
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
     // muP settings
-    int use_mup = 1;  // muP or SP
-    int mup_coord_check = 1;  // muP coordinate check
-    float mup_width_mult = 768.f / 256.f;  // muP width multiplier
-    int mup_width = 768;
+    int use_mup = 0;  // muP or SP (standard parametrization)
+    float mup_width_mult = 1.f;  // muP width multiplier
+    int mup_coord_check = 0;  // should do muP coordinate check? tests for correctness of muP
+    int mup_coord_check_width = 256;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1534,7 +1536,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm' && argv[i][2] == '\0') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g' && argv[i][2] == 'e') { gelu_fusion = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
@@ -1555,9 +1557,10 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'p' && argv[i][2] == 'u') { use_mup = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'p' && argv[i][2] == 'w') { mup_width_mult = atof(argv[i+1]); }
-        else if (argv[i][1] == 'p' && argv[i][2] == 'o') { mup_width = atof(argv[i+1]); }
+        else if (argv[i][1] == 'm' && argv[i][2] == 'e') { use_mup = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm' && argv[i][2] == 'm') { mup_width_mult = atof(argv[i+1]); }
+        else if (argv[i][1] == 'm' && argv[i][2] == 'c') { mup_coord_check = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm' && argv[i][2] == 'w') { mup_coord_check_width = atof(argv[i+1]); }
         else { error_usage(); }
     }
     if (mup_coord_check) {
@@ -1646,7 +1649,7 @@ int main(int argc, char *argv[]) {
     } else if (load_filename[0] == 'd') {
         int depth = atoi(load_filename + 1);
         if (depth > 1 && depth <= 1000) { // we're not going to train models this big right? heh
-            gpt2_build_from_random(&model, depth, mup_width, mup_coord_check);
+            gpt2_build_from_random(&model, depth, mup_coord_check_width, mup_coord_check);
         } else {
             exit(EXIT_FAILURE);
         }
@@ -1721,6 +1724,9 @@ int main(int argc, char *argv[]) {
     printf0("batch_size B=%d * seq_len T=%d * num_processes=%d and total_batch_size=%d\n",
             B, T, multi_gpu_config.num_processes, total_batch_size);
     printf0("=> setting grad_accum_steps=%d\n", grad_accum_steps);
+    if (mup_coord_check) {
+        assert(grad_accum_steps == 1);
+    }
 
     // set up logging
     if (multi_gpu_config.process_rank == 0) { create_dir_if_not_exists(output_log_dir); }
@@ -1887,7 +1893,6 @@ int main(int argc, char *argv[]) {
             // fetch the next data batch
             dataloader_next_batch(&train_loader);
             // forward pass. note that we pass in grad_accum_steps, which scales down the loss
-            assert(micro_step ==0);  // TMP
             gpt2_forward(&model, train_loader.inputs, B, T, step, coord_check_data);
             // backward pass. all model params accumulate gradients with += inside this inner loop
             gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
