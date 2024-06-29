@@ -143,7 +143,7 @@ module_names_hardcoded = [
 
 def get_coord_check_data(fpath):
     data = []
-    num_steps = 3
+    num_steps = 4
     num_activations = len(module_names_hardcoded)
     for f in fpath:
         name = os.path.basename(f)  # file format example: `usemup=0_width=256_coord_check_data.bin`
@@ -162,8 +162,8 @@ def get_coord_check_data(fpath):
 def save_plot(file_paths, mup):
     legend=False
     optimizer = 'adam'
-    lr = 0.0006
-    nseeds = 3
+    lr = 0.006
+    nseeds = 4
     df = get_coord_check_data(file_paths)
     prm = 'μP' if mup else 'SP'
     save_to = os.path.join(root_dir, f'{prm.lower()}_trsfmr_{optimizer}_coord.png')
