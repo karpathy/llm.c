@@ -57,119 +57,126 @@ struct GPT2 {
     // allocate space for all the parameters and read them in
     printf("num_parameters: %zu\n", gpt2_->NumParameters());
 
-    // read in all the parameters from file
-    freadCheck(gpt2_->wte_->weight_->data(), sizeof(float),
-               gpt2_->wte_->NumParameters(), model_file);
-    freadCheck(gpt2_->wpe_->weight_->data(), sizeof(float),
-               gpt2_->wpe_->NumParameters(), model_file);
+    auto restore_fn = [&](nn::Parameter* p, const std::string& name){
+      LOG_FIRST_N(INFO, 1) << "wte weight: " << p->size();
+      freadCheck(p->data(), sizeof(float), p->size(), model_file);
+    };
+    ApplyFn(restore_fn, L, kRestore);
+    fcloseCheck(model_file);
+  }
+
+  void Parameters(std::vector<nn::Parameter*>* parameters) {
+    static int offset = 0;
+    auto collect_fn = [&](nn::Parameter* p, const std::string& name) {
+      p->SetName(name);
+      p->SetOffset(offset);
+      parameters->push_back(p);
+      offset += p->size();
+    };
+    ApplyFn(collect_fn, config.num_layers, kCollect);
+  }
+
+  enum ApplyType {
+    kCollect,
+    kRestore
+  };
+
+  void ApplyFn(const std::function<void(nn::Parameter*, const std::string&)>& apply_fn, int L, ApplyType type) {
+    apply_fn(gpt2_->wte_->weight_.get(), "wte");
+    apply_fn(gpt2_->wpe_->weight_.get(), "wpe");
+
+    auto name_with_layer = [](const std::string& name, int l) {
+      return name + "-L" + std::to_string(l);
+    };
+
     // ln1w
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->ln1_->weight_->data();
-      int num = block->ln1_->normalized_shape_;
-      freadCheck(p, sizeof(float), num, model_file);
+      nn::Parameter* p = block->ln1_->weight_.get();
+      apply_fn(p, name_with_layer("ln1w", l));
     }
 
     // ln1b
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->ln1_->bias_->data();
-      int num = block->ln1_->normalized_shape_;
-      freadCheck(p, sizeof(float), num, model_file);
+      nn::Parameter* p = block->ln1_->bias_.get();
+      apply_fn(p, name_with_layer("ln1b", l));
     }
 
     // qkvw
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->attn_->c_attn_->weight_->data();
-      int num = block->attn_->c_attn_->out_features_ *
-                block->attn_->c_attn_->in_features_;
-      freadCheck(p, sizeof(float), num, model_file);
+      nn::Parameter* p = block->attn_->c_attn_->weight_.get();
+      apply_fn(p, name_with_layer("qkvw", l));
     }
 
     // qkvb
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->attn_->c_attn_->bias_->data();
-      int num = block->attn_->c_attn_->out_features_;
-      freadCheck(p, sizeof(float), num, model_file);
+      nn::Parameter* p = block->attn_->c_attn_->bias_.get();
+      apply_fn(p, name_with_layer("qkvb", l));
     }
 
     // attprojw
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->attn_->c_proj_->weight_->data();
-      int num = block->attn_->c_proj_->out_features_ *
-                block->attn_->c_proj_->in_features_;
-      freadCheck(p, sizeof(float), num, model_file);
+      nn::Parameter* p = block->attn_->c_proj_->weight_.get();
+      apply_fn(p, name_with_layer("attprojw", l));
     }
 
     // attprojb
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->attn_->c_proj_->bias_->data();
-      int num = block->attn_->c_proj_->out_features_;
-      freadCheck(p, sizeof(float), num, model_file);
+      nn::Parameter* p = block->attn_->c_proj_->bias_.get();
+      apply_fn(p, name_with_layer("attprojb", l));
     }
 
     // ln2w
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->ln2_->weight_->data();
-      int num = block->ln2_->normalized_shape_;
-      freadCheck(p, sizeof(float), num, model_file);
+      nn::Parameter* p = block->ln2_->weight_.get();
+      apply_fn(p, name_with_layer("ln2w", l));
     }
 
     // ln2b
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->ln2_->bias_->data();
-      int num = block->ln2_->normalized_shape_;
-      freadCheck(p, sizeof(float), num, model_file);
+      nn::Parameter* p = block->ln2_->bias_.get();
+      apply_fn(p, name_with_layer("ln2b", l));
     }
 
     // fcw
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->mlp_->c_fc_->weight_->data();
-      int num =
-          block->mlp_->c_fc_->out_features_ * block->mlp_->c_fc_->in_features_;
-      freadCheck(p, sizeof(float), num, model_file);
+      nn::Parameter* p = block->mlp_->c_fc_->weight_.get();
+      apply_fn(p, name_with_layer("fcw", l));
     }
 
     // fcb
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->mlp_->c_fc_->bias_->data();
-      int num = block->mlp_->c_fc_->out_features_;
-      freadCheck(p, sizeof(float), num, model_file);
+      nn::Parameter* p = block->mlp_->c_fc_->bias_.get();
+      apply_fn(p, name_with_layer("fcb", l));
     }
 
     // fcprojw
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->mlp_->c_proj_->weight_->data();
-      int num = block->mlp_->c_proj_->out_features_ *
-                block->mlp_->c_proj_->in_features_;
-      freadCheck(p, sizeof(float), num, model_file);
+      nn::Parameter* p = block->mlp_->c_proj_->weight_.get();
+      apply_fn(p, name_with_layer("fcprojw", l));
     }
 
     // fcprojb
     for (int l = 0; l < L; ++l) {
       const auto& block = gpt2_->h_[l];
-      float* p = block->mlp_->c_proj_->bias_->data();
-      int num = block->mlp_->c_proj_->out_features_;
-      freadCheck(p, sizeof(float), num, model_file);
+      nn::Parameter* p = block->mlp_->c_proj_->bias_.get();
+      apply_fn(p, name_with_layer("fcprojb", l));
     }
 
     // lnfw
-    freadCheck(gpt2_->lnf_->weight_->data(), sizeof(float),
-               gpt2_->lnf_->normalized_shape_, model_file);
+    apply_fn(gpt2_->lnf_->weight_.get(), "lnfw");
     // lnfb
-    freadCheck(gpt2_->lnf_->bias_->data(), sizeof(float),
-               gpt2_->lnf_->normalized_shape_, model_file);
-
-    fcloseCheck(model_file);
+    apply_fn(gpt2_->lnf_->bias_.get(), "lnfb");
   }
 
   GPT2Config config;

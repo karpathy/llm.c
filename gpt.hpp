@@ -535,6 +535,8 @@ struct GPT {
     // https://paperswithcode.com/method/weight-tying
     std::memcpy(wte_->weight_->data(), lm_head_unused_->weight_->data(),
                 sizeof(float) * vocab_size * n_embed);
+    std::memset(wte_->weight_->data() + vocab_size * n_embed, 0,
+                sizeof(float) * (padded_vocab_size - vocab_size) * n_embed);
     lm_head_ = wte_->weight_->data();
     softmax_cross_entropy_ = std::make_unique<nn::SoftmaxCrossEntropy>(
         nn::SoftmaxCrossEntropy::MEAN, true);
@@ -601,11 +603,13 @@ struct GPT {
     }
     LAZY_ALLOCATE_TENSOR3D(tok_emb_grad_, B, T, C);
     LAZY_ALLOCATE_MATRIX(pos_emb_grad_, T, C);
+    LAZY_ALLOCATE_TENSOR3D(encoded_grad_, B, T, C);
     LAZY_ALLOCATE_TENSOR4D(block_y_grad_, L, B, T, C);
     LAZY_ALLOCATE_MATRIX(lnf_y_grad_, BT, C);
     LAZY_ALLOCATE_MATRIX(logits_grad_, BT, vocab_size_);
     tok_emb_grad_.setZero();
     pos_emb_grad_.setZero();
+    encoded_grad_.setZero();
     block_y_grad_.setZero();
     lnf_y_grad_.setZero();
     logits_grad_.setZero();
@@ -623,6 +627,18 @@ struct GPT {
     auto lm_head_grad = Eigen::Map<nn::Matrix>(lm_head_grad_, vocab_size_, C);
     lnf_y_grad +=
         logits_grad_2d * lm_head;  // [BT, vocab_size] x [vocab_size, C]
+
+    // debug only
+    //    for (int bt = 0; bt < BT; ++bt) {
+    //      for (int c = 0; c < C; ++c) {
+    //        float val = 0.0f;
+    //        for (int v = 0; v < vocab_size_; ++v) {
+    //          val += logits_grad_2d(bt, v) * lm_head(v, c);
+    //        }
+    //        lnf_y_grad(bt, c) += val;
+    //      }
+    //    }
+
     lm_head_grad.array() += (logits_grad_2d.transpose() * lnf_y)
                                 .array();  // [vocab_size, BT] x [BT, C]
 
@@ -639,9 +655,9 @@ struct GPT {
     // backward blocks
     for (int l = n_layer_ - 1; l >= 0; --l) {
       const auto& block = h_[l];
-      float* x = l == 0 ? tok_emb_.data() : block_y_.data() + (l - 1) * BTC;
+      float* x = l == 0 ? encoded_.data() : block_y_.data() + (l - 1) * BTC;
       float* x_grad =
-          l == 0 ? tok_emb_grad_.data() : block_y_grad_.data() + (l - 1) * BTC;
+          l == 0 ? encoded_grad_.data() : block_y_grad_.data() + (l - 1) * BTC;
       float* y_grad = block_y_grad_.data() + l * BTC;
       auto block_x_3d = Eigen::TensorMap<nn::Tensor3D>(x, B, T, C);
       auto block_x_grad_3d = Eigen::TensorMap<nn::Tensor3D>(x_grad, B, T, C);
@@ -650,12 +666,15 @@ struct GPT {
     }
 
     // backward tok_emb, pos_emb
+    auto encoded_grad = Eigen::Map<nn::Matrix>(encoded_grad_.data(), B, TC);
     auto tok_emb_grad = Eigen::Map<nn::Matrix>(tok_emb_grad_.data(), B, TC);
     auto pos_emb_grad =
         Eigen::Map<Eigen::RowVectorXf>(pos_emb_grad_.data(), TC);
-    for (int b = 0; b < B; ++b) {
-      pos_emb_grad += tok_emb_grad.row(b);
-    }
+    tok_emb_grad.noalias() = encoded_grad;
+    pos_emb_grad.noalias() = tok_emb_grad.colwise().sum();
+    //    for (int b = 0; b < B; ++b) {
+    //      pos_emb_grad.array() += tok_emb_grad.row(b).array();
+    //    }
 
     // backward wte, wpe
     std::vector<int> pos(T);
@@ -699,6 +718,7 @@ struct GPT {
     // Lazily allocate memory
     LAZY_ALLOCATE_TENSOR3D(tok_emb_, B, T, C);
     LAZY_ALLOCATE_MATRIX(pos_emb_, T, C);
+    LAZY_ALLOCATE_TENSOR3D(encoded_, B, T, C);
     LAZY_ALLOCATE_TENSOR4D(block_y_, L, B, T, C);
     LAZY_ALLOCATE_MATRIX(lnf_y_, BT, C);
     LAZY_ALLOCATE_VECTOR(lnf_mean_, BT);
@@ -709,11 +729,12 @@ struct GPT {
 
     auto tok_emb = Eigen::Map<nn::Matrix>(tok_emb_.data(), B, TC);
     auto pos_emb = Eigen::Map<Eigen::RowVectorXf>(pos_emb_.data(), TC);
-    tok_emb.rowwise() += pos_emb;
+    auto encoded = Eigen::Map<nn::Matrix>(encoded_.data(), B, TC);
+    encoded.array() = tok_emb.array().rowwise() + pos_emb.array();
 
     for (int l = 0; l < n_layer_; ++l) {
       const auto& block = h_[l];
-      float* x = l == 0 ? tok_emb_.data() : block_y_.data() + (l - 1) * BTC;
+      float* x = l == 0 ? encoded_.data() : block_y_.data() + (l - 1) * BTC;
       float* y = block_y_.data() + l * BTC;
       auto block_x_3d = Eigen::TensorMap<nn::Tensor3D>(x, B, T, C);
       auto block_y_3d = Eigen::TensorMap<nn::Tensor3D>(y, B, T, C);
@@ -749,6 +770,7 @@ struct GPT {
   // activation tensors and gradients
   nn::Tensor3D tok_emb_, tok_emb_grad_;     // [B, T, C]
   nn::Matrix pos_emb_, pos_emb_grad_;       // [T, C]
+  nn::Tensor3D encoded_, encoded_grad_;     // [B, T, C]
   nn::Tensor4D block_y_, block_y_grad_;     // [L, B, T, C]
   nn::Matrix lnf_y_, lnf_y_grad_;           // [B*T, C]
   Eigen::RowVectorXf lnf_mean_, lnf_rstd_;  // [B*T]

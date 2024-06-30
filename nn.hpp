@@ -1,4 +1,8 @@
+#ifndef LLM_CPP__NN_HPP_
+#define LLM_CPP__NN_HPP_
+
 #include <unistd.h>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <random>
@@ -31,6 +35,31 @@ void KaimingUniformFill(absl::Span<float> weight, int in_features) {
   uniform_(weight.data(), weight.size(), -bound, bound, &g_mt19937_state);
 }
 
+std::string DebugString(absl::Span<const float> span, int num_elements) {
+  std::stringstream ss;
+  ss << std::setprecision(6) << std::fixed << "[";
+  auto x1 = span.subspan(0, num_elements / 2);
+  auto x2 = span.subspan(span.size() - (num_elements - num_elements / 2));
+  bool first = true;
+
+  auto print_fn = [&](absl::Span<const float> x) {
+    for (int i = 0; i < x.size(); ++i) {
+      ss << x[i];
+      if (first) {
+        first = false;
+      } else {
+        ss << ", ";
+      }
+    }
+  };
+
+  print_fn(x1);
+  print_fn(x2);
+  ss << "]";
+
+  return ss.str();
+}
+
 using Matrix =
     Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 using MatrixInt =
@@ -48,15 +77,19 @@ inline Eigen::Map<Matrix> GetMatrixMap(Matrix& m) {
 struct Parameter {
   enum DataType { kValue, kGrad };
 
-  Parameter(size_t length) : length_(length) {
+  Parameter(int64_t length) : length_(length) {
     value_ = std::make_unique<float[]>(length);
     grad_ = nullptr;
   }
 
-  size_t size() const { return length_; }
+  int64_t size() const { return length_; }
   float* data() const { return value_.get(); }
   float* grad() const { return grad_.get(); }
+  const std::string& name() const { return name_; }
 
+  void SetOffset(int offset) { offset_ = offset; }
+
+  void SetName(const std::string& name) { name_ = name; }
   void AllocateGradient() {
     if (grad_ == nullptr) {
       grad_ = std::make_unique<float[]>(length_);
@@ -72,7 +105,8 @@ struct Parameter {
   absl::Span<float> View(DataType type = DataType::kValue) const {
     LOG_IF(FATAL, type == kGrad && grad_ == nullptr)
         << "Gradient memory has not been allocated!";
-    return {type == kValue ? value_.get() : grad_.get(), length_};
+    return {type == kValue ? value_.get() : grad_.get(),
+            static_cast<size_t>(length_)};
   }
 
   Eigen::Map<Eigen::RowVectorXf> View(int length,
@@ -95,7 +129,9 @@ struct Parameter {
  private:
   std::unique_ptr<float[]> value_;
   std::unique_ptr<float[]> grad_;
-  size_t length_;
+  int64_t length_;
+  std::string name_;
+  int offset_ = 0;
 };
 
 struct MatMul {
@@ -168,10 +204,10 @@ struct Linear {
         out_features_(out_features),
         has_bias_(bias) {
     weight_ = std::make_unique<Parameter>(out_features * in_features);
-    bias_ = std::make_unique<Parameter>(out_features);
     KaimingUniformFill(weight_->View(), in_features);
     if (bias) {
-      const float bound = 1.f / std::sqrt(in_features);
+      bias_ = std::make_unique<Parameter>(out_features);
+      const float bound = 1.0f / std::sqrt(static_cast<float>(in_features));
       UniformFill(bias_->View(), -bound, bound);
     }
   }
@@ -183,10 +219,13 @@ struct Linear {
     CHECK_EQ(x.rows(), y.rows());
 
     auto weight = weight_->View(out_features_, in_features_);
-    auto bias = bias_->View(out_features_);
-
     // y = x * w^T + b
-    y.noalias() = (x * weight.transpose()).rowwise() + bias;
+    if (has_bias_) {
+      auto bias = bias_->View(out_features_);
+      y.noalias() = (x * weight.transpose()).rowwise() + bias;
+    } else {
+      y.noalias() = x * weight.transpose();
+    }
   }
 
   void Backward(const Eigen::Map<Matrix>& x, const Eigen::Map<Matrix>& y_grad,
@@ -455,7 +494,7 @@ struct NewGELU {
 };
 
 struct Softmax {
-  Softmax(bool stable_softmax = false) : stable_softmax_(stable_softmax) {}
+  Softmax(bool stable_softmax = true) : stable_softmax_(stable_softmax) {}
 
   void Forward(const Eigen::Map<Matrix>& x, Eigen::Map<Matrix>& y) {
     // x: [B, D], y: [B, D]
@@ -593,3 +632,5 @@ struct VanillaCrossEntropy {
 };
 
 }  // namespace nn
+
+#endif  // LLM_CPP__NN_HPP_

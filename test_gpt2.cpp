@@ -3,10 +3,50 @@
 #include <memory>
 
 #include "gpt2.hpp"
+#include "optim.hpp"
 
 #include "Eigen/Core"
 #include "absl/types/span.h"
-#include "glog/logging.h"
+
+float* restore_tensor(const std::string& name, int* num) {
+  FILE* fp = fopen(name.c_str(), "rb");
+  fread(num, sizeof(int), 1, fp);
+
+  float* data = new float[*num];
+  fread(data, sizeof(float), *num, fp);
+  fclose(fp);
+  return data;
+}
+
+void diff_tensor(absl::Span<const float> value, float* gt, int len,
+                 const char* desc) {
+  CHECK_EQ(value.size(), len);
+  int diff_count5 = 0, diff_count6 = 0;
+  for (size_t i = 0; i < value.size(); ++i) {
+    float val = value[i], val_gt = gt[i];
+    if (std::abs(val - val_gt) > 1e-5) {
+      if (diff_count5 < 10) {
+        fprintf(stdout, "--- diff5(%s): %d(%d) %.6f %.6f\n", desc, i, len, val,
+                val_gt);
+      }
+      diff_count5++;
+    }
+
+    if (std::abs(val - val_gt) > 1e-6) {
+      if (diff_count6 < 10) {
+        fprintf(stdout, "--- diff6(%s): %d(%d) %.6f %.6f\n", desc, i, len, val,
+                val_gt);
+      }
+      diff_count6++;
+    }
+  }
+  fprintf(stdout, "--- diff5 count(%s): %d\n", desc, diff_count5);
+  fprintf(stdout, "--- diff6 count(%s): %d\n", desc, diff_count6);
+}
+
+void diff_tensor(nn::Parameter* p, float* gt, int len, const char* desc) {
+  diff_tensor(p->View(nn::Parameter::kGrad), gt, len, desc);
+}
 
 int main(int argc, char** argv) {
   GPT2 model;
@@ -59,15 +99,48 @@ int main(int argc, char** argv) {
 
   // overall OK signal for the test
   int allok = 1;
+  // let's do 10 training iterations, following the pytorch code
+  float expected_losses[10] = {5.270007133483887,  4.059706687927246,
+                               3.3751230239868164, 2.8007826805114746,
+                               2.315382242202759,  1.8490285873413086,
+                               1.3946564197540283, 0.9991465210914612,
+                               0.6240804195404053, 0.37651097774505615};
+
   auto idx = Eigen::Map<nn::MatrixInt>(x.get(), B, T);
   auto target = Eigen::Map<nn::MatrixInt>(y.get(), B, T);
   auto logit_3d =
       Eigen::TensorMap<nn::Tensor3D>(calculated_logits.get(), B, T, V);
+  std::vector<nn::Parameter*> parameters;
+  model.Parameters(&parameters);
+  optim::AdamW optimizer(parameters, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f);
 
-  for (int step = 0; step < 1; step++) {
+  for (int step = 0; step < 10; step++) {
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
     model.gpt2_->Forward(idx, target, logit_3d, &loss);
+    optimizer.ZeroGrad();
+    model.gpt2_->Backward(idx, target);
+
+    /*
+    int num_restore = 0;
+    auto wte = restore_tensor("wte.dat", &num_restore);
+    auto wte_span = model.gpt2_->wte_->weight_->View();
+    diff_tensor(wte_span, wte, num_restore, "wte");
+    auto logit_grad = restore_tensor("logit_grad.dat", &num_restore);
+    diff_tensor(model.gpt2_->logits_grad_, logit_grad, num_restore,
+                "logit_grad");
+    auto lnf = restore_tensor("lnf.dat", &num_restore);
+    diff_tensor(model.gpt2_->lnf_y_grad_, lnf, num_restore, "lnf_y_grad");
+    auto lnf_mean = restore_tensor("lnf_mean.dat", &num_restore);
+    diff_tensor(model.gpt2_->lnf_mean_, lnf_mean, num_restore, "lnf_mean");
+    auto lnf_rstd = restore_tensor("lnf_rstd.dat", &num_restore);
+    diff_tensor(model.gpt2_->lnf_rstd_, lnf_rstd, num_restore, "lnf_rstd");
+
+    auto lnfb = restore_tensor("lnfb.dat", &num_restore);
+    diff_tensor(model.gpt2_->lnf_->bias_.get(), lnfb, num_restore, "lnfb");
+    */
+
+    optimizer.Step(step + 1);
     clock_gettime(CLOCK_MONOTONIC, &end);
     double time_elapsed_s =
         (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
@@ -110,6 +183,13 @@ int main(int argc, char** argv) {
         printf("LOSS OK: %f %f\n", loss, expected_loss);
       }
     }
+
+    float expected_loss = expected_losses[step];
+    int step_loss_ok = fabsf(expected_loss - loss) < 1e-2;
+    allok = allok && step_loss_ok;
+    // print the timing information at the end
+    printf("step %d: loss %f (took %f ms) OK = %d\n", step, loss,
+           time_elapsed_s * 1000, step_loss_ok);
   }
 
   return 0;

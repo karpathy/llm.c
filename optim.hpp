@@ -68,8 +68,8 @@ struct AdamW {
         v = beta2_ * v + (1.0f - beta2_) * grad * grad;
 
         // bias-correct both moments
-        float m_hat = m / (1.0f - powf(beta1_, t));
-        float v_hat = v / (1.0f - powf(beta2_, t));
+        float m_hat = m / (1.0f - std::pow(beta1_, t));
+        float v_hat = v / (1.0f - std::pow(beta2_, t));
 
         // update
         parameter[j] -=
