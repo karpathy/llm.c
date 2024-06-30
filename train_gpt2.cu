@@ -850,7 +850,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch = acts.fch + l * B * T * 4*C;
+        floatX* l_fch_pre_gelu = acts.fch + l * B * T * 4*C;
         floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
