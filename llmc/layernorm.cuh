@@ -142,6 +142,7 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
 __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed, float* mean, float* rstd,
                                                const floatX* inp1, const floatX* inp2,
                                                const floatX* weight, const floatX* bias,
+                                               int use_mup, float mup_scale,
                                                int N, int C) {
     assert(blockDim.x == WARP_SIZE);
 
@@ -206,6 +207,9 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
         for(int k = 0; k < x128::size; ++k) {
             float n = s * ((float)res[k] - m); // normalized output
             float o = n * (float)w[k] + (float)b[k]; // scale and shift it
+            if (use_mup) {
+                o *= mup_scale;
+            }
             out[k] = o;
         }
 
@@ -234,6 +238,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
     layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                                 const floatX* dout, const floatX* inp, const floatX* weight,
                                 const float* mean, const float* rstd,
+                                int use_mup, float mup_scale,
                                 int B, int T, int C) {
     int BLOCK_SIZE = blockDim.x;
     int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
@@ -276,7 +281,8 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
             x128 inp128_i    = load128(inp_bt  + i);
             x128 weight128_i = load128(weight  + i);
             for (int k = 0; k < x128::size; k++) {
-                float dnorm_i = (float)weight128_i[k] * (float)dout128_i[k];
+                float dout_rescaled = use_mup ? (float)dout128_i[k] * mup_scale : (float)dout128_i[k];
+                float dnorm_i = (float)weight128_i[k] * dout_rescaled;
                 dnorm_mean += dnorm_i;
                 dnorm_norm_mean += dnorm_i * (float)inp128_i[k];
             }
@@ -307,13 +313,13 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
                 f128 dweight_f;
                 for(int i = 0; i < f128::size; ++i) {
                     int x = o * f128::size + i;
-                    float dout_i = (float)dout128[x];
+                    float dout_i = use_mup ? (float)dout128[x] * mup_scale : (float)dout128[x];
                     float norm_bti = ((float)inp128[x] - mean_bt) * rstd_bt;
                     dbias_f[i] = dout_i;
                     dweight_f[i] = norm_bti * dout_i;
 
                     float dval = 0.0f;
-                    dval += (float) weight128[x] * (float)dout128[x]; // term 1
+                    dval += (float) weight128[x] * dout_i; // term 1
                     dval -= dnorm_mean; // term 2
                     dval -= norm_bti * dnorm_norm_mean; // term 3
                     dval *= rstd_bt; // final scale
@@ -432,7 +438,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
 // similar to `fused_residual_forward5`
 void layernorm_forward(floatX* out, float* mean, float* rstd,
                        floatX* inp, const floatX* weight, const floatX* bias,
-                       int B, int T, int C, cudaStream_t stream) {
+                       int B, int T, int C, float* coord_check_data, int cc_cnt, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
@@ -453,6 +459,18 @@ void layernorm_forward(floatX* out, float* mean, float* rstd,
         layernorm_forward_kernel3<<<grid_size_fb, block_size, 0, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
     }
     cudaCheck(cudaGetLastError());
+    // data collection
+    if (coord_check_data != NULL) {
+        float sum = 0.0;
+        float* sum_d;
+        cudaMalloc(&sum_d, sizeof(float));
+        cudaCheck(cudaMemsetAsync(sum_d, 0, sizeof(float), stream));
+        abs_sum_kernel<<<B*T, WARP_SIZE, 0, stream>>>(out, B*T, C, sum_d);
+        cudaCheck(cudaGetLastError());
+        cudaCheck(cudaMemcpy(&sum, sum_d, sizeof(float), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaFree(sum_d));
+        coord_check_data[cc_cnt] = (float)(sum / (B*T*C));
+    }
 }
 
 void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N, cudaStream_t stream) {
@@ -467,7 +485,7 @@ void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N
 void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, float* rstd,
                              const floatX* inp1, const floatX* inp2,
                              const floatX* weight, const floatX* bias,
-                             int N, int C, cudaStream_t stream) {
+                             int N, int C, int use_mup, float mup_scale, float* coord_check_data, int cc_cnt, cudaStream_t stream) {
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
     const int grid_size = CEIL_DIV(N, block_y);
@@ -481,17 +499,31 @@ void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, floa
     if(status == cudaSuccess) {
         fused_residual_forward_kernel5<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(residual, normed,
                                                                                               mean, rstd, inp1, inp2,
-                                                                                              weight, bias, N, C);
+                                                                                              weight, bias, use_mup, mup_scale, N, C);
     } else {
+        assert(false); // this should never happen
         residual_forward(residual, inp1, inp2, N*C, stream);
-        layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C, stream);
+        layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C, NULL, 0, stream);
     }
     cudaCheck(cudaGetLastError());
+
+    // data collection
+    if (coord_check_data != NULL) {
+        float sum = 0.0;
+        float* sum_d;
+        cudaMalloc(&sum_d, sizeof(float));
+        cudaCheck(cudaMemsetAsync(sum_d, 0, sizeof(float), stream));
+        abs_sum_kernel<<<N, WARP_SIZE, 0, stream>>>(residual, N, C, sum_d);
+        cudaCheck(cudaGetLastError());
+        cudaCheck(cudaMemcpy(&sum, sum_d, sizeof(float), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaFree(sum_d));
+        coord_check_data[cc_cnt] = sum / (N*C);
+    }
 }
 
 void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                         const floatX* dout, const floatX* inp, const floatX* weight, const float* mean, const float* rstd,
-                        int B, int T, int C, cudaStream_t stream) {
+                        int B, int T, int C, int use_mup, float mup_scale, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 512;
     const int blocks_per_sm = 2; // supported on every architecture and less cache thrashing than 3
@@ -500,6 +532,6 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - 32) * f128::size) * sizeof(float);
 
     cudaCheck(cudaMemsetAsync(scratch, 0, 1 * sizeof(float), stream)); // only need to reset the flag to 0
-    layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+    layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, use_mup, mup_scale, B, T, C);
     cudaCheck(cudaGetLastError());
 }
