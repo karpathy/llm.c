@@ -740,10 +740,11 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
     return mean_loss;
 }
 
-
 void gpt2_zero_grad(GPT2 *model) {
     NVTX_RANGE_FN();
-    // the losses accumulate over the duration of gradient accumulation micro steps, also reset here
+    // there are currently two state vars during the gradient accumulation inner loop:
+    // 1) the losses accumulate += into acts.losses, reset here
+    // 2) the gradients accumulate += into grads_memory, reset here
     cudaCheck(cudaMemset(model->acts.losses, 0, model->batch_size * model->seq_len * sizeof(float)));
     if (model->grads_memory != NULL) {
         cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(floatX)));
@@ -751,8 +752,14 @@ void gpt2_zero_grad(GPT2 *model) {
     cudaCheck(cudaDeviceSynchronize());
 }
 
-void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, bool last_step) {
+void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
     NVTX_RANGE_FN();
+    bool last_step = micro_step == grad_accum_steps - 1;
+
+    // on the first micro-step zero the gradients, as we're about to += accumulate into them
+    if (micro_step == 0) {
+        gpt2_zero_grad(model);
+    }
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
@@ -760,8 +767,6 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // allocate buffers for weight gradients
         printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
-        // init gradients of parameters and activations to zero
-        gpt2_zero_grad(model);
         // initialise cpu scratch buffers for encoder backward
         size_t num_c_groups = CEIL_DIV(model->config.channels, (WARP_SIZE * x128::size));
         assert((size_t)(model->batch_size * model->seq_len) * num_c_groups < (1ULL<<31ULL)); // todo - maybe an issue for llama3-400B(?)
@@ -1795,7 +1800,7 @@ int main(int argc, char *argv[]) {
             // forward pass. note that we pass in grad_accum_steps, which scales down the loss
             gpt2_forward(&model, train_loader.inputs, B, T);
             // backward pass. all model params accumulate gradients with += inside this inner loop
-            gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step == grad_accum_steps - 1);
+            gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
         }
         float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss)); // loss z-score
         // fetch the next learning rate
@@ -1814,8 +1819,6 @@ int main(int argc, char *argv[]) {
             float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
             gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
         }
-        // zero out the gradients for the next iteration
-        gpt2_zero_grad(&model);
         cudaCheck(cudaEventRecord(end));
         cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
         // --------------- TRAINING SECTION END -------------------

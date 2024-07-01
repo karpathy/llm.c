@@ -698,10 +698,6 @@ if __name__ == "__main__":
         write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
         # reset the train_loader for the optimization below
         train_loader.reset()
-        # clear the grads here explicitly because otherwise we'd have a duplicate grad accumulation
-        # since in the training loop we do a backward() and then zero_grad() at the end of the loop
-        # this would cause an incorrect first training step
-        model.zero_grad()
 
     # -------------------------------------------------------------------------
     # main training loop
@@ -794,6 +790,7 @@ if __name__ == "__main__":
 
         # --------------- TRAINING SECTION BEGIN -----------------
         model.train()
+        optimizer.zero_grad(set_to_none=True)
         # if we are trying to overfit a single batch, we reset the loader here
         if args.overfit_single_batch:
             train_loader.reset()
@@ -830,7 +827,6 @@ if __name__ == "__main__":
             param_group['lr'] = lr
         # step the optimizer
         optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
 

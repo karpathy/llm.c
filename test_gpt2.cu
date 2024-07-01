@@ -218,7 +218,7 @@ int main(int argc, char *argv[]) {
         clock_gettime(CLOCK_MONOTONIC, &start);
         gpt2_forward(&model, x, B, T);
         gpt2_zero_grad(&model);
-        gpt2_backward_and_reduce(&model, x, y, 1, true);
+        gpt2_backward_and_reduce(&model, x, y, 1, 0);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
@@ -336,7 +336,7 @@ int main(int argc, char *argv[]) {
         dataloader_next_batch(&loader);
         gpt2_forward(&model, loader.inputs, B, T);
         gpt2_zero_grad(&model);
-        gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, true);
+        gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, 0);
         gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
         losses[step] = model.mean_loss;
         tokens[step] = loader.inputs[0];
@@ -351,7 +351,7 @@ int main(int argc, char *argv[]) {
         dataloader_next_batch(&loader);
         gpt2_forward(&model, loader.inputs, B, T);
         gpt2_zero_grad(&model);
-        gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, true);
+        gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, 0);
         gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
 
         if(loader.inputs[0] != tokens[step]) {
