@@ -751,11 +751,13 @@ void gpt2_zero_grad(GPT2 *model) {
     cudaCheck(cudaDeviceSynchronize());
 }
 
-void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, bool last_step) {
+void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
     NVTX_RANGE_FN();
+    bool last_step = micro_step == grad_accum_steps - 1;
 
-    // init gradients of parameters and activations to zero
-    gpt2_zero_grad(model);
+    if (micro_step == 0) {
+        gpt2_zero_grad(model);  // set correct grad state on first micro-step
+    }
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
@@ -1795,7 +1797,7 @@ int main(int argc, char *argv[]) {
             // forward pass. note that we pass in grad_accum_steps, which scales down the loss
             gpt2_forward(&model, train_loader.inputs, B, T);
             // backward pass. all model params accumulate gradients with += inside this inner loop
-            gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step == grad_accum_steps - 1);
+            gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
         }
         float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss)); // loss z-score
         // fetch the next learning rate
