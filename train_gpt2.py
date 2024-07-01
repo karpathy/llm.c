@@ -592,7 +592,7 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
     # mup - maximum update parametrization
-    parser.add_argument("--use_mup", type=int, default=1, help="should we use maximum update parametrization")
+    parser.add_argument("--use_mup", type=int, default=0, help="should we use maximum update parametrization")
     parser.add_argument("--mup_width_mult", type=float, default=1.0, help="width multiplier - ratio of width to base model width")
     parser.add_argument("--mup_base_attn_mult", type=float, default=1.0, help="base attention multiplier")
     # evaluation
