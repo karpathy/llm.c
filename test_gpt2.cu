@@ -269,6 +269,7 @@ int main(int argc, char *argv[]) {
 
             float grad_thresholds[NUM_PARAMETER_TENSORS] = {5e-1f, 4e-3f, 1e-1f, 3.5e-2f, 2e-2f, 3e-2f, 5e-2f, 5e-2f, 5e-2f, 1.5e-2f, 5e-4f, 8e-3f, 1.5e-3f, 2.5e-3f, 1e-1f, 2e-2f};
             if (model.use_mup) {
+                grad_thresholds[4] = 3.3e-2f; // attprojw
                 grad_thresholds[6] = 1.6e-1f; // fcw
                 grad_thresholds[7] = 1.6e-1f; // fcb
                 grad_thresholds[8] = 1.6e-1f; // fcprojw
