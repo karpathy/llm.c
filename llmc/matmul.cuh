@@ -173,15 +173,15 @@ void matmul_forward_cublaslt(floatX* out,
     cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
     // data collection
     if (coord_check_data != NULL) {
-        double sum = 0.0;
-        double* sum_d;
-        cudaMalloc(&sum_d, sizeof(double));
-        cudaCheck(cudaMemsetAsync(sum_d, 0, sizeof(double), stream));
+        float sum = 0.0;
+        float* sum_d;
+        cudaMalloc(&sum_d, sizeof(float));
+        cudaCheck(cudaMemsetAsync(sum_d, 0, sizeof(float), stream));
         abs_sum_kernel<<<B*T, WARP_SIZE, 0, stream>>>(out, B*T, OC, sum_d);
         cudaCheck(cudaGetLastError());
-        cudaCheck(cudaMemcpy(&sum, sum_d, sizeof(double), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaMemcpy(&sum, sum_d, sizeof(float), cudaMemcpyDeviceToHost));
         cudaCheck(cudaFree(sum_d));
-        coord_check_data[cc_cnt] = (float)(sum / (B*T*OC));
+        coord_check_data[cc_cnt] = sum / (B*T*OC);
     }
 }
 
