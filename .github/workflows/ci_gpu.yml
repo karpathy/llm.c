@@ -53,14 +53,14 @@ jobs:
       - name: Run recompute LN
         run: ./test_gpt2cu -r 2
 
-      - name: Run preprocessing for mup - set context
-        run: python dev/data/tinyshakespeare.py --use_mup 1
+      - name: Set correct state for mup
+        run: python train_gpt2.py --use_mup 1
 
       - name: Run muP
         run: ./test_gpt2cu -m 1
 
-      - name: Run preprocessing - reset context
-        run: python dev/data/tinyshakespeare.py
+      - name: Reset state
+        run: python train_gpt2.py
 
       - name: Build BF16 precision
         run: PRECISION=BF16 make train_gpt2cu test_gpt2cu profile_gpt2cu
@@ -77,14 +77,14 @@ jobs:
       - name: Run recompute LN
         run: ./test_gpt2cu -r 2
 
-      - name: Run preprocessing for mup - set context
-        run: python dev/data/tinyshakespeare.py --use_mup 1
+      - name: Set correct state for mup
+        run: python train_gpt2.py --use_mup 1
 
       - name: Run muP
         run: ./test_gpt2cu -m 1
 
-      - name: Run preprocessing for mup - reset context
-        run: python dev/data/tinyshakespeare.py
+      - name: Reset state
+        run: python train_gpt2.py
 
       - name: Train model fp32 (With OpenMP)
         run: OMP_NUM_THREADS=8 ./train_gpt2fp32cu
