@@ -19,8 +19,10 @@ template <typename Tp, typename Tg>
 __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                              float grad_scale, unsigned int seed) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_parameters) { return; }  // guard
+    int raw_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float num = blockReduce<warpReduceSum>(raw_idx < num_parameters ? 1.f : 0.f, true);
+
+    int idx = min(raw_idx, (int)num_parameters - 1);
 
     // get the gradient, m, and v for this parameter
     float grad = grad_scale * (float)grads_memory[idx];
@@ -36,6 +38,17 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
     v /= beta2_correction;  // v_hat
     // fetch the old value of this parameter as a float, from either source
     float old_param = (master_params_memory != NULL) ? master_params_memory[idx] : (float)params_memory[idx];
+
+    // stable adamW modification
+    float r = grad*grad / v;
+    if(raw_idx >= num_parameters)
+        r = 0.f;
+    float s_r = blockReduce<warpReduceSum>(r);
+    float rms = sqrtf(s_r / num);
+    learning_rate = learning_rate / max(1.f, rms);
+
+    if(raw_idx >= num_parameters) return;
+
     // update this parameter
     float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * old_param));
     // update our low precision version of the parameters using stochastic rounding
