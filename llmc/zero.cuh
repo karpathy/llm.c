@@ -407,7 +407,7 @@ int multi_gpu_get_local_device_idx(int process_rank, int num_processes) {
 
 #endif
 
-MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank, int gpus_per_node, char* server_ip, char* fs_path, char* init_method) {
+MultiGpuConfig multi_gpu_config_init(int device, int num_processes, int process_rank, int gpus_per_node, char* server_ip, char* fs_path, char* init_method) {
 #ifdef MULTI_GPU
     MultiGpuConfig result;
     ncclUniqueId nccl_id;
@@ -455,11 +455,11 @@ MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank, int gp
     return result;
 #else
     printf("Multi-GPU support is disabled. Using a single GPU.\n");
-    cudaCheck(cudaSetDevice(0));
+    cudaCheck(cudaSetDevice(device));
     MultiGpuConfig result;
     result.process_rank = 0;
     result.num_processes = 1;
-    result.local_device_idx = 0;
+    result.local_device_idx = device;
     return result;
 #endif
 }

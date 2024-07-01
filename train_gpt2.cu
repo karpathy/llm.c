@@ -1389,6 +1389,8 @@ void error_usage() {
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
+    // single-node settings
+    fprintf(stderr, "  -dn <int>    which GPU to use (default = 0)\n");
     // multi-node settings
     fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
     fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
@@ -1432,6 +1434,8 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    // single-node settings
+    int device = 0;  // which GPU to use
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1452,7 +1456,8 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'y') { resume = atoi(argv[i+1]); }
         else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'd' && argv[i][2] == '\0') { total_batch_size = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'd' && argv[i][2] == 'n') { device = atoi(argv[i+1]); }
         else if (argv[i][1] == 'l') { learning_rate = atof(argv[i+1]); }
         else if (argv[i][1] == 'u') { warmup_iterations = atoi(argv[i+1]); }
         else if (argv[i][1] == 'q') { final_learning_rate_frac = atof(argv[i+1]); }
@@ -1481,7 +1486,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
         else { error_usage(); }
     }
-    multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
+    multi_gpu_config = multi_gpu_config_init(device, num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
 
     // should do a bit more error checking here
     assert(warmup_iterations >= 0);

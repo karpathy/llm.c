@@ -34,7 +34,8 @@ int main(int argc, char *argv[]) {
     int gpus_per_node = -1;  // doesn't matter when using MPI
     char server_ip[256] = "";  // doesn't matter when using MPI
     char fs_path[256] = "";  // doesn't matter when using MPI
-    multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
+    int device = 0;
+    multi_gpu_config = multi_gpu_config_init(device, num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
     common_start(true, true);
 
     // build the GPT-2 model from a checkpoint
