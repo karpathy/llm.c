@@ -732,26 +732,9 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
     return mean_loss;
 }
 
-void gpt2_zero_grad(GPT2 *model) {
-    NVTX_RANGE_FN();
-    // there are currently two state vars during the gradient accumulation inner loop:
-    // 1) the losses accumulate += into acts.losses, reset here
-    // 2) the gradients accumulate += into grads_memory, reset here
-    cudaCheck(cudaMemset(model->acts.losses, 0, model->batch_size * model->seq_len * sizeof(float)));
-    if (model->grads_memory != NULL) {
-        cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(floatX)));
-    }
-    cudaCheck(cudaDeviceSynchronize());
-}
-
 void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
     NVTX_RANGE_FN();
     bool last_step = micro_step == grad_accum_steps - 1;
-
-    // on the first micro-step zero the gradients, as we're about to += accumulate into them
-    if (micro_step == 0) {
-        gpt2_zero_grad(model);
-    }
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
@@ -764,6 +747,15 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         assert((size_t)(model->batch_size * model->seq_len) * num_c_groups < (1ULL<<31ULL)); // todo - maybe an issue for llama3-400B(?)
         model->workload_indices = (int*)mallocCheck(sizeof(int) * model->batch_size * model->seq_len * num_c_groups);
         model->bucket_info = (int4*)mallocCheck(sizeof(int4) * model->batch_size * model->seq_len * num_c_groups);
+    }
+
+    // on the first micro-step zero the gradients, as we're about to += accumulate into them
+    if (micro_step == 0) {
+        // there are currently two state vars during the gradient accumulation inner loop:
+        // 1) the losses accumulate += into acts.losses, reset here
+        // 2) the gradients accumulate += into grads_memory, reset here
+        cudaCheck(cudaMemsetAsync(model->acts.losses, 0, model->batch_size * model->seq_len * sizeof(float), main_stream));
+        cudaCheck(cudaMemsetAsync(model->grads_memory, 0, model->num_parameters * sizeof(floatX), main_stream));
     }
 
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
