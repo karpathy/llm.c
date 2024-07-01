@@ -338,7 +338,7 @@ int main(int argc, char *argv[]) {
         1.707019
     };
 
-    if (use_mup) {
+    if (model.use_mup) {
         for (int i = 0; i < 10; i++) {
             expected_losses[i] = mup_expected_losses[i];
         }
