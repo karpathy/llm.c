@@ -234,15 +234,15 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     cudaCheck(cudaGetLastError());
     // data collection
     if (coord_check_data != NULL) {
-        double sum = 0.0;
-        double* sum_d;
-        cudaMalloc(&sum_d, sizeof(double));
-        cudaCheck(cudaMemsetAsync(sum_d, 0, sizeof(double), stream));
+        float sum = 0.0;
+        float* sum_d;
+        cudaMalloc(&sum_d, sizeof(float));
+        cudaCheck(cudaMemsetAsync(sum_d, 0, sizeof(float), stream));
         abs_sum_kernel<<<B*T, WARP_SIZE, 0, stream>>>(out, B*T, C, sum_d);
         cudaCheck(cudaGetLastError());
-        cudaCheck(cudaMemcpy(&sum, sum_d, sizeof(double), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaMemcpy(&sum, sum_d, sizeof(float), cudaMemcpyDeviceToHost));
         cudaCheck(cudaFree(sum_d));
-        coord_check_data[cc_cnt] = (float)(sum / (B*T*C));
+        coord_check_data[cc_cnt] = sum / (B*T*C);
     }
 }
 
