@@ -794,14 +794,15 @@ if __name__ == "__main__":
 
         # --------------- TRAINING SECTION BEGIN -----------------
         model.train()
+        # if we are trying to overfit a single batch, we reset the loader here
+        if args.overfit_single_batch:
+            train_loader.reset()
         # micro-batch loop where we do gradient accumulation to reach desired total batch size
         lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
         for micro_step in range(grad_accum_steps):
             # fetch a batch
-            if not args.overfit_single_batch \
-                or (args.overfit_single_batch and step == 0 and micro_step == 0):
-                x, y = train_loader.next_batch()
-                x, y = x.to(device), y.to(device)
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
             if ddp:
                 # we want only the last micro-step to sync grads in a DDP model
                 # the official way to do this is with model.no_sync(), but that is a
