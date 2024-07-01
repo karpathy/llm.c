@@ -740,10 +740,11 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
     return mean_loss;
 }
 
-
 void gpt2_zero_grad(GPT2 *model) {
     NVTX_RANGE_FN();
-    // the losses accumulate over the duration of gradient accumulation micro steps, also reset here
+    // there are currently two state vars during the gradient accumulation inner loop:
+    // 1) the losses accumulate += into acts.losses, reset here
+    // 2) the gradients accumulate += into grads_memory, reset here
     cudaCheck(cudaMemset(model->acts.losses, 0, model->batch_size * model->seq_len * sizeof(float)));
     if (model->grads_memory != NULL) {
         cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(floatX)));
@@ -755,8 +756,9 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     NVTX_RANGE_FN();
     bool last_step = micro_step == grad_accum_steps - 1;
 
+    // on the first micro-step zero the gradients, as we're about to += accumulate into them
     if (micro_step == 0) {
-        gpt2_zero_grad(model);  // set correct grad state on first micro-step
+        gpt2_zero_grad(model);
     }
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
