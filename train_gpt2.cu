@@ -1580,8 +1580,9 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val
+    int permute_train_loader = (overfit_single_batch == 1) ? 0 : 1;
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 1);
+    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, permute_train_loader);
     dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 0);
     // figure out the number of training steps we will run for
     int train_num_batches = max_steps; // passed in from command line
@@ -1781,16 +1782,16 @@ int main(int argc, char *argv[]) {
         if (last_step) { break; }
 
         // --------------- TRAINING SECTION BEGIN -----------------
+        if (overfit_single_batch == 1) {
+            // if we are trying to overfit a single batch, we reset the loader here
+            dataloader_reset(&train_loader);
+        }
         // do one training step, doing forward/backward/update on total_batch_size tokens
         cudaEventRecord(start);
         // gradient and loss accumulation loop over micro-batches
         for (int micro_step = 0; micro_step < grad_accum_steps; micro_step++) {
             // fetch the next data batch
-            // and if we're overfitting a single batch, we'll only call this a single time
-            if (overfit_single_batch == 0 ||
-               (overfit_single_batch == 1 && step == 0 && micro_step == 0)) {
-                dataloader_next_batch(&train_loader);
-            }
+            dataloader_next_batch(&train_loader);
             // forward pass. note that we pass in grad_accum_steps, which scales down the loss
             gpt2_forward(&model, train_loader.inputs, B, T);
             // backward pass. all model params accumulate gradients with += inside this inner loop
