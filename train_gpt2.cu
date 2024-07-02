@@ -294,7 +294,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[9] = TENSOR_SPEC(data->ln2_rstd, L * B * T);
     tensors[10] = TENSOR_SPEC(data->fch, L * B * T * 4*C);
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
-    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
+    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : 0);
     tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C);
     tensors[13] = TENSOR_SPEC(data->lnf, B * T * C);
     tensors[14] = TENSOR_SPEC(data->lnf_mean, B * T);
@@ -575,25 +575,30 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     free(params_memory_cpu);
 }
 
-// propagate inputs through the network to produce logits.
-// right now, this function is fully synchronous with the host
+// ----------------------------------------------------------------------------
+// GPT-2 model execution
+// ----------------------------------------------------------------------------
+
+// the forward pass propagates inputs through the network to produce logits
 void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     NVTX_RANGE_FN();
-    // we must be careful and use size_t instead of int, otherwise
-    // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
 
-    // ensure the model was initialized or error out
+    // convenience parameters
+    // everything must use size_t as we risk overflowing 32-bit integers
+    cudaStream_t &ms = main_stream;
+    ActivationTensors acts  = model->acts;
+    ParameterTensors params = model->params;
+    const size_t V  = model->config.vocab_size;
+    const size_t Vp = model->config.padded_vocab_size;
+    const size_t L  = model->config.num_layers;
+    const size_t NH = model->config.num_heads;
+    const size_t C  = model->config.channels;
+
+    // ensure the model was initialized
     if (model->params_memory == NULL) {
         printf("Error: model was not initialized properly.\n");
         exit(EXIT_FAILURE);
     }
-
-    // convenience parameters
-    const size_t V = model->config.vocab_size;
-    const size_t Vp = model->config.padded_vocab_size;
-    const size_t L = model->config.num_layers;
-    const size_t NH = model->config.num_heads;
-    const size_t C = model->config.channels;
 
     // allocate space for all the activations if needed (done here, lazily)
     if(model->acts_memory == NULL) {
@@ -617,88 +622,151 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
             exit(EXIT_FAILURE);
         }
     }
-
-    // copy inputs/targets to the model
+    // copy inputs/targets to the model (CPU/GPU synchronisation point which we will remove in the future)
     cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
     // validate inputs, all indices must be in the range [0, V)
-    // we can do this while the copies are already underway
     tokenCheck(inputs, B*T, V);
 
-    // forward pass
-    ParameterTensors params = model->params; // for brevity
-    ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    // ------------------------------------------------------------------------
+    // start of forward pass
+    // ------------------------------------------------------------------------
 
-    // first layernorm isn't fused
-    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
+    // encoder converts integer tokens into float vectors
+    // model->input (B*T int) ==> acts.encoded (B*T*C float)
+    // (wte: C*V=768*50257 and wpe: C*T=768*1024 for GPT2-124M)
+    encoder_forward(acts.encoded,
+                    model->inputs, params.wte, params.wpe,
+                    B, T, C, ms); // encoding goes into residual[0]
+
+    // the 1st layernorm output is read by the 1st layer as l_ln1 (see comments on recompute below)
+    // GPT2 is "Pre-LN" so the residual comes directly from acts.encoded rather than this LN output
+    // see "On Layer Normalization in the Transformer Architecture" (and the original Transformer paper)
+    floatX* layernorm_output = (model->recompute < 2) ? acts.ln1 : acts.lnf;
+    layernorm_forward(layernorm_output, acts.ln1_mean, acts.ln1_rstd,
+                      acts.encoded, params.ln1w, params.ln1b,
+                      B, T, C, ms);
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
 
-        floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
+        // residual input is the residual output of the previous layer (or encoder for layer 0)
+        floatX* residual    = (l == 0) ? (acts.encoded) : (acts.residual3 + (l-1) * B * T * C);
 
         // get the pointers of the weights for this layer
-        floatX* l_qkvw = params.qkvw + l * 3*C * C;
-        floatX* l_qkvb = params.qkvb + l * 3*C;
-        floatX* l_attprojw = params.attprojw + l * C * C;
-        floatX* l_attprojb = params.attprojb + l * C;
-        floatX* l_ln2w = params.ln2w + l * C;
-        floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcb = params.fcb + l * 4*C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
-        floatX* l_fcprojb = params.fcprojb + l * C;
+        floatX* l_qkvw      = params.qkvw       + l * 3*C * C;
+        floatX* l_qkvb      = params.qkvb       + l * 3*C;
+        floatX* l_attprojw  = params.attprojw   + l * C * C;
+        floatX* l_attprojb  = params.attprojb   + l * C;
+        floatX* l_ln2w      = params.ln2w       + l * C;
+        floatX* l_ln2b      = params.ln2b       + l * C;
+        floatX* l_fcw       = params.fcw        + l * 4*C * C;
+        floatX* l_fcb       = params.fcb        + l * 4*C;
+        floatX* l_fcprojw   = params.fcprojw    + l * 4*C * C;
+        floatX* l_fcprojb   = params.fcprojb    + l * C;
 
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
-        floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
-        floatX* l_atty = acts.atty + l * B * T * C;
-        floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
-        float* l_ln2_mean = acts.ln2_mean + l * B * T;
-        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch = acts.fch + l * B * T * 4*C;
-        // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
-        // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
-        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
-        floatX* l_residual3 = acts.residual3 + l * B * T * C;
-        floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
+        floatX* l_qkvr      = acts.qkvr         + l * B * T * 3*C;
+        floatX* l_atty      = acts.atty         + l * B * T * C;
+        floatX* l_residual2 = acts.residual2    + l * B * T * C;
+        float*  l_ln2_mean  = acts.ln2_mean     + l * B * T;
+        float*  l_ln2_rstd  = acts.ln2_rstd     + l * B * T;
+        floatX* l_fch       = acts.fch          + l * B * T * 4*C;
+        floatX* l_residual3 = acts.residual3    + l * B * T * C;
 
-        // now do the forward pass
-        #ifdef ENABLE_CUDNN
-        float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
+        // activations potentially affected by recompute setting
+        // reuse the same activation buffer at each layer, as we'll re-compute the gelu/ln during backward
+        // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
+        // (to save even more memory, for gelu we reuse gradient activation tensors from the backward pass)
+        floatX* l_ln1       = (model->recompute < 2) ? (acts.ln1      + l * B * T * C  ) : acts.lnf;
+        floatX* l_ln2       = (model->recompute < 2) ? (acts.ln2      + l * B * T * C  ) : acts.lnf;
+        floatX* l_fch_gelu  = (model->recompute < 1) ? (acts.fch_gelu + l * B * T * 4*C) : acts.scratch_bt4c;
+
+        // scratch buffer reusing the output tensor which is not needed until after the final layer
+        // scratch_btc and scratch_bt4c are already used for layernorm and gelu recomputation
+        // the ones below must never be used simultaneously as they reuse the same buffer
+        floatX* scratch         = acts.output;
+        floatX* scratch_fcproj  = scratch;
+        floatX* scratch_attproj = scratch;
+
+        // every layer starts with attention (but it's not all it needs)
+        // we have both a cuDNN path (NVIDIA blackbox) and our own slower kernels (more work in progress)
+        #ifndef ENABLE_CUDNN
+        // non-cuDNN path
+        // it is not fused (no Flash Attention) so it needs a very big attention tensor
+        floatX* l_att       = acts.att          + l * B * NH * T * T;
+        // calculate QKV to feed into attention
+        matmul_forward_cublaslt(scratch, // scratch is QKV (needs to be permuted in attention)
+                                l_ln1, l_qkvw, l_qkvb,
+                                B, T, C, 3*C, ms);
+        // calculate attention: inputs are QKV in scratch, the result is in l_atty
+        attention_forward      (l_atty, l_qkvr, l_att, // l_qkvr and l_att are kept for backward
+                                scratch, // permutes into l_qkvr and reuses this input as a scratch buffer
+                                B, T, C, NH, ms);
         #else
-        floatX* l_att = acts.att + l * B * NH * T * T;
-        // these are only needed as scratchpads for the forward pass, but
-        // need not be stored for backward
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
+        // cuDNN path
+        // it is fused (aka Flash Attention) so it only stores some statistics for the backward pass
+        float* l_stats      = (float*)acts.att  + l * B * NH * T;
+        // calculate QKV to feed into attention
+        matmul_forward_cublaslt(l_qkvr, // cuDNN can handle our unpermuted QKV as-is
+                                l_ln1, l_qkvw, l_qkvb,
+                                B, T, C, 3*C, ms);
+        // calculate attention: inputs are QKV in l_qkvr, the result is in l_atty
+        attention_forward_cudnn(l_atty, l_stats,
+                                l_qkvr,
+                                B, T, NH, C, ms);
         #endif
 
-        matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
-        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
-        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
-        // OK, fusion across blocks.
+        // linear layer at the end of attention (after "concat" in figure 2 of the Transformer paper)
+        matmul_forward_cublaslt(scratch_attproj,
+                                l_atty, l_attprojw, l_attprojb,
+                                B, T, C, C, ms);
+        // this is a fused "Pre-LN" layer as per "On Layer Normalization in the Transformer Architecture"
+        // corresponds to the central "addition" and top right "layernorm" of (b) on figure 1 of that paper
+        // it does the addition first (residual) with a separate layernorm output used for the feed forward
+        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd,
+                                residual, scratch_attproj, l_ln2w, l_ln2b,
+                                B*T, C, ms);
+
+        // 1st linear layer of feed-forward network (FFN) with GELU
+        // corresponds to the "max(o, xW1+b1)" of Equation 2 on Page 5 of the Transformer paper
+        // (except we use GELU rather than RELU as per the GPT2 paper)
+        matmul_forward_cublaslt(l_fch_gelu,
+                                l_ln2, l_fcw, l_fcb,
+                                B, T, C, 4*C, ms,
+                                l_fch, model->gelu_fusion); // pre-GELU output into l_fch (write only)
+        // 2nd linear layer of feed-forward network (FFN)
+        // corresponds to the "oW2+b2" of Equation 2 on Page 5 of the Transformer paper
+        matmul_forward_cublaslt(scratch_fcproj,
+                                l_fch_gelu, l_fcprojw, l_fcprojb,
+                                B, T, 4*C, C, ms);
+
+        // this is a fused "Pre-LN" layer asd per On Layer Normalization in the Transformer Architecture"
+        // corresponds to the top "addition" and *bottom* right "Layer Norm" of (b) on figure 1 of that paper
+        // we need to merge "addition" of layer l with "Layer Norm" of layer l+1 which is a bit more complicated
+        // for the final layer, we merge with what that paper calls the "additional final-layer normalization" LN
+        // (unfortunately it's not visible on figure 1 or in the original Transformer paper since it's post-LN!)
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
             float* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
             float* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
             const floatX* l_ln1b = params.ln1b + (l + 1) * C;
-            fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
-                                    B * T, C, main_stream);
+            fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd,
+                                    l_residual2, scratch_fcproj, l_ln1w, l_ln1b,
+                                    B * T, C, ms);
         } else {
-            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
-                                    params.lnfw, params.lnfb,
-                                    B * T, C, main_stream);
+            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd,
+                                    l_residual2, scratch_fcproj, params.lnfw, params.lnfb,
+                                    B * T, C, ms);
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
-    cudaCheck(cudaDeviceSynchronize());
+    // final linear layer which outputs logits (read by fused_classifier in the next step)
+    // this is just before "softmax" in Figure 1 of the Transformer paper
+    matmul_forward_cublaslt(acts.output,
+                            acts.lnf, params.wte, NULL, // no bias
+                            B, T, C, Vp, ms);
+    cudaCheck(cudaDeviceSynchronize()); // CPU/GPU synchronisation we will remove in the future
 }
 
 
