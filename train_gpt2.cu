@@ -294,7 +294,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[9] = TENSOR_SPEC(data->ln2_rstd, L * B * T);
     tensors[10] = TENSOR_SPEC(data->fch, L * B * T * 4*C);
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
-    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : 0);
+    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
     tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C);
     tensors[13] = TENSOR_SPEC(data->lnf, B * T * C);
     tensors[14] = TENSOR_SPEC(data->lnf_mean, B * T);
@@ -676,13 +676,11 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // activations potentially affected by recompute setting
         // reuse the same activation buffer at each layer, as we'll re-compute the gelu/ln during backward
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
-        // (to save even more memory, for gelu we reuse gradient activation tensors from the backward pass)
         floatX* l_ln1       = (model->recompute < 2) ? (acts.ln1      + l * B * T * C  ) : acts.lnf;
         floatX* l_ln2       = (model->recompute < 2) ? (acts.ln2      + l * B * T * C  ) : acts.lnf;
-        floatX* l_fch_gelu  = (model->recompute < 1) ? (acts.fch_gelu + l * B * T * 4*C) : acts.scratch_bt4c;
+        floatX* l_fch_gelu  = (model->recompute < 1) ? (acts.fch_gelu + l * B * T * 4*C) : acts.fch_gelu;
 
         // scratch buffer reusing the output tensor which is not needed until after the final layer
-        // scratch_btc and scratch_bt4c are already used for layernorm and gelu recomputation
         // the ones below must never be used simultaneously as they reuse the same buffer
         floatX* scratch         = acts.output;
         floatX* scratch_fcproj  = scratch;
