@@ -177,7 +177,7 @@ loss.backward()
   }
 }
 
-TEST(GPT, Forward) {
+TEST(GPT, ForwardAndBackward) {
   /*
 torch.set_printoptions(precision=6)
 torch.manual_seed(42)

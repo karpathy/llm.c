@@ -41,6 +41,9 @@ target_link_libraries(test_gpt2 m ${OpenMP_CXX_LIBRARIES})
 add_executable(test_gpt2_cpp llmcpp/test_gpt2.cpp)
 target_link_libraries(test_gpt2_cpp absl::strings absl::log absl::check)
 
+add_executable(train_gpt2_cpp llmcpp/train_gpt2.cpp)
+target_link_libraries(train_gpt2_cpp absl::strings absl::log absl::check)
+
 add_executable(nn_test llmcpp/nn_test.cpp)
 target_link_libraries(nn_test absl::strings absl::log absl::check GTest::gtest_main)
 
