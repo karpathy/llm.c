@@ -586,8 +586,6 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // convenience parameters
     // everything must use size_t as we risk overflowing 32-bit integers
     cudaStream_t &ms = main_stream;
-    ActivationTensors acts  = model->acts;
-    ParameterTensors params = model->params;
     const size_t V  = model->config.vocab_size;
     const size_t Vp = model->config.padded_vocab_size;
     const size_t L  = model->config.num_layers;
@@ -630,6 +628,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // ------------------------------------------------------------------------
     // start of forward pass
     // ------------------------------------------------------------------------
+    ActivationTensors acts  = model->acts;
+    ParameterTensors params = model->params;
 
     // encoder converts integer tokens into float vectors
     // model->input (B*T int) ==> acts.encoded (B*T*C float)
