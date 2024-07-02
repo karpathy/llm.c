@@ -709,20 +709,20 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T, int step, 
         // now do the forward pass
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, NULL, 0., main_stream);
+        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, model->use_mup, model->mup_base_attn_mult, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream, coord_check_data, &cc_cnt);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, model->use_mup, model->mup_base_attn_mult, coord_check_data, cc_cnt++, main_stream);
         #endif
 
-        matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+        matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream, coord_check_data, &cc_cnt);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, 0., 0., coord_check_data, cc_cnt++, main_stream);
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
-        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, coord_check_data, &cc_cnt, l_fch, model->gelu_fusion);
+        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream, coord_check_data, &cc_cnt);
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
@@ -739,7 +739,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T, int step, 
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream, coord_check_data, &cc_cnt);
     cudaCheck(cudaDeviceSynchronize());
 }
 
