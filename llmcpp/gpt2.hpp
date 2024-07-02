@@ -5,6 +5,7 @@
 #include "gpt.hpp"
 #include "llmc/utils.h"
 
+namespace gpt2 {
 struct GPT2Config {
   int max_seq_len;        // max sequence length, e.g. 1024
   int vocab_size;         // vocab size, e.g. 50257
@@ -57,31 +58,30 @@ struct GPT2 {
     // allocate space for all the parameters and read them in
     printf("num_parameters: %zu\n", gpt2_->NumParameters());
 
-    auto restore_fn = [&](nn::Parameter* p, const std::string& name){
-      LOG_FIRST_N(INFO, 1) << "wte weight: " << p->size();
+    auto restore_fn = [&](nn::Parameter* p, const std::string& name) {
       freadCheck(p->data(), sizeof(float), p->size(), model_file);
     };
-    ApplyFn(restore_fn, L, kRestore);
+    ApplyFn(restore_fn, L);
     fcloseCheck(model_file);
   }
 
-  void Parameters(std::vector<nn::Parameter*>* parameters) {
-    static int offset = 0;
+  void Parameters(std::vector<nn::Parameter*>* parameters) const {
     auto collect_fn = [&](nn::Parameter* p, const std::string& name) {
-      p->SetName(name);
-      p->SetOffset(offset);
       parameters->push_back(p);
-      offset += p->size();
     };
-    ApplyFn(collect_fn, config.num_layers, kCollect);
+    ApplyFn(collect_fn, config.num_layers);
   }
 
-  enum ApplyType {
-    kCollect,
-    kRestore
-  };
+  void Parameters(std::unordered_map<std::string , nn::Parameter*>* parameters) const {
+    auto collect_fn = [&](nn::Parameter* p, const std::string& name) {
+      parameters->insert({name, p});
+    };
+    ApplyFn(collect_fn, config.num_layers);
+  }
 
-  void ApplyFn(const std::function<void(nn::Parameter*, const std::string&)>& apply_fn, int L, ApplyType type) {
+  void ApplyFn(
+      const std::function<void(nn::Parameter*, const std::string&)>& apply_fn,
+      int L) const {
     apply_fn(gpt2_->wte_->weight_.get(), "wte");
     apply_fn(gpt2_->wpe_->weight_.get(), "wpe");
 
@@ -182,5 +182,6 @@ struct GPT2 {
   GPT2Config config;
   std::unique_ptr<gpt::GPT> gpt2_;
 };
+}  // namespace gpt2
 
 #endif  // LLM_CPP__GPT2_HPP_

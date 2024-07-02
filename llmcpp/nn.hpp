@@ -85,11 +85,7 @@ struct Parameter {
   int64_t size() const { return length_; }
   float* data() const { return value_.get(); }
   float* grad() const { return grad_.get(); }
-  const std::string& name() const { return name_; }
 
-  void SetOffset(int offset) { offset_ = offset; }
-
-  void SetName(const std::string& name) { name_ = name; }
   void AllocateGradient() {
     if (grad_ == nullptr) {
       grad_ = std::make_unique<float[]>(length_);
@@ -130,8 +126,6 @@ struct Parameter {
   std::unique_ptr<float[]> value_;
   std::unique_ptr<float[]> grad_;
   int64_t length_;
-  std::string name_;
-  int offset_ = 0;
 };
 
 struct MatMul {
@@ -238,12 +232,9 @@ struct Linear {
 
     // Lazily allocate the memory for gradients
     weight_->AllocateGradient();
-    bias_->AllocateGradient();
     auto weight = weight_->View(out_features_, in_features_);
-    auto bias = bias_->View(out_features_);
     auto weight_grad =
         weight_->View(out_features_, in_features_, Parameter::kGrad);
-    auto bias_grad = bias_->View(out_features_, Parameter::kGrad);
 
     // x_grad = dL/dy * dy/dx
     //        = y_grad(B, out_features) * W(out_features, in_features)
@@ -256,6 +247,8 @@ struct Linear {
     weight_grad.noalias() += y_grad.transpose() * x;
 
     if (has_bias_) {
+      bias_->AllocateGradient();
+      auto bias_grad = bias_->View(out_features_, Parameter::kGrad);
       // b_grad = dL/dy * dy/db
       //        = \sum_i^(B)(y_grad(B, out_features))
       //        = [out_features,]

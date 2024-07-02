@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(BUILD_SHARED_LIBS OFF)
 add_compile_options(-Ofast -march=native)
 enable_testing()
+include_directories(.)
 
 # OpenMP
 find_package(OpenMP)
@@ -24,7 +25,9 @@ add_subdirectory(third_party/googletest)
 
 # Eigen
 set(EIGEN3_INCLUDE_DIR third_party/eigen)
-#set(EIGEN_FAST_MATH 0)
+#add_definitions(-DEIGEN_FAST_MATH=0)
+#add_definitions(-DEIGEN_DONT_PARALLELIZE)
+#add_definitions(-DEIGEN_DONT_VECTORIZE)
 include_directories(${EIGEN3_INCLUDE_DIR})
 
 # llm.c
@@ -35,14 +38,14 @@ add_executable(test_gpt2 test_gpt2.c)
 target_link_libraries(test_gpt2 m ${OpenMP_CXX_LIBRARIES})
 
 # llm.cpp
-add_executable(test_gpt2_cpp test_gpt2.cpp)
+add_executable(test_gpt2_cpp llmcpp/test_gpt2.cpp)
 target_link_libraries(test_gpt2_cpp absl::strings absl::log absl::check)
 
-add_executable(nn_test nn_test.cpp)
+add_executable(nn_test llmcpp/nn_test.cpp)
 target_link_libraries(nn_test absl::strings absl::log absl::check GTest::gtest_main)
 
-add_executable(optim_test optim_test.cpp)
+add_executable(optim_test llmcpp/optim_test.cpp)
 target_link_libraries(optim_test absl::strings absl::log absl::check GTest::gtest_main)
 
-add_executable(gpt_test gpt_test.cpp)
+add_executable(gpt_test llmcpp/gpt_test.cpp)
 target_link_libraries(gpt_test absl::strings absl::log absl::check GTest::gtest_main)
