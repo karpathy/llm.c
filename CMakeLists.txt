@@ -49,3 +49,6 @@ target_link_libraries(optim_test absl::strings absl::log absl::check GTest::gtes
 
 add_executable(gpt_test llmcpp/gpt_test.cpp)
 target_link_libraries(gpt_test absl::strings absl::log absl::check GTest::gtest_main)
+
+add_executable(gpt_optim llmcpp/gpt_optim.cpp)
+target_link_libraries(gpt_optim absl::strings absl::log absl::check GTest::gtest_main)

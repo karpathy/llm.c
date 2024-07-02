@@ -10,44 +10,6 @@
 #include "absl/types/span.h"
 #include "train_gpt2.c"
 
-float* restore_tensor(const std::string& name, int* num) {
-  FILE* fp = fopen(name.c_str(), "rb");
-  fread(num, sizeof(int), 1, fp);
-
-  float* data = new float[*num];
-  fread(data, sizeof(float), *num, fp);
-  fclose(fp);
-  return data;
-}
-
-void diff_tensor(absl::Span<const float> value,
-                 const std::string& gt_file_name) {
-  int num = 0;
-  float* gt = restore_tensor(gt_file_name, &num);
-  CHECK_EQ(value.size(), num);
-
-  int diff_count5 = 0, diff_count6 = 0;
-  float maxdiff = 0.0;
-  for (size_t i = 0; i < value.size(); ++i) {
-    float val = value[i], val_gt = gt[i];
-    float diff = std::abs(val - val_gt);
-    if (diff > 1e-5) {
-      diff_count5++;
-    }
-    if (diff > 1e-6) {
-      diff_count6++;
-    }
-    if (diff > maxdiff) {
-      maxdiff = diff;
-    }
-  }
-
-  auto pos = gt_file_name.find_first_of('.');
-  auto name = gt_file_name.substr(0, pos);
-  fprintf(stdout, "--- diff count \t %s %.6f \t %d \t %d \t %d\n", name.c_str(),
-          maxdiff, diff_count5, diff_count6, num);
-}
-
 // poor man's tensor checker
 int check_tensor(float* a, float* b, int n, const char* label) {
   int print_upto = 5;
@@ -87,21 +49,6 @@ int check_tensor(float* a, float* b, int n, const char* label) {
     printf("TENSOR NOT OK, maxdiff = %e\n", maxdiff);
   }
   return ok;
-}
-
-void check_all_zero(float* t, int len, const char* label) {
-  bool all_zero = true;
-  for (int i = 0; i < len; ++i) {
-    if (t[i] > 1e-5) {
-      all_zero = false;
-      break;
-    }
-  }
-  if (all_zero) {
-    printf("TENSOR %s ALL ZERO\n", label);
-  } else {
-    printf("TENSOR %s NOT ALL ZERO\n", label);
-  }
 }
 
 int main(int argc, char** argv) {
@@ -189,21 +136,6 @@ int main(int argc, char** argv) {
     model_cpp.gpt2_->Forward(idx, target, logit_3d, &loss);
     optimizer.ZeroGrad();
     model_cpp.gpt2_->Backward(idx, target);
-
-    /*
-    if (step == 0) {
-      auto wte_span = model_cpp.gpt2_->wte_->weight_->View();
-      diff_tensor(wte_span, "wte.dat");
-      auto logit = absl::Span<const float>(calculated_logits, B * T * V);
-      diff_tensor(logit, "logit.data");
-      diff_tensor(model_cpp.gpt2_->logits_grad_, "logit_grad.dat");
-      diff_tensor(model_cpp.gpt2_->lnf_y_grad_, "lnf.dat");
-      diff_tensor(model_cpp.gpt2_->lnf_mean_, "lnf_mean.dat");
-      diff_tensor(model_cpp.gpt2_->lnf_rstd_, "lnf_rstd.dat");
-      diff_tensor(model_cpp.gpt2_->lnf_->bias_->View(nn::Parameter::kGrad),
-                  "lnfb.dat");
-    }
-    */
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     double time_elapsed_s =

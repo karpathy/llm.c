@@ -547,6 +547,7 @@ struct SoftmaxCrossEntropy {
     softmax_->Forward(logits, probs);
 
     // targets: [B,]
+    *loss = 0.0f;
     for (int i = 0; i < targets.size(); ++i) {
       int ix = targets[i];
       *loss += -std::log(probs(i, ix));

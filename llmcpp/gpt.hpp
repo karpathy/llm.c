@@ -627,18 +627,6 @@ struct GPT {
     auto lm_head_grad = Eigen::Map<nn::Matrix>(lm_head_grad_, vocab_size_, C);
     lnf_y_grad +=
         logits_grad_2d * lm_head;  // [BT, vocab_size] x [vocab_size, C]
-
-    // debug only
-    //    for (int bt = 0; bt < BT; ++bt) {
-    //      for (int c = 0; c < C; ++c) {
-    //        float val = 0.0f;
-    //        for (int v = 0; v < vocab_size_; ++v) {
-    //          val += logits_grad_2d(bt, v) * lm_head(v, c);
-    //        }
-    //        lnf_y_grad(bt, c) += val;
-    //      }
-    //    }
-
     lm_head_grad.array() += (logits_grad_2d.transpose() * lnf_y)
                                 .array();  // [vocab_size, BT] x [BT, C]
 
