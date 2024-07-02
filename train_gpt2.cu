@@ -709,7 +709,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T, int step, 
         // now do the forward pass
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream, coord_check_data, &cc_cnt);
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, model->use_mup, model->mup_base_attn_mult, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
