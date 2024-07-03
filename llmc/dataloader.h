@@ -339,7 +339,12 @@ void evalloader_init(EvalLoader *loader,
                      int num_processes) {
     loader->process_rank = process_rank;
     loader->num_processes = num_processes;
-    loader->B = B;
+    if (B < ASSUMED_NUM_COMPLETIONS) {
+        printf("WARNING: Batch size too small for evaluation, increasing from %d to %d\n", (int)B, ASSUMED_NUM_COMPLETIONS);
+        loader->B = ASSUMED_NUM_COMPLETIONS;
+    } else {
+        loader->B = B;
+    }
     loader->T = T;
 
     // open the file and validate the header
