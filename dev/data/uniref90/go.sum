@@ -1,0 +1,4 @@
+github.com/koeng101/dnadesign/lib v0.0.0-20240531162423-45295e318ef3 h1:sFmsnmeffIPhLUBSdhy+9pIaCBHCTddOApZpE3Wvd2I=
+github.com/koeng101/dnadesign/lib v0.0.0-20240531162423-45295e318ef3/go.mod h1:sGDJMyNYf4fMqEwwMj2icJ5PpNNc7RjxvctJTM25pLY=
+golang.org/x/sync v0.5.0 h1:60k92dhOjHxJkrqnwsfl8KuaHbn/5dl0lUPUklKo3qE=
+golang.org/x/sync v0.5.0/go.mod h1:Czt+wKu1gCyEFDUtn0jG5QVvpJ6rzVqr5aXyt9drQfk=
