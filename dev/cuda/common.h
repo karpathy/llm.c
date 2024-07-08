@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
+#include <cuda_fp8.h>
 #include <float.h>
 
 #define WARP_SIZE 32U
@@ -293,6 +294,7 @@ void setup_main() {
     cuda_arch_major = deviceProp.major;
     cuda_arch_minor = deviceProp.minor;
 
+    #if !defined(SKIP_CUBLAS)
     // setup cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
@@ -305,6 +307,7 @@ void setup_main() {
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
+    #endif
 }
 
 template<class D, class T>
@@ -319,19 +322,19 @@ void validate_result(D* device_result, const T* cpu_reference, const char* name,
 #endif
     for (int i = 0; i < num_elements; i++) {
         // Skip masked elements
-        if(!isfinite(cpu_reference[i]))
+        if(!isfinite((float)cpu_reference[i]))
             continue;
 
         // print the first few comparisons
         if (i < 5) {
-            printf("%f %f\n", cpu_reference[i], (T)out_gpu[i]);
+            printf("%f %f\n", (float)cpu_reference[i], (float)out_gpu[i]);
         }
         // effective tolerance is based on expected rounding error (epsilon),
         // plus any specified additional tolerance
-        float t_eff = tolerance + fabs(cpu_reference[i]) * epsilon;
+        float t_eff = (float)tolerance + fabs((float)cpu_reference[i]) * epsilon;
         // ensure correctness for all elements.
-        if (fabs(cpu_reference[i] - (T)out_gpu[i]) > t_eff) {
-            printf("Mismatch of %s at %d: CPU_ref: %f vs GPU: %f\n", name, i, cpu_reference[i], (T)out_gpu[i]);
+        if (fabs((float)cpu_reference[i] - (float)out_gpu[i]) > t_eff) {
+            printf("Mismatch of %s at %d: CPU_ref: %f vs GPU: %f\n", name, i, (float)cpu_reference[i], (float)out_gpu[i]);
             nfaults ++;
             if (nfaults >= 10) {
                 free(out_gpu);
