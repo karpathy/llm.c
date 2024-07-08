@@ -19,6 +19,8 @@ DEFAULT_TILE=64 (tile size for transpose kernels, this affects shared memory and
 WIDTH=8192 (width of the input tensor, default=8192)
 HEIGHT=3072 (height of the input tensor, default=3072)
 ABSMAX_ITERATIONS_PER_THREAD=2 (outer loop iterations for absmax kernel 20)
+FUSED_ABSMAX_FIRST_PHASE_BYTES=52428800 (number of bytes the fused absmax assumes can fit in the L2 cache)
+FUSED_RESCALE_IN_PLACE=true (always rescale to avoid all overflow in the fused absmax kernel 30)
 
 Kernel versions:
 
@@ -30,6 +32,14 @@ version 3 is a simpler very optimized copy (with support for absmax calculation)
 version 10 is a non-optimized transpose (no elementwise, no absmax)
 version 11 is a fast transpose with shared memory (no support for absmax at the moment)
 version 12 is a very fast transpose with shared memory and 128-bit loads/stores (with support for absmax calculation)
+
+version 20 is an absmax-only kernel (no copy or transpose)
+version 21 is the same but without the memset (sanity checking, ~no performance difference)
+version 22 is the same as 20 but with persistent threads
+
+version 25 is a non-fused absmax + scale with 2 kernel invocations
+version 26 is the same as 25 but the copy is in reverse order to maximise L2 cache hits
+version 30 is an extremely complicated fused absmax+scale+rescale kernel (see defines above)
 
 Usage example: ./transpose 12
 */
@@ -50,6 +60,7 @@ Usage example: ./transpose 12
 //#define WIDTH 8192
 //#define HEIGHT 768
 //#define ABSMAX_ITERATIONS_PER_THREAD 1
+//#define FUSED_ABSMAX_FIRST_PHASE_BYTES 52428800
 //#define FUSED_RESCALE_IN_PLACE true
 
 #if !defined(IN_TYPE)
@@ -109,7 +120,7 @@ Usage example: ./transpose 12
 #endif
 
 #if !defined(FUSED_RESCALE_IN_PLACE)
-#define FUSED_RESCALE_IN_PLACE true // WIP not ready yet
+#define FUSED_RESCALE_IN_PLACE false
 #endif
 
 // ----------------------------------------------------------------------------
@@ -1021,10 +1032,10 @@ void run_advanced(int kernel_num,
         case 22:
             get_absmax_persistent(input, width * height, block_size, true);
             break;
-        case 23:
+        case 25:
             absmax_and_copy(copy, input, width * height, block_size, true);
             break;
-        case 24:
+        case 26:
             // reversed copy which leads to some L2 cache hits on copy after absmax
             absmax_and_copy<true>(copy, input, width * height, block_size, true);
             break;
@@ -1160,7 +1171,7 @@ int main(int argc, const char **argv) {
         }
         #endif
         if (kernel_num >= FIRST_ABSMAX_ONLY_KERNEL && kernel_num != 30) {
-            if (kernel_num < 23) {
+            if (kernel_num < 25) {
                 memory_ops = 0; // 20/21/22 only do the absmax, no copy
             }
             memory_ops += W * H * sizeof(IN_TYPE); // read-only absmax kernel (+copy for 22/23)
