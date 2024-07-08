@@ -717,7 +717,7 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
         if (scale_output) {
             asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
             float absmax_this_iteration = __uint_as_float(absmax_uint);
-            if (absmax_this_iteration < estimated_absmax) {
+            if (absmax_this_iteration > estimated_absmax) {
                 scale_output = false;
             } else {
                 last_scaled = i;
@@ -766,9 +766,9 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
     // If we did this naively, we'd waste half the warps in a block when size(T) > sizeof(TOut) (e.g. BF16->FP8)
     // instead we make different warps do different loop iterations to maintain 100% occupancy
     constexpr int size_ratio = sizeof(T) / sizeof(TOut);
-    unsigned int start_o = 0;
-    unsigned int step_o = 1;
-    unsigned int tid_x = threadIdx.x;
+    int start_o = 0;
+    int step_o = 1;
+    int tid_x = threadIdx.x;
     if (size_ratio > 1) {
         constexpr int threads_per_o = (NUM_WARPS*32) / size_ratio;
         tid_x = threadIdx.x % threads_per_o;
@@ -785,7 +785,7 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
     for (int i = last_scaled; i >= 0; i--) {
         size_t idx = start_idx + (i * elements_per_block_iteration) + (tid_x * Packed128<TOut>::size);
         if (idx < N) {
-            for (int o = start_o; o < ABSMAX_ITERATIONS_PER_THREAD; o++) {
+            for (int o = start_o; o < ABSMAX_ITERATIONS_PER_THREAD; o += step_o) {
                 Packed128<TOut> packed_in_out = load128(out + idx);
                 for(int k = 0; k < Packed128<TOut>::size; ++k) {
                     packed_in_out[k] = (TOut)((float)packed_in_out[k] * rescale);
@@ -795,16 +795,11 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
         }
     }
 
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        float rescaled_absmax = estimated_absmax * ratio_power_of_2;
-        *absmax_scaling = __float_as_uint(rescaled_absmax);
-    }
-
     // Go through all the iterations we did *not* scale on this warp because we knew the scale was wrong
     for (int i = last_scaled+1; i < iterations_per_block; i++) {
-        size_t idx = start_idx + (i * elements_per_block_iteration) + (threadIdx.x * Packed128<T>::size);
+        size_t idx = start_idx + (i * elements_per_block_iteration) + (tid_x * Packed128<T>::size);
         if (idx < N) {
-            for (unsigned int o = 0; o < ABSMAX_ITERATIONS_PER_THREAD; o += step_o) {
+            for (int o = start_o; o < ABSMAX_ITERATIONS_PER_THREAD; o += step_o) {
                 Packed128<TOut> packed_out;
                 Packed128<T> packed_inp = load128cs(inp + idx); // last read, do not cache in either L1 or L2
                 for(int k = 0; k < packed_inp.size; ++k) {
@@ -814,6 +809,12 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
                 idx += blockDim.x * packed_inp.size;
             }
         }
+    }
+
+    // Update absmax_scaling so other kernels know what to descale by
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        float rescaled_absmax = estimated_absmax * ratio_power_of_2;
+        *absmax_scaling = __float_as_uint(rescaled_absmax);
     }
     #endif
 }
