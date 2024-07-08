@@ -76,7 +76,7 @@ Usage example: ./transpose 12
 #if !defined(CALCULATE_ABSMAX)
 #define CALCULATE_ABSMAX false
 #endif
-#define DEFAULT_ABSMAX_DIVIDER 4
+#define DEFAULT_ABSMAX_DIVIDER 2
 #if CALCULATE_ABSMAX == true
 #define ABSMAX_DIVIDER DEFAULT_ABSMAX_DIVIDER
 #else
@@ -100,8 +100,16 @@ Usage example: ./transpose 12
 #define ABSMAX_ITERATIONS_PER_THREAD 2
 #endif
 
+#if !defined(FUSED_ABSMAX_FIRST_PHASE_BYTES)
+#define FUSED_ABSMAX_FIRST_PHASE_BYTES (40*1024*1024)
+#endif
+
+#if !defined(FUSED_ABSMAX_CONSERVATIVE_FUDGE_FACTOR)
+#define FUSED_ABSMAX_CONSERVATIVE_FUDGE_FACTOR 4.0f
+#endif
+
 #if !defined(FUSED_RESCALE_IN_PLACE)
-#define FUSED_RESCALE_IN_PLACE false // WIP not ready yet
+#define FUSED_RESCALE_IN_PLACE true // WIP not ready yet
 #endif
 
 // ----------------------------------------------------------------------------
@@ -584,12 +592,10 @@ __global__ void get_absmax_persistent_kernel(const T* inp, unsigned int* absmax_
     }
 }
 
-#define FUSED_ABSMAX_FIRST_PHASE_BYTES 40 * 1024 * 1024
-#define FUSED_ABSMAX_CONSERVATIVE_FUDGE_FACTOR 8.0f
-
 template <int NUM_WARPS=32, typename T=IN_TYPE, typename TOut=OUT_TYPE>
 __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* __restrict__ out, unsigned int* __restrict__ absmax_scaling, unsigned int* __restrict__ absmax_actual, unsigned int* __restrict__ absmax_counter,
                                                                          const T* inp, size_t N, float absmax_divider=1.0f) {
+    // todo - move these calculations to CPU?
     int elements_per_block_iteration = blockDim.x * ABSMAX_ITERATIONS_PER_THREAD * Packed128<T>::size;
     int iterations_per_block = (int)ceil_div(N, (size_t)(gridDim.x * elements_per_block_iteration));
     size_t start_idx = blockIdx.x * elements_per_block_iteration * iterations_per_block;
@@ -678,9 +684,12 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
                 packed_out[k] = (TOut)((float)packed_inp[o][k] / estimated_absmax);
             }
             store_same_length<T,TOut>(out + idx, packed_out);
-            idx += blockDim.x * packed_inp[o].size;
+            idx += blockDim.x * Packed128<T>::size;
         }
     }
+
+    int last_scaled = 0;
+    bool scale_output = true;
 
     // We do the scaling for everything else, while keeping track of the absmax
     // if the absmax no longer matches, stop copying and only calculate absmax, then copy everything at the end
@@ -696,11 +705,27 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
                     absmax_uint = max(absmax_uint, x);
                     packed_out[k] = (TOut)((float)packed_inp[k] / estimated_absmax);
                 }
-                store_same_length<T,TOut>(out + idx, packed_out);
-                idx += blockDim.x * packed_inp.size;
+                if (scale_output) {
+                    store_same_length<T,TOut>(out + idx, packed_out);
+                }
+                idx += blockDim.x * Packed128<T>::size;
             }
         }
+        #if FUSED_RESCALE_IN_PLACE == true
+        // per-warp "stop scaling if we have ever seen a value too big" (effectively discarding the iteration above)
+        // doing it per-warp rather than per-block reduces sync overhead (and we end up using in-place rescaling a lot)
+        if (scale_output) {
+            asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
+            float absmax_this_iteration = __uint_as_float(absmax_uint);
+            if (absmax_this_iteration < estimated_absmax) {
+                scale_output = false;
+            } else {
+                last_scaled = i;
+            }
+        }
+        #endif
     }
+    (void)last_scaled; (void)scale_output; // avoid compiler warnings if not used
 
     // Now update the global max and wait until all other blocks are done to recheck the absmax
     asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
@@ -713,10 +738,9 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
         atomicMax(absmax_actual, absmax_uint);
     }
 
-    // todo - this is a WIP path that rescales the tensor in-place
-    // right now, this will result in overflowed values just being scaled down, which is obviously not what we want
-    // it would require separate metadata to track the scaling factor used for each part of the tensor
-    // or just stop scaling as soon as we detect a value that is too big locally, and read BF16 version here instead
+    // todo - this is a WIP path that rescales the tensor in-place if it was already scaled to FP8,
+    // and scales from BF16 input for every part that has not been scaled (since we knew the scale was wrong)
+    // NOT PROPERLY TESTED YET - DO NOT TRUST IT TO WORK CORRECTLY!
     #if FUSED_RESCALE_IN_PLACE == true
     if (warp_id == 0) {
         if (threadIdx.x == 0) {
@@ -734,24 +758,37 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
     absmax_uint = tmp[0];
     float final_absmax = __uint_as_float(absmax_uint);
 
-    // todo - this wastes half the warps in the BF16->FP8 case, we can do better than this!
-    if (threadIdx.x >= (blockDim.x * Packed128<T>::size) / Packed128<TOut>::size) { return; }
-    if (final_absmax <= estimated_absmax) { return; }
-
-    // We need to rescale the entire tensor! :(
+    if (final_absmax <= estimated_absmax) { return; } // no rescaling needed, we're done!
+    // We need to rescale everything we did output! :(
     // We scale the FP8 tensor in-place by a power of 2 so it only affects the exponent bits
     // (except for subnormals and special numbers, but because this is a persistent kernel, it's still deterministic)
+
+    // If we did this naively, we'd waste half the warps in a block when size(T) > sizeof(TOut) (e.g. BF16->FP8)
+    // instead we make different warps do different loop iterations to maintain 100% occupancy
+    constexpr int size_ratio = sizeof(T) / sizeof(TOut);
+    unsigned int start_o = 0;
+    unsigned int step_o = 1;
+    unsigned int tid_x = threadIdx.x;
+    if (size_ratio > 1) {
+        constexpr int threads_per_o = (NUM_WARPS*32) / size_ratio;
+        tid_x = threadIdx.x % threads_per_o;
+        start_o = threadIdx.x / threads_per_o;
+        step_o = size_ratio;
+    }
+
     float ratio = final_absmax / estimated_absmax;
     float ratio_power_of_2 = exp2f(ceil(__log2f(ratio)));
-    float scale = 1.0f / ratio_power_of_2;
+    float rescale = 1.0f / ratio_power_of_2;
 
-    for (int i = iterations_per_block-1; i >= 0; i--) {
-        size_t idx = start_idx + (i * elements_per_block_iteration) + (threadIdx.x * Packed128<TOut>::size);
+    // rescale the the incorrectly scaled FP8 outputs with the new scale
+    // iterate in reverse so we are more likely to hit in the cache
+    for (int i = last_scaled; i >= 0; i--) {
+        size_t idx = start_idx + (i * elements_per_block_iteration) + (tid_x * Packed128<TOut>::size);
         if (idx < N) {
-            for (int o = 0; o < ABSMAX_ITERATIONS_PER_THREAD; o++) {
+            for (int o = start_o; o < ABSMAX_ITERATIONS_PER_THREAD; o++) {
                 Packed128<TOut> packed_in_out = load128(out + idx);
                 for(int k = 0; k < Packed128<TOut>::size; ++k) {
-                    packed_in_out[k] = (TOut)((float)packed_in_out[k] * scale);
+                    packed_in_out[k] = (TOut)((float)packed_in_out[k] * rescale);
                 }
                 store128cs<TOut>(out + idx, packed_in_out);
             }
@@ -761,6 +798,22 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         float rescaled_absmax = estimated_absmax * ratio_power_of_2;
         *absmax_scaling = __float_as_uint(rescaled_absmax);
+    }
+
+    // Go through all the iterations we did *not* scale on this warp because we knew the scale was wrong
+    for (int i = last_scaled+1; i < iterations_per_block; i++) {
+        size_t idx = start_idx + (i * elements_per_block_iteration) + (threadIdx.x * Packed128<T>::size);
+        if (idx < N) {
+            for (unsigned int o = 0; o < ABSMAX_ITERATIONS_PER_THREAD; o += step_o) {
+                Packed128<TOut> packed_out;
+                Packed128<T> packed_inp = load128cs(inp + idx); // last read, do not cache in either L1 or L2
+                for(int k = 0; k < packed_inp.size; ++k) {
+                    packed_out[k] = (TOut)((float)packed_inp[k] / final_absmax);
+                }
+                store_same_length<T,TOut>(out + idx, packed_out);
+                idx += blockDim.x * packed_inp.size;
+            }
+        }
     }
     #endif
 }
@@ -879,7 +932,7 @@ void absmax_and_copy(T1* copy, const T2* input, size_t N, const size_t block_siz
 
 template <typename T>
 void get_absmax_persistent(const T* input, size_t N, const size_t block_size, bool memset=true, unsigned int* absmax_output=d_absmax_estimate, float absmax_divider=(float)ABSMAX_DIVIDER) {
-    size_t grid_size = 114 * (2048 / block_size);
+    size_t grid_size = cuda_num_SMs * min(32, (int)(cuda_threads_per_SM / block_size)); // maximum of 32 blocks in flight
     absmax_divider = absmax_divider ? absmax_divider : (float)DEFAULT_ABSMAX_DIVIDER;
     //assert((N % (Packed128<T>::size * ABSMAX_ITERATIONS_PER_THREAD)) == 0);
 
@@ -902,7 +955,7 @@ void get_absmax_persistent(const T* input, size_t N, const size_t block_size, bo
 
 template <typename T1, typename T2>
 void fused_absmax_scale_persistent(T1* out, const T2* input, size_t N, const size_t block_size, bool memset=true, float absmax_divider=(float)ABSMAX_DIVIDER) {
-    size_t grid_size = 114 * min(32, (int)(2048 / block_size)); // maximum of 32 blocks in flight
+    size_t grid_size = cuda_num_SMs * min(32, (int)(cuda_threads_per_SM / block_size)); // maximum of 32 blocks in flight
     absmax_divider = absmax_divider ? absmax_divider : (float)DEFAULT_ABSMAX_DIVIDER;
     //assert((N % (Packed128<T1>::size * ABSMAX_ITERATIONS_PER_THREAD)) == 0);
 
@@ -911,6 +964,7 @@ void fused_absmax_scale_persistent(T1* out, const T2* input, size_t N, const siz
         cudaMemset(d_absmax_counter, 0, sizeof(unsigned int));
         cudaMemset(d_absmax_actual, 0, sizeof(unsigned int));
     }
+    cudaCheck(cudaGetLastError());
 
     // todo - ideally this should use cooperative thread launches so that the CUDA API itself guarantees all blocks can execute simultaneously
     switch (block_size) {
@@ -999,7 +1053,8 @@ int main(int argc, const char **argv) {
     float* input = make_random_float_01(W * H);
 
     // add an outlier towards the end to make the job of fused absmax really hard
-    input[(W/7) + ((H*4)/5)*W] = 435.0f;
+    //input[(W/7) + ((H*4)/5)*W] = 435.0f;
+    input[W-1 + (H-1)*W] = 1000.0f;
 
     // read kernel_num from command line
     int kernel_num = 12;
@@ -1031,7 +1086,7 @@ int main(int argc, const char **argv) {
     cudaCheck(cudaMemset(d_absmax_actual, 0, sizeof(unsigned int)));
 
     // time the kernel at different block sizes
-    int block_sizes[] = {1024,512,256};
+    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
 
     // kernel 12 specifically does not support all block sizes, so act accordingly
     size_t num_block_sizes = sizeof(block_sizes) / sizeof(int);
@@ -1086,6 +1141,7 @@ int main(int argc, const char **argv) {
                 validate_result((float*)d_absmax_estimate, (float*)&absmax_storage, "absmax", 1, 1e-5f);
             }
         }
+        // todo - sanity checks specifically for kernel 30
     }
     printf("All results match. Starting benchmarks.\n\n");
 
@@ -1098,7 +1154,7 @@ int main(int argc, const char **argv) {
         // napkin math: estimate the memory bandwidth achieved
         size_t memory_ops = W * H * (sizeof(IN_TYPE) + sizeof(OUT_TYPE));
         #if TRANSPOSE_AND_COPY == true
-        if (kernel_num >= FIRST_TRANSPOSE_KERNEL) {
+        if (kernel_num >= FIRST_TRANSPOSE_KERNE && kernel_num < FIRST_ABSMAX_ONLY_KERNE) {
             memory_ops += W * H * sizeof(OUT_TYPE);
         }
         #endif
