@@ -87,11 +87,11 @@ Usage example: ./transpose 12
 #if !defined(CALCULATE_ABSMAX)
 #define CALCULATE_ABSMAX false
 #endif
-#define DEFAULT_ABSMAX_DIVIDER 2
+#define DEFAULT_ABSMAX_FACTOR 2
 #if CALCULATE_ABSMAX == true
-#define ABSMAX_DIVIDER DEFAULT_ABSMAX_DIVIDER
+#define ABSMAX_FACTOR DEFAULT_ABSMAX_FACTOR
 #else
-#define ABSMAX_DIVIDER 0
+#define ABSMAX_FACTOR 0
 #endif
 #if !defined(ABSMAX_EXPONENT_ONLY)
 #define ABSMAX_EXPONENT_ONLY false
@@ -115,10 +115,6 @@ Usage example: ./transpose 12
 #define FUSED_ABSMAX_FIRST_PHASE_BYTES (40*1024*1024)
 #endif
 
-#if !defined(FUSED_ABSMAX_CONSERVATIVE_FUDGE_FACTOR)
-#define FUSED_ABSMAX_CONSERVATIVE_FUDGE_FACTOR 4.0f
-#endif
-
 #if !defined(FUSED_RESCALE_IN_PLACE)
 #define FUSED_RESCALE_IN_PLACE false
 #endif
@@ -139,23 +135,22 @@ constexpr int FIRST_ABSMAX_ONLY_KERNEL = 20; // kernels 20+ are absmax kernels, 
 // elementwise functions which can be applied as part of the copy/transpose
 // for elementwise kernels that require metadata (e.g. layernorm forward with known mean/std),
 // we could maybe store it in constant buffers rather than in yet-another-function-parameter...
-using elementwise_func_t = float (*) (float, uint, uint, uint, uint, const void**);
+using elementwise_func_t = float (*) (float, const void**, uint, uint, uint, uint);
 #if ENABLE_GELU == true
 #define DEFAULT_ELEMENTWISE gelu_forward_elementwise
 #else
 #define DEFAULT_ELEMENTWISE nothing_elementwise
 #endif
 
-__host__ __device__ float nothing_elementwise(float in, uint x, uint y, uint width, uint height, const void** __restrict__ metadata=NULL) {
-    (void)x; (void)y; (void)width; (void)height; (void)metadata; // avoid compiler warnings for unused variables
+__host__ __device__ float nothing_elementwise(float in, const void** __restrict__ metadata, uint x, uint y, uint w, uint h) {
+    (void)x; (void)y; (void)w; (void)h; (void)metadata; // avoid compiler warnings for unused variables
     return in;
 }
 
-#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__host__ __device__ float gelu_forward_elementwise(float in, uint x, uint y, uint width, uint height, const void** __restrict__ metadata=NULL) {
-    (void)x; (void)y; (void)width; (void)height; (void)metadata; // avoid compiler warnings for unused variables
+__host__ __device__ float gelu_forward_elementwise(float in, const void** __restrict__ metadata, uint x, uint y, uint w, uint h) {
+    (void)x; (void)y; (void)w; (void)h; (void)metadata; // avoid compiler warnings for unused variables
     float cube = 0.044715f * in * in * in;
-    return 0.5f * in * (1.0f + tanhf(GELU_SCALING_FACTOR * (in + cube)));
+    return 0.5f * in * (1.0f + tanhf(sqrtf(2.0f / M_PI) * (in + cube)));
 }
 
 // ----------------------------------------------------------------------------
@@ -168,14 +163,14 @@ void transpose_cpu(T1* transposed, T1* transposed_gelu, T1* copy, T1* copy_gelu,
         for (size_t x = 0; x < width; x++) {
             // note (IN_TYPE) unlike GPU version because T2 is actually always float for simplicity
             float in = (float)((IN_TYPE)input[x + y*width]);
-            float gelu = gelu_forward_elementwise(in, x, y, width, height, metadata);
+            float gelu = gelu_forward_elementwise(in, metadata, x, y, width, height);
 
-            // absmax calculation is pre-scaling (but has its own ABSMAX_DIVIDER)
-            float absmax_divider = (ABSMAX_DIVIDER != 0) ? (float)ABSMAX_DIVIDER : DEFAULT_ABSMAX_DIVIDER;
+            // absmax calculation is pre-scaling (but has its own ABSMAX_FACTOR)
+            float absmax_factor = (ABSMAX_FACTOR != 0) ? (float)ABSMAX_FACTOR : DEFAULT_ABSMAX_FACTOR;
             #if ENABLE_GELU == true
-            float absmax = gelu / (float)absmax_divider;
+            float absmax = gelu / (float)absmax_factor;
             #else
-            float absmax = in / (float)absmax_divider;
+            float absmax = in / (float)absmax_factor;
             #endif
             constexpr uint absmax_mask = ABSMAX_EXPONENT_ONLY ? 0x7f800000 : 0x7fffffff;
             absmax_storage = max(absmax_storage, *((uint*)&absmax) & absmax_mask);
@@ -212,10 +207,17 @@ __device__ void store_same_length(ElementType* target, Packed128<ElementType> va
     }
 }
 
-// to update the absmax for the entire threadgroup (single thread for the global memory atomic)
-__device__ void update_absmax(unsigned int* absmax_output, unsigned int absmax_uint) {
-    uint lane_id = threadIdx.x % 32;
-    uint warp_id = threadIdx.x / 32;
+// updates the absmax for the entire threadgroup
+// requires all warps in threadblock to be active
+// caller can rely on there always being a __syncthreads() for other work
+template <bool is2D=false> // templating to avoid useless calculations for 1D (no support for 3D)
+__device__ void update_global_absmax(unsigned int* absmax_output, unsigned int absmax_uint) {
+    uint bidY = is2D ? blockDim.y : 1;
+    uint tidY = is2D ? threadIdx.y : 0;
+    uint tidXY = threadIdx.x + blockDim.x * tidY;
+    uint num_warps = blockDim.x * bidY;
+    uint lane_id = tidXY % 32;
+    uint warp_id = tidXY / 32;
 
     // use native integer reductions as much as possible (supported on all GPUs with FP8)
     // todo - we could use cooperative groups instead of PTX here but it'd increase compile time
@@ -224,14 +226,24 @@ __device__ void update_absmax(unsigned int* absmax_output, unsigned int absmax_u
     if (lane_id == 0) {
         tmp[warp_id] = absmax_uint;
     }
-    if (warp_id != 0) { return; }
-    uint shared_idx = (lane_id < blockIdx.x) ? lane_id : 0;
-
     __syncthreads();
-    absmax_uint = tmp[shared_idx];
-    asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
-    if (lane_id == 0) {
+
+    if (warp_id == 0) {
+        absmax_uint = tmp[lane_id < num_warps ? lane_id : 0];
+        // compiler automatically does a warp reduction here and global atomic is single-threaded
+        // if we try to do it ourselves, we might end up with *two* warp reductions :(
         atomicMax(absmax_output, absmax_uint);
+    }
+}
+
+// absmax factor is related to the maximum value of the target format, e.g. 448 for FP8 e4m3
+// we skip everything absmax-related if it is at the default value of 0
+// absmax_factor should be a constant known at compile time for performance
+template <bool always=false, bool absmax_exponent_only=ABSMAX_EXPONENT_ONLY, typename T>
+__device__ void update_local_absmax(unsigned int &absmax_uint, T data, uint absmax_factor=0) {
+    if (always || absmax_factor != 0) {
+        constexpr uint absmax_mask = absmax_exponent_only ? 0x7f800000 : 0x7fffffff;
+        absmax_uint = max(absmax_uint, __float_as_uint((float)data / (float)absmax_factor) & absmax_mask);
     }
 }
 
@@ -259,9 +271,8 @@ __global__ void copy_fast_kernel1(T1 *copy, const T2 *input, size_t N, const flo
 
     // note: if sizeof(T1) < sizeof(T2), compiler will skip unused elements of load128
     // so it may turn out to be a ldg.32 or ldg.64
-    Packed128<T2> inp128;
+    Packed128<T2> inp128 = load128<T2>(input + n);
     Packed128<T1> out128;
-    inp128 = load128<T2>(input + n);
     for (int k = 0; k < vec_size; k++) {
         out128[k] = (T1)((float)inp128[k] * scale_factor);
     }
@@ -273,8 +284,8 @@ __global__ void copy_fast_kernel1(T1 *copy, const T2 *input, size_t N, const flo
 // overly complicated copy & format conversion kernel without store_same_length
 // this keeps all loads & stores 128-bit at the cost of more complexity and more register pressure
 template <bool scaling=SCALING, elementwise_func_t elementwise_func=DEFAULT_ELEMENTWISE,
-          uint absmax_divider=ABSMAX_DIVIDER, typename T1, typename T2>
-__global__ void copy_advanced_kernel2(T1 *copy, const T2 *input, size_t N, const float* __restrict__ scale_pointer=d_scaling_factor, unsigned int* absmax_output=d_absmax_estimate, const void** metadata=NULL) {
+          uint absmax_factor=ABSMAX_FACTOR, typename T1, typename T2>
+__global__ void copy_advanced_kernel2(T1 *copy, const T2 *input, size_t N, const float* __restrict__ scale_pointer=d_scaling_factor, unsigned int* absmax_output=d_absmax_estimate, const void** meta=NULL) {
     // Optional fused absmax calculation
     uint absmax_uint = 0;
 
@@ -286,33 +297,27 @@ __global__ void copy_advanced_kernel2(T1 *copy, const T2 *input, size_t N, const
     Packed128<T2> inp128;
     Packed128<T1> out128;
     float scale_factor = scaling ? *scale_pointer : 1.0f;
-    #pragma unroll
     for (int o = 0; o < max(1, out128.size/inp128.size); o++) {
         inp128 = load128cs<T2>(input + n + o*inp128.size);
-        #pragma unroll
         for (int k = 0; k < min(inp128.size, out128.size); k++) {
-            float out_float = elementwise_func((float)inp128[k], n+o*inp128.size, 0, N, 1, metadata);
+            float out_float = elementwise_func((float)inp128[k], meta, n+o*inp128.size, 0, N, 1);
             out128[k+o*inp128.size] = (T1)(out_float * (scaling ? scale_factor : 1.0f));
-
-            if constexpr (absmax_divider != 0) { // absmax is calculated before scaling
-                constexpr uint absmax_mask = ABSMAX_EXPONENT_ONLY ? 0x7f800000 : 0x7fffffff;
-                absmax_uint = max(absmax_uint, __float_as_uint(out_float / (float)absmax_divider) & absmax_mask);
-            }
+            update_local_absmax(absmax_uint, out_float, absmax_factor); // optional absmax
         }
     }
     store128<T1>(copy + n, out128);
 
     // update absmax if required
-    if constexpr (absmax_divider != 0) {
-        update_absmax(absmax_output, absmax_uint);
+    if constexpr (absmax_factor != 0) {
+        update_global_absmax<false>(absmax_output, absmax_uint);
     }
 }
 
 // simplified copy & format conversion kernel using store_same_length
 // keeps the largest format at 128-bit and smallest at 32-bit or 64-bit
 template <bool reversed_order=false, bool scaling=SCALING, elementwise_func_t elementwise_func=DEFAULT_ELEMENTWISE,
-          uint absmax_divider=ABSMAX_DIVIDER, typename T1, typename T2>
-__global__ void copy_advanced_kernel3(T1 *copy, const T2 *input, size_t N, const float* __restrict__ scale_pointer=d_scaling_factor, unsigned int* absmax_output=d_absmax_estimate, const void** metadata=NULL) {
+          uint absmax_factor=ABSMAX_FACTOR, typename T1, typename T2>
+__global__ void copy_advanced_kernel3(T1 *copy, const T2 *input, size_t N, const float* __restrict__ scale_pointer=d_scaling_factor, unsigned int* absmax_output=d_absmax_estimate, const void** meta=NULL) {
     // Optional fused absmax calculation
     uint absmax_uint = 0;
     // Optionally process in reverse order to maximise L2 cache hits across kernels for large tensors
@@ -329,20 +334,16 @@ __global__ void copy_advanced_kernel3(T1 *copy, const T2 *input, size_t N, const
     inp128 = load128cs<T2>(input + n);
     float scale_factor = scaling ? *scale_pointer : 1.0f;
     for (int k = 0; k < vec_size; k++) {
-        float out_float = elementwise_func((float)inp128[k], n+k, 0, N, 1, metadata);
+        float out_float = elementwise_func((float)inp128[k], meta, n+k, 0, N, 1);
         out128[k] = (T1)(out_float * scale_factor);
-
-        if constexpr (absmax_divider != 0) { // absmax is calculated before scaling
-            constexpr uint absmax_mask = ABSMAX_EXPONENT_ONLY ? 0x7f800000 : 0x7fffffff;
-            absmax_uint = max(absmax_uint, __float_as_uint(out_float / (float)absmax_divider) & absmax_mask);
-        }
+        update_local_absmax(absmax_uint, out_float, absmax_factor); // optional absmax
     }
     // if sizeof(T2) < sizeof(T1), this will use stg.32 or stg.64 instead of stg.128
     store_same_length<T2,T1>(copy + n, out128);
 
     // update absmax if required
-    if constexpr (absmax_divider != 0) {
-        update_absmax(absmax_output, absmax_uint);
+    if constexpr (absmax_factor != 0) {
+        update_global_absmax(absmax_output, absmax_uint);
     }
 }
 
@@ -374,24 +375,24 @@ __global__ void transpose_naive_kernel(T1 *transposed, T1* copy, const T2 *input
 template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=DEFAULT_TILE, bool scaling=SCALING, bool enable_copy=TRANSPOSE_AND_COPY,
          elementwise_func_t elementwise_func=DEFAULT_ELEMENTWISE, typename T1, typename T2>
 __global__ void transpose_kernel1(T1 *transposed, T1 *copy, const T2 *input,
-                                  const float* __restrict__ scale_pointer=d_scaling_factor, const void** metadata=NULL)
+                                  const float* __restrict__ scale_pointer=d_scaling_factor, const void** meta=NULL)
 {
     __shared__ T1 tile[TILE_DIM][TILE_DIM+1]; // +1 for bank conflict avoidance
-    int width = gridDim.x * TILE_DIM;
-    int height = gridDim.y * TILE_DIM;
+    int w = gridDim.x * TILE_DIM;
+    int h = gridDim.y * TILE_DIM;
 
     float scale_factor = scaling ? *scale_pointer : 1.0f;
     int x = blockIdx.x * TILE_DIM + threadIdx.x;
     int y = blockIdx.y * TILE_DIM + threadIdx.y;
 
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-        T2 in = input[x + (y+j)*width];
-        float post_elementwise = elementwise_func((float)in, x, y+j, width, height, metadata);
+        T2 in = input[x + (y+j)*w];
+        float post_elementwise = elementwise_func((float)in, meta, x, y+j, w, h);
         T1 out = scaling ? (T1)(post_elementwise * scale_factor) : (T1)post_elementwise;
 
         tile[threadIdx.y+j][threadIdx.x] = out;
         if constexpr (enable_copy) {
-            copy[x + (y+j)*width] = out; // separate copy with format conversion (on top of the transpose)
+            copy[x + (y+j)*w] = out; // separate copy with format conversion (on top of the transpose)
         }
     }
     __syncthreads();
@@ -402,26 +403,23 @@ __global__ void transpose_kernel1(T1 *transposed, T1 *copy, const T2 *input,
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
         // avoiding bank conflicts for 32-bit data types thanks to +1 above
         // (also seems to help sub-32-bit but less so, HW behaviour unclear)
-        transposed[x + (y+j)*height] = tile[threadIdx.x][threadIdx.y + j];
+        transposed[x + (y+j)*h] = tile[threadIdx.x][threadIdx.y + j];
     }
 }
 
 // more optimized transpose kernel using 128-bit load/store and shared memory
 // only slightly faster by default, but much faster with TRANSPOSE_AND_COPY as sub-32-bit store in kernel1 is inefficient
 template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=DEFAULT_TILE, bool scaling=SCALING, bool enable_copy=TRANSPOSE_AND_COPY,
-         uint absmax_divider=ABSMAX_DIVIDER, elementwise_func_t elementwise_func=DEFAULT_ELEMENTWISE, typename T1, typename T2>
+         uint absmax_factor=ABSMAX_FACTOR, elementwise_func_t elementwise_func=DEFAULT_ELEMENTWISE, typename T1, typename T2>
 __global__ void transpose_kernel2(T1* __restrict__ transposed, T1* __restrict__ copy, const T2* __restrict__ input,
-                                  const float* __restrict__ scale_pointer=d_scaling_factor, unsigned int* absmax_output=d_absmax_estimate, const void** metadata=NULL)
+                                  const float* __restrict__ scale_pointer=d_scaling_factor, unsigned int* absmax_output=d_absmax_estimate, const void** meta=NULL)
 {
-    // Optional fused absmax calculation
-    uint absmax_uint = 0;
-
     // no +1 for bank conflict avoidance because:
     // 1) 128-bit shared memory stores need to be aligned to 128-bit boundaries
     // 2) it doesn't help as much with sub-32-bit data types
     __shared__ T1 tile[TILE_DIM][TILE_DIM];
-    int width  = gridDim.x * TILE_DIM;
-    int height = gridDim.y * TILE_DIM;
+    int w  = gridDim.x * TILE_DIM;
+    int h = gridDim.y * TILE_DIM;
 
     constexpr size_t T1_elements = 16 / sizeof(T1);
     constexpr size_t T2_elements = 16 / sizeof(T2);
@@ -430,55 +428,41 @@ __global__ void transpose_kernel2(T1* __restrict__ transposed, T1* __restrict__ 
     float scale_factor = scaling ? *scale_pointer : 1.0f;
     int x = blockIdx.x * TILE_DIM + (threadIdx.x * T2_elements);
     int y = blockIdx.y * TILE_DIM + threadIdx.y;
+    uint absmax_uint = 0;
 
     #pragma unroll
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-        Packed128<T2> in128 = load128<T2>(input + x + (y+j)*width);
+        Packed128<T2> in128 = load128<T2>(input + x + (y+j)*w);
         Packed128<T1> copy128[copy_len];
-        #pragma unroll
         for (int k = 0; k < in128.size; k++) {
             T2 in = in128[k];
-            float out_float = elementwise_func((float)in, x+k, y+j, width, height, metadata);
+            float out_float = elementwise_func((float)in, meta, x+k, y+j, w, h);
+
             T1 out = (T1)(out_float * scale_factor);
             copy128[k/T1_elements][k%T1_elements] = out; // optimised away by compiler if unused
-
-            if constexpr (absmax_divider != 0) { // absmax is calculated before scaling
-                constexpr uint absmax_mask = ABSMAX_EXPONENT_ONLY ? 0x7f800000 : 0x7fffffff;
-                absmax_uint = max(absmax_uint, __float_as_uint(out_float / (float)absmax_divider) & absmax_mask);
-            }
+            update_local_absmax(absmax_uint, out_float, absmax_factor); // optional absmax
         }
 
-        #pragma unroll
         for (int o = 0; o < copy_len; o++) {
             if constexpr (enable_copy) {
-                store_same_length<T2,T1>(copy + x + (y+j)*width + o*T1_elements, copy128[o]);
+                store_same_length<T2,T1>(copy + x + (y+j)*w + o*T1_elements, copy128[o]);
             }
             size_t tile_offset = (threadIdx.x * T2_elements) + (threadIdx.y+j)*TILE_DIM + o*T1_elements;
             store_same_length<T2,T1>(&tile[0][0] + tile_offset, copy128[o]);
         }
     }
-    uint tid = threadIdx.x + threadIdx.y*blockDim.x;
-    uint lane_id = tid % 32;
-    uint warp_id = tid / 32;
-    __shared__ uint tmp_absmax[32];
 
-    if constexpr (absmax_divider != 0) {
-        // use native integer reductions as much as possible (supported on all GPUs with FP8)
-        // todo - we could use cooperative groups instead of PTX here but it'd increase compile time
-        asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
-        if (lane_id == 0) {
-            tmp_absmax[warp_id] = absmax_uint;
-        }
+    if constexpr (absmax_factor != 0) {
+        update_global_absmax<true>(absmax_output, absmax_uint);
+    } else {
+        __syncthreads();
     }
-    __syncthreads();
 
     // reduce the number of threads for the write if T1_elements > T2_elements
     // we want to keep all 32 threads in a warp active, so we try to eliminate in y dimension first
     // so we create fake/adjusted tid.x/tid.y where "extra" threadIdx.x adds to the effective tid.y
     constexpr size_t block_size_x = (DEFAULT_TILE * sizeof(T2)) / 16;
     constexpr size_t block_size_y = BLOCK_ROWS;
-    constexpr size_t num_warps = (block_size_x * block_size_y + 31) / 32;
-
     constexpr size_t desired_ratio = (sizeof(T2) >= sizeof(T1)) ? (sizeof(T2) / sizeof(T1)) : 1;
     constexpr size_t ratio = (desired_ratio <= block_size_y) ? desired_ratio : block_size_y;
     constexpr size_t block_size_x_div_r = block_size_x / ratio;
@@ -507,63 +491,33 @@ __global__ void transpose_kernel2(T1* __restrict__ transposed, T1* __restrict__ 
                 // extremely hard to avoid and not a bottleneck when everything else is well optimised
                 out128[k] = tile[k + (adjusted_tid_x + o * blockDim.x) * out128.size][adjusted_tid_y + j];
             }
-            store128<T1>(transposed + x + (o * blockDim.x * out128.size) + (y+j)*height, out128);
+            store128<T1>(transposed + x + (o * blockDim.x * out128.size) + (y+j)*h, out128);
         }
-    }
-
-    if constexpr (absmax_divider != 0) {
-        // reduce the absmax for the entire threadgroup then do the atomicMax to global memory
-        if (warp_id != 0) { return; }
-        absmax_uint = tmp_absmax[lane_id % num_warps];
-        asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
-        if (lane_id == 0) {
-            atomicMax(absmax_output, absmax_uint);
-        }
-    }
-}
+    }}
 
 // ----------------------------------------------------------------------------
 // GPU kernels for absmax
 
 // kernel to calculate absmax of the input tensor
-template <int NUM_WARPS=32, typename T=IN_TYPE>
-__global__ void get_absmax_kernel(const T* inp, unsigned int* absmax_scalar, size_t N, float absmax_divider=1.0f) {
-    size_t idx = ((blockIdx.x * blockDim.x * ABSMAX_ITERATIONS_PER_THREAD) + threadIdx.x) * Packed128<T>::size;
+template <typename T=IN_TYPE>
+__global__ void get_absmax_kernel(const T* inp, unsigned int* absmax_output, size_t N, uint absmax_factor=1) {
     uint absmax_uint = 0;
 
+    size_t idx = ((blockIdx.x * blockDim.x * ABSMAX_ITERATIONS_PER_THREAD) + threadIdx.x) * Packed128<T>::size;
     if (idx < N) {
-        #pragma unroll
         for (int i = 0; i < ABSMAX_ITERATIONS_PER_THREAD; i++) {
             Packed128<T> packed_inp = load128(inp + idx);
             for(int k = 0; k < packed_inp.size; ++k) {
-                constexpr uint absmax_mask = ABSMAX_EXPONENT_ONLY ? 0x7f800000 : 0x7fffffff;
-                uint x = __float_as_uint((float)packed_inp[k] / absmax_divider) & absmax_mask;
-                absmax_uint = max(absmax_uint, x);
+                update_local_absmax<true>(absmax_uint, packed_inp[k], absmax_factor); // optional absmax
             }
             idx += blockDim.x * packed_inp.size;
         }
     }
-    // Use inline PTX for redux.sync.max.u32
-    uint lane_id = threadIdx.x % 32;
-    uint warp_id = threadIdx.x / 32;
-
-    asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
-    __shared__ uint tmp[NUM_WARPS];
-    if (lane_id == 0) {
-        tmp[warp_id] = absmax_uint;
-    }
-    __syncthreads();
-    if (warp_id == 0) {
-        absmax_uint = tmp[lane_id % NUM_WARPS];
-        asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
-        if (lane_id == 0) {
-            atomicMax(absmax_scalar, absmax_uint);
-        }
-    }
+    update_global_absmax<false>(absmax_output, absmax_uint);
 }
 
-template <int NUM_WARPS=32, typename T=IN_TYPE>
-__global__ void get_absmax_persistent_kernel(const T* inp, unsigned int* absmax_scalar, size_t N, float absmax_divider=1.0f) {
+template <typename T=IN_TYPE>
+__global__ void get_absmax_persistent_kernel(const T* inp, unsigned int* absmax_output, size_t N, uint absmax_factor=1) {
     int elements_per_block_iteration = blockDim.x * ABSMAX_ITERATIONS_PER_THREAD * Packed128<T>::size;
     int iterations_per_block = (int)ceil_div(N, (size_t)(gridDim.x * elements_per_block_iteration));
     size_t start_idx = blockIdx.x * elements_per_block_iteration * iterations_per_block;
@@ -575,37 +529,18 @@ __global__ void get_absmax_persistent_kernel(const T* inp, unsigned int* absmax_
             for (int o = 0; o < ABSMAX_ITERATIONS_PER_THREAD; o++) {
                 Packed128<T> packed_inp = load128(inp + idx);
                 for(int k = 0; k < packed_inp.size; ++k) {
-                    constexpr uint absmax_mask = ABSMAX_EXPONENT_ONLY ? 0x7f800000 : 0x7fffffff;
-                    uint x = __float_as_uint((float)packed_inp[k] / absmax_divider) & absmax_mask;
-                    absmax_uint = max(absmax_uint, x);
+                    update_local_absmax<true>(absmax_uint, packed_inp[k], absmax_factor);
                 }
                 idx += blockDim.x * packed_inp.size;
             }
         }
     }
-
-    // Use inline PTX for redux.sync.max.u32
-    uint lane_id = threadIdx.x % 32;
-    uint warp_id = threadIdx.x / 32;
-
-    asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
-    __shared__ uint tmp[NUM_WARPS];
-    if (lane_id == 0) {
-        tmp[warp_id] = absmax_uint;
-    }
-    __syncthreads();
-    if (warp_id == 0) {
-        absmax_uint = tmp[lane_id % NUM_WARPS];
-        asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
-        if (lane_id == 0) {
-            atomicMax(absmax_scalar, absmax_uint);
-        }
-    }
+    update_global_absmax<false>(absmax_output, absmax_uint);
 }
 
 template <int NUM_WARPS=32, typename T=IN_TYPE, typename TOut=OUT_TYPE>
 __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* __restrict__ out, unsigned int* __restrict__ absmax_scaling, unsigned int* __restrict__ absmax_actual, unsigned int* __restrict__ absmax_counter,
-                                                                         const T* inp, size_t N, float absmax_divider=1.0f) {
+                                                                         const T* inp, size_t N, uint absmax_factor=1) {
     // todo - move these calculations to CPU?
     int elements_per_block_iteration = blockDim.x * ABSMAX_ITERATIONS_PER_THREAD * Packed128<T>::size;
     int iterations_per_block = (int)ceil_div(N, (size_t)(gridDim.x * elements_per_block_iteration));
@@ -621,42 +556,19 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
         size_t idx = start_idx + (i * elements_per_block_iteration) + (threadIdx.x * Packed128<T>::size);
         if (idx < N) {
             for (int o = 0; o < ABSMAX_ITERATIONS_PER_THREAD; o++) {
-                packed_inp[o] = (i == 0) ? load128cs(inp + idx) : load128(inp + idx); // i=0 is cached in registers, so do not keep in L2
+                // i=0 is cached in registers, so use load128cs to not keep in L2
+                packed_inp[o] = (i == 0) ? load128cs(inp + idx) : load128(inp + idx);
                 for(int k = 0; k < packed_inp[o].size; ++k) {
-                    constexpr uint absmax_mask = ABSMAX_EXPONENT_ONLY ? 0x7f800000 : 0x7fffffff;
-                    uint x = __float_as_uint((float)packed_inp[o][k] / absmax_divider) & absmax_mask;
-                    absmax_uint = max(absmax_uint, x);
+                    update_local_absmax<true>(absmax_uint, packed_inp[o][k], absmax_factor);
                 }
                 idx += blockDim.x * packed_inp[o].size;
             }
         }
     }
-
-    // Use inline PTX for redux.sync.max.u32
-    uint lane_id = threadIdx.x % 32;
-    uint warp_id = threadIdx.x / 32;
-
-    asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
-    __shared__ unsigned int tmp[NUM_WARPS];
-    if (lane_id == 0) {
-        tmp[warp_id] = absmax_uint;
-    }
-    __syncthreads();
-    if (warp_id == 0) {
-        absmax_uint = tmp[lane_id % NUM_WARPS];
-
-        // apply fudge factor to reduce overflow (doesn't affect absmax_uint which is used for the "real" absmax later)
-        float absmax_tmp = __uint_as_float(absmax_uint);
-        absmax_tmp *= FUSED_ABSMAX_CONSERVATIVE_FUDGE_FACTOR;
-
-        // global memory atomicMax (the compiler seems to automatically add a redux.sync.max to optimise this)
-        atomicMax(absmax_scaling, __float_as_uint(absmax_tmp));
-
-        // increment the number of blocks done with phase 1
-        __threadfence(); // to make sure the atomicInc always happens after the atomicMax
-        if (lane_id == 0) {
-            atomicInc(absmax_counter, gridDim.x-1);
-        }
+    update_global_absmax<false>(absmax_scaling, absmax_uint);
+    __threadfence(); // make sure the atomicInc always happens after the atomicMax
+    if (threadIdx.x == 0) {
+        atomicInc(absmax_counter, gridDim.x-1); // increment the number of blocks done with phase 1
     }
     __syncthreads();
 
@@ -667,6 +579,7 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
     }
 
     // Wait until all blocks have incremented the counter indicating they are done with phase 1
+    __shared__ unsigned int absmax_shared;
     if (threadIdx.x == 0) {
         // volatile read of absmax_counter: wait until it is reset to 0 (because val = gridDim.x-1)
         bool done = (__ldcg(absmax_counter) == 0);
@@ -674,10 +587,10 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
             __nanosleep(100); // sleep for 100 nanoseconds, i.e. 200 cycles at 2GHz, then retry
             done = (__ldcg(absmax_counter) == 0);
         }
-        tmp[0] = __ldcg(absmax_scaling);
+        absmax_shared = __ldcg(absmax_scaling);
     }
     __syncthreads();
-    unsigned int absmax_uint_used = tmp[0];
+    unsigned int absmax_uint_used = absmax_shared;
     float estimated_absmax = __uint_as_float(absmax_uint_used);
 
     // Prefetch the 2nd part of the next iteration so the DRAM controller has something to do
@@ -711,9 +624,7 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
                 Packed128<TOut> packed_out;
                 Packed128<T> packed_inp = load128cs(inp + idx); // last read, do not cache in either L1 or L2
                 for(int k = 0; k < packed_inp.size; ++k) {
-                    constexpr uint absmax_mask = ABSMAX_EXPONENT_ONLY ? 0x7f800000 : 0x7fffffff;
-                    uint x = __float_as_uint((float)packed_inp[k] / absmax_divider) & absmax_mask;
-                    absmax_uint = max(absmax_uint, x);
+                    update_local_absmax<true>(absmax_uint, packed_inp[k], absmax_factor);
                     packed_out[k] = (TOut)((float)packed_inp[k] / estimated_absmax);
                 }
                 if (scale_output) {
@@ -739,15 +650,7 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
     (void)last_scaled; (void)scale_output; // avoid compiler warnings if not used
 
     // Now update the global max and wait until all other blocks are done to recheck the absmax
-    asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
-    if (lane_id == 0) {
-        tmp[warp_id] = absmax_uint;
-    }
-    __syncthreads();
-    if (warp_id == 0) {
-        absmax_uint = tmp[lane_id % NUM_WARPS];
-        atomicMax(absmax_actual, absmax_uint);
-    }
+    update_global_absmax<false>(absmax_actual, absmax_uint);
 
     // todo - this is a WIP path that rescales the tensor in-place if it was already scaled to FP8,
     // and scales from BF16 input for every part that has not been scaled (since we knew the scale was wrong)
@@ -909,31 +812,21 @@ void transpose2(T1 *transposed, const T2 *input, size_t width, size_t height, co
 }
 
 template <typename T>
-void get_absmax(const T* input, size_t N, const size_t block_size, bool memset=true, unsigned int* absmax_output=d_absmax_estimate, float absmax_divider=(float)ABSMAX_DIVIDER) {
+void get_absmax(const T* input, size_t N, const size_t block_size, bool memset=true, unsigned int* absmax_output=d_absmax_estimate, uint absmax_factor=ABSMAX_FACTOR) {
     size_t grid_size = ceil_div(N, block_size * x128::size * ABSMAX_ITERATIONS_PER_THREAD);
-    absmax_divider = absmax_divider ? absmax_divider : (float)DEFAULT_ABSMAX_DIVIDER;
+    absmax_factor = absmax_factor ? absmax_factor : (float)DEFAULT_ABSMAX_FACTOR;
     //assert((N % (Packed128<T>::size * ABSMAX_ITERATIONS_PER_THREAD)) == 0);
 
     if (memset) {
         cudaMemset(absmax_output, 0, sizeof(unsigned int));
     }
-
-    switch (block_size) {
-        case 32: get_absmax_kernel<1><<<grid_size, block_size>>>(input, absmax_output, N, absmax_divider); break;
-        case 64: get_absmax_kernel<2><<<grid_size, block_size>>>(input, absmax_output, N, absmax_divider); break;
-        case 128: get_absmax_kernel<4><<<grid_size, block_size>>>(input, absmax_output, N, absmax_divider); break;
-        case 256: get_absmax_kernel<8><<<grid_size, block_size>>>(input, absmax_output, N, absmax_divider); break;
-        case 512: get_absmax_kernel<16><<<grid_size, block_size>>>(input, absmax_output, N, absmax_divider); break;
-        case 768: get_absmax_kernel<24><<<grid_size, block_size>>>(input, absmax_output, N, absmax_divider); break;
-        case 1024: get_absmax_kernel<32><<<grid_size, block_size>>>(input, absmax_output, N, absmax_divider); break;
-        default: printf("Invalid block size: %lu\n", block_size); exit(1);
-    }
+    get_absmax_kernel<<<grid_size, block_size>>>(input, absmax_output, N, absmax_factor);
     cudaCheck(cudaGetLastError());
 }
 
 template <bool reversed_copy=false, typename T1, typename T2>
-void absmax_and_copy(T1* copy, const T2* input, size_t N, const size_t block_size, bool memset=true, unsigned int* absmax_output=d_absmax_estimate, float absmax_divider=(float)ABSMAX_DIVIDER) {
-    get_absmax(input, N, block_size, false, absmax_output, absmax_divider);
+void absmax_and_copy(T1* copy, const T2* input, size_t N, const size_t block_size, bool memset=true, unsigned int* absmax_output=d_absmax_estimate, uint absmax_factor=ABSMAX_FACTOR) {
+    get_absmax(input, N, block_size, false, absmax_output, absmax_factor);
 
     size_t fewest_elements = min(Packed128<T1>::size, Packed128<T2>::size);
     const dim3 grid_size_copy(ceil_div(N, block_size * fewest_elements));
@@ -943,32 +836,22 @@ void absmax_and_copy(T1* copy, const T2* input, size_t N, const size_t block_siz
 }
 
 template <typename T>
-void get_absmax_persistent(const T* input, size_t N, const size_t block_size, bool memset=true, unsigned int* absmax_output=d_absmax_estimate, float absmax_divider=(float)ABSMAX_DIVIDER) {
+void get_absmax_persistent(const T* input, size_t N, const size_t block_size, bool memset=true, unsigned int* absmax_output=d_absmax_estimate, uint absmax_factor=ABSMAX_FACTOR) {
     size_t grid_size = cuda_num_SMs * min(32, (int)(cuda_threads_per_SM / block_size)); // maximum of 32 blocks in flight
-    absmax_divider = absmax_divider ? absmax_divider : (float)DEFAULT_ABSMAX_DIVIDER;
+    absmax_factor = absmax_factor ? absmax_factor : DEFAULT_ABSMAX_FACTOR;
     //assert((N % (Packed128<T>::size * ABSMAX_ITERATIONS_PER_THREAD)) == 0);
 
     if (memset) {
         cudaMemset(absmax_output, 0, sizeof(unsigned int));
     }
-
-    switch (block_size) {
-        case 32: get_absmax_persistent_kernel<1><<<grid_size, block_size>>>(input, absmax_output, N, absmax_divider); break;
-        case 64: get_absmax_persistent_kernel<2><<<grid_size, block_size>>>(input, absmax_output, N, absmax_divider); break;
-        case 128: get_absmax_persistent_kernel<4><<<grid_size, block_size>>>(input, absmax_output, N, absmax_divider); break;
-        case 256: get_absmax_persistent_kernel<8><<<grid_size, block_size>>>(input, absmax_output, N, absmax_divider); break;
-        case 512: get_absmax_persistent_kernel<16><<<grid_size, block_size>>>(input, absmax_output, N, absmax_divider); break;
-        case 768: get_absmax_persistent_kernel<24><<<grid_size, block_size>>>(input, absmax_output, N, absmax_divider); break;
-        case 1024: get_absmax_persistent_kernel<32><<<grid_size, block_size>>>(input, absmax_output, N, absmax_divider); break;
-        default: printf("Invalid block size: %lu\n", block_size); exit(1);
-    }
+    get_absmax_persistent_kernel<<<grid_size, block_size>>>(input, absmax_output, N, absmax_factor);
     cudaCheck(cudaGetLastError());
 }
 
 template <typename T1, typename T2>
-void fused_absmax_scale_persistent(T1* out, const T2* input, size_t N, const size_t block_size, bool memset=true, float absmax_divider=(float)ABSMAX_DIVIDER) {
+void fused_absmax_scale_persistent(T1* out, const T2* input, size_t N, const size_t block_size, bool memset=true, uint absmax_factor=ABSMAX_FACTOR) {
     size_t grid_size = cuda_num_SMs * min(32, (int)(cuda_threads_per_SM / block_size)); // maximum of 32 blocks in flight
-    absmax_divider = absmax_divider ? absmax_divider : (float)DEFAULT_ABSMAX_DIVIDER;
+    absmax_factor = absmax_factor ? absmax_factor : DEFAULT_ABSMAX_FACTOR;
     //assert((N % (Packed128<T1>::size * ABSMAX_ITERATIONS_PER_THREAD)) == 0);
 
     if (memset) {
@@ -980,13 +863,13 @@ void fused_absmax_scale_persistent(T1* out, const T2* input, size_t N, const siz
 
     // todo - ideally this should use cooperative thread launches so that the CUDA API itself guarantees all blocks can execute simultaneously
     switch (block_size) {
-        case 32: fused_absmax_scale_persistent<1><<<grid_size, block_size>>>(out, d_absmax_estimate, d_absmax_actual, d_absmax_counter, input, N, absmax_divider); break;
-        case 64: fused_absmax_scale_persistent<2><<<grid_size, block_size>>>(out, d_absmax_estimate, d_absmax_actual, d_absmax_counter, input, N, absmax_divider); break;
-        case 128: fused_absmax_scale_persistent<4><<<grid_size, block_size>>>(out, d_absmax_estimate, d_absmax_actual, d_absmax_counter, input, N, absmax_divider); break;
-        case 256: fused_absmax_scale_persistent<8><<<grid_size, block_size>>>(out, d_absmax_estimate, d_absmax_actual, d_absmax_counter, input, N, absmax_divider); break;
-        case 512: fused_absmax_scale_persistent<16><<<grid_size, block_size>>>(out, d_absmax_estimate, d_absmax_actual, d_absmax_counter, input, N, absmax_divider); break;
-        case 768: fused_absmax_scale_persistent<24><<<grid_size, block_size>>>(out, d_absmax_estimate, d_absmax_actual, d_absmax_counter, input, N, absmax_divider); break;
-        case 1024: fused_absmax_scale_persistent<32><<<grid_size, block_size>>>(out, d_absmax_estimate, d_absmax_actual, d_absmax_counter, input, N, absmax_divider); break;
+        case 32: fused_absmax_scale_persistent<1><<<grid_size, block_size>>>(out, d_absmax_estimate, d_absmax_actual, d_absmax_counter, input, N, absmax_factor); break;
+        case 64: fused_absmax_scale_persistent<2><<<grid_size, block_size>>>(out, d_absmax_estimate, d_absmax_actual, d_absmax_counter, input, N, absmax_factor); break;
+        case 128: fused_absmax_scale_persistent<4><<<grid_size, block_size>>>(out, d_absmax_estimate, d_absmax_actual, d_absmax_counter, input, N, absmax_factor); break;
+        case 256: fused_absmax_scale_persistent<8><<<grid_size, block_size>>>(out, d_absmax_estimate, d_absmax_actual, d_absmax_counter, input, N, absmax_factor); break;
+        case 512: fused_absmax_scale_persistent<16><<<grid_size, block_size>>>(out, d_absmax_estimate, d_absmax_actual, d_absmax_counter, input, N, absmax_factor); break;
+        case 768: fused_absmax_scale_persistent<24><<<grid_size, block_size>>>(out, d_absmax_estimate, d_absmax_actual, d_absmax_counter, input, N, absmax_factor); break;
+        case 1024: fused_absmax_scale_persistent<32><<<grid_size, block_size>>>(out, d_absmax_estimate, d_absmax_actual, d_absmax_counter, input, N, absmax_factor); break;
         default: printf("Invalid block size: %lu\n", block_size); exit(1);
     }
     cudaCheck(cudaGetLastError());
