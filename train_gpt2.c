@@ -352,7 +352,7 @@ void attention_backward(float* dinp, float* dpreatt, float* datt,
     // dout is (B, T, C)
     int C3 = C*3;
     int hs = C / NH; // head size
-    float scale = 1.0 / sqrtf(hs);
+    float scale = 1.f / sqrtf(hs);
 
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {

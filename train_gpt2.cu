@@ -1599,8 +1599,8 @@ int main(int argc, char *argv[]) {
     // build an EvalLoader for HellaSwag
     EvalLoader eval_loader;
     const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
-    const char hellaswag_available = access(hellaswag_path, F_OK) == 0;
-    const char run_hellaswag = hellaswag_eval && hellaswag_available;
+    const bool hellaswag_available = access(hellaswag_path, F_OK) == 0;
+    const bool run_hellaswag = hellaswag_eval && hellaswag_available;
     if (run_hellaswag) {
         evalloader_init(&eval_loader, hellaswag_path, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
     }
