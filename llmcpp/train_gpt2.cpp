@@ -37,7 +37,6 @@ int sample_mult(float* probabilities, int n, float coin) {
 }
 
 int main(int argc, char** argv) {
-  Eigen::setNbThreads(4);
   gpt2::GPT2 model;
   model.BuildFromCheckpoint("gpt2_124M.bin");
 
@@ -118,8 +117,8 @@ int main(int argc, char** argv) {
         auto gen_tokens_2d = Eigen::Map<nn::MatrixInt>(gen_tokens, B, T);
         auto logit_3d = Eigen::TensorMap<nn::Tensor3D>(logit.get(), B, T, V);
         model.gpt2_->Forward(gen_tokens_2d, logit_3d);
-        auto logit_2d = Eigen::Map<nn::Matrix>(logit.get(), B * T, V);
-        auto prob_2d = Eigen::Map<nn::Matrix>(prob.get(), B * T, V);
+        auto logit_2d = Eigen::TensorMap<nn::Tensor2D>(logit.get(), B * T, V);
+        auto prob_2d = Eigen::TensorMap<nn::Tensor2D>(prob.get(), B * T, V);
         softmax.Forward(logit_2d, prob_2d);
         // furthermore, below we're only using b=0 (i.e. the first row) of all B
         // rows we're in principle running B "inference streams" in parallel

@@ -60,13 +60,16 @@ struct MLP {
     LAZY_ALLOCATE_MATRIX(fch_gelu_, x.rows(), 4 * n_embed_);
 
     // forward
-    Eigen::Map<nn::Matrix> fch(fch_.data(), fch_.rows(), fch_.cols());
-    Eigen::Map<nn::Matrix> fch_gelu(fch_gelu_.data(), fch_gelu_.rows(),
-                                    fch_gelu_.cols());
-    c_fc_->Forward(x, fch);
+    Eigen::TensorMap<nn::Tensor2D> fch(fch_.data(), fch_.rows(), fch_.cols());
+    Eigen::TensorMap<nn::Tensor2D> fch_gelu(fch_gelu_.data(), fch_gelu_.rows(),
+                                            fch_gelu_.cols());
+    auto x_2d = Eigen::TensorMap<nn::Tensor2D>(const_cast<float*>(x.data()),
+                                               x.rows(), x.cols());
+    auto y_2d = Eigen::TensorMap<nn::Tensor2D>(y.data(), y.rows(), y.cols());
+    c_fc_->Forward(x_2d, fch);
     gelu_->Forward(absl::MakeSpan(fch.data(), fch.size()),
                    absl::MakeSpan(fch_gelu.data(), fch_gelu.size()));
-    c_proj_->Forward(fch_gelu, y);
+    c_proj_->Forward(fch_gelu, y_2d);
   }
 
   void Backward(const Eigen::Map<nn::Matrix>& x,
@@ -86,15 +89,24 @@ struct MLP {
     fch_grad_.setZero();
     fch_gelu_grad_.setZero();
 
-    Eigen::Map<nn::Matrix> fch_gelu = nn::GetMatrixMap(fch_gelu_);
-    Eigen::Map<nn::Matrix> fch_gelu_grad = nn::GetMatrixMap(fch_gelu_grad_);
-    c_proj_->Backward(fch_gelu, y_grad, fch_gelu_grad);
+    auto fch_gelu = Eigen::TensorMap<nn::Tensor2D>(
+        fch_gelu_.data(), fch_gelu_.rows(), fch_gelu_.cols());
+    auto fch_gelu_grad = Eigen::TensorMap<nn::Tensor2D>(
+        fch_gelu_grad_.data(), fch_gelu_grad_.rows(), fch_gelu_grad_.cols());
+    auto y_grad_2d = Eigen::TensorMap<nn::Tensor2D>(
+        const_cast<float*>(y_grad.data()), y_grad.rows(), y_grad.cols());
+    c_proj_->Backward(fch_gelu, y_grad_2d, fch_gelu_grad);
 
     auto fch = absl::MakeSpan(fch_);
-    Eigen::Map<nn::Matrix> fch_grad = nn::GetMatrixMap(fch_grad_);
+    auto fch_grad = Eigen::TensorMap<nn::Tensor2D>(
+        fch_grad_.data(), fch_grad_.rows(), fch_grad_.cols());
     gelu_->Backward(fch, fch_gelu_grad, absl::MakeSpan(fch_grad));
 
-    c_fc_->Backward(x, fch_grad, x_grad);
+    auto x_2d = Eigen::TensorMap<nn::Tensor2D>(const_cast<float*>(x.data()),
+                                               x.rows(), x.cols());
+    auto x_grad_2d = Eigen::TensorMap<nn::Tensor2D>(
+        x_grad.data(), x_grad.rows(), x_grad.cols());
+    c_fc_->Backward(x_2d, fch_grad, x_grad_2d);
   }
 
   size_t NumParameters() const {
@@ -127,7 +139,7 @@ struct CausalSelfAttention {
     // output projection
     c_proj_ = std::make_unique<nn::Linear>(n_embed, n_embed);
 
-    softmax_ = std::make_unique<nn::Softmax>(true);
+    softmax_ = std::make_unique<nn::Softmax>();
 
     // mask
     bias_ = Eigen::MatrixXi::Ones(block_size, block_size)
@@ -154,8 +166,8 @@ struct CausalSelfAttention {
     LAZY_ALLOCATE_TENSOR4D(att_, B, NH, T, HS);
     LAZY_ALLOCATE_TENSOR4D(att2_, B, T, NH, HS);
 
-    auto _x = Eigen::Map<nn::Matrix>(x.data(), B * T, C);
-    auto qkv = Eigen::Map<nn::Matrix>(qkv_.data(), B * T, 3 * C);
+    auto _x = Eigen::TensorMap<nn::Tensor2D>(x.data(), B * T, C);
+    auto qkv = Eigen::TensorMap<nn::Tensor2D>(qkv_.data(), B * T, 3 * C);
     c_attn_->Forward(_x, qkv);
 
     Eigen::array<Eigen::Index, 3> offsets_q = {0, 0, 0};
@@ -181,20 +193,22 @@ struct CausalSelfAttention {
     const float factor = 1.0f / std::sqrt(static_cast<float>(HS));
     for (int b = 0; b < B; ++b) {
       for (int h = 0; h < NH; ++h) {
-        auto q2d =
-            Eigen::Map<nn::Matrix>(q_.data() + (b * NH + h) * T * HS, T, HS);
-        auto k2d =
-            Eigen::Map<nn::Matrix>(k_.data() + (b * NH + h) * HS * T, HS, T);
-        auto v2d =
-            Eigen::Map<nn::Matrix>(v_.data() + (b * NH + h) * T * HS, T, HS);
-        auto preatt2d =
-            Eigen::Map<nn::Matrix>(preatt_.data() + (b * NH + h) * T * T, T, T);
-        auto preatt_softmax2d = Eigen::Map<nn::Matrix>(
+        auto q2d = Eigen::TensorMap<nn::Tensor2D>(
+            q_.data() + (b * NH + h) * T * HS, T, HS);
+        auto k2d = Eigen::TensorMap<nn::Tensor2D>(
+            k_.data() + (b * NH + h) * HS * T, HS, T);
+        auto v2d = Eigen::TensorMap<nn::Tensor2D>(
+            v_.data() + (b * NH + h) * T * HS, T, HS);
+        auto preatt2d = Eigen::TensorMap<nn::Tensor2D>(
+            preatt_.data() + (b * NH + h) * T * T, T, T);
+        auto preatt_softmax2d = Eigen::TensorMap<nn::Tensor2D>(
             preatt_softmax_.data() + (b * NH + h) * T * T, T, T);
-        auto att2d =
-            Eigen::Map<nn::Matrix>(att_.data() + (b * NH + h) * T * HS, T, HS);
+        auto att2d = Eigen::TensorMap<nn::Tensor2D>(
+            att_.data() + (b * NH + h) * T * HS, T, HS);
 
-        preatt2d.noalias() = (q2d * k2d) * factor;
+        //        preatt2d.noalias() = (q2d * k2d) * factor;
+        nn::MatMul::Forward(q2d, k2d, preatt2d);
+        preatt2d = preatt2d * factor;
         for (int i = 0; i < T; ++i) {
           for (int j = 0; j < T; ++j) {
             if (!bias_(i, j)) {
@@ -204,18 +218,22 @@ struct CausalSelfAttention {
         }
 
         // softmax
-        softmax_->Forward(preatt2d, preatt_softmax2d);
+        auto preatt2d_tensor = Eigen::TensorMap<nn::Tensor2D>(
+            preatt_.data() + (b * NH + h) * T * T, T, T);
+        auto preatt_softmax2d_tensor = Eigen::TensorMap<nn::Tensor2D>(
+            preatt_softmax_.data() + (b * NH + h) * T * T, T, T);
+        softmax_->Forward(preatt2d_tensor, preatt_softmax2d_tensor);
 
         // att * v
-        att2d = preatt_softmax2d * v2d;
+        //        att2d = preatt_softmax2d * v2d;
+        nn::MatMul::Forward(preatt_softmax2d, v2d, att2d);
       }
     }
 
     Eigen::array<Eigen::Index, 4> shuffle_att = {0, 2, 1, 3};
     att2_ = att_.shuffle(shuffle_att);  // [B, T, NH, HS]
-    auto att2_2d = Eigen::Map<nn::Matrix>(att2_.data(), B * T, C);
-
-    auto y2d = Eigen::Map<nn::Matrix>(y.data(), B * T, C);
+    auto att2_2d = Eigen::TensorMap<nn::Tensor2D>(att2_.data(), B * T, C);
+    auto y2d = Eigen::TensorMap<nn::Tensor2D>(y.data(), B * T, C);
     c_proj_->Forward(att2_2d, y2d);
   }
 
@@ -249,9 +267,10 @@ struct CausalSelfAttention {
     att2_grad_.setZero();
 
     // attproj backward
-    auto att2_2d = Eigen::Map<nn::Matrix>(att2_.data(), B * T, C);
-    auto y_grad_2d = Eigen::Map<nn::Matrix>(y_grad.data(), B * T, C);
-    auto att2_grad_2d = Eigen::Map<nn::Matrix>(att2_grad_.data(), B * T, C);
+    auto att2_2d = Eigen::TensorMap<nn::Tensor2D>(att2_.data(), B * T, C);
+    auto y_grad_2d = Eigen::TensorMap<nn::Tensor2D>(y_grad.data(), B * T, C);
+    auto att2_grad_2d =
+        Eigen::TensorMap<nn::Tensor2D>(att2_grad_.data(), B * T, C);
     c_proj_->Backward(att2_2d, y_grad_2d, att2_grad_2d);
 
     // shuffle backward
@@ -259,30 +278,30 @@ struct CausalSelfAttention {
     att_grad_ = att2_grad_.shuffle(shuffle_att);  // [B, NH, T, HS]
 
     // attention backward
-    const float factor = 1.0f / std::sqrt(static_cast<float>(HS));
+    float factor = 1.0f / std::sqrt(static_cast<float>(HS));
     for (int b = 0; b < B; ++b) {
       for (int h = 0; h < NH; ++h) {
-        auto q2d =
-            Eigen::Map<nn::Matrix>(q_.data() + (b * NH + h) * T * HS, T, HS);
-        auto q_grad2d = Eigen::Map<nn::Matrix>(
+        auto q2d = Eigen::TensorMap<nn::Tensor2D>(
+            q_.data() + (b * NH + h) * T * HS, T, HS);
+        auto q_grad2d = Eigen::TensorMap<nn::Tensor2D>(
             q_grad_.data() + (b * NH + h) * T * HS, T, HS);
-        auto k2d =
-            Eigen::Map<nn::Matrix>(k_.data() + (b * NH + h) * HS * T, HS, T);
-        auto k_grad2d = Eigen::Map<nn::Matrix>(
+        auto k2d = Eigen::TensorMap<nn::Tensor2D>(
+            k_.data() + (b * NH + h) * HS * T, HS, T);
+        auto k_grad2d = Eigen::TensorMap<nn::Tensor2D>(
             k_grad_.data() + (b * NH + h) * HS * T, HS, T);
-        auto v2d =
-            Eigen::Map<nn::Matrix>(v_.data() + (b * NH + h) * T * HS, T, HS);
-        auto v_grad2d = Eigen::Map<nn::Matrix>(
+        auto v2d = Eigen::TensorMap<nn::Tensor2D>(
+            v_.data() + (b * NH + h) * T * HS, T, HS);
+        auto v_grad2d = Eigen::TensorMap<nn::Tensor2D>(
             v_grad_.data() + (b * NH + h) * T * HS, T, HS);
-        auto preatt2d =
-            Eigen::Map<nn::Matrix>(preatt_.data() + (b * NH + h) * T * T, T, T);
-        auto preatt_softmax2d = Eigen::Map<nn::Matrix>(
+        auto preatt2d = Eigen::TensorMap<nn::Tensor2D>(
+            preatt_.data() + (b * NH + h) * T * T, T, T);
+        auto preatt_softmax2d = Eigen::TensorMap<nn::Tensor2D>(
             preatt_softmax_.data() + (b * NH + h) * T * T, T, T);
-        auto preatt_grad2d = Eigen::Map<nn::Matrix>(
+        auto preatt_grad2d = Eigen::TensorMap<nn::Tensor2D>(
             preatt_grad_.data() + (b * NH + h) * T * T, T, T);
-        auto preatt_softmax_grad2d = Eigen::Map<nn::Matrix>(
+        auto preatt_softmax_grad2d = Eigen::TensorMap<nn::Tensor2D>(
             preatt_softmax_grad_.data() + (b * NH + h) * T * T, T, T);
-        auto att_grad2d = Eigen::Map<nn::Matrix>(
+        auto att_grad2d = Eigen::TensorMap<nn::Tensor2D>(
             att_grad_.data() + (b * NH + h) * T * HS, T, HS);
 
         // backward: att * v
@@ -290,14 +309,20 @@ struct CausalSelfAttention {
                              preatt_softmax_grad2d, v_grad2d);
 
         // backward: softmax
+        //        auto preatt_softmax_matrix = Eigen::Map<nn::Matrix>(
+        //            preatt_softmax_.data() + (b * NH + h) * T * T, T, T);
+        //        auto preatt_softmax_grad_matrix = Eigen::Map<nn::Matrix>(
+        //            preatt_softmax_grad_.data() + (b * NH + h) * T * T, T, T);
+        //        auto preatt_grad_matrix = Eigen::Map<nn::Matrix>(
+        //            preatt_grad_.data() + (b * NH + h) * T * T, T, T);
         softmax_->Backward(preatt_softmax2d, preatt_softmax_grad2d,
                            preatt_grad2d);
 
         // backward: mask
         // backward: q * k
         nn::MatMul::Backward(q2d, k2d, preatt_grad2d, q_grad2d, k_grad2d);
-        q_grad2d.array() *= factor;
-        k_grad2d.array() *= factor;
+        q_grad2d = q_grad2d * factor;
+        k_grad2d = k_grad2d * factor;
       }
     }
 
@@ -322,9 +347,10 @@ struct CausalSelfAttention {
         v_grad_.shuffle(shuffle_qv).reshape(shape);
 
     // backward: qkv
-    auto _x = Eigen::Map<nn::Matrix>(x.data(), B * T, C);
-    auto qkv_grad = Eigen::Map<nn::Matrix>(qkv_grad_.data(), B * T, 3 * C);
-    auto _x_grad = Eigen::Map<nn::Matrix>(x_grad.data(), B * T, C);
+    auto _x = Eigen::TensorMap<nn::Tensor2D>(x.data(), B * T, C);
+    auto qkv_grad =
+        Eigen::TensorMap<nn::Tensor2D>(qkv_grad_.data(), B * T, 3 * C);
+    auto _x_grad = Eigen::TensorMap<nn::Tensor2D>(x_grad.data(), B * T, C);
     c_attn_->Backward(_x, qkv_grad, _x_grad);
   }
 
@@ -399,8 +425,11 @@ struct Block {
     attn_->Forward(ln1_y_3d, att_y_3d);
 
     // Residual
-    auto att_y_2d = Eigen::Map<nn::Matrix>(att_y_.data(), B * T, C);
-    nn::Residual::Forward(x_2d, att_y_2d, absl::MakeSpan(residual1_));
+    auto x_1d = Eigen::TensorMap<nn::Tensor1D>(x.data(), B * T * C);
+    auto att_y_1d = Eigen::TensorMap<nn::Tensor1D>(att_y_.data(), B * T * C);
+    auto residual1_1d =
+        Eigen::TensorMap<nn::Tensor1D>(residual1_.data(), residual1_.size());
+    nn::Residual::Forward(x_1d, att_y_1d, residual1_1d);
 
     // LN2
     auto ln2_y_2d = Eigen::Map<nn::Matrix>(ln2_y_.data(), B * T, C);
@@ -414,7 +443,9 @@ struct Block {
     mlp_->Forward(ln2_y_2d, mlp_y_2d);
 
     // Residual
-    nn::Residual::Forward(residual1_2d, mlp_y_2d, absl::MakeSpan(y));
+    auto mlp_y_1d = Eigen::TensorMap<nn::Tensor1D>(mlp_y_.data(), B * T * C);
+    auto y_1d = Eigen::TensorMap<nn::Tensor1D>(y.data(), y.size());
+    nn::Residual::Forward(residual1_1d, mlp_y_1d, y_1d);
   }
 
   void Backward(const Eigen::TensorMap<nn::Tensor3D>& x,
@@ -443,8 +474,13 @@ struct Block {
     mlp_y_grad_.setZero();
 
     // backward residual
-    nn::Residual::Backward(y_grad, absl::MakeSpan(residual1_grad_),
-                           absl::MakeSpan(mlp_y_grad_));
+    auto y_grad_1d =
+        Eigen::TensorMap<nn::Tensor1D>(y_grad.data(), y_grad.size());
+    auto residual1_grad_1d = Eigen::TensorMap<nn::Tensor1D>(
+        residual1_grad_.data(), residual1_grad_.size());
+    auto mlp_y_grad_1d =
+        Eigen::TensorMap<nn::Tensor1D>(mlp_y_grad_.data(), mlp_y_grad_.size());
+    nn::Residual::Backward(y_grad_1d, residual1_grad_1d, mlp_y_grad_1d);
     //    std::cout << "mlp_y grad:\n" << mlp_y_grad_ << std::endl;
 
     // backward MLP
@@ -465,8 +501,11 @@ struct Block {
     //    std::cout << "residual grad:\n" << residual1_grad_2d << std::endl;
 
     // backward residual
-    nn::Residual::Backward(residual1_grad_2d, absl::MakeSpan(x_grad),
-                           absl::MakeSpan(att_y_grad_));
+    auto x_grad_1d =
+        Eigen::TensorMap<nn::Tensor1D>(x_grad.data(), x_grad.size());
+    auto att_y_grad_1d =
+        Eigen::TensorMap<nn::Tensor1D>(att_y_grad_.data(), att_y_grad_.size());
+    nn::Residual::Backward(residual1_grad_1d, x_grad_1d, att_y_grad_1d);
 
     // backward attention
     auto ln1_y_3d = Eigen::TensorMap<nn::Tensor3D>(ln1_y_.data(), B, T, C);
@@ -539,7 +578,7 @@ struct GPT {
                 sizeof(float) * (padded_vocab_size - vocab_size) * n_embed);
     lm_head_ = wte_->weight_->data();
     softmax_cross_entropy_ = std::make_unique<nn::SoftmaxCrossEntropy>(
-        nn::SoftmaxCrossEntropy::MEAN, true);
+        nn::SoftmaxCrossEntropy::MEAN);
   }
 
   void Forward(const Eigen::Map<nn::MatrixInt>& idx,
@@ -556,11 +595,14 @@ struct GPT {
     // last position
     //    auto lnf_y_3d = Eigen::TensorMap<nn::Tensor3D>(lnf_y_.data(), B, T,
     //    C); nn::Tensor2D lnf_y_last_t = lnf_y_3d.chip(T - 1, 1);
-    auto lnf_y = Eigen::Map<nn::Matrix>(lnf_y_.data(), BT, C);
-    auto lm_head = Eigen::Map<nn::Matrix>(lm_head_, vocab_size_, C);
-    auto logits_2d = Eigen::Map<nn::Matrix>(logits.data(), BT, vocab_size_);
+    auto lnf_y = Eigen::TensorMap<nn::Tensor2D>(lnf_y_.data(), BT, C);
+    auto lm_head = Eigen::TensorMap<nn::Tensor2D>(lm_head_, vocab_size_, C);
+    auto logits_2d =
+        Eigen::TensorMap<nn::Tensor2D>(logits.data(), BT, vocab_size_);
     //    nn::MatMul::Forward(lnf_y, lm_head, logits_2d);
-    logits_2d.noalias() = lnf_y * lm_head.transpose();
+    Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
+        Eigen::IndexPair<int>(1, 1)};
+    logits_2d.device(nn::g_cpu_device) = lnf_y.contract(lm_head, product_dims);
   }
 
   void Forward(const Eigen::Map<nn::MatrixInt>& idx,
@@ -578,13 +620,18 @@ struct GPT {
 
     LAZY_ALLOCATE_MATRIX(probs_, BT, vocab_size_);
 
-    auto lnf_y = Eigen::Map<nn::Matrix>(lnf_y_.data(), BT, C);
-    auto lm_head = Eigen::Map<nn::Matrix>(lm_head_, vocab_size_, n_embed_);
-    auto logits_2d = Eigen::Map<nn::Matrix>(logits.data(), BT, vocab_size_);
-    auto probs_2d = Eigen::Map<nn::Matrix>(probs_.data(), BT, vocab_size_);
+    auto lnf_y = Eigen::TensorMap<nn::Tensor2D>(lnf_y_.data(), BT, C);
+    auto lm_head =
+        Eigen::TensorMap<nn::Tensor2D>(lm_head_, vocab_size_, n_embed_);
+    auto logits_2d =
+        Eigen::TensorMap<nn::Tensor2D>(logits.data(), BT, vocab_size_);
+    auto probs_2d =
+        Eigen::TensorMap<nn::Tensor2D>(probs_.data(), BT, vocab_size_);
 
     // [BT, C] x [C, vocab_size] -> [BT, vocab_size]
-    logits_2d.noalias() = lnf_y * lm_head.transpose();
+    Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
+        Eigen::IndexPair<int>(1, 1)};
+    logits_2d.device(nn::g_cpu_device) = lnf_y.contract(lm_head, product_dims);
     softmax_cross_entropy_->Forward(logits_2d, targets, probs_2d, loss);
   }
 
@@ -615,20 +662,26 @@ struct GPT {
     logits_grad_.setZero();
 
     // backward cross entropy
-    auto probs_2d = Eigen::Map<nn::Matrix>(probs_.data(), BT, vocab_size_);
+    auto probs_2d =
+        Eigen::TensorMap<nn::Tensor2D>(probs_.data(), BT, vocab_size_);
     auto logits_grad_2d =
-        Eigen::Map<nn::Matrix>(logits_grad_.data(), BT, vocab_size_);
+        Eigen::TensorMap<nn::Tensor2D>(logits_grad_.data(), BT, vocab_size_);
     softmax_cross_entropy_->Backward(probs_2d, targets, logits_grad_2d);
 
     // backward lm_head
-    auto lnf_y = Eigen::Map<nn::Matrix>(lnf_y_.data(), BT, C);
-    auto lnf_y_grad = Eigen::Map<nn::Matrix>(lnf_y_grad_.data(), BT, C);
-    auto lm_head = Eigen::Map<nn::Matrix>(lm_head_, vocab_size_, C);
-    auto lm_head_grad = Eigen::Map<nn::Matrix>(lm_head_grad_, vocab_size_, C);
-    lnf_y_grad +=
-        logits_grad_2d * lm_head;  // [BT, vocab_size] x [vocab_size, C]
-    lm_head_grad.array() += (logits_grad_2d.transpose() * lnf_y)
-                                .array();  // [vocab_size, BT] x [BT, C]
+    auto lnf_y = Eigen::TensorMap<nn::Tensor2D>(lnf_y_.data(), BT, C);
+    auto lnf_y_grad = Eigen::TensorMap<nn::Tensor2D>(lnf_y_grad_.data(), BT, C);
+    auto lm_head = Eigen::TensorMap<nn::Tensor2D>(lm_head_, vocab_size_, C);
+    auto lm_head_grad =
+        Eigen::TensorMap<nn::Tensor2D>(lm_head_grad_, vocab_size_, C);
+    Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
+        Eigen::IndexPair<int>(1, 0)};
+    Eigen::array<Eigen::IndexPair<int>, 1> product_dims2 = {
+        Eigen::IndexPair<int>(0, 0)};
+    lnf_y_grad += logits_grad_2d.contract(
+        lm_head, product_dims);  // [BT, vocab_size] x [vocab_size, C]
+    lm_head_grad += logits_grad_2d.contract(
+        lnf_y, product_dims2);  // [vocab_size, BT] x [BT, C]
 
     // backward LNF
     auto block_out_2d =
@@ -637,7 +690,8 @@ struct GPT {
         Eigen::Map<nn::Matrix>(block_y_grad_.data() + (L - 1) * BTC, BT, C);
     auto lnf_mean = Eigen::Map<Eigen::RowVectorXf>(lnf_mean_.data(), BT);
     auto lnf_rstd = Eigen::Map<Eigen::RowVectorXf>(lnf_rstd_.data(), BT);
-    lnf_->Backward(block_out_2d, lnf_y_grad, lnf_mean, lnf_rstd,
+    auto lnf_y_grad_2d = Eigen::Map<nn::Matrix>(lnf_y_grad_.data(), BT, C);
+    lnf_->Backward(block_out_2d, lnf_y_grad_2d, lnf_mean, lnf_rstd,
                    block_out_grad_2d);
 
     // backward blocks

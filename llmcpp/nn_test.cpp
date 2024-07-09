@@ -72,9 +72,9 @@ loss.backward()
 
   // forward
   std::vector<float> y(M * K);
-  auto x1m = Eigen::Map<nn::Matrix>(x1.data(), M, N);
-  auto x2m = Eigen::Map<nn::Matrix>(x2.data(), N, K);
-  auto ym = Eigen::Map<nn::Matrix>(y.data(), M, K);
+  auto x1m = Eigen::TensorMap<nn::Tensor2D>(x1.data(), M, N);
+  auto x2m = Eigen::TensorMap<nn::Tensor2D>(x2.data(), N, K);
+  auto ym = Eigen::TensorMap<nn::Tensor2D>(y.data(), M, K);
   nn::MatMul::Forward(x1m, x2m, ym);
 
   std::vector<float> expected_y = {0.556428, -0.253943, 1.119845, -1.617147,
@@ -86,9 +86,9 @@ loss.backward()
   // backward
   std::vector<float> y_grad(y.size(), 1.0);
   std::vector<float> x1_grad(x1.size(), 0.0), x2_grad(x2.size(), 0.0);
-  auto y_gradm = Eigen::Map<nn::Matrix>(y_grad.data(), M, K);
-  auto x1_gradm = Eigen::Map<nn::Matrix>(x1_grad.data(), M, N);
-  auto x2_gradm = Eigen::Map<nn::Matrix>(x2_grad.data(), N, K);
+  auto y_gradm = Eigen::TensorMap<nn::Tensor2D>(y_grad.data(), M, K);
+  auto x1_gradm = Eigen::TensorMap<nn::Tensor2D>(x1_grad.data(), M, N);
+  auto x2_gradm = Eigen::TensorMap<nn::Tensor2D>(x2_grad.data(), N, K);
   nn::MatMul::Backward(x1m, x2m, y_gradm, x1_gradm, x2_gradm);
 
   std::vector<float> expected_x1_grad = {
@@ -126,8 +126,8 @@ loss.backward()
 
   // forward
   std::vector<float> y(8);
-  auto xm = Eigen::Map<nn::Matrix>(x.data(), B, in_features);
-  auto ym = Eigen::Map<nn::Matrix>(y.data(), B, out_features);
+  auto xm = Eigen::TensorMap<nn::Tensor2D>(x.data(), B, in_features);
+  auto ym = Eigen::TensorMap<nn::Tensor2D>(y.data(), B, out_features);
   m.Forward(xm, ym);
 
   std::vector<float> expected_y = {-1.164687, 0.024384, -0.377635, -0.026553,
@@ -139,8 +139,8 @@ loss.backward()
   // backward
   std::vector<float> y_grad(y.size(), 1.0f);
   std::vector<float> x_grad(x.size(), 0.f);
-  auto y_gradm = Eigen::Map<nn::Matrix>(y_grad.data(), B, out_features);
-  auto x_gradm = Eigen::Map<nn::Matrix>(x_grad.data(), B, in_features);
+  auto y_gradm = Eigen::TensorMap<nn::Tensor2D>(y_grad.data(), B, out_features);
+  auto x_gradm = Eigen::TensorMap<nn::Tensor2D>(x_grad.data(), B, in_features);
   m.Backward(xm, y_gradm, x_gradm);
 
   std::vector<float> expected_w_grad = {-2.915748, 0.095726, 4.543815,
@@ -426,15 +426,16 @@ loss.backward()
   nn::NormalFill(absl::MakeSpan(logits));
   std::vector<int> target = {1, 2, 1, 0};
 
-  auto logits_m = Eigen::Map<nn::Matrix>(logits.data(), batch, dim);
-  auto probs_m = Eigen::Map<nn::Matrix>(probs.data(), batch, dim);
+  auto logits_m = Eigen::TensorMap<nn::Tensor2D>(logits.data(), batch, dim);
+  auto probs_m = Eigen::TensorMap<nn::Tensor2D>(probs.data(), batch, dim);
   float loss1 = 0.0, loss2 = 0.0;
 
   // Reduction: MEAN
   nn::SoftmaxCrossEntropy criterion1(nn::SoftmaxCrossEntropy::MEAN);
   criterion1.Forward(logits_m, absl::MakeSpan(target), probs_m, &loss1);
 
-  auto logits_grad_m = Eigen::Map<nn::Matrix>(logits_grad.data(), batch, dim);
+  auto logits_grad_m =
+      Eigen::TensorMap<nn::Tensor2D>(logits_grad.data(), batch, dim);
   criterion1.Backward(probs_m, absl::MakeSpan(target), logits_grad_m);
 
   std::vector<float> expected_logits_grad1 = {
@@ -487,8 +488,8 @@ loss.backward()
   nn::NormalFill(absl::MakeSpan(logits));
   std::vector<int> target = {1, 2, 1, 0};
 
-  auto logits_m = Eigen::Map<nn::Matrix>(logits.data(), batch, dim);
-  auto probs_m = Eigen::Map<nn::Matrix>(probs.data(), batch, dim);
+  auto logits_m = Eigen::TensorMap<nn::Tensor2D>(logits.data(), batch, dim);
+  auto probs_m = Eigen::TensorMap<nn::Tensor2D>(probs.data(), batch, dim);
   float loss1 = 0.0, loss2 = 0.0;
 
   // Reduction: MEAN
@@ -497,8 +498,10 @@ loss.backward()
   softmax.Forward(logits_m, probs_m);
   criterion1.Forward(probs_m, absl::MakeSpan(target), &loss1);
 
-  auto logits_grad_m = Eigen::Map<nn::Matrix>(logits_grad.data(), batch, dim);
-  auto probs_grad_m = Eigen::Map<nn::Matrix>(probs_grad.data(), batch, dim);
+  auto logits_grad_m =
+      Eigen::TensorMap<nn::Tensor2D>(logits_grad.data(), batch, dim);
+  auto probs_grad_m =
+      Eigen::TensorMap<nn::Tensor2D>(probs_grad.data(), batch, dim);
   criterion1.Backward(probs_m, absl::MakeSpan(target), probs_grad_m);
   softmax.Backward(probs_m, probs_grad_m, logits_grad_m);
 

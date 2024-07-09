@@ -23,8 +23,8 @@ for _ in range(10):
   // forward
   std::vector<float> x(B * in_features), y(B * out_features);
   nn::NormalFill(absl::MakeSpan(x));
-  auto xm = Eigen::Map<nn::Matrix>(x.data(), B, in_features);
-  auto ym = Eigen::Map<nn::Matrix>(y.data(), B, out_features);
+  auto xm = Eigen::TensorMap<nn::Tensor2D>(x.data(), B, in_features);
+  auto ym = Eigen::TensorMap<nn::Tensor2D>(y.data(), B, out_features);
 
   // optimizer
   std::vector<nn::Parameter*> parameters;
@@ -34,8 +34,8 @@ for _ in range(10):
   // backward
   std::vector<float> y_grad(y.size(), 1.0f);
   std::vector<float> x_grad(x.size(), 0.f);
-  auto y_gradm = Eigen::Map<nn::Matrix>(y_grad.data(), B, out_features);
-  auto x_gradm = Eigen::Map<nn::Matrix>(x_grad.data(), B, in_features);
+  auto y_gradm = Eigen::TensorMap<nn::Tensor2D>(y_grad.data(), B, out_features);
+  auto x_gradm = Eigen::TensorMap<nn::Tensor2D>(x_grad.data(), B, in_features);
 
   int step = 10;
   for (int i = 0; i < step; ++i) {
@@ -81,8 +81,8 @@ for _ in range(10):
   // forward
   std::vector<float> x(B * in_features), y(B * out_features);
   nn::NormalFill(absl::MakeSpan(x));
-  auto xm = Eigen::Map<nn::Matrix>(x.data(), B, in_features);
-  auto ym = Eigen::Map<nn::Matrix>(y.data(), B, out_features);
+  auto xm = Eigen::TensorMap<nn::Tensor2D>(x.data(), B, in_features);
+  auto ym = Eigen::TensorMap<nn::Tensor2D>(y.data(), B, out_features);
 
   // optimizer
   std::vector<nn::Parameter*> parameters;
@@ -92,8 +92,8 @@ for _ in range(10):
   // backward
   std::vector<float> y_grad(y.size(), 1.0f);
   std::vector<float> x_grad(x.size(), 0.f);
-  auto y_gradm = Eigen::Map<nn::Matrix>(y_grad.data(), B, out_features);
-  auto x_gradm = Eigen::Map<nn::Matrix>(x_grad.data(), B, in_features);
+  auto y_gradm = Eigen::TensorMap<nn::Tensor2D>(y_grad.data(), B, out_features);
+  auto x_gradm = Eigen::TensorMap<nn::Tensor2D>(x_grad.data(), B, in_features);
 
   int step = 10;
   for (int i = 0; i < step; ++i) {
