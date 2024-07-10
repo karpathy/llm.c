@@ -397,7 +397,7 @@ void gpt2_init_common(GPT2 *model) {
     model->use_master_weights = 1; // safe default: do keep master weights in fp32
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
-    model->disable_biases = 1; // default: do not biases
+    model->disable_biases = 1; // default: do not use attn & fc biases
 }
 
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
