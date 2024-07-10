@@ -223,6 +223,23 @@ __device__ __forceinline__ void stochastic_rounding(float in, __nv_bfloat16 *out
     float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
     *out = __float2bfloat16_rn(__uint_as_float(float_bits));
 }
+// WIP INEFFICIENT FP8 - so many wasted bits, would like to use one uint across multiple roundings
+__device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e5m2 *out, unsigned int seed) {
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
+    unsigned int threshold = random & 0x001FFFFF;
+    unsigned int float_bits = __float_as_uint(in);
+    unsigned int rounded_bits = float_bits & 0x001FFFFF;
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0x001FFFFF) : (float_bits  & ~0x001FFFFF);
+    *out = __nv_fp8_e5m2(__uint_as_float(float_bits));
+}
+__device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e4m3 *out, unsigned int seed) {
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
+    unsigned int threshold = random & 0x000FFFFF;
+    unsigned int float_bits = __float_as_uint(in);
+    unsigned int rounded_bits = float_bits & 0x000FFFFF;
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0x000FFFFF) : (float_bits  & ~0x000FFFFF);
+    *out = __nv_fp8_e4m3(__uint_as_float(float_bits));
+}
 __device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigned int random) {
     *out = (float)in; // todo - implement this...
 }
