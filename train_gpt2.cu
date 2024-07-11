@@ -292,7 +292,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[7] = TENSOR_SPEC(data->ln2, (recompute < 2) ? L * B * T * C : 0);
     tensors[8] = TENSOR_SPEC(data->ln2_mean, L * B * T);
     tensors[9] = TENSOR_SPEC(data->ln2_rstd, L * B * T);
-    tensors[10] = TENSOR_SPEC(data->fch, L * B * T * 4*C);
+    tensors[10] = TENSOR_SPEC(data->fch, (recompute < 3) ? L * B * T * 4*C : B * T * 4*C);
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
     tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
     tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C);
@@ -367,7 +367,7 @@ typedef struct {
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
     int use_master_weights; // keep master weights copy in float for optim update? 0|1
     int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
-    int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
+    int recompute; // recompute gelu | layernorm | MLP during model backward? 0|1|2|3
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
@@ -663,7 +663,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch = acts.fch + l * B * T * 4*C;
+        floatX* l_fch = (model->recompute < 3) ? acts.fch + l * B * T * 4*C : acts.fch;
         // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
         floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
@@ -850,7 +850,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch_pre_gelu = acts.fch + l * B * T * 4*C;
+        floatX* l_fch_pre_gelu = (model->recompute < 3) ? acts.fch + l * B * T * 4*C : acts.fch;
         floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
@@ -860,12 +860,20 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
         // start the backward pass for this layer
         if(model->recompute >= 1) {
-            // recompute >= 1 means we recompute gelu. in this case,
-            // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
-            gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream);
+            if(model->recompute >= 3) {
+                // if we want to recompute the entire MLP block, we need to start with layernorm, followed by
+                // matmul and (potentially fused) gelu
+                layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
+                matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch_pre_gelu,
+                                        model->gelu_fusion);
+            } else {
+                // recompute >= 1 means we recompute gelu. in this case,
+                // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
+                gelu_forward(l_fch_gelu, l_fch_pre_gelu, B * T * 4 * C, main_stream);
+            }
         }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
-        if(model->recompute >= 2) {
+        if(model->recompute == 2) {
             // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
             layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
         }
@@ -1384,7 +1392,7 @@ void error_usage() {
     fprintf(stderr, "  -ge <int>   gelu fusion: 0=none, 1=forward, 2=forward+backward (default: 2 for >=SM90, 0 for older GPUs)\n");
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
-    fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
+    fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2|3 = none,gelu,gelu+ln,mlp+ln\n");
     // multi-node settings
     fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
     fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
