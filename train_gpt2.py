@@ -45,6 +45,8 @@ class NewGELU(nn.Module):
 # using a global to toggle flash-attention
 FLASH = 0
 
+attn_fc_bias_keys = ["c_attn.bias", "attn.c_proj.bias", "c_fc.bias", "mlp.c_proj.bias"]
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -246,7 +248,6 @@ class GPT(nn.Module):
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        attn_fc_bias_keys = ["c_attn.bias", "attn.c_proj.bias", "c_fc.bias", "mlp.c_proj.bias"]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2 and (not disable_bias or (disable_bias and not any(k in n for k in attn_fc_bias_keys)))]
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
@@ -663,6 +664,14 @@ if __name__ == "__main__":
     else:
         # load the GPT-2 model weights
         model = GPT.from_pretrained(args.model)
+
+    if args.disable_bias:
+        # set all biases to zero because we can't prevent them from being added in nn.Linear
+        # w/o doing some monkey patching - this is needed to make the code equivalent to our C code.
+        for name, param in model.named_parameters():
+            if any(k in name for k in attn_fc_bias_keys):
+                param.data.zero_()
+
     model.train()
     model.to(device)
     if args.compile:
@@ -689,6 +698,11 @@ if __name__ == "__main__":
         x, y = x.to(device), y.to(device)
         logits, loss = model(x, y)
         loss.backward()
+        if args.disable_bias:
+            # clean up the bias gradients, as we don't want to test them
+            for name, param in model.named_parameters():
+                if any(k in name for k in attn_fc_bias_keys):
+                    param.grad.zero_()
         # save model params, in both float32 and bfloat16
         model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
         model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
