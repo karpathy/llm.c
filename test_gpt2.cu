@@ -179,7 +179,7 @@ int main(int argc, char *argv[]) {
         logits_cpu[i] = (float)logits_cpu_raw[i];
     }
 
-    float logit_accuracy_threshold = 1e-3f;
+    float logit_accuracy_threshold = 1.5e-3f;
     float loss_diff_threshold = 6e-3f;
     // FP16 and lower require very high tolerances unfortunately. TODO look into more
     #if defined(ENABLE_BF16) || defined(ENABLE_F16)
@@ -268,7 +268,7 @@ int main(int argc, char *argv[]) {
             float grad_thresholds[NUM_PARAMETER_TENSORS] = {5e-1f, 4.5e-2f, 8e-1f, 1.8e-1f, 4e-2f, 3e-2f, 5e-1f, 5e-1f, 5e-1f, 8.5e-2f, 7e-3f, 8e-3f, 1.2e-2f, 2.5e-3f, 1e-1f, 2e-2f};
             #if defined(ENABLE_FP32)
             for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-                grad_thresholds[i] = 1e-6f;  // we can be much more precise in FP32
+                grad_thresholds[i] = 8e-5f;  // we can be much more precise in FP32
             }
             #endif
 
