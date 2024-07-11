@@ -60,6 +60,8 @@ public:
         if (is_new) {
             if (calculateIfNeeded) {
                 return calculateManualAbsMax(tensorAddress, size, associatedTensor);
+            } else {
+                return NULL;
             }
         }
         return (float*)(d_storage + getStorageOffset(info.index) + ABSMAX_HISTORY_SIZE);

@@ -94,14 +94,14 @@ __device__ void update_local_absmax(unsigned int &absmax_uint, T data, uint absm
 
 // copy & format conversion kernel using store_same_length
 // keeps the largest format at 128-bit and smallest at 32-bit or 64-bit
-template <bool reciprocal=true, bool scaling=false, typename T1, typename T2>
+template <bool reciprocal_scale=true, bool scaling=false, typename T1, typename T2>
 __global__ void copy_simple_kernel(T1 *copy, const T2 *input, size_t N, const float* __restrict__ scale_pointer=(float*)NULL) {
     constexpr size_t vec_size = 16 / ((sizeof(T1) < sizeof(T2)) ? sizeof(T2) : sizeof(T1));
     size_t n = (blockIdx.x * blockDim.x + threadIdx.x) * vec_size;
     if (n >= N) { return; }
 
     float scale_factor = scaling ? *scale_pointer : 1.0f;
-    scale_factor = (reciprocal && scale_factor != 0.0f) ? (1.0f / scale_factor) : scale_factor;
+    scale_factor = (reciprocal_scale && scale_factor != 0.0f) ? (1.0f / scale_factor) : scale_factor;
     Packed128<T2> inp128 = load128cs<T2>(input + n);
     Packed128<T1> out128;
     for (int k = 0; k < vec_size; k++) {
@@ -112,9 +112,10 @@ __global__ void copy_simple_kernel(T1 *copy, const T2 *input, size_t N, const fl
 
 // Same as copy_simple_kernel but with optional absmax and elementwise function options
 // absmax is calculated before scaling but after the elementwise function
-template <bool reciprocal=true, bool scaling=false, bool reversed_order=false,
+template <bool reciprocal_scale=true, bool scaling=false, bool reversed_order=false,
           elementwise_func_t elementwise_func=nothing_elementwise, int absmax_factor=0, typename T1, typename T2>
 __global__ void copy_advanced_kernel(T1 *copy, const T2 *input, size_t N,
+                                     const float* __restrict__ descale_pointer=(float*)NULL,
                                      const float* __restrict__ scale_pointer=(float*)NULL,
                                      unsigned int* absmax_output=(unsigned int*)NULL,
                                      const void** meta=NULL) {
@@ -124,12 +125,13 @@ __global__ void copy_advanced_kernel(T1 *copy, const T2 *input, size_t N,
     size_t n = (adjusted_blockidx_x * blockDim.x + threadIdx.x) * vec_size;
     if (n >= N) { return; }
 
-    float scale_factor = scaling ? *scale_pointer : 1.0f;
-    scale_factor = (reciprocal && scale_factor != 0.0f) ? (1.0f / scale_factor) : scale_factor;
+    float scale_factor = (scaling && scale_pointer) ? *scale_pointer : 1.0f;
+    float descale_factor = (scaling && descale_pointer) ? *descale_pointer : 1.0f;
+    scale_factor = (reciprocal_scale && scale_factor != 0.0f) ? (1.0f / scale_factor) : scale_factor;
     Packed128<T2> inp128 = load128cs<T2>(input + n);
     Packed128<T1> out128;
     for (int k = 0; k < vec_size; k++) {
-        float out_float = elementwise_func((float)inp128[k]);
+        float out_float = elementwise_func((float)inp128[k] * descale_factor);
         update_local_absmax(absmax_uint, out_float, absmax_factor); // optional absmax
         out128[k] = (T1)(out_float * scale_factor);
     }
@@ -141,10 +143,11 @@ __global__ void copy_advanced_kernel(T1 *copy, const T2 *input, size_t N,
 }
 
 // transpose + copy + format conversion (+ elementwise + absmax) kernel
-template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=DEFAULT_TILE_SIZE, bool reciprocal=true, bool enable_copy=false, bool scaling=true,
+template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=DEFAULT_TILE_SIZE, bool reciprocal_scale=true, bool enable_copy=false, bool scaling=true,
          uint absmax_factor=0, elementwise_func_t elementwise_func=nothing_elementwise, typename T1, typename T2>
 __global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ copy, const T2* __restrict__ input,
-                                 const float* __restrict__ scale_pointer=(float*)NULL, unsigned int* absmax_output=(unsigned int*)NULL, const void** meta=NULL)
+                                 const float* __restrict__ descale_pointer=(float*)NULL, const float* __restrict__ scale_pointer=(float*)NULL,
+                                 unsigned int* absmax_output=(unsigned int*)NULL, const void** meta=NULL)
 {
     __shared__ T1 tile[TILE_DIM][TILE_DIM];
     int width  = gridDim.x * TILE_DIM;
@@ -154,8 +157,9 @@ __global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ c
     constexpr size_t T2_elements = 16 / sizeof(T2);
     constexpr size_t copy_vectors = (sizeof(T1) >= sizeof(T2)) ? (sizeof(T1) / sizeof(T2)) : 1;
 
+    float descale_factor = (scaling && descale_pointer) ? *descale_pointer : 1.0f; // never reciprocal
     float scale_factor = (scaling && scale_pointer) ? *scale_pointer : 1.0f;
-    scale_factor = (reciprocal && scale_factor != 0.0f) ? (1.0f / scale_factor) : scale_factor;
+    scale_factor = (reciprocal_scale && scale_factor != 0.0f) ? (1.0f / scale_factor) : scale_factor;
     int x = blockIdx.x * TILE_DIM + (threadIdx.x * T2_elements);
     int y = blockIdx.y * TILE_DIM + threadIdx.y;
     uint absmax_uint = 0;
@@ -166,7 +170,7 @@ __global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ c
         Packed128<T1> copy128[copy_vectors];
         for (int k = 0; k < in128.size; k++) {
             T2 in = in128[k];
-            float out_float = elementwise_func((float)in);
+            float out_float = elementwise_func((float)in * descale_factor);
             update_local_absmax(absmax_uint, out_float, absmax_factor); // optional absmax
 
             T1 out = (T1)(out_float * scale_factor);
@@ -228,16 +232,18 @@ __global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ c
 }
 
 // only calculate absmax of the input tensor (non-fused)
-template <typename T>
-__global__ void get_absmax_kernel(unsigned int* absmax_output, const T* inp, size_t N, unsigned int absmax_factor=1) {
+template <bool descale=false, typename T>
+__global__ void get_absmax_kernel(unsigned int* absmax_output, const T* inp, size_t N, unsigned int absmax_factor=1,
+                                  const float* __restrict__ descale_pointer=(float*)NULL) {
     uint absmax_uint = 0;
 
+    float descale_factor = (descale && descale_pointer) ? *descale_pointer : 1.0f;
     size_t idx = ((blockIdx.x * blockDim.x * ABSMAX_ITERATIONS_PER_THREAD) + threadIdx.x) * Packed128<T>::size;
     if (idx < N) {
         for (int i = 0; i < ABSMAX_ITERATIONS_PER_THREAD; i++) {
             Packed128<T> packed_inp = load128(inp + idx);
             for(int k = 0; k < packed_inp.size; ++k) {
-                update_local_absmax<true>(absmax_uint, packed_inp[k], absmax_factor);
+                update_local_absmax<true>(absmax_uint, (float)packed_inp[k] * descale_factor, absmax_factor);
             }
             idx += blockDim.x * packed_inp.size;
         }
@@ -262,7 +268,7 @@ void copy_simple(T1 *copy, const T2 *input, size_t N, float* scale_pointer=NULL,
 }
 
 template <bool reversed_order=false, elementwise_func_t elementwise_func=nothing_elementwise, bool reciprocal=true, typename T1, typename T2>
-void copy_advanced(T1 *copy, const T2 *input, size_t N, float* scale_pointer=NULL, void* absmax_output=NULL, bool memset_absmax=true, const size_t block_size=512) {
+void copy_advanced(T1 *copy, const T2 *input, size_t N, float* descale_pointer=NULL, float* scale_pointer=NULL, void* absmax_output=NULL, bool memset_absmax=true, cudaStream_t stream=0, const size_t block_size=512) {
     size_t fewest_elements = min(Packed128<T1>::size, Packed128<T2>::size);
     const dim3 grid_size(CEIL_DIV(N, block_size * fewest_elements));
     assert((N % fewest_elements) == 0);
@@ -274,16 +280,16 @@ void copy_advanced(T1 *copy, const T2 *input, size_t N, float* scale_pointer=NUL
         if (memset_absmax) {
             cudaMemset(absmax_output, 0, sizeof(unsigned int));
         }
-        if (scale_pointer) {
-            copy_advanced_kernel<reciprocal, true, reversed_order, elementwise_func, absmax_factor><<<grid_size, dim3(block_size)>>>(copy, input, N, scale_pointer, absmax_uint);
+        if (scale_pointer || descale_pointer) {
+            copy_advanced_kernel<reciprocal, true, reversed_order, elementwise_func, absmax_factor><<<grid_size, dim3(block_size), 0, stream>>>(copy, input, N, descale_pointer, scale_pointer, absmax_uint);
         } else {
-            copy_advanced_kernel<reciprocal, false, reversed_order, elementwise_func, absmax_factor><<<grid_size, dim3(block_size)>>>(copy, input, N, NULL, absmax_uint);
+            copy_advanced_kernel<reciprocal, false, reversed_order, elementwise_func, absmax_factor><<<grid_size, dim3(block_size), 0, stream>>>(copy, input, N, NULL, NULL, absmax_uint);
         }
     } else {
-        if (scale_pointer) {
-            copy_advanced_kernel<reciprocal, true, reversed_order, elementwise_func><<<grid_size, dim3(block_size)>>>(copy, input, N, scale_pointer);
+        if (scale_pointer || descale_pointer) {
+            copy_advanced_kernel<reciprocal, true, reversed_order, elementwise_func><<<grid_size, dim3(block_size), 0, stream>>>(copy, input, N, descale_pointer, scale_pointer);
         } else {
-            copy_advanced_kernel<reciprocal, false, reversed_order, elementwise_func><<<grid_size, dim3(block_size)>>>(copy, input, N);
+            copy_advanced_kernel<reciprocal, false, reversed_order, elementwise_func><<<grid_size, dim3(block_size), 0, stream>>>(copy, input, N);
         }
     }
     cudaCheck(cudaGetLastError());
@@ -294,8 +300,8 @@ void copy_advanced(T1 *copy, const T2 *input, size_t N, float* scale_pointer=NUL
 // slight inefficiency in that we don't optimise away scaling for kernels that don't need it (kernel checks for NULL)
 template <bool write_absmax=false, elementwise_func_t elementwise_func=nothing_elementwise, bool reciprocal=true,
           bool enable_copy=false, typename T1, typename T2> // advanced template options, usually don't need to be changed
-void transpose(T1 *transposed, const T2 *input, size_t w, size_t h, float* scale_pointer=NULL, void* absmax_output=NULL,
-               bool memset_absmax=true, const size_t block_size=64, T1 *copy=NULL) { // advanced parameters
+void transpose(T1 *transposed, const T2 *input, size_t w, size_t h, float* descale_pointer=NULL, float* scale_pointer=NULL, void* absmax_output=NULL,
+               bool memset_absmax=true, cudaStream_t stream=0, const size_t block_size=64, T1 *copy=NULL) { // advanced parameters
     assert((w % DEFAULT_TILE_SIZE) == 0 && (h % DEFAULT_TILE_SIZE) == 0);
     cudaCheck(cudaGetLastError());
 
@@ -323,12 +329,12 @@ void transpose(T1 *transposed, const T2 *input, size_t w, size_t h, float* scale
     */
 
     switch (block_size_y) {
-        case 32: transpose_kernel<32, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim>>>(transposed, copy, input, scale_pointer, absmax_uint); break;
-        case 16: transpose_kernel<16, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim>>>(transposed, copy, input, scale_pointer, absmax_uint); break;
-        case 8: transpose_kernel<8, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim>>>(transposed, copy, input, scale_pointer, absmax_uint); break;
-        case 4: transpose_kernel<4, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim>>>(transposed, copy, input, scale_pointer, absmax_uint); break;
-        case 2: transpose_kernel<2, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim>>>(transposed, copy, input, scale_pointer, absmax_uint); break;
-        case 1: transpose_kernel<1, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim>>>(transposed, copy, input, scale_pointer, absmax_uint); break;
+        case 32: transpose_kernel<32, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
+        case 16: transpose_kernel<16, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
+        case 8: transpose_kernel<8, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
+        case 4: transpose_kernel<4, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
+        case 2: transpose_kernel<2, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
+        case 1: transpose_kernel<1, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
         default: printf("Invalid block size (might be easy to add): %lu\n", block_size_y); exit(1);
     }
     cudaCheck(cudaGetLastError());
@@ -337,22 +343,22 @@ void transpose(T1 *transposed, const T2 *input, size_t w, size_t h, float* scale
 
 // wrapper so the parameters of the standard transpose function are less messy
 template <bool write_absmax=false, elementwise_func_t elementwise_func=nothing_elementwise, bool reciprocal=true, typename T1, typename T2>
-void copy_and_transpose(T1 *transposed, T1 *copy, const T2 *input, size_t w, size_t h, float* scale_pointer=NULL, unsigned int* absmax_output=NULL, bool memset_absmax=true, const size_t block_size=64) {
-    transpose<write_absmax, elementwise_func, reciprocal, true, T1, T2>(transposed, input, w, h, scale_pointer, absmax_output, memset_absmax, block_size, copy);
+void copy_and_transpose(T1 *transposed, T1 *copy, const T2 *input, size_t w, size_t h, float* descale_pointer=NULL, float* scale_pointer=NULL, unsigned int* absmax_output=NULL, bool memset_absmax=true, cudaStream_t stream=0, const size_t block_size=64) {
+    transpose<write_absmax, elementwise_func, reciprocal, true, T1, T2>(transposed, input, w, h, descale_pointer, scale_pointer, absmax_output, memset_absmax, stream, block_size, copy);
 }
 
 template <bool write_absmax=false, elementwise_func_t elementwise_func=nothing_elementwise, bool reciprocal=true, typename T1, typename T2>
-void copy_or_transpose(bool transposing, T1 *output, const T2 *input, size_t w, size_t h, float* scale_pointer=NULL, unsigned int* absmax_output=NULL, bool memset_absmax=true, const size_t block_size=64) {
+void copy_or_transpose(bool transposing, T1 *output, const T2 *input, size_t w, size_t h, float* descale_pointer=NULL, float* scale_pointer=NULL, unsigned int* absmax_output=NULL, bool memset_absmax=true, cudaStream_t stream=0, const size_t block_size=64) {
     if (transposing) {
-        transpose<write_absmax, elementwise_func, reciprocal, false, T1, T2>(output, input, w, h, scale_pointer, absmax_output, memset_absmax, block_size);
+        transpose<write_absmax, elementwise_func, reciprocal, false, T1, T2>(output, input, w, h, descale_pointer, scale_pointer, absmax_output, memset_absmax, stream, block_size);
     } else {
-        copy_advanced<false, elementwise_func, reciprocal>(output, input, w*h, scale_pointer, absmax_output, memset_absmax, block_size);
+        copy_advanced<false, elementwise_func, reciprocal>(output, input, w*h, descale_pointer, scale_pointer, absmax_output, memset_absmax, stream, block_size);
     }
     cudaCheck(cudaGetLastError());
 }
 
 template <typename T>
-void get_absmax(void* absmax_output, const T* inp, size_t N, cudaStream_t stream=0,
+void get_absmax(void* absmax_output, const T* inp, size_t N, cudaStream_t stream=0, float* descale_pointer=NULL,
                 bool memset_absmax=true, unsigned int absmax_factor=1, size_t block_size=512) { // advanced parameters
 
     // find the largest block size that divides N
@@ -365,8 +371,11 @@ void get_absmax(void* absmax_output, const T* inp, size_t N, cudaStream_t stream
     if (memset_absmax) {
         cudaMemset(absmax_output, 0, sizeof(unsigned int));
     }
-
-    get_absmax_kernel<<<grid_size, dim3(block_size), 0, stream>>>((unsigned int*)absmax_output, inp, N, absmax_factor);
+    if (descale_pointer != NULL) {
+        get_absmax_kernel<true><<<grid_size, dim3(block_size), 0, stream>>>((unsigned int*)absmax_output, inp, N, absmax_factor, descale_pointer);
+    } else {
+        get_absmax_kernel<false><<<grid_size, dim3(block_size), 0, stream>>>((unsigned int*)absmax_output, inp, N, absmax_factor, descale_pointer);
+    }
     cudaCheck(cudaGetLastError());
 }
 

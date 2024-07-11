@@ -25,14 +25,16 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp) {
     store128(out + idx, packed_out);
 }
 
-__global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const floatX* inp) {
+template <typename Ti>
+__global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const Ti* inp, float* descale_pointer) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    float descale_factor = descale_pointer ? *descale_pointer : 1.0f;
 
     x128 packed_dinp;
-    x128 packed_inp = load128cs(inp + idx);
+    Packed128<Ti> packed_inp = load128cs(inp + idx);
     x128 packed_dout = load128(d_in_out + idx);
-    for (int k = 0; k < packed_inp.size; ++k) {
-        float x = (float)packed_inp[k];
+    for (int k = 0; k < x128::size; ++k) {
+        float x = (float)packed_inp[k] * descale_factor;
         float cube = 0.044715f * x * x * x;
         float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
         float tanh_out = tanhf(tanh_arg);
@@ -56,11 +58,16 @@ void gelu_forward(floatX* out, const floatX* inp, int N, cudaStream_t stream) {
     cudaCheck(cudaGetLastError());
 }
 
-void gelu_backward_inplace(floatX* d_in_out, const floatX* inp, const int N, cudaStream_t stream) {
+template <typename Ti>
+void gelu_backward_inplace(floatX* d_in_out, const Ti* inp, const int N, cudaStream_t stream, float* descale_pointer) {
     NVTX_RANGE_FN();
+
+    // because we are just using x128::size for the loop count, Packed128<Ti>::size must be >= that
+    assert(sizeof(floatX) >= sizeof(Ti));
+
     const int block_size = 128;
     assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_backward_inplace_kernel<<<grid_size, block_size, 0, stream>>>(d_in_out, inp);
+    gelu_backward_inplace_kernel<<<grid_size, block_size, 0, stream>>>(d_in_out, inp, descale_pointer);
     cudaCheck(cudaGetLastError());
 }
