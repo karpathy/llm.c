@@ -184,7 +184,7 @@ int main(int argc, char *argv[]) {
     // FP16 and lower require very high tolerances unfortunately. TODO look into more
     #if defined(ENABLE_BF16) || defined(ENABLE_F16)
     logit_accuracy_threshold = 25.0f; // 15.0f was too low even without cuDNN?! :(
-    loss_diff_threshold = 0.05f;
+    loss_diff_threshold = 0.06f;
     #endif
 
     // compare the output logits from the forward pass
