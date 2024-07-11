@@ -229,7 +229,7 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
 
 // small wrapper around matmul_cublaslt for the forward pass (keeping historical order of arguments)
 void matmul_forward_cublaslt(floatX* out,
-                     floatX* inp, floatX* weight, floatX* bias,
+                     floatX* inp, const floatX* weight, const floatX* bias,
                      int B, int T, int C, int OC, cudaStream_t stream,
                      floatX* pre_gelu=NULL, int gelu_fusion=1) {
     // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
@@ -242,7 +242,7 @@ void matmul_forward_cublaslt(floatX* out,
 }
 
 void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
-                     floatX* dout, floatX* inp, floatX* weight,
+                     floatX* dout, floatX* inp, const floatX* weight,
                      float* dbias_buffer,
                      int B, int T, int C, int OC, cudaStream_t stream,
                      floatX* pre_gelu=NULL, int gelu_fusion=1) {
