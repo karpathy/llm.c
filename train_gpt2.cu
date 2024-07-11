@@ -860,23 +860,22 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
         // start the backward pass for this layer
         if(model->recompute >= 1) {
-            if(model->recompute >= 3) {
-                // if we want to recompute the entire MLP block, we need to start with layernorm, followed by
-                // matmul and (potentially fused) gelu
+            if(model->recompute >= 2) {
+                // l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
                 layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
+            }
+            if(model->recompute >= 3) {
                 matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch_pre_gelu,
                                         model->gelu_fusion);
             } else {
+                // matmul_forward_cublaslt has fused gelu, so we only need to recompute explicitly
+                // if we are not recomputing the matmul.
                 // recompute >= 1 means we recompute gelu. in this case,
                 // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
                 gelu_forward(l_fch_gelu, l_fch_pre_gelu, B * T * 4 * C, main_stream);
             }
         }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
-        if(model->recompute == 2) {
-            // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
-            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
-        }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
