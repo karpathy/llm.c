@@ -2,6 +2,9 @@
 Helpers for FP8 including copy and transpose with format conversion, and absmax
 See /dev/cuda/advanced_copy_transpose.cu for more information and options
 */
+#ifndef FP8_HELPERS_CUH
+#define FP8_HELPERS_CUH
+
 #include <assert.h>
 #include <typeinfo>
 #include "cuda_common.h"
@@ -427,3 +430,5 @@ public:
     }
 };
 std::vector<CudaScratchAllocator::Allocation> CudaScratchAllocator::allocations;
+
+#endif

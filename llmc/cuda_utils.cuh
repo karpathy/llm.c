@@ -101,6 +101,12 @@ __device__ float cast_value<float, __nv_bfloat16>(__nv_bfloat16 val) {
     return __bfloat162float(val);
 }
 
+template<>
+__device__ float cast_value<float, __nv_fp8_e4m3>(__nv_fp8_e4m3 val) {
+    return (float)val;
+}
+
+// todo: why do we have all these separate cast functions? Just "(float)val" should work AFAIK?
 template<typename Td, typename Ts>
 __global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n, ptrdiff_t stride_dst, ptrdiff_t stride_src) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

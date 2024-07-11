@@ -13,14 +13,18 @@
 #include "cuda_utils.cuh"
 
 constexpr uint8_t ABSMAX_HISTORY_SIZE = 16;
-constexpr uint8_t CALCULATED_VALUES_COUNT = 3;
+#define ALWAYS_UPDATE_ABSMAX false // very inefficient, for sanity checking only
+#define SKIP_UPDATE_ZERO_ABSMAX true // do not update the scale/descale if max absmax is 0
 
 // Offsets for calculated values
 enum CalculatedValueOffset {
     ABSMAX_OFFSET = 0,
     SCALE_OFFSET = 1,
-    DESCALE_OFFSET = 2
+    DESCALE_OFFSET = 2,
+    SCALING_FACTOR_OFFSET = 3,
+    ABSMAX_VALUES_COUNT = 4
 };
+const float absmax_two_ones[2] = {1.0f, 1.0f}; // global so memory stays allocated for cudaMemcpyAsync
 
 class TensorAbsMaxTracker {
 public:
@@ -44,18 +48,19 @@ public:
         bool is_new;
         TensorInfo& info = getOrCreateTensorInfo(tensorAddress, size, associatedTensor, scaleFactor, is_new);
 
-        /*
-        float* absmax_memory = getNextAbsMaxPtr(tensorAddress, size, associatedTensor);
-        get_absmax(absmax_memory, tensorAddress, size);
-        updateSingleTensorAbsMax(tensorAddress, size, associatedTensor, 1.0f);
-        return (float*)(d_storage + getStorageOffset(info.index) + ABSMAX_HISTORY_SIZE);
-        */
+        #if ALWAYS_UPDATE_ABSMAX == true // for sanity checking only
+        if (calculateIfNeeded) {
+            float* absmax_memory = getNextAbsMaxPtr(tensorAddress, size, associatedTensor);
+            get_absmax(absmax_memory, tensorAddress, size);
+            updateSingleTensorAbsMax(tensorAddress, size, associatedTensor, 1.0f);
+            return (float*)(d_storage + getStorageOffset(info.index) + ABSMAX_HISTORY_SIZE);
+        }
+        #endif
 
         if (is_new) {
             if (calculateIfNeeded) {
                 return calculateManualAbsMax(tensorAddress, size, associatedTensor);
             }
-            return nullptr;
         }
         return (float*)(d_storage + getStorageOffset(info.index) + ABSMAX_HISTORY_SIZE);
     }
@@ -78,7 +83,7 @@ public:
             throw std::runtime_error("Tensor not registered");
         }
         it->second.scaleFactor = scaleFactor;
-        size_t offset = getStorageOffset(it->second.index) + ABSMAX_HISTORY_SIZE + CALCULATED_VALUES_COUNT;
+        size_t offset = getStorageOffset(it->second.index) + ABSMAX_HISTORY_SIZE + SCALING_FACTOR_OFFSET;
         cudaCheck(cudaMemcpy(d_storage + offset, &scaleFactor, sizeof(float), cudaMemcpyHostToDevice));
     }
 
@@ -92,9 +97,9 @@ public:
     float* calculateManualAbsMax(const T* tensorAddress, size_t size, const void* associatedTensor, cudaStream_t stream = 0);
 
     void printAllTensorInfo() {
-        std::vector<float> hostData(currentTensorCount * (ABSMAX_HISTORY_SIZE + CALCULATED_VALUES_COUNT + 1));
+        std::vector<float> hostData(currentTensorCount * (ABSMAX_HISTORY_SIZE + ABSMAX_VALUES_COUNT));
         cudaCheck(cudaMemcpy(hostData.data(), d_storage,
-                             currentTensorCount * (ABSMAX_HISTORY_SIZE + CALCULATED_VALUES_COUNT + 1) * sizeof(float),
+                             currentTensorCount * (ABSMAX_HISTORY_SIZE + ABSMAX_VALUES_COUNT) * sizeof(float),
                              cudaMemcpyDeviceToHost));
 
         std::cout << "Tensor Address,Associated Tensor,Type,Size,AbsMax,Scale,Descale,Scale Factor,Current Index";
@@ -112,7 +117,7 @@ public:
                       << hostData[offset + ABSMAX_HISTORY_SIZE + ABSMAX_OFFSET] << ","
                       << hostData[offset + ABSMAX_HISTORY_SIZE + SCALE_OFFSET] << ","
                       << hostData[offset + ABSMAX_HISTORY_SIZE + DESCALE_OFFSET] << ","
-                      << pair.second.scaleFactor << ","
+                      << hostData[offset + ABSMAX_HISTORY_SIZE + SCALING_FACTOR_OFFSET] << ","
                       << static_cast<int>(h_currentIndices[pair.second.index]) << ",";
             for (uint8_t i = 0; i < ABSMAX_HISTORY_SIZE; ++i) {
                 std::cout << std::setprecision(6) << hostData[offset + i];
@@ -164,7 +169,7 @@ private:
             newMaxTensorCount *= 2;
         }
 
-        size_t newSize = newMaxTensorCount * (ABSMAX_HISTORY_SIZE + CALCULATED_VALUES_COUNT + 1) * sizeof(float);
+        size_t newSize = newMaxTensorCount * (ABSMAX_HISTORY_SIZE + ABSMAX_VALUES_COUNT) * sizeof(float);
         float* new_storage;
         uint8_t* new_indices;
         cudaCheck(cudaMalloc(&new_storage, newSize));
@@ -173,7 +178,7 @@ private:
         cudaCheck(cudaMemset(new_indices, 0, newMaxTensorCount * sizeof(uint8_t)));
         if (d_storage) {
             cudaCheck(cudaMemcpy(new_storage, d_storage,
-                                 maxTensorCount * (ABSMAX_HISTORY_SIZE + CALCULATED_VALUES_COUNT + 1) * sizeof(float),
+                                 maxTensorCount * (ABSMAX_HISTORY_SIZE + ABSMAX_VALUES_COUNT) * sizeof(float),
                                  cudaMemcpyDeviceToDevice));
             cudaCheck(cudaMemcpy(new_indices, d_currentIndices, maxTensorCount * sizeof(uint8_t),
                                  cudaMemcpyDeviceToDevice));
@@ -189,7 +194,7 @@ private:
     }
 
     size_t getStorageOffset(size_t index) const {
-        return index * (ABSMAX_HISTORY_SIZE + CALCULATED_VALUES_COUNT + 1);
+        return index * (ABSMAX_HISTORY_SIZE + ABSMAX_VALUES_COUNT);
     }
 
     template<typename T>
@@ -217,8 +222,9 @@ private:
             float actualScaleFactor = scaleFactor == 0.0f ? getDefaultScaleFactor<T>() : scaleFactor;
             it = tensorInfoMap.emplace(key, TensorInfo{newIndex, actualScaleFactor}).first;
 
-            cudaCheck(cudaMemcpy(d_storage + getStorageOffset(newIndex) + ABSMAX_HISTORY_SIZE + CALCULATED_VALUES_COUNT,
-                                 &actualScaleFactor, sizeof(float), cudaMemcpyHostToDevice));
+            float allValues[ABSMAX_VALUES_COUNT] = {0.0f, 1.0f, 1.0f, actualScaleFactor};
+            cudaCheck(cudaMemcpy(d_storage + getStorageOffset(newIndex) + ABSMAX_HISTORY_SIZE,
+                                 &allValues, ABSMAX_VALUES_COUNT * sizeof(float), cudaMemcpyHostToDevice));
         } else if (scaleFactor != 0.0f && it->second.scaleFactor != scaleFactor) {
             setScaleFactor(tensorAddress, size, associatedTensor, scaleFactor);
         }
@@ -230,15 +236,23 @@ __global__ void updateAbsMaxKernel(float* data, uint8_t* currentIndices, size_t 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= tensorCount) { return; }
 
-    size_t offset = idx * (ABSMAX_HISTORY_SIZE + CALCULATED_VALUES_COUNT + 1);
+    size_t offset = idx * (ABSMAX_HISTORY_SIZE + ABSMAX_VALUES_COUNT);
     uint8_t currentIndex = currentIndices[idx];
     float maxVal = 0.0f;
     for (uint8_t i = 0; i < ABSMAX_HISTORY_SIZE; ++i) {
         maxVal = max(maxVal, data[offset + i]);
     }
-    maxVal = maxVal == 0.0f ? 1.0f : maxVal;
-    float scaleFactor = data[offset + ABSMAX_HISTORY_SIZE + CALCULATED_VALUES_COUNT];
+    #if SKIP_UPDATE_ZERO_ABSMAX == true
+    if (maxVal == 0.0f) {
+        data[offset + ABSMAX_HISTORY_SIZE + ABSMAX_OFFSET]  = 0.0f;
+        data[offset + ABSMAX_HISTORY_SIZE + SCALE_OFFSET]   = 1.0f;
+        data[offset + ABSMAX_HISTORY_SIZE + DESCALE_OFFSET] = 1.0f;
+        return;
+    }
+    #endif
 
+    maxVal = maxVal == 0.0f ? 1.0f : maxVal;
+    float scaleFactor = data[offset + ABSMAX_HISTORY_SIZE + SCALING_FACTOR_OFFSET];
     data[offset + ABSMAX_HISTORY_SIZE + ABSMAX_OFFSET]  = maxVal;
     data[offset + ABSMAX_HISTORY_SIZE + SCALE_OFFSET]   = 1.0f / (maxVal * fudgeFactor * scaleFactor);
     data[offset + ABSMAX_HISTORY_SIZE + DESCALE_OFFSET] = maxVal * fudgeFactor * scaleFactor;
@@ -250,8 +264,17 @@ __global__ void updateSingleTensorAbsMaxKernel(float* data, uint8_t* currentInde
     for (uint8_t i = 0; i < ABSMAX_HISTORY_SIZE; ++i) {
         maxVal = max(maxVal, data[i]);
     }
+    #if SKIP_UPDATE_ZERO_ABSMAX == true
+    if (maxVal == 0.0f) {
+        data[ABSMAX_HISTORY_SIZE + ABSMAX_OFFSET]  = 0.0f;
+        data[ABSMAX_HISTORY_SIZE + SCALE_OFFSET]   = 1.0f;
+        data[ABSMAX_HISTORY_SIZE + DESCALE_OFFSET] = 1.0f;
+        return;
+    }
+    #endif
+
     maxVal = maxVal == 0.0f ? 1.0f : maxVal;
-    float scaleFactor = data[ABSMAX_HISTORY_SIZE + CALCULATED_VALUES_COUNT];
+    float scaleFactor = data[ABSMAX_HISTORY_SIZE + SCALING_FACTOR_OFFSET];
 
     data[ABSMAX_HISTORY_SIZE + ABSMAX_OFFSET]  = maxVal;
     data[ABSMAX_HISTORY_SIZE + SCALE_OFFSET]   = 1.0f / (maxVal * fudgeFactor * scaleFactor);

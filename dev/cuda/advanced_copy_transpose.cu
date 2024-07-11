@@ -3,8 +3,8 @@ Kernels for copy & transpose with format conversion (+ optional elementwise oper
 Many parameters are configurable by changing the defines
 
 Compile examples (change 90 to your SM architecture - do not trust performance without it):
-nvcc -O3 --generate-code arch=compute_90,code=[compute_90,sm_90] --use_fast_math transpose.cu -o transpose
-nvcc -DENABLE_GELU -DIN_TYPE=half -DOUT_TYPE=float -DSCALING_FACTOR=0.5f -DTRANSPOSE_AND_COPY=true -O3 --generate-code arch=compute_90,code=[compute_90,sm_90] --use_fast_math transpose.cu -o transpose
+nvcc -O3 --generate-code arch=compute_90,code=[compute_90,sm_90] --use_fast_math advanced_copy_transpose.cu -o advanced_copy_transpose
+nvcc -DENABLE_GELU -DIN_TYPE=half -DOUT_TYPE=float -DSCALING_FACTOR=0.5f -DTRANSPOSE_AND_COPY=true -O3 --generate-code arch=compute_90,code=[compute_90,sm_90] --use_fast_math advanced_copy_transpose.cu -o advanced_copy_transpose
 
 Useful defines (not all options available in all kernels):
 
@@ -41,7 +41,7 @@ version 25 is a non-fused absmax + scale with 2 kernel invocations
 version 26 is the same as 25 but the copy is in reverse order to maximise L2 cache hits
 version 30 is an extremely complicated fused absmax+scale+rescale kernel (see defines above)
 
-Usage example: ./transpose 12
+Usage example: ./advanced_copy_transpose 12
 */
 
 #define SKIP_CUBLAS // to save compile time
@@ -64,7 +64,7 @@ Usage example: ./transpose 12
 //#define FUSED_RESCALE_IN_PLACE true
 
 #if !defined(IN_TYPE)
-#define IN_TYPE __nv_bfloat16
+#define IN_TYPE __nv_fp8_e4m3
 #endif
 #if !defined(OUT_TYPE)
 #define OUT_TYPE __nv_fp8_e4m3
@@ -101,10 +101,10 @@ Usage example: ./transpose 12
 #define DEFAULT_TILE 32UL // 32x32 transpose is a good default but 64x64 might be better for absmax
 #endif
 #if !defined(WIDTH)
-#define WIDTH 32768
+#define WIDTH 768
 #endif
 #if !defined(HEIGHT)
-#define HEIGHT 3072
+#define HEIGHT 50304
 #endif
 
 #if !defined(ABSMAX_ITERATIONS_PER_THREAD)
@@ -143,12 +143,12 @@ using elementwise_func_t = float (*) (float, const void**, uint, uint, uint, uin
 #endif
 
 __host__ __device__ float nothing_elementwise(float in, const void** __restrict__ metadata, uint x, uint y, uint w, uint h) {
-    (void)x; (void)y; (void)w; (void)h; (void)metadata; // avoid compiler warnings for unused variables
+    (void)x; (void)y; (void)w; (void)h; (void)metadata;
     return in;
 }
 
 __host__ __device__ float gelu_forward_elementwise(float in, const void** __restrict__ metadata, uint x, uint y, uint w, uint h) {
-    (void)x; (void)y; (void)w; (void)h; (void)metadata; // avoid compiler warnings for unused variables
+    (void)x; (void)y; (void)w; (void)h; (void)metadata;
     float cube = 0.044715f * in * in * in;
     return 0.5f * in * (1.0f + tanhf(sqrtf(2.0f / M_PI) * (in + cube)));
 }
@@ -215,7 +215,7 @@ __device__ void update_global_absmax(unsigned int* absmax_output, unsigned int a
     uint bidY = is2D ? blockDim.y : 1;
     uint tidY = is2D ? threadIdx.y : 0;
     uint tidXY = threadIdx.x + blockDim.x * tidY;
-    uint num_warps = blockDim.x * bidY;
+    uint num_warps = (blockDim.x * bidY) / 32;
     uint lane_id = tidXY % 32;
     uint warp_id = tidXY / 32;
 
@@ -423,7 +423,7 @@ __global__ void transpose_kernel2(T1* __restrict__ transposed, T1* __restrict__ 
 
     constexpr size_t T1_elements = 16 / sizeof(T1);
     constexpr size_t T2_elements = 16 / sizeof(T2);
-    constexpr size_t copy_len = (sizeof(T1) >= sizeof(T2)) ? (sizeof(T1) / sizeof(T2)) : 1;
+    constexpr size_t copy_vectors = (sizeof(T1) >= sizeof(T2)) ? (sizeof(T1) / sizeof(T2)) : 1;
 
     float scale_factor = scaling ? *scale_pointer : 1.0f;
     int x = blockIdx.x * TILE_DIM + (threadIdx.x * T2_elements);
@@ -432,8 +432,8 @@ __global__ void transpose_kernel2(T1* __restrict__ transposed, T1* __restrict__ 
 
     #pragma unroll
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-        Packed128<T2> in128 = load128<T2>(input + x + (y+j)*w);
-        Packed128<T1> copy128[copy_len];
+        Packed128<T2> in128 = load128cs<T2>(input + x + (y+j)*w);
+        Packed128<T1> copy128[copy_vectors];
         for (int k = 0; k < in128.size; k++) {
             T2 in = in128[k];
             float out_float = elementwise_func((float)in, meta, x+k, y+j, w, h);
@@ -443,7 +443,7 @@ __global__ void transpose_kernel2(T1* __restrict__ transposed, T1* __restrict__ 
             update_local_absmax(absmax_uint, out_float, absmax_factor); // optional absmax
         }
 
-        for (int o = 0; o < copy_len; o++) {
+        for (int o = 0; o < copy_vectors; o++) {
             if constexpr (enable_copy) {
                 store_same_length<T2,T1>(copy + x + (y+j)*w + o*T1_elements, copy128[o]);
             }
@@ -461,7 +461,7 @@ __global__ void transpose_kernel2(T1* __restrict__ transposed, T1* __restrict__ 
     // reduce the number of threads for the write if T1_elements > T2_elements
     // we want to keep all 32 threads in a warp active, so we try to eliminate in y dimension first
     // so we create fake/adjusted tid.x/tid.y where "extra" threadIdx.x adds to the effective tid.y
-    constexpr size_t block_size_x = (DEFAULT_TILE * sizeof(T2)) / 16;
+    constexpr size_t block_size_x = (TILE_DIM * sizeof(T2)) / 16;
     constexpr size_t block_size_y = BLOCK_ROWS;
     constexpr size_t desired_ratio = (sizeof(T2) >= sizeof(T1)) ? (sizeof(T2) / sizeof(T1)) : 1;
     constexpr size_t ratio = (desired_ratio <= block_size_y) ? desired_ratio : block_size_y;
@@ -483,7 +483,7 @@ __global__ void transpose_kernel2(T1* __restrict__ transposed, T1* __restrict__ 
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
         // we need more instructions for the write than the read if T2_elements > T1_elements
         #pragma unroll
-        for (int o = 0; o < copy_len; o++) {
+        for (int o = 0; o < copy_vectors; o++) {
             Packed128<T1> out128;
             #pragma unroll
             for (int k = 0; k < out128.size; k++) {
@@ -813,7 +813,7 @@ void transpose2(T1 *transposed, const T2 *input, size_t width, size_t height, co
 
 template <typename T>
 void get_absmax(const T* input, size_t N, const size_t block_size, bool memset=true, unsigned int* absmax_output=d_absmax_estimate, uint absmax_factor=ABSMAX_FACTOR) {
-    size_t grid_size = ceil_div(N, block_size * x128::size * ABSMAX_ITERATIONS_PER_THREAD);
+    size_t grid_size = ceil_div(N, block_size * Packed128<T>::size * ABSMAX_ITERATIONS_PER_THREAD);
     absmax_factor = absmax_factor ? absmax_factor : (float)DEFAULT_ABSMAX_FACTOR;
     //assert((N % (Packed128<T>::size * ABSMAX_ITERATIONS_PER_THREAD)) == 0);
 

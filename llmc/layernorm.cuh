@@ -473,6 +473,9 @@ void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, floa
     const int grid_size = CEIL_DIV(N, block_y);
     size_t smem = (2 + block_y) * C * sizeof(floatX);
 
+    // dedicate as much of the L1 to shared memory as possible (we should never hit in the L1 here!)
+    cudaFuncSetAttribute(fused_residual_forward_kernel5, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+
     // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
     // this may fail, in which case we fall back to the smem free implementation.
     cudaCheck(cudaGetLastError());
