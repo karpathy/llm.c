@@ -74,7 +74,7 @@ srun -l -u bash -c "
     -u 700 \
     -n 5000 \
     -y 1 \
-    -e d12 \
+    -e gpt2:12 \
     -pn \$SLURM_NTASKS \
     -pr \$SLURM_PROCID \
     -pg \$SLURM_NTASKS_PER_NODE \

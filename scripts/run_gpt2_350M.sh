@@ -37,7 +37,7 @@ while true; do
                 -n 2000 \
                 -x 60000 \
                 -y 1 \
-                -e "d24"
+                -e "gpt2:24"
 
     sleep 1
 done
