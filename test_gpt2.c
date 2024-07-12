@@ -9,7 +9,7 @@ int check_tensor(float *a, float *b, int n, const char* label) {
     float tol = 2e-2f;
     printf("%s\n", label);
     for (int i = 0; i < n; i++) {
-        // look at the diffence at position i of these two tensors
+        // look at the difference at position i of these two tensors
         float diff = fabsf(a[i] - b[i]);
 
         // keep track of the overall error
