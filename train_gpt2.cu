@@ -903,21 +903,6 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     }
 }
 
-// Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
-float multi_gpu_cpu_float_sum(float value, MultiGpuConfig* multi_gpu_config) {
-#ifdef MULTI_GPU
-    if (multi_gpu_config->num_processes == 1) return value;
-
-    float* unified_buffer = multi_gpu_config->unified_buffer;
-    *unified_buffer = value;
-    ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
-    cudaCheck(cudaDeviceSynchronize());
-    return *unified_buffer;
-#else
-    return value;
-#endif
-}
-
 // Gets the offset of a specific tensor for a specific layer in the GPT2 model
 // layer_id is ignored for weights that are not part of a transformer block
 ShardInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_tensor_id) {

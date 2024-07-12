@@ -578,5 +578,20 @@ void set_zero_configs(MultiGpuConfig* config, int zero_stage, size_t total_param
     }
 }
 
+// Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
+float multi_gpu_cpu_float_sum(float value, MultiGpuConfig* config) {
+#ifdef MULTI_GPU
+    if (config->num_processes == 1) return value;
+
+    float* unified_buffer = config->unified_buffer;
+    *unified_buffer = value;
+    ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, config->nccl_comm, config->nccl_stream));
+    cudaCheck(cudaDeviceSynchronize());
+    return *unified_buffer;
+#else
+    return value;
+#endif
+}
+
 #endif
 
