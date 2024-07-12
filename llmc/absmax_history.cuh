@@ -47,9 +47,14 @@ public:
         bool is_new;
         TensorInfo& info = get_tensor_info(tensor_address, size, associated_tensor, scale_factor, is_new);
 
+        if (!is_new && info.call_count == 0 && info.previous_call_count == 0) {
+            printf("Warning: get_absmax_data() with call_count=0 and previous_call_count=0 for existing tensor at %p (size %lu)\n",
+                info.call_count, tensor_address, size);
+        }
+
         #if ALWAYS_UPDATE_ABSMAX == true // slow, for sanity checking only
         if (calculate_if_needed) {
-            float* absmax_memory = getNextAbsMaxPtr(tensor_address, size, calculate_if_needed);
+            float* absmax_memory = next_absmax_ptr(tensor_address, size, calculate_if_needed);
             get_absmax(absmax_memory, tensor_address, size);
             update_single_absmax(tensor_address, size, calculate_if_needed, 1.0f);
             return (float*)(d_storage + get_storage_offset(info.index) + ABSMAX_HISTORY_SIZE);
@@ -82,6 +87,13 @@ public:
                            const void* associated_tensor = nullptr, float scale_factor = 0.0f) {
         bool is_new;
         TensorInfo& info = get_tensor_info(tensor_address, size, associated_tensor, scale_factor, is_new);
+
+        info.call_count++;
+        if (info.call_count > 1) {
+            printf("Warning: next_absmax_ptr() called %zu times for tensor at %p (size %lu) since last update_all_absmax() [previous call count: %d]\n",
+                info.call_count, tensor_address, size, info.previous_call_count);
+        }
+
         uint8_t currentIndex = h_current_indices[info.index];
         h_current_indices[info.index] = (currentIndex + 1) % ABSMAX_HISTORY_SIZE;
         return (float*)(d_storage + get_storage_offset(info.index) + currentIndex);
@@ -164,6 +176,8 @@ private:
     struct TensorInfo {
         size_t index;
         float scale_factor;
+        size_t call_count;
+        size_t previous_call_count;
     };
 
     size_t current_tensor_count;
@@ -172,6 +186,13 @@ private:
     uint8_t* d_current_indices;
     std::unordered_map<TensorKey, TensorInfo, TensorKeyHash> tensor_info_map;
     std::vector<uint8_t> h_current_indices;
+
+    void reset_all_call_counts() {
+        for (auto& pair : tensor_info_map) {
+            pair.second.previous_call_count = pair.second.call_count;
+            pair.second.call_count = 0;
+        }
+    }
 
     void grow_storage_if_needed(size_t newTensorCount) {
         // todo - not 100% convinced this is safe...
@@ -234,7 +255,7 @@ private:
             h_current_indices[newIndex] = 0;
 
             float actualScaleFactor = scale_factor == 0.0f ? get_default_scale_factor<T>() : scale_factor;
-            it = tensor_info_map.emplace(key, TensorInfo{newIndex, actualScaleFactor}).first;
+            it = tensor_info_map.emplace(key, TensorInfo{newIndex, actualScaleFactor, 0, 0}).first;
 
             float allValues[ABSMAX_VALUES_COUNT] = {0.0f, 1.0f, 1.0f, actualScaleFactor};
             cudaCheck(cudaMemcpy(d_storage + get_storage_offset(newIndex) + ABSMAX_HISTORY_SIZE,
@@ -307,6 +328,7 @@ void TensorAbsMaxTracker::update_all_absmax(cudaStream_t stream, float fudgeFact
     update_all_absmax_kernel<<<grid_size, block_size, 0, stream>>>
                             (d_storage, d_current_indices, current_tensor_count, fudgeFactor);
     cudaCheck(cudaGetLastError());
+    reset_all_call_counts();  // Reset call counts after updating
 }
 
 // this is literally just a single thread, this should not trigger after the 1st step! (outside of testing)
@@ -324,6 +346,10 @@ void TensorAbsMaxTracker::update_single_absmax(const T* tensor_address, size_t s
 
     update_single_absmax_kernel<<<1, 1, 0, stream>>>(d_storage + offset, d_current_indices + index, fudgeFactor);
     cudaCheck(cudaGetLastError());
+
+    // reset call count after updating
+    it->second.previous_call_count = it->second.call_count;
+    it->second.call_count = 0;
 }
 
 template<typename T>

@@ -3,9 +3,9 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 
 // todo - make into proper makefile config options
-#define FORCE_FP8_MATMUL true
-#define FORCE_FP8_WEIGHTS true // not compatible with existing checkpoints
-#define FORCE_FP8_ACTIVATIONS true // compatible with existing checkpoints
+#define FORCE_FP8_MATMUL false
+#define FORCE_FP8_WEIGHTS false // not compatible with existing checkpoints
+#define FORCE_FP8_ACTIVATIONS false // compatible with existing checkpoints
 
 // todo - make command line parameters for tuning
 // 1.0/448.0f would be the most aggressive setting for e4m3
@@ -628,6 +628,9 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
 // right now, this function is fully synchronous with the host
 void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     NVTX_RANGE_FN();
+    // todo - this is not ideal, gets rid of our history for the backward pass!
+    absmax_tracker.update_all_absmax(main_stream);
+
     // we must be careful and use size_t instead of int, otherwise
     // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
 
@@ -1883,8 +1886,6 @@ int main(int argc, char *argv[]) {
             gpt2_forward(&model, train_loader.inputs, B, T);
             // backward pass. all model params accumulate gradients with += inside this inner loop
             gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
-            // update the absmax history once per micro-step (must be before gpt2_update only)
-            absmax_tracker.update_all_absmax(main_stream);
         }
         float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss)); // loss z-score
         // fetch the next learning rate
