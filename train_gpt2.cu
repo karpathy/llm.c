@@ -4,8 +4,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 
 // todo - make into proper makefile config options
 #define FORCE_FP8_MATMUL true
-#define FORCE_FP8_WEIGHTS false // not compatible with existing checkpoints
-#define FORCE_FP8_ACTIVATIONS false // compatible with existing checkpoints
+#define FORCE_FP8_WEIGHTS true // not compatible with existing checkpoints
+#define FORCE_FP8_ACTIVATIONS true // compatible with existing checkpoints
 
 // todo - make command line parameters for tuning
 // 1.0/448.0f would be the most aggressive setting for e4m3
@@ -19,7 +19,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #define DESCALE_FP8_WEIGHTS (1.0f/SCALE_FP8_WEIGHTS)
 
 // to make it easy to compare BF16 vs FP8 for layernorm output
-#define floatNorm floatX
+#define floatNorm floatN
 
 #include <unistd.h>
 #include <stdio.h>
