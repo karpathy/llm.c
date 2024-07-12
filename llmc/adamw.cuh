@@ -119,9 +119,9 @@ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memo
         // (CUDA supports up to 4KiB pre-12.1 and 64KiB after, so it's fine, although not very flexible due to fixed size)
         for (int i = 0; i < num_slices; i++) {
             Tp* layer_params_memory = params_memory + i * num_parameters;
-            float *calculated_from_absmax = absmax_tracker.getCalculatedValuesPtr(layer_params_memory, num_parameters, NULL, SCALE_FP8_WEIGHTS);
+            float *calculated_from_absmax = absmax_tracker.get_absmax_data(layer_params_memory, num_parameters, NULL, SCALE_FP8_WEIGHTS);
             absmax_params.scale_factor[i] = calculated_from_absmax + SCALE_OFFSET;
-            absmax_params.absmax_output[i] = absmax_tracker.getNextAbsMaxPtr(layer_params_memory, num_parameters, NULL);
+            absmax_params.absmax_output[i] = absmax_tracker.next_absmax_ptr(layer_params_memory, num_parameters, NULL);
         }
         adamw_kernel3_absmax<<<dim3(num_blocks, num_slices), block_size, 0, stream>>>(params_memory, master_params_memory, grads_memory,
                                                             m_memory, v_memory, num_parameters, w_stride, g_stride, s_stride,

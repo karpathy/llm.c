@@ -19,10 +19,11 @@ E.g., the layernorms are connected to the residuals so we += in layernorm backwa
 
 __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
-                                    const floatX* __restrict__ bias, int N, int C) {
+                                    const floatX* __restrict__ bias, int N, int C, float* out_scale_ptr=NULL) {
     int lane_id = threadIdx.x % WARP_SIZE;
     int warp_id = threadIdx.x / WARP_SIZE;
     int num_warps = blockDim.x / WARP_SIZE;
+    float out_scale = out_scale_ptr ? *out_scale_ptr : 1.0f;
 
     int idx = blockIdx.x * num_warps + warp_id;
     if(idx >= N) { return; } // guard
@@ -60,14 +61,18 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, float* __res
         // indicating that this data will not be reused soon, and can be streamed through the caches
         // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
         float n = s * ((float)__ldcs(x+c) - m);
-        __stcs(o+c, (floatX)(n * (float)weight[c] + (float)bias[c]));
+        __stcs(o+c, (floatX)(n * out_scale * (float)weight[c] + (float)bias[c]));
     }
 }
 
-__global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+template <typename Tn>
+__global__ void layernorm_forward_kernel6(Tn* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
-                                    const floatX* __restrict__ bias, int N, int C) {
+                                    const floatX* __restrict__ bias, int N, int C,
+                                    float* out_scale_ptr, float* normed_out_absmax) {
     assert(blockDim.x == WARP_SIZE);
+    float out_scale = out_scale_ptr ? *out_scale_ptr : 1.0f;
+    unsigned int absmax_uint;
 
     // load weights and biases into shared memory
     // do this before we allow any threads to exit!
@@ -86,64 +91,76 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
     __syncthreads();
 
     int idx = blockIdx.x * blockDim.y + threadIdx.y;
-    if(idx >= N) { return; } // guard
 
-    // adjust pointers to current token
-    inp += idx * C;
-    out += idx * C;
+    if(idx < N) {
+        // adjust pointers to current token
+        inp += idx * C;
+        out += idx * C;
 
-    const float eps = 1e-5f;
-    float sum = 0.0f;
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 in_data = load128cs(inp + c);
-        for(int k = 0; k < x128::size; ++k) {
-            sum += (float)in_data[k];
-        }
-        s_in[c / x128::size] = in_data;
-    }
-
-    sum = warpReduceSum(sum);
-    float m = sum / C;
-    float v = 0.f;
-
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 in_data = s_in[c / x128::size];
-        for(int k = 0; k < x128::size; ++k) {
-            v += ((float)in_data[k] - m) * ((float)in_data[k] - m);
-        }
-    }
-
-    v = warpReduceSum(v) / C;
-    float s = rsqrtf(v + eps);
-
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 in_data = s_in[c / x128::size];
-        const x128 w = s_weight[c / x128::size];
-        const x128 b = s_bias[c / x128::size];
-        x128 out_data;
-        for(int k = 0; k < x128::size; ++k) {
-            float n = s * ((float)in_data[k] - m); // normalized output
-            float o = n * (float)w[k] + (float)b[k]; // scale and shift it
-            out_data[k] = (floatX)o;
+        const float eps = 1e-5f;
+        float sum = 0.0f;
+        for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
+            const x128 in_data = load128cs(inp + c);
+            for(int k = 0; k < x128::size; ++k) {
+                sum += (float)in_data[k];
+            }
+            s_in[c / x128::size] = in_data;
         }
 
-        store128cs(out + c, out_data);
+        sum = warpReduceSum(sum);
+        float m = sum / C;
+        float v = 0.f;
+
+        for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
+            const x128 in_data = s_in[c / x128::size];
+            for(int k = 0; k < x128::size; ++k) {
+                v += ((float)in_data[k] - m) * ((float)in_data[k] - m);
+            }
+        }
+
+        v = warpReduceSum(v) / C;
+        float s = rsqrtf(v + eps);
+
+        for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
+            const x128 in_data = s_in[c / x128::size];
+            const x128 w = s_weight[c / x128::size];
+            const x128 b = s_bias[c / x128::size];
+            Packed128<Tn> out_data;
+            for(int k = 0; k < x128::size; ++k) {
+                float n = s * ((float)in_data[k] - m); // normalized output
+                float o = n * (float)w[k] + (float)b[k]; // scale and shift it
+                update_local_absmax(absmax_uint, o, (normed_out_absmax ? 1 : 0)); // optional absmax
+                out_data[k] = (Tn)(o * out_scale);
+            }
+
+            store_same_length<floatX, Tn>(out + c, out_data); // todo: .cs hint?
+            //store128cs(out + c, out_data);
+        }
+        // cache the mean and rstd for the backward pass later
+        if(threadIdx.x == 0 && mean != nullptr) {
+            __stcs(mean + idx, m);
+        }
+        // store the rstd, no need to cache it
+        if(threadIdx.x == 0 && rstd != nullptr) {
+            __stcs(rstd + idx, s);
+        }
     }
-    // cache the mean and rstd for the backward pass later
-    if(threadIdx.x == 0 && mean != nullptr) {
-        __stcs(mean + idx, m);
-    }
-    // store the rstd, no need to cache it
-    if(threadIdx.x == 0 && rstd != nullptr) {
-        __stcs(rstd + idx, s);
+
+    if (normed_out_absmax) {
+        update_global_absmax<true>((unsigned int*)normed_out_absmax, absmax_uint); // true because 2D
     }
 }
 
-__global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed, float* mean, float* rstd,
-                                               const floatX* inp1, const floatX* inp2,
+template <typename Tn, typename T2>
+__global__ void fused_residual_forward_kernel5(floatX* residual, Tn* normed, float* mean, float* rstd,
+                                               const floatX* inp1, const T2* inp2,
                                                const floatX* weight, const floatX* bias,
-                                               int N, int C) {
+                                               int N, int C, float* inp2_descale_ptr, float* normed_scale_ptr,
+                                               float* normed_out_absmax) {
     assert(blockDim.x == WARP_SIZE);
+    float inp2_descale = inp2_descale_ptr ? *inp2_descale_ptr : 1.0f;
+    float normed_scale = normed_scale_ptr ? *normed_scale_ptr : 1.0f;
+    uint absmax_uint = 0;
 
     // load weights and biases into shared memory
     // do this before we allow any threads to exit!
@@ -162,70 +179,78 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     __syncthreads();
 
     int idx = blockIdx.x * blockDim.y + threadIdx.y;
-    if(idx > N) return;
+    if(idx <= N) { // todo, all threads must be active for absmax update, probably possible to avoid
+        // adjust pointers to current token
+        residual += C * idx;
+        normed += C * idx;
+        inp1 += C * idx;
+        inp2 += C * idx;
 
-    // adjust pointers to current token
-    residual += C * idx;
-    normed += C * idx;
-    inp1 += C * idx;
-    inp2 += C * idx;
-
-    const float eps = 1e-5f;
-    float sum = 0.0f;
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 in1 = load128cs(inp1 + c);
-        const x128 in2 = load128cs(inp2 + c);
-        x128 out;
-        for(int k = 0; k < x128::size; ++k) {
-            out[k] = (float)in1[k] + (float)in2[k];
-            sum += (float)out[k];
-        }
-        store128cs(residual + c, out);
-        s_res[c / x128::size] = out;
-    }
-
-    sum = warpReduceSum(sum);
-    float m = sum / C;
-    float v = 0.f;
-
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 res = s_res[c / x128::size];
-        for(int k = 0; k < x128::size; ++k) {
-            v += ((float)res[k] - m) * ((float)res[k] - m);
-        }
-    }
-
-    v = warpReduceSum(v) / C;
-    float s = rsqrtf(v + eps);
-
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 res = s_res[c / x128::size];
-        const x128 w = s_weight[c / x128::size];
-        const x128 b = s_bias[c / x128::size];
-        x128 out;
-        for(int k = 0; k < x128::size; ++k) {
-            float n = s * ((float)res[k] - m); // normalized output
-            float o = n * (float)w[k] + (float)b[k]; // scale and shift it
-            out[k] = o;
+        const float eps = 1e-5f;
+        float sum = 0.0f;
+        for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
+            const x128 in1 = load128cs(inp1 + c);
+            const Packed128<T2> in2 = load128cs(inp2 + c);
+            x128 out;
+            for(int k = 0; k < x128::size; ++k) {
+                out[k] = (float)in1[k] + (float)in2[k] * inp2_descale;
+                sum += (float)out[k];
+            }
+            store128cs(residual + c, out);
+            s_res[c / x128::size] = out;
         }
 
-        store128cs(normed + c, out);
+        sum = warpReduceSum(sum);
+        float m = sum / C;
+        float v = 0.f;
+
+        for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
+            const x128 res = s_res[c / x128::size];
+            for(int k = 0; k < x128::size; ++k) {
+                v += ((float)res[k] - m) * ((float)res[k] - m);
+            }
+        }
+
+        v = warpReduceSum(v) / C;
+        float s = rsqrtf(v + eps);
+
+        for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
+            const x128 res = s_res[c / x128::size];
+            const x128 w = s_weight[c / x128::size];
+            const x128 b = s_bias[c / x128::size];
+            Packed128<Tn> out;
+            for(int k = 0; k < x128::size; ++k) {
+                float n = s * ((float)res[k] - m); // normalized output
+                float o = n * (float)w[k] + (float)b[k]; // scale and shift it
+                out[k] = (Tn)(o * normed_scale);
+                update_local_absmax(absmax_uint, o, (normed_out_absmax ? 1 : 0)); // optional absmax
+            }
+
+            store_same_length<floatX, Tn>(normed + c, out); // todo: .cs hint?
+            //store128cs(normed + c, out);
+        }
+        // cache the mean and rstd for the backward pass later
+        if(threadIdx.x == 0) {
+            mean[idx] = m;
+            rstd[idx] = s;
+        }
     }
-    // cache the mean and rstd for the backward pass later
-    if(threadIdx.x == 0) {
-        mean[idx] = m;
-        rstd[idx] = s;
+
+    if (normed_out_absmax) {
+        update_global_absmax<true>((unsigned int*)normed_out_absmax, absmax_uint); // true because 2D
     }
 }
 
-__global__ void residual_forward_kernel(floatX* out, const floatX* inp1, const floatX* inp2) {
+template <typename T2>
+__global__ void residual_forward_kernel(floatX* out, const floatX* inp1, const T2* inp2, float* inp2_descale_ptr) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    float inp2_descale = inp2_descale_ptr ? *inp2_descale_ptr : 1.0f;
 
     x128 packed_out;
     x128 packed_inp1 = load128cs(inp1 + idx);
-    x128 packed_inp2 = load128cs(inp2 + idx);
+    Packed128<T2> packed_inp2 = load128cs(inp2 + idx);
     for (int k = 0; k < packed_inp1.size; k++) {
-        packed_out[k] = (floatX)((float)packed_inp1[k] + (float)packed_inp2[k]);
+        packed_out[k] = (floatX)((float)packed_inp1[k] + (float)packed_inp2[k] * inp2_descale);
     }
     store128(out + idx, packed_out);
 }
@@ -430,7 +455,8 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
 // kernel launchers
 
 // similar to `fused_residual_forward5`
-void layernorm_forward(floatX* out, float* mean, float* rstd,
+template <typename Tn>
+void layernorm_forward(Tn* out, float* mean, float* rstd,
                        floatX* inp, const floatX* weight, const floatX* bias,
                        int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
@@ -440,54 +466,106 @@ void layernorm_forward(floatX* out, float* mean, float* rstd,
     const int grid_size = CEIL_DIV(N, block_y);
     size_t smem = (2 + block_y) * C * sizeof(floatX);
 
+    float *scale_normed = NULL;
+    float *next_absmax_normed = NULL;
+    bool recompute_due_to_absmax = false;
+
+    if (std::is_same<Tn, __nv_fp8_e4m3>::value) {
+        float *calculated_from_absmax = absmax_tracker.get_absmax_data(out, B*T*C, mean, SCALE_FORWARD_B, false);
+        if (!calculated_from_absmax) {
+            recompute_due_to_absmax = true; // will need to do the matmul twice :(
+            calculated_from_absmax = absmax_tracker.get_absmax_data(out, B*T*C, mean, SCALE_FORWARD_B);
+        }
+        scale_normed = calculated_from_absmax + SCALE_OFFSET;
+        next_absmax_normed = absmax_tracker.next_absmax_ptr(out, B*T*C, mean);
+    }
+
+    // ...
+
     // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
     // this may fail, in which case we fall back to the smem free implementation.
     cudaCheck(cudaGetLastError());
-    auto status = cudaFuncSetAttribute(layernorm_forward_kernel6, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    auto status = cudaFuncSetAttribute(layernorm_forward_kernel6<Tn>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaGetLastError();
     if (status == cudaSuccess) {
-        layernorm_forward_kernel6<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
+        layernorm_forward_kernel6<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(out, mean, rstd, inp, weight, bias, N, C, scale_normed, next_absmax_normed);
+        if(recompute_due_to_absmax) {
+            absmax_tracker.update_single_absmax(out, B*T*C, mean, 1.0f, stream); // this will update scale_normed
+            layernorm_forward_kernel6<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(out, mean, rstd, inp, weight, bias, N, C, scale_normed, next_absmax_normed);
+        }
     } else {
         // fall back to the version without shared memory
-        const int grid_size_fb = CEIL_DIV(N * WARP_SIZE, block_size);
-        layernorm_forward_kernel3<<<grid_size_fb, block_size, 0, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
+        assert(false); // todo
+        //const int grid_size_fb = CEIL_DIV(N * WARP_SIZE, block_size);
+        //layernorm_forward_kernel3<<<grid_size_fb, block_size, 0, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
     }
     cudaCheck(cudaGetLastError());
 }
 
-void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N, cudaStream_t stream) {
+template <typename T2>
+void residual_forward(floatX* out, const floatX* inp1, const T2* inp2, int N, float* inp2_descale_ptr, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    residual_forward_kernel<<<grid_size, block_size, 0, stream>>>(out, inp1, inp2);
+    residual_forward_kernel<<<grid_size, block_size, 0, stream>>>(out, inp1, inp2, inp2_descale_ptr);
     cudaCheck(cudaGetLastError());
 }
 
-void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, float* rstd,
-                             const floatX* inp1, const floatX* inp2,
+template <typename Tn, typename T2>
+void fused_residual_forward5(floatX* residual, Tn* normed, float* mean, float* rstd,
+                             const floatX* inp1, const T2* inp2,
                              const floatX* weight, const floatX* bias,
-                             int N, int C, cudaStream_t stream) {
+                             int N, int C,
+                             void* associated_tensor, // hack - todo - for FP8 to find fch_gelu history
+                             cudaStream_t stream) {
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
     const int grid_size = CEIL_DIV(N, block_y);
     size_t smem = (2 + block_y) * C * sizeof(floatX);
+    float* inp2_descale_ptr = absmax_tracker.get_descale_ptr(inp2, N*C, associated_tensor);
+
+    float *scale_normed = NULL;
+    float *next_absmax_normed = NULL;
+    bool recompute_due_to_absmax = false;
+
+    if (std::is_same<Tn, __nv_fp8_e4m3>::value) {
+        float *calculated_from_absmax = absmax_tracker.get_absmax_data(normed, N*C, mean, SCALE_FORWARD_B, false);
+        if (!calculated_from_absmax) {
+            recompute_due_to_absmax = true; // will need to do the matmul twice :(
+            calculated_from_absmax = absmax_tracker.get_absmax_data(normed, N*C, mean, SCALE_FORWARD_B);
+        }
+        scale_normed = calculated_from_absmax + SCALE_OFFSET;
+        next_absmax_normed = absmax_tracker.next_absmax_ptr(normed, N*C, mean);
+    }
 
     // dedicate as much of the L1 to shared memory as possible (we should never hit in the L1 here!)
-    cudaFuncSetAttribute(fused_residual_forward_kernel5, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(fused_residual_forward_kernel5<Tn,T2>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
 
     // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
     // this may fail, in which case we fall back to the smem free implementation.
     cudaCheck(cudaGetLastError());
-    auto status = cudaFuncSetAttribute(fused_residual_forward_kernel5, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    auto status = cudaFuncSetAttribute(fused_residual_forward_kernel5<Tn,T2>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaGetLastError();
     if(status == cudaSuccess) {
         fused_residual_forward_kernel5<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(residual, normed,
                                                                                               mean, rstd, inp1, inp2,
-                                                                                              weight, bias, N, C);
+                                                                                              weight, bias, N, C,
+                                                                                              inp2_descale_ptr, scale_normed,
+                                                                                              next_absmax_normed);
+        if(recompute_due_to_absmax) {
+            absmax_tracker.update_single_absmax(normed, N*C, mean, 1.0f, stream); // this will update scale_normed
+            fused_residual_forward_kernel5<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(residual, normed,
+                                                                                                mean, rstd, inp1, inp2,
+                                                                                                weight, bias, N, C,
+                                                                                                inp2_descale_ptr, scale_normed,
+                                                                                                next_absmax_normed);
+        }
     } else {
-        residual_forward(residual, inp1, inp2, N*C, stream);
-        layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C, stream);
+        assert(scale_normed == NULL); // todo
+        assert(false); // todo
+        //residual_forward(residual, inp1, inp2, N*C, inp2_descale_ptr, stream);
+        //layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C, stream);
     }
     cudaCheck(cudaGetLastError());
 }

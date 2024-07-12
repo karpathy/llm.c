@@ -9,12 +9,10 @@ See /dev/cuda/advanced_copy_transpose.cu for more information and options
 #include <typeinfo>
 #include "cuda_common.h"
 #include "cuda_utils.cuh"
-#include "absmax_history.cuh"
 
 // todo - tune these for performance (but should be close to optimal already)
 #define ABSMAX_ITERATIONS_PER_THREAD 4
-#define DEFAULT_TILE_SIZE 32UL
-
+#define TRANSPOSE_TILE_SIZE 32UL
 
 // ----------------------------------------------------------------------------
 // CUDA helpers
@@ -95,7 +93,7 @@ __device__ void update_local_absmax(unsigned int &absmax_uint, T data, uint absm
 // copy & format conversion kernel using store_same_length
 // keeps the largest format at 128-bit and smallest at 32-bit or 64-bit
 template <bool reciprocal_scale=true, bool scaling=false, typename T1, typename T2>
-__global__ void copy_simple_kernel(T1 *copy, const T2 *input, size_t N, const float* __restrict__ scale_pointer=(float*)NULL) {
+__global__ void copy_simple_kernel(T1 *copy, const T2 *input, size_t N, const float* __restrict__ scale_pointer=nullptr) {
     constexpr size_t vec_size = 16 / ((sizeof(T1) < sizeof(T2)) ? sizeof(T2) : sizeof(T1));
     size_t n = (blockIdx.x * blockDim.x + threadIdx.x) * vec_size;
     if (n >= N) { return; }
@@ -143,7 +141,7 @@ __global__ void copy_advanced_kernel(T1 *copy, const T2 *input, size_t N,
 }
 
 // transpose + copy + format conversion (+ elementwise + absmax) kernel
-template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=DEFAULT_TILE_SIZE, bool reciprocal_scale=true, bool enable_copy=false, bool scaling=true,
+template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=TRANSPOSE_TILE_SIZE, bool reciprocal_scale=true, bool enable_copy=false, bool scaling=true,
          uint absmax_factor=0, elementwise_func_t elementwise_func=nothing_elementwise, typename T1, typename T2>
 __global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ copy, const T2* __restrict__ input,
                                  const float* __restrict__ descale_pointer=(float*)NULL, const float* __restrict__ scale_pointer=(float*)NULL,
@@ -302,13 +300,13 @@ template <bool write_absmax=false, elementwise_func_t elementwise_func=nothing_e
           bool enable_copy=false, typename T1, typename T2> // advanced template options, usually don't need to be changed
 void transpose(T1 *transposed, const T2 *input, size_t w, size_t h, float* descale_pointer=NULL, float* scale_pointer=NULL, void* absmax_output=NULL,
                bool memset_absmax=true, cudaStream_t stream=0, const size_t block_size=64, T1 *copy=NULL) { // advanced parameters
-    assert((w % DEFAULT_TILE_SIZE) == 0 && (h % DEFAULT_TILE_SIZE) == 0);
+    assert((w % TRANSPOSE_TILE_SIZE) == 0 && (h % TRANSPOSE_TILE_SIZE) == 0);
     cudaCheck(cudaGetLastError());
 
     // printf EVERYTHING for debug
-    size_t block_size_x = (DEFAULT_TILE_SIZE * sizeof(T2)) / 16;
-    size_t block_size_y = min(DEFAULT_TILE_SIZE, block_size / block_size_x);
-    dim3 grid_size(w / DEFAULT_TILE_SIZE, h / DEFAULT_TILE_SIZE);
+    size_t block_size_x = (TRANSPOSE_TILE_SIZE * sizeof(T2)) / 16;
+    size_t block_size_y = min(TRANSPOSE_TILE_SIZE, block_size / block_size_x);
+    dim3 grid_size(w / TRANSPOSE_TILE_SIZE, h / TRANSPOSE_TILE_SIZE);
     dim3 block_size_dim(block_size_x, block_size_y);
 
     constexpr uint absmax_factor = write_absmax ? 1 : 0;
@@ -317,28 +315,16 @@ void transpose(T1 *transposed, const T2 *input, size_t w, size_t h, float* desca
         cudaMemset(absmax_output, 0, sizeof(unsigned int));
     }
 
-    /*
-    printf("Transposing %s -> %s, w=%lu, h=%lu, block_size=%lu, enable_copy=%d, write_absmax=%d, elementwise_func=%p\n",
-           typeid(T2).name(), typeid(T1).name(), w, h, block_size, enable_copy, write_absmax, elementwise_func);
-    printf("transposed=%p, copy=%p, input=%p, scale_pointer=%p, absmax_output=%p, memset_absmax=%d, absmax_factor=%u\n",
-           transposed, copy, input, scale_pointer, absmax_output, memset_absmax, absmax_factor);
-    printf("sizeof(T1)=%lu, sizeof(T2)=%lu, sizeof(Packed128<T1>)=%lu, sizeof(Packed128<T2>)=%lu\n",
-           sizeof(T1), sizeof(T2), sizeof(Packed128<T1>), sizeof(Packed128<T2>));
-    printf("block_size_x=%lu, block_size_y=%lu, grid_size=(%d,%d), block_size_dim=(%d,%d)\n",
-           block_size_x, block_size_y, grid_size.x, grid_size.y, block_size_dim.x, block_size_dim.y);
-    */
-
     switch (block_size_y) {
-        case 32: transpose_kernel<32, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
-        case 16: transpose_kernel<16, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
-        case 8: transpose_kernel<8, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
-        case 4: transpose_kernel<4, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
-        case 2: transpose_kernel<2, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
-        case 1: transpose_kernel<1, DEFAULT_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
+        case 32: transpose_kernel<32, TRANSPOSE_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
+        case 16: transpose_kernel<16, TRANSPOSE_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
+        case 8: transpose_kernel<8, TRANSPOSE_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
+        case 4: transpose_kernel<4, TRANSPOSE_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
+        case 2: transpose_kernel<2, TRANSPOSE_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
+        case 1: transpose_kernel<1, TRANSPOSE_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
         default: printf("Invalid block size (might be easy to add): %lu\n", block_size_y); exit(1);
     }
     cudaCheck(cudaGetLastError());
-    //printf("===\n");
 }
 
 // wrapper so the parameters of the standard transpose function are less messy
@@ -379,8 +365,10 @@ void get_absmax(void* absmax_output, const T* inp, size_t N, cudaStream_t stream
     cudaCheck(cudaGetLastError());
 }
 
-// Scratch allocation
 // ----------------------------------------------------------------------------
+// Scratch allocation for FP8 conversions etc.
+// todo - consider alternatives (or at least move it somewhere else)
+
 #include <vector>
 #include <algorithm>
 #include <cuda_runtime.h>
@@ -414,6 +402,7 @@ public:
         }
 
         // If no suitable allocation found, create a new one
+        printf("Allocating CUDA scratch memory: %lu bytes\n", size);
         void* new_ptr;
         cudaMalloc(&new_ptr, size);
         allocations.emplace_back(new_ptr, size);
@@ -423,6 +412,7 @@ public:
 
     template<typename T>
     static void releaseMemory(T* ptr) {
+        if (ptr == nullptr) { return; }
         auto it = std::find_if(allocations.begin(), allocations.end(),
             [ptr](const Allocation& a) { return a.ptr == (void*)ptr; });
 
