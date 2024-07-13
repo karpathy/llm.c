@@ -101,6 +101,12 @@ __device__ float cast_value<float, __nv_bfloat16>(__nv_bfloat16 val) {
     return __bfloat162float(val);
 }
 
+template<>
+__device__ float cast_value<float, __nv_fp8_e4m3>(__nv_fp8_e4m3 val) {
+    return (float)val;
+}
+
+// todo: why do we have all these separate cast functions? Just "(float)val" should work AFAIK?
 template<typename Td, typename Ts>
 __global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n, ptrdiff_t stride_dst, ptrdiff_t stride_src) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -222,6 +228,23 @@ __device__ __forceinline__ void stochastic_rounding(float in, __nv_bfloat16 *out
     unsigned int rounded_bits = float_bits & 0x0000FFFF;
     float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
     *out = __float2bfloat16_rn(__uint_as_float(float_bits));
+}
+// WIP INEFFICIENT FP8 - so many wasted bits, would like to use one uint across multiple roundings
+__device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e5m2 *out, unsigned int seed) {
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
+    unsigned int threshold = random & 0x001FFFFF;
+    unsigned int float_bits = __float_as_uint(in);
+    unsigned int rounded_bits = float_bits & 0x001FFFFF;
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0x001FFFFF) : (float_bits  & ~0x001FFFFF);
+    *out = __nv_fp8_e5m2(__uint_as_float(float_bits));
+}
+__device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e4m3 *out, unsigned int seed) {
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
+    unsigned int threshold = random & 0x000FFFFF;
+    unsigned int float_bits = __float_as_uint(in);
+    unsigned int rounded_bits = float_bits & 0x000FFFFF;
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0x000FFFFF) : (float_bits  & ~0x000FFFFF);
+    *out = __nv_fp8_e4m3(__uint_as_float(float_bits));
 }
 __device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigned int random) {
     *out = (float)in; // todo - implement this...

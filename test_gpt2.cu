@@ -241,9 +241,17 @@ int main(int argc, char *argv[]) {
                     memcpy(dst_iterator, src_iterator, model.param_elements[i] * sizeof(float));
                 } else {
                     // low-precision tensor => convert to float
-                    assert(model.param_sizeof[i] == sizeof(floatX)); // floatX is the single non-float supported atm
-                    for (size_t j = 0; j < model.param_elements[i]; j++) {
-                        dst_iterator[j] = ((floatX*)src_iterator)[j]; // convert to float
+                    if (model.param_sizeof[i] == sizeof(floatX)) {
+                        for (size_t j = 0; j < model.param_elements[i]; j++) {
+                            dst_iterator[j] = ((floatX*)src_iterator)[j]; // convert to float
+                        }
+                    } else if (model.param_sizeof[i] == 1) {
+                        for (size_t j = 0; j < model.param_elements[i]; j++) {
+                            dst_iterator[j] = (float)((__nv_fp8_e4m3*)src_iterator)[j]; // convert to float
+                        }
+                    } else {
+                        fprintf(stderr, "Unsupported parameter size\n");
+                        exit(EXIT_FAILURE);
                     }
                 }
                 // for convenience record the position of comparison for reality vs. expectation

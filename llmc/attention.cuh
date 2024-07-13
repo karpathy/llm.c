@@ -238,13 +238,15 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
 void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
                         const floatX* dout,
-                        const floatX* qkvr, const floatX* att,
+                        floatX* qkvr, const floatX* att,
                         int B, int T, int C, int NH, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int HS = C / NH; // head size
 
     // unpack convenience pointers into q, k, v
+    // hack - with FP8, dqkvr might effectively only be B*T*2C
+    // so we reuse v to store dv, since it's no longer needed at that point
     const floatX *q, *k, *v;
     q = qkvr + 0 * B * T * C;
     k = qkvr + 1 * B * T * C;
@@ -252,7 +254,7 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     floatX *dq, *dk, *dv;
     dq = dqkvr + 0 * B * T * C;
     dk = dqkvr + 1 * B * T * C;
-    dv = dqkvr + 2 * B * T * C;
+    dv = qkvr + 2 * B * T * C;
 
     // backward through the unpermute operation
     int num_blocks = CEIL_DIV(B * T * C, block_size);

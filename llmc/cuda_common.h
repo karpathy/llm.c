@@ -15,7 +15,7 @@ Common utilities for CUDA code.
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-
+#include <cuda_fp8.h>
 #include "utils.h"
 
 // ----------------------------------------------------------------------------
@@ -89,6 +89,18 @@ typedef half floatX;
 #else // Default to bfloat16
 typedef __nv_bfloat16 floatX;
 #define PRECISION_MODE PRECISION_BF16
+#endif
+
+#if FORCE_FP8_MATMUL == true && FORCE_FP8_WEIGHTS == true
+typedef __nv_fp8_e4m3 floatW;
+#else
+typedef floatX floatW;
+#endif
+
+#if FORCE_FP8_MATMUL == true && FORCE_FP8_ACTIVATIONS == true
+typedef __nv_fp8_e4m3 floatN;
+#else
+typedef floatX floatN;
 #endif
 
 // ----------------------------------------------------------------------------
