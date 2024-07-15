@@ -37,7 +37,7 @@ while true; do
                 -x 32000 \
                 -ge 1 \
                 -y 1 \
-                -e d48"
+                -e "d48"
 
     sleep 1
 done
