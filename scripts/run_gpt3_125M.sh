@@ -37,7 +37,7 @@ while true; do
                 -n 10000 \
                 -y 1 \
                 -x 565950 \
-                -e "gpt3:768"
+                -e "gpt3:c768"
 
     sleep 1
 done

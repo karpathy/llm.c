@@ -45,5 +45,5 @@ mpirun -np 16 --host $host1:8,$host2:8 \
     -u 700 \
     -n 1000 \
     -y 0 \
-    -e gpt2:12 \
+    -e d12 \
     -pi "mpi" \
