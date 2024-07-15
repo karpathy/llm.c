@@ -1605,17 +1605,6 @@ int main(int argc, char *argv[]) {
         // construct GPT-2 / GPT-3 models in a convenient format. See the function for docs.
         gpt_build_from_descriptor(&model, load_filename);
     }
-    // cross-check the desired sequence length T with the model's max sequence length
-    if (T != model.config.max_seq_len) {
-        printf0("Warning: sequence length T=%d (set with -t) is not equal to model's max_seq_len=%d\n",
-                T, model.config.max_seq_len);
-        printf0("HINT: If you're training a GPT-2 use -t 1024. If GPT-3, use -t 2048.\n");
-        printf0("This could in principle be ok if T <= max_seq_length, but this is a major footgun...\n");
-        printf0("Failing catastrophically for now.\n");
-        exit(EXIT_FAILURE);
-    }
-    // in any case, this must be true or we'd index beyond the model's wpe (position embedding table)
-    assert(T <= model.config.max_seq_len);
 
     model.use_master_weights = use_master_weights;
     model.gelu_fusion = gelu_fusion;
@@ -1715,6 +1704,23 @@ int main(int argc, char *argv[]) {
     OutlierDetector loss_outlier_detector, grad_norm_outlier_detector;
     init_detector(&loss_outlier_detector);
     init_detector(&grad_norm_outlier_detector);
+
+    // do some checks here before we kick off training
+    // cross-check the desired sequence length T with the model's max sequence length
+    if (T < model.config.max_seq_len) {
+        printf0("!!!!!!!!\n");
+        printf0("WARNING:\n");
+        printf0("- The training sequence length is: T=%d (set with -t)\n", T);
+        printf0("- The model's max sequence length is: max_seq_len=%d\n", model.config.max_seq_len);
+        printf0("You are attempting to train with a sequence length shorter than the model's max.\n");
+        printf0("This will lead to unused parameters in the wpe position embedding weights.\n");
+        printf0("If you know what you're doing you can ignore this warning.\n");
+        printf0("If you're like ???, you are most likely misconfiguring your training run.\n");
+        printf0("---> HINT: If you're training GPT-2 use -t 1024. If GPT-3, use -t 2048.\n");
+        printf0("!!!!!!!!\n");
+    }
+    // in any case, this must be true or we'd index beyond the model's wpe (position embedding table)
+    assert(T <= model.config.max_seq_len);
 
     // train
     cudaEvent_t start, end;
