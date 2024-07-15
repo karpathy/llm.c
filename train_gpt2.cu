@@ -73,43 +73,8 @@ char filename_buffer[512];
 // global vars containing information about the GPU this process is running on
 cudaDeviceProp deviceProp; // fills in common_start()
 cudaStream_t main_stream;
-// one global variable to hold the multi-GPU configuration for this process
-MultiGpuConfig multi_gpu_config;
 // buffer size to use for device <-> disk io
 constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
-
-// convenience function that only prints if the rank of process is zero
-void printf0(const char *format, ...) {
-    if (multi_gpu_config.process_rank == 0) {
-        va_list args;
-        va_start(args, format);
-        vprintf(format, args);
-        va_end(args);
-    }
-}
-
-void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t total_parameters) {
-    multi_gpu_config->zero_stage = 0;
-    multi_gpu_config->shard_num_parameters = total_parameters;
-    // Check the Zero Stage and define sharding parameters
-    if (zero_stage == 0) {
-        printf0("| Zero Optimization is disabled                                              |\n");
-    }
-    else if (zero_stage == 1) {
-        if (total_parameters % multi_gpu_config->num_processes != 0) {
-            printf0("| Zero Optimization is disabled, Can't equally partition parameters          |\n");
-            multi_gpu_config->zero_stage = 0;
-        }
-        else {
-            multi_gpu_config->zero_stage = 1;
-            multi_gpu_config->shard_num_parameters = total_parameters / multi_gpu_config->num_processes;
-        }
-    }
-    else{
-        printf0("| Disabling Zero Optimization, Zero Stage2 and Stage3 are not yet supported  |\n");
-        multi_gpu_config->zero_stage = 0;
-    }
-}
 
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
@@ -980,21 +945,6 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     } else {
         model->mean_loss = -1.f; // no loss available yet
     }
-}
-
-// Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
-float multi_gpu_cpu_float_sum(float value, MultiGpuConfig* multi_gpu_config) {
-#ifdef MULTI_GPU
-    if (multi_gpu_config->num_processes == 1) return value;
-
-    float* unified_buffer = multi_gpu_config->unified_buffer;
-    *unified_buffer = value;
-    ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
-    cudaCheck(cudaDeviceSynchronize());
-    return *unified_buffer;
-#else
-    return value;
-#endif
 }
 
 // Gets the offset of a specific tensor for a specific layer in the GPT2 model
