@@ -494,22 +494,88 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     cudaCheck(cudaDeviceSynchronize());
 }
 
-void gpt2_build_from_random(GPT2 *model, int depth) {
-    // init random (training from scratch)
-
-    // parameterize the size of gpt2 based only on the depth of the model (num_layers)
-    model->config.num_layers = depth;
-    // follows GPT-2 sizes
+void gpt2_setup(GPT2Config* config, const char* depth_str) {
+    int depth = atoi(depth_str);
     int channels, num_heads;
-    if      (depth == 6)  { channels = 384; num_heads = 6; } // gpt2-tiny (30M)
-    else if (depth == 12) { channels = 768; num_heads = 12; } // gpt2 (124M)
-    else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
-    else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
-    else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
-    else { fprintf(stderr, "Unsupported depth for now\n"); exit(EXIT_FAILURE); }
-    model->config.channels = channels;
-    model->config.num_heads = num_heads;
-    model->config.max_seq_len = 1024;
+    switch(depth) {
+        case 12:
+        case 24:
+        case 36:
+        case 48:
+            break;
+        default:
+            printf("Specified depth %d does not correspond to an official GPT2 model size.\n", depth);
+            printf(" Generating an interpolated model.\n");
+    }
+
+    if      (depth <= 6)  { channels = 384; num_heads = 6; }   // (unofficial) gpt2-tiny (30M)
+    else if (depth <= 12) { channels = 768; num_heads = 12; }  // gpt2 (124M)
+    else if (depth <= 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
+    else if (depth <= 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
+    else if (depth <= 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
+    else if (depth <= 60) { channels = 1920; num_heads = 30; } // (unofficial) 2.7B
+    else if (depth <= 72) { channels = 2880; num_heads = 30; } // (unofficial) 7.3B
+    else if (depth <= 84) { channels = 3456; num_heads = 36; } // (unofficial) 12.2B
+    else { fprintf(stderr, "Unsupported depth %d for now\n", depth); exit(EXIT_FAILURE); }
+    config->num_layers = depth;
+    config->channels = channels;
+    config->num_heads = num_heads;
+    config->max_seq_len = 1024;
+}
+
+void gpt3_setup(GPT2Config* config, const char* channels_str) {
+    // note: we do not quite get the same model as gpt3, because we consistently use
+    // dense attention, instead of alternating banded attention
+    int channels = atoi(channels_str);
+
+    switch(channels) {
+        case 768:
+        case 1024:
+        case 1536:
+        case 2048:
+        case 2560:
+        case 4096:
+        case 5140:
+        case 12288:
+            break;
+        default:
+            printf("Specified channels %d do not correspond to an official GPT3 model size.\n", channels);
+            printf(" Generating an interpolated model.\n");
+    }
+
+    int depth, head_size;
+    if      (channels <= 384)   { depth = 6;  head_size = 64; }  // (unofficial) gpt3-tiny (31M)
+    else if (channels <= 768)   { depth = 12; head_size = 64; } // gpt3-small (125M)
+    else if (channels <= 1024)  { depth = 24; head_size = 64; } // gpt3-medium (350M)
+    else if (channels <= 1536)  { depth = 24; head_size = 96; } // gpt3-large (760M)
+    else if (channels <= 2048)  { depth = 24; head_size = 128; } // gpt3-xl (1.3B) [heads fixed]
+    else if (channels <= 2560)  { depth = 32; head_size = 80; } // gpt3-2.7B
+    else if (channels <= 4096)  { depth = 32; head_size = 128; } // gpt3-6.7B
+    else if (channels <= 5140)  { depth = 40; head_size = 128; } // gpt3-13B
+    else if (channels <= 12288) { depth = 96; head_size = 128; } // gpt3 (175B)
+    else { fprintf(stderr, "Unsupported channels %d for now\n", channels); exit(EXIT_FAILURE); }
+    if(channels % head_size != 0) {
+        fprintf(stderr, "Number of channels %d incompatible with head size %d\n", channels, head_size);
+        fprintf(stderr, " The next valid number of channels is %d\n", CEIL_DIV(channels, head_size) * head_size);
+        exit(EXIT_FAILURE);
+    }
+    config->num_layers = depth;
+    config->channels = channels;
+    config->num_heads = channels / head_size;
+    config->max_seq_len = 2048;
+}
+
+void gpt2_build_from_random(GPT2 *model, const char* config) {
+    // init random (training from scratch)
+    const char* cfg = strchr(config, ':') + 1;
+    if(strncmp(config, "gpt2", 4) == 0) {
+        gpt2_setup(&model->config, cfg);
+    } else if(strncmp(config, "gpt3", 4) == 0) {
+        gpt3_setup(&model->config, cfg);
+    } else {
+        fprintf(stderr, "Unsupported model type %s\n", config); exit(EXIT_FAILURE);
+    }
+
     model->config.vocab_size = 50257;
     model->config.padded_vocab_size = 50304; // padded to 128
 
@@ -1556,13 +1622,8 @@ int main(int argc, char *argv[]) {
     assert(strlen(load_filename) >= 2);
     if (resuming == 1) {
         gpt2_build_from_checkpoint(&model, filename_buffer);
-    } else if (load_filename[0] == 'd') {
-        int depth = atoi(load_filename + 1);
-        if (depth > 1 && depth <= 1000) { // we're not going to train models this big right? heh
-            gpt2_build_from_random(&model, depth);
-        } else {
-            exit(EXIT_FAILURE);
-        }
+    } else if (strchr(load_filename, ':') != nullptr) {
+       gpt2_build_from_random(&model, load_filename);
     } else {
         gpt2_build_from_checkpoint(&model, load_filename);
     }
