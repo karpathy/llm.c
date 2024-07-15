@@ -63,6 +63,11 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines: global_norm_squared
 #include "llmc/global_norm.cuh"
 // ----------- Multi-GPU support -----------
+// defines: ncclFloatX, ncclCheck, MultiGpuConfig, ShardInfo
+// defines: printf0, multi_gpu_config
+// defines: multi_gpu_config_init, multi_gpu_config_free
+// defines: set_zero_configs, multi_gpu_cpu_float_sum, multi_gpu_barrier
+// defines: multi_gpu_get_shard_offset, multi_gpu_async_reduce_gradient
 #include "llmc/zero.cuh"
 
 // ----------------------------------------------------------------------------
