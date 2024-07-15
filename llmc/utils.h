@@ -212,4 +212,15 @@ extern inline int find_max_step(const char* output_log_dir) {
     return max_step;
 }
 
+extern inline bool ends_with_bin(const char* str) {
+    // checks if str ends with ".bin". could be generalized in the future.
+    if (str == NULL) { return false; }
+    size_t len = strlen(str);
+    const char* suffix = ".bin";
+    size_t suffix_len = strlen(suffix);
+    if (len < suffix_len) { return false; }
+    bool suffix_matches = strncmp(str + len - suffix_len, suffix, suffix_len) == 0;
+    return suffix_matches;
+}
+
 #endif
