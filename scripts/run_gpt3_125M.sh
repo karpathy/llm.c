@@ -1,5 +1,5 @@
-# GPT-3 (124M) repro on FineWeb
-# 124M parameter model on 300B tokens
+# GPT-3 (125M) repro on FineWeb
+# 125M parameter model on 300B tokens
 # note context length: 1024 -> 2048 for GPT-3
 # => 6 * 124e6 * 300e9 = 7.44e18 ~= 2.2e20 capability model
 # 565,950 steps of 524,288 tokens/step
@@ -37,7 +37,7 @@ while true; do
                 -n 10000 \
                 -y 1 \
                 -x 565950 \
-                -e "d12"
+                -e "gpt3:c768"
 
     sleep 1
 done
