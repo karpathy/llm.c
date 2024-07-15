@@ -1153,14 +1153,14 @@ void gpt2_free(GPT2 *model) {
 void common_start(bool override_enable_tf32 = true, bool print_device_info = true) {
 
     // get CUDA device infos
-    cudaGetDeviceProperties(&deviceProp, multi_gpu_config.local_device_idx);
+    cudaCheck(cudaGetDeviceProperties(&deviceProp, multi_gpu_config.local_device_idx));
     if (print_device_info) {
         printf("[System]\n");
         printf("Device %d: %s\n", multi_gpu_config.local_device_idx, deviceProp.name);
     }
 
     // set up the cuda streams. atm everything is on the single main stream
-    cudaStreamCreate(&main_stream);
+    cudaCheck(cudaStreamCreate(&main_stream));
     nvtxNameCudaStreamA(main_stream, "main stream");
 
     // set up cuBLAS and cuBLASLt
@@ -1788,7 +1788,7 @@ int main(int argc, char *argv[]) {
             dataloader_reset(&train_loader);
         }
         // do one training step, doing forward/backward/update on total_batch_size tokens
-        cudaEventRecord(start);
+        cudaCheck(cudaEventRecord(start));
         // gradient and loss accumulation loop over micro-batches
         for (int micro_step = 0; micro_step < grad_accum_steps; micro_step++) {
             // fetch the next data batch
