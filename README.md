@@ -240,6 +240,10 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 
 - Zig
   - [llm.zig](https://github.com/Saimirbaci/llm.zig) by @[saimirbaci](https://github.com/Saimirbaci): a Zig port of this project
+ 
+- SYCL support
+  - [llm.sycl](https://github.com/abhilash1910/llm.sycl/) by @[abhilash1910](https://github.com/abhilash1910): support for SYCL runtime for Intel GPU, Nvidia and AMD
+
 
 - Nim
   - [llm.nim](https://github.com/Vindaar/llm.nim) by @[Vindaar](https://github.com/Vindaar): a Nim port of this project
