@@ -240,6 +240,9 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 
 - Zig
   - [llm.zig](https://github.com/Saimirbaci/llm.zig) by @[saimirbaci](https://github.com/Saimirbaci): a Zig port of this project
+ 
+- Habana Gaudi2
+  - [llm.tpc](https://github.com/abhilash1910/llm.tpc) by @[abhilash1910](https://github.com/abhilash1910): a Habana Gaudi2 port of this project 
 
 - Nim
   - [llm.nim](https://github.com/Vindaar/llm.nim) by @[Vindaar](https://github.com/Vindaar): a Nim port of this project
