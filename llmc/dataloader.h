@@ -302,6 +302,12 @@ void evalloader_reset(EvalLoader *loader) {
     // determine how much work there is for all processes
     int examples_per_process = CEIL_DIV(loader->num_examples, loader->num_processes);
     int can_fit_examples = (int) (loader->B / ASSUMED_NUM_COMPLETIONS);
+    if (can_fit_examples == 0) {
+        // this could be fixed in the future, but for now keeping it simple and throw error when B too low
+        printf("HellaSwag EvalLoader: batch size %zu is < %d\n", loader->B, ASSUMED_NUM_COMPLETIONS);
+        printf("---> HINT: Disable HellaSwag eval with -h 0, or increase batch size with -b\n");
+        exit(EXIT_FAILURE);
+    }
     loader->num_batches = CEIL_DIV(examples_per_process, can_fit_examples);
     // determine the start and end example indices for this process
     loader->start_example_index = examples_per_process * loader->process_rank;
