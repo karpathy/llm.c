@@ -37,7 +37,7 @@ int sample_mult(float* probabilities, int n, float coin) {
 }
 
 int main(int argc, char** argv) {
-  gpt2::GPT2 model;
+  gpt2::GPT2<float> model;
   model.BuildFromCheckpoint("gpt2_124M.bin");
 
   // build the DataLoaders from tokens files. for now use tiny_shakespeare if
@@ -79,11 +79,11 @@ int main(int argc, char** argv) {
   int V = model.config.vocab_size;
   std::unique_ptr<float[]> logit = std::make_unique<float[]>(B * T * V);
   std::unique_ptr<float[]> prob = std::make_unique<float[]>(B * T * V);
-  nn::Softmax softmax;
+  nn::Softmax<float> softmax;
   std::vector<nn::Parameter*> parameters;
   model.Parameters(&parameters);
   optim::AdamW optimizer(parameters, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f);
-  for (int step = 0; step <= 40; step++) {
+  for (int step = 0; step <= 10; step++) {
     // once in a while estimate the validation loss
     if (step % 10 == 0) {
       float val_loss = 0.0f;
@@ -91,9 +91,9 @@ int main(int argc, char** argv) {
       for (int i = 0; i < val_num_batches; i++) {
         dataloader_next_batch(&val_loader);
         float loss = 0.0f;
-        auto idx = Eigen::Map<nn::MatrixInt>(val_loader.inputs, B, T);
-        auto target = Eigen::Map<nn::MatrixInt>(val_loader.targets, B, T);
-        auto logit_3d = Eigen::TensorMap<nn::Tensor3D>(logit.get(), B, T, V);
+        auto idx = TTypes<int>::ConstMatrix(val_loader.inputs, B, T);
+        auto target = TTypes<int>::ConstMatrix(val_loader.targets, B, T);
+        auto logit_3d = Make3DTensor(logit.get(), B, T, V);
         model.gpt2_->Forward(idx, target, logit_3d, &loss);
         val_loss += loss;
       }
@@ -114,11 +114,11 @@ int main(int argc, char** argv) {
         // we re-calculate the forward pass for all of (B,T) positions from
         // scratch but the inference here is just for sanity checking anyway and
         // we can maybe optimize a bit more later, with careful tests
-        auto gen_tokens_2d = Eigen::Map<nn::MatrixInt>(gen_tokens, B, T);
-        auto logit_3d = Eigen::TensorMap<nn::Tensor3D>(logit.get(), B, T, V);
+        auto gen_tokens_2d = TTypes<int>::ConstMatrix(gen_tokens, B, T);
+        auto logit_3d = Make3DTensor(logit.get(), B, T, V);
         model.gpt2_->Forward(gen_tokens_2d, logit_3d);
-        auto logit_2d = Eigen::TensorMap<nn::Tensor2D>(logit.get(), B * T, V);
-        auto prob_2d = Eigen::TensorMap<nn::Tensor2D>(prob.get(), B * T, V);
+        auto logit_2d = MakeConstMatrix(logit.get(), B * T, V);
+        auto prob_2d = MakeMatrix(prob.get(), B * T, V);
         softmax.Forward(logit_2d, prob_2d);
         // furthermore, below we're only using b=0 (i.e. the first row) of all B
         // rows we're in principle running B "inference streams" in parallel
@@ -147,9 +147,9 @@ int main(int argc, char** argv) {
     clock_gettime(CLOCK_MONOTONIC, &start);
     dataloader_next_batch(&train_loader);
     float loss = 0.0f;
-    auto idx = Eigen::Map<nn::MatrixInt>(train_loader.inputs, B, T);
-    auto target = Eigen::Map<nn::MatrixInt>(train_loader.targets, B, T);
-    auto logit_3d = Eigen::TensorMap<nn::Tensor3D>(logit.get(), B, T, V);
+    auto idx = TTypes<int>::ConstMatrix(train_loader.inputs, B, T);
+    auto target = TTypes<int>::ConstMatrix(train_loader.targets, B, T);
+    auto logit_3d = Make3DTensor(logit.get(), B, T, V);
     model.gpt2_->Forward(idx, target, logit_3d, &loss);
     optimizer.ZeroGrad();
     model.gpt2_->Backward(idx, target);

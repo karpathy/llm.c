@@ -29,7 +29,7 @@ loss.backward()
 
   nn::ManualSeed(42);
   int B = 4, n_embed = 3;
-  gpt::MLP mlp(n_embed);
+  gpt::MLP<float> mlp(n_embed);
 
   // initialize
   std::vector<float> x = {0.548416, -0.441472, 1.581529, -0.198127,
@@ -37,8 +37,8 @@ loss.backward()
                           0.648762, 0.449632,  0.322023, -1.050281};
   // forward
   std::vector<float> y(x.size(), 0);
-  auto xm = Eigen::Map<nn::Matrix>(x.data(), B, n_embed);
-  auto ym = Eigen::Map<nn::Matrix>(y.data(), B, n_embed);
+  auto xm = MakeConstMatrix(x.data(), B, n_embed);
+  auto ym = MakeMatrix(y.data(), B, n_embed);
   mlp.Forward(xm, ym);
 
   std::vector<float> expected_y = {0.068570,  0.127020, 0.150101,  0.318999,
@@ -50,8 +50,8 @@ loss.backward()
 
   // backward
   std::vector<float> x_grad(x.size(), 0), y_grad(y.size(), 1);
-  auto x_grad_m = Eigen::Map<nn::Matrix>(x_grad.data(), B, n_embed);
-  auto y_grad_m = Eigen::Map<nn::Matrix>(y_grad.data(), B, n_embed);
+  auto x_grad_m = MakeMatrix(x_grad.data(), B, n_embed);
+  auto y_grad_m = MakeConstMatrix(y_grad.data(), B, n_embed);
   mlp.Backward(xm, y_grad_m, x_grad_m);
 
   std::vector<float> expected_x_grad = {
@@ -75,13 +75,13 @@ y = attn(x)
 
   nn::ManualSeed(42);
   int B = 2, T = 4, C = 6, nh = 2, hs = C / nh;
-  gpt::CausalSelfAttention attn(T, nh, C);
+  gpt::CausalSelfAttention<float> attn(T, nh, C);
 
   std::vector<float> x(B * T * C), y(B * T * C), x_grad(B * T * C),
       y_grad(B * T * C, 1.0f);
   nn::NormalFill(absl::MakeSpan(x));
-  Eigen::TensorMap<nn::Tensor3D> xt(x.data(), B, T, C);
-  Eigen::TensorMap<nn::Tensor3D> yt(y.data(), B, T, C);
+  auto xt = MakeConst3DTensor(x.data(), B, T, C);
+  auto yt = Make3DTensor(y.data(), B, T, C);
   //  std::cout << "input\n" << xt << std::endl;
   attn.Forward(xt, yt);
 
@@ -101,8 +101,8 @@ y = attn(x)
   }
 
   // backward
-  Eigen::TensorMap<nn::Tensor3D> x_grad_t(x_grad.data(), B, T, C);
-  Eigen::TensorMap<nn::Tensor3D> y_grad_t(y_grad.data(), B, T, C);
+  auto x_grad_t = Make3DTensor(x_grad.data(), B, T, C);
+  auto y_grad_t = MakeConst3DTensor(y_grad.data(), B, T, C);
   attn.Backward(xt, y_grad_t, x_grad_t);
   std::vector<float> expected_x_grad = {
       1.341534, 0.306510, -0.398248, -1.307186, 0.308231,  1.364989,
@@ -137,12 +137,12 @@ loss.backward()
 
   nn::ManualSeed(42);
   int B = 2, T = 4, C = 6, nh = 2, hs = C / nh;
-  gpt::Block block(T, nh, C);
+  gpt::Block<float> block(T, nh, C);
 
   std::vector<float> x(B * T * C), y(B * T * C);
   nn::NormalFill(absl::MakeSpan(x));
-  Eigen::TensorMap<nn::Tensor3D> xt(x.data(), B, T, C);
-  Eigen::TensorMap<nn::Tensor3D> yt(y.data(), B, T, C);
+  auto xt = MakeConst3DTensor(x.data(), B, T, C);
+  auto yt = Make3DTensor(y.data(), B, T, C);
   block.Forward(xt, yt);
 
   std::vector<float> expected_y = {
@@ -160,8 +160,8 @@ loss.backward()
 
   // backward
   std::vector<float> x_grad(B * T * C, 0.0), y_grad(B * T * C, 1.0f);
-  auto x_grad_3d = Eigen::TensorMap<nn::Tensor3D>(x_grad.data(), B, T, C);
-  auto y_grad_3d = Eigen::TensorMap<nn::Tensor3D>(y_grad.data(), B, T, C);
+  auto x_grad_3d = Make3DTensor(x_grad.data(), B, T, C);
+  auto y_grad_3d = MakeConst3DTensor(y_grad.data(), B, T, C);
   block.Backward(xt, y_grad_3d, x_grad_3d);
 
   std::vector<float> expected_x_grad = {
@@ -192,14 +192,14 @@ logits, loss = gpt2(idx)
   nn::ManualSeed(42);
   int block_size = 4, n_embd = 6, n_head = 2, n_layer = 12, vocab_size = 10;
   int B = 2, T = block_size, C = n_embd, nh = n_head, hs = n_embd / nh;
-  gpt::GPT gpt(block_size, vocab_size, vocab_size, n_layer, n_head, n_embd);
+  gpt::GPT<float> gpt(block_size, vocab_size, vocab_size, n_layer, n_head, n_embd);
 
   std::vector<int> idx = {1, 2, 4, 5, 4, 3, 2, 9};
-  auto idx_m = Eigen::Map<nn::MatrixInt>(idx.data(), B, T);
+  auto idx_m = TTypes<int>::ConstMatrix(idx.data(), B, T);
   std::vector<float> logits(B * T * vocab_size);
   //  auto logits_2d = Eigen::Map<nn::Matrix>(logits.data(), B * T, vocab_size);
   auto logits_3d =
-      Eigen::TensorMap<nn::Tensor3D>(logits.data(), B, T, vocab_size);
+      Make3DTensor(logits.data(), B, T, vocab_size);
 
   // Without targets
   gpt.Forward(idx_m, logits_3d);
@@ -216,7 +216,7 @@ logits, loss = gpt2(idx)
 
   // With targets
   std::vector<int> target = {2, 4, 5, 6, 3, 2, 9, 0};
-  auto target_m = Eigen::Map<nn::MatrixInt>(target.data(), B, T);
+  auto target_m = TTypes<int>::ConstMatrix (target.data(), B, T);
   float loss = 0.0;
   gpt.Forward(idx_m, target_m, logits_3d, &loss);
 

@@ -14,7 +14,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "llmc/rand.h"
-#include "unsupported/Eigen/CXX11/Tensor"
+#include "span.hpp"
 #include "unsupported/Eigen/CXX11/ThreadPool"
 
 namespace nn {
@@ -56,55 +56,21 @@ using Tensor2D = Eigen::Tensor<float, 2, Eigen::RowMajor>;
 using Tensor3D = Eigen::Tensor<float, 3, Eigen::RowMajor>;
 using Tensor4D = Eigen::Tensor<float, 4, Eigen::RowMajor>;
 
-template <typename T>
-struct Span2D {
-  size_t size() const { return flat_.size(); }
-  size_t rows() const { return rows_; }
-  size_t cols() const { return cols_; }
-
-  Eigen::TensorMap<Tensor1D> View1D() const {
-    return Eigen::TensorMap<Tensor1D>(flat_.data(), flat_.size());
-  }
-
-  Eigen::TensorMap<Tensor2D> View2D() const {
-    return Eigen::TensorMap<Tensor2D>(flat_.data(), rows_, cols_);
-  }
-
-  Eigen::TensorMap<Tensor3D> View3D(size_t dim0, size_t dim1,
-                                    size_t dim2) const {
-    CHECK_EQ(dim0 * dim1 * dim2, flat_.size());
-    return Eigen::TensorMap<Tensor3D>(flat_.data(), dim0, dim1, dim2);
-  }
-
-  Eigen::TensorMap<Tensor4D> View4D(size_t dim0, size_t dim1, size_t dim2,
-                                    size_t dim3) const {
-    CHECK_EQ(dim0 * dim1 * dim2 * dim3, flat_.size());
-    return Eigen::TensorMap<Tensor4D>(flat_.data(), dim0, dim1, dim2, dim3);
-  }
-
- private:
-  Span2D(T* array, size_t rows, size_t cols)
-      : flat_(array, rows * cols), rows_(rows), cols_(cols) {}
-
-  absl::Span<T> flat_;
-  size_t rows_;
-  size_t cols_;
-};
-
 Eigen::ThreadPool g_thread_pool(16 /* number of threads in pool */);
 Eigen::ThreadPoolDevice g_cpu_device(&g_thread_pool,
                                      12 /* number of threads to use */);
 
 // Parameter weight and its corresponding gradient
 struct Parameter {
+  using T = floatX;
   enum DataType { kValue, kGrad };
 
   Parameter(const Parameter&) = delete;
   Parameter& operator=(const Parameter&) = delete;
 
   Parameter(int64_t length) : length_(length) {
-    value_ = static_cast<float*>(g_cpu_device.allocate(sizeof(float) * length));
-    g_cpu_device.memset(value_, 0, sizeof(float) * length);
+    value_ = static_cast<T*>(g_cpu_device.allocate(sizeof(T) * length));
+    g_cpu_device.memset(value_, 0, sizeof(T) * length);
     grad_ = nullptr;
   }
 
@@ -114,24 +80,23 @@ struct Parameter {
   }
 
   int64_t size() const { return length_; }
-  float* data() const { return value_; }
-  float* grad() const { return grad_; }
+  T* data() const { return value_; }
+  T* grad() const { return grad_; }
 
   void AllocateGradient() {
     if (grad_ == nullptr) {
-      grad_ =
-          static_cast<float*>(g_cpu_device.allocate(sizeof(float) * length_));
-      g_cpu_device.memset(grad_, 0, sizeof(float) * length_);
+      grad_ = static_cast<T*>(g_cpu_device.allocate(sizeof(T) * length_));
+      g_cpu_device.memset(grad_, 0, sizeof(T) * length_);
     }
   }
 
   void ZeroGrad() {
     if (grad_ != nullptr) {
-      g_cpu_device.memset(grad_, 0, sizeof(float) * length_);
+      g_cpu_device.memset(grad_, 0, sizeof(T) * length_);
     }
   }
 
-  absl::Span<float> View(DataType type = DataType::kValue) const {
+  absl::Span<T> View(DataType type = DataType::kValue) const {
     LOG_IF(FATAL, type == kGrad && grad_ == nullptr)
         << "Gradient memory has not been allocated!";
     return {type == kValue ? value_ : grad_, static_cast<size_t>(length_)};
@@ -146,24 +111,66 @@ struct Parameter {
             static_cast<Eigen::Index>(length_)};
   }
 
-  Eigen::Map<nn::Matrix> View(int rows, int cols,
-                              DataType type = DataType::kValue) const {
-    LOG_IF(FATAL, type == kGrad && grad_ == nullptr)
+  TTypes<T, 1>::Tensor View1D(int length) const {
+    CHECK_EQ(length, length_);
+    return {value_, length_};
+  }
+
+  TTypes<T, 1>::Tensor ViewGrad1D(int length) const {
+    LOG_IF(FATAL, grad_ == nullptr)
         << "Gradient memory has not been allocated!";
-    CHECK_EQ(rows * cols, length_);
-    return {type == kValue ? value_ : grad_, rows, cols};
+    CHECK_EQ(length, length_);
+    return {grad_, length_};
+  }
+
+  TTypes<T, 2>::Tensor View2D(int rows, int cols) const {
+    CHECK_EQ(length_, rows * cols);
+    return {value_, rows, cols};
+  }
+
+  TTypes<T, 2>::Tensor ViewGrad2D(int rows, int cols) const {
+    LOG_IF(FATAL, grad_ == nullptr)
+        << "Gradient memory has not been allocated!";
+    CHECK_EQ(length_, rows * cols);
+    return {grad_, rows, cols};
+  }
+
+  TTypes<T, 3>::Tensor View3D(int dim0, int dim1, int dim2) const {
+    CHECK_EQ(length_, dim0 * dim1 * dim2);
+    return {value_, dim0, dim1, dim2};
+  }
+
+  TTypes<T, 3>::Tensor ViewGrad3D(int dim0, int dim1, int dim2) const {
+    LOG_IF(FATAL, grad_ == nullptr)
+        << "Gradient memory has not been allocated!";
+    CHECK_EQ(length_, dim0 * dim1 * dim2);
+    return {grad_, dim0, dim1, dim2};
+  }
+
+  TTypes<T, 4>::Tensor View4D(int dim0, int dim1, int dim2, int dim3) const {
+    CHECK_EQ(length_, dim0 * dim1 * dim2 * dim3);
+    return {value_, dim0, dim1, dim2, dim3};
+  }
+
+  TTypes<T, 4>::Tensor ViewGrad4D(int dim0, int dim1, int dim2,
+                                  int dim3) const {
+    LOG_IF(FATAL, grad_ == nullptr)
+        << "Gradient memory has not been allocated!";
+    CHECK_EQ(length_, dim0 * dim1 * dim2 * dim3);
+    return {grad_, dim0, dim1, dim2, dim3};
   }
 
  private:
-  float* value_;
-  float* grad_;
+  T* value_;
+  T* grad_;
   int64_t length_;
 };
 
+template <typename T>
 struct MatMul {
-  static void Forward(const Eigen::TensorMap<Tensor2D>& x1,
-                      const Eigen::TensorMap<Tensor2D>& x2,
-                      Eigen::TensorMap<Tensor2D>& y) {
+  static void Forward(typename TTypes<T>::ConstMatrix x1,
+                      typename TTypes<T>::ConstMatrix x2,
+                      typename TTypes<T>::Matrix y) {
     // x: [M, N], x2: [N, K], y: [M, K]
     CHECK_EQ(x1.dimension(0), y.dimension(0));
     CHECK_EQ(x1.dimension(1), x2.dimension(0));
@@ -176,11 +183,11 @@ struct MatMul {
     y.device(g_cpu_device) = x1.contract(x2, product_dims);
   }
 
-  static void Backward(const Eigen::TensorMap<Tensor2D>& x1,
-                       const Eigen::TensorMap<Tensor2D>& x2,
-                       const Eigen::TensorMap<Tensor2D>& y_grad,
-                       Eigen::TensorMap<Tensor2D>& x1_grad,
-                       Eigen::TensorMap<Tensor2D>& x2_grad) {
+  static void Backward(typename TTypes<T>::ConstMatrix x1,
+                       typename TTypes<T>::ConstMatrix x2,
+                       typename TTypes<T>::ConstMatrix y_grad,
+                       typename TTypes<T>::Matrix x1_grad,
+                       typename TTypes<T>::Matrix x2_grad) {
     // input:
     // x1: [M, N], x2:[N, K]
     // y_grad: [M, K]
@@ -210,10 +217,11 @@ struct MatMul {
   }
 };
 
+template <typename T>
 struct Residual {
-  static void Forward(const Eigen::TensorMap<Tensor1D>& x,
-                      const Eigen::TensorMap<Tensor1D>& Fx,
-                      Eigen::TensorMap<Tensor1D>& Hx) {
+  static void Forward(typename TTypes<T>::ConstFlat x,
+                      typename TTypes<T>::ConstFlat Fx,
+                      typename TTypes<T>::Flat Hx) {
     int N = x.size();
     CHECK(N == Fx.size() && N == Hx.size());
 
@@ -224,9 +232,9 @@ struct Residual {
     Hx.device(g_cpu_device) = x + Fx;
   }
 
-  static void Backward(const Eigen::TensorMap<Tensor1D>& Hx_grad,
-                       Eigen::TensorMap<Tensor1D> x_grad,
-                       Eigen::TensorMap<Tensor1D> Fx_grad) {
+  static void Backward(typename TTypes<T>::ConstFlat Hx_grad,
+                       typename TTypes<T>::Flat x_grad,
+                       typename TTypes<T>::Flat Fx_grad) {
     int N = Hx_grad.size();
     CHECK(N == x_grad.size() && N == Fx_grad.size());
 
@@ -239,6 +247,7 @@ struct Residual {
   }
 };
 
+template <typename T>
 struct Linear {
   Linear(int in_features, int out_features, bool bias = true)
       : in_features_(in_features),
@@ -253,8 +262,8 @@ struct Linear {
     }
   }
 
-  void Forward(const Eigen::TensorMap<Tensor2D>& x,
-               Eigen::TensorMap<Tensor2D>& y) const {
+  void Forward(typename TTypes<T>::ConstMatrix x,
+               typename TTypes<T>::Matrix y) const {
     // x: [B, in_features], y: [B, out_features]
     CHECK_EQ(x.dimension(1), in_features_);
     CHECK_EQ(y.dimension(1), out_features_);
@@ -276,9 +285,9 @@ struct Linear {
     }
   }
 
-  void Backward(const Eigen::TensorMap<Tensor2D>& x,
-                const Eigen::TensorMap<Tensor2D>& y_grad,
-                Eigen::TensorMap<Tensor2D>& x_grad) {
+  void Backward(typename TTypes<T>::ConstMatrix x,
+                typename TTypes<T>::ConstMatrix y_grad,
+                typename TTypes<T>::Matrix x_grad) {
     // x: [B, in_features], y_grad: [B, out_features], x_grad: [B, in_features]
     CHECK_EQ(x.dimension(1), in_features_);
     CHECK_EQ(y_grad.dimension(1), out_features_);
@@ -393,6 +402,7 @@ struct Embedding {
   std::unique_ptr<Parameter> weight_;
 };
 
+template <typename T>
 struct LayerNorm {
   LayerNorm(int normalized_shape)
       : normalized_shape_(normalized_shape), eps_(1e-5) {
@@ -404,20 +414,13 @@ struct LayerNorm {
     absl::c_fill(b, 0.0f);
   }
 
-  void Forward(const Eigen::Map<Matrix>& x, Eigen::Map<Matrix>& y,
-               Eigen::Map<Eigen::RowVectorXf>& mean,
-               Eigen::Map<Eigen::RowVectorXf>& rstd) {
+  void Forward(typename TTypes<T>::ConstMatrix x, typename TTypes<T>::Matrix y,
+               typename TTypes<T>::Flat mean, typename TTypes<T>::Flat rstd) {
     // x: [B, D], y: [B, D]
-    CHECK_EQ(x.cols(), normalized_shape_);
-    CHECK_EQ(y.cols(), normalized_shape_);
-    CHECK_EQ(x.rows(), y.rows());
-    int B = x.rows();
-
-    auto x2d = Eigen::TensorMap<Tensor2D>(const_cast<float*>(x.data()),
-                                          x.rows(), x.cols());
-    auto y2d = Eigen::TensorMap<Tensor2D>(y.data(), y.rows(), y.cols());
-    auto mean_1d = Eigen::TensorMap<Tensor1D>(mean.data(), mean.size());
-    auto rstd_1d = Eigen::TensorMap<Tensor1D>(rstd.data(), rstd.size());
+    CHECK_EQ(x.dimension(1), normalized_shape_);
+    CHECK_EQ(y.dimension(1), normalized_shape_);
+    CHECK_EQ(x.dimension(0), y.dimension(0));
+    int B = x.dimension(0);
 
     // mean: [B,], rstd: [B,]
     CHECK_EQ(mean.size(), B);
@@ -428,7 +431,7 @@ struct LayerNorm {
     */
 
     Eigen::array<Eigen::Index, 1> along_class = {1};
-    mean_1d.device(g_cpu_device) = x2d.mean(along_class);
+    mean.device(g_cpu_device) = x.mean(along_class);
 
     // x_zero_centered(B, D) = x.colwise() - m.transpose()
     // x_zero_centered_square(B, D) = x_zero_centered.array().square()
@@ -443,11 +446,11 @@ struct LayerNorm {
                .sqrt();
     */
 
-    int batch_size = x2d.dimension(0), num_class = x2d.dimension(1);
+    int batch_size = x.dimension(0), num_class = x.dimension(1);
     Eigen::array<Eigen::Index, 2> batch_by_one = {batch_size, 1};
     Eigen::array<Eigen::Index, 2> one_by_class = {1, num_class};
-    rstd_1d.device(g_cpu_device) =
-        ((x2d - mean_1d.reshape(batch_by_one).broadcast(one_by_class))
+    rstd.device(g_cpu_device) =
+        ((x - mean.reshape(batch_by_one).broadcast(one_by_class))
              .square()
              .mean(along_class) +
          eps_)
@@ -474,38 +477,31 @@ struct LayerNorm {
     auto weight_1d =
         Eigen::TensorMap<Tensor1D>(weight_->data(), normalized_shape_);
     auto bias_1d = Eigen::TensorMap<Tensor1D>(bias_->data(), normalized_shape_);
-    y2d.device(g_cpu_device) =
-        (x2d - mean_1d.reshape(batch_by_one).broadcast(one_by_class)) *
-            rstd_1d.reshape(batch_by_one).broadcast(one_by_class) *
+    y.device(g_cpu_device) =
+        (x - mean.reshape(batch_by_one).broadcast(one_by_class)) *
+            rstd.reshape(batch_by_one).broadcast(one_by_class) *
             weight_1d.reshape(one_by_class).broadcast(batch_by_one) +
         bias_1d.reshape(one_by_class).broadcast(batch_by_one);
   }
 
-  void Backward(const Eigen::Map<Matrix>& x, const Eigen::Map<Matrix>& y_grad,
-                const Eigen::Map<Eigen::RowVectorXf>& mean,
-                const Eigen::Map<Eigen::RowVectorXf>& rstd,
-                Eigen::Map<Matrix>& x_grad) {
+  void Backward(typename TTypes<T>::ConstMatrix x,
+                typename TTypes<T>::ConstMatrix y_grad,
+                typename TTypes<T>::ConstFlat mean,
+                typename TTypes<T>::ConstFlat rstd,
+                typename TTypes<T>::Matrix x_grad) {
     // x: [B, D], y_grad: [B, D], x_grad: [B, D]
-    CHECK_EQ(x.cols(), normalized_shape_);
-    CHECK_EQ(y_grad.cols(), normalized_shape_);
-    CHECK_EQ(x_grad.cols(), normalized_shape_);
-    CHECK_EQ(x.rows(), y_grad.rows());
-    CHECK_EQ(x.rows(), x_grad.rows());
-    int B = x.rows();
+    CHECK_EQ(x.dimension(1), normalized_shape_);
+    CHECK_EQ(y_grad.dimension(1), normalized_shape_);
+    CHECK_EQ(x_grad.dimension(1), normalized_shape_);
+    CHECK_EQ(x.dimension(0), y_grad.dimension(0));
+    CHECK_EQ(x.dimension(0), x_grad.dimension(0));
+    int B = x.dimension(0);
 
     // mean: [B,], rstd: [B,]
     CHECK_EQ(mean.size(), B);
     CHECK_EQ(rstd.size(), B);
 
-    auto x2d = Eigen::TensorMap<Tensor2D>(const_cast<float*>(x.data()),
-                                          x.rows(), x.cols());
-    auto y_grad_2d = Eigen::TensorMap<Tensor2D>(
-        const_cast<float*>(y_grad.data()), y_grad.rows(), y_grad.cols());
-    auto mean_1d = Eigen::TensorMap<Tensor1D>(const_cast<float*>(mean.data()),
-                                              mean.size());
-    auto rstd_1d = Eigen::TensorMap<Tensor1D>(const_cast<float*>(rstd.data()),
-                                              rstd.size());
-    int batch_size = x2d.dimension(0), num_class = x2d.dimension(1);
+    int batch_size = x.dimension(0), num_class = x.dimension(1);
     Eigen::array<Eigen::Index, 2> batch_by_one = {batch_size, 1};
     Eigen::array<Eigen::Index, 2> one_by_class = {1, num_class};
 
@@ -546,23 +542,21 @@ struct LayerNorm {
     */
 
     Tensor2D norm_2d =
-        (x2d - mean_1d.reshape(batch_by_one).broadcast(one_by_class)) *
-        rstd_1d.reshape(batch_by_one).broadcast(one_by_class);  // [B, D]
+        (x - mean.reshape(batch_by_one).broadcast(one_by_class)) *
+        rstd.reshape(batch_by_one).broadcast(one_by_class);  // [B, D]
     Tensor2D dnorm_2d =
-        y_grad_2d *
+        y_grad *
         weight_1d.reshape(one_by_class).broadcast(batch_by_one);  // [B, D]
     Eigen::array<Eigen::Index, 1> along_class = {1};
     Tensor1D dnorm_mean_1d = dnorm_2d.mean(along_class);  // [B,]
     Tensor1D dnorm_norm_mean_1d =
         (dnorm_2d * norm_2d).mean(along_class);  // [B,]
-    auto x_grad_2d =
-        Eigen::TensorMap<Tensor2D>(x_grad.data(), x_grad.rows(), x_grad.cols());
-    x_grad_2d.device(g_cpu_device) +=
+    x_grad.device(g_cpu_device) +=
         ((dnorm_2d -
           dnorm_mean_1d.reshape(batch_by_one).broadcast(one_by_class)) -
          norm_2d *
              dnorm_norm_mean_1d.reshape(batch_by_one).broadcast(one_by_class)) *
-        rstd_1d.reshape(batch_by_one).broadcast(one_by_class);
+        rstd.reshape(batch_by_one).broadcast(one_by_class);
 
     // w_grad = dL/dy * dy/dw
     //        = dL/dy * x_norm(B,D)
@@ -578,8 +572,7 @@ struct LayerNorm {
     */
 
     Eigen::array<Eigen::Index, 1> along_batch = {0};
-    weight_grad_1d.device(g_cpu_device) +=
-        (y_grad_2d * norm_2d).sum(along_batch);
+    weight_grad_1d.device(g_cpu_device) += (y_grad * norm_2d).sum(along_batch);
 
     // b_grad = dL/dy * dy/db
     //        = \sum_i^(B)(y_grad(B, D))
@@ -587,7 +580,7 @@ struct LayerNorm {
 
     //    bias_grad.noalias() += y_grad.colwise().sum();
 
-    bias_grad_1d.device(g_cpu_device) += y_grad_2d.sum(along_batch);
+    bias_grad_1d.device(g_cpu_device) += y_grad.sum(along_batch);
   }
 
   size_t NumParameters() const { return normalized_shape_ * 2; }
@@ -605,8 +598,9 @@ struct LayerNorm {
 
 // Careful there are a few versions of GeLU, this one is the exact one used by
 // OpenAI
+template <typename T>
 struct NewGELU {
-  void Forward(absl::Span<const float> x, absl::Span<float> y) {
+  void Forward(typename TTypes<T>::ConstFlat x, typename TTypes<T>::Flat y) {
     CHECK_EQ(x.size(), y.size());
     const float sqrt_2_over_pi = std::sqrt(M_2_PI);
 
@@ -618,17 +612,13 @@ struct NewGELU {
     //    }
 
     float coeff = 0.044715f;
-    auto input = Eigen::TensorMap<Tensor1D>(
-        const_cast<Tensor1D::Scalar*>(x.data()), x.size());
-    auto output = Eigen::TensorMap<Tensor1D>(y.data(), y.size());
-    output.device(g_cpu_device) =
-        0.5 * input *
-        (1.0 +
-         ((sqrt_2_over_pi * (input + coeff * input * input * input)).tanh()));
+    y.device(g_cpu_device) =
+        0.5 * x * (1.0 + ((sqrt_2_over_pi * (x + coeff * x * x * x)).tanh()));
   }
 
-  void Backward(absl::Span<const float> x, absl::Span<const float> y_grad,
-                absl::Span<float> x_grad) {
+  void Backward(typename TTypes<T>::ConstFlat x,
+                typename TTypes<T>::ConstFlat y_grad,
+                typename TTypes<T>::Flat x_grad) {
     CHECK_EQ(x.size(), y_grad.size());
     CHECK_EQ(x.size(), x_grad.size());
 
@@ -654,26 +644,22 @@ struct NewGELU {
 
     const float sqrt_2_over_pi = std::sqrt(M_2_PI);
     float coeff = 0.044715f;
-    auto input = Eigen::TensorMap<Tensor1D>(
-        const_cast<Tensor1D::Scalar*>(x.data()), x.size());
-    auto output_grad = Eigen::TensorMap<Tensor1D>(
-        const_cast<Tensor1D::Scalar*>(y_grad.data()), y_grad.size());
-    auto input_grad = Eigen::TensorMap<Tensor1D>(x_grad.data(), x_grad.size());
-    auto cube = coeff * input * input * input;
-    auto tanh_arg = sqrt_2_over_pi * (input + cube);
+    auto cube = coeff * x * x * x;
+    auto tanh_arg = sqrt_2_over_pi * (x + cube);
     auto tanh_out = tanh_arg.tanh();
     auto dydx = 0.5f * (1.0f + tanh_out) +
-                0.5f * input * (1.0f - tanh_out * tanh_out) *
-                    (sqrt_2_over_pi * (1.0f + 3.0f * coeff * input * input));
-    input_grad.device(g_cpu_device) += output_grad * dydx;
+                0.5f * x * (1.0f - tanh_out * tanh_out) *
+                    (sqrt_2_over_pi * (1.0f + 3.0f * coeff * x * x));
+    x_grad.device(g_cpu_device) += y_grad * dydx;
   }
 };
 
+template <typename T>
 struct Softmax {
   Softmax() {}
 
-  void Forward(const Eigen::TensorMap<Tensor2D>& x,
-               Eigen::TensorMap<Tensor2D>& y) {
+  void Forward(typename TTypes<T>::ConstMatrix x,
+               typename TTypes<T>::Matrix y) {
     // x: [B, D], y: [B, D]
     CHECK_EQ(x.dimension(0), y.dimension(0));
     CHECK_EQ(x.dimension(1), y.dimension(1));
@@ -736,9 +722,9 @@ struct Softmax {
     */
   }
 
-  void Backward(const Eigen::TensorMap<Tensor2D>& y,
-                const Eigen::TensorMap<Tensor2D>& y_grad,
-                Eigen::TensorMap<Tensor2D>& x_grad) {
+  void Backward(typename TTypes<T>::ConstMatrix y,
+                typename TTypes<T>::ConstMatrix y_grad,
+                typename TTypes<T>::Matrix x_grad) {
     // y:[B, D], y_grad: [B, D], x_grad: [B, D]
     int B = y.dimension(0), D = y.dimension(1);
     CHECK(B == y_grad.dimension(0) && B == x_grad.dimension(0));
@@ -788,16 +774,17 @@ struct Softmax {
   }
 };
 
+template <typename T>
 struct SoftmaxCrossEntropy {
   enum Reduction { MEAN, SUM };
 
   SoftmaxCrossEntropy(Reduction reduction = Reduction::MEAN)
       : reduction_(reduction) {
-    softmax_ = std::make_unique<Softmax>();
+    softmax_ = std::make_unique<Softmax<T>>();
   }
 
-  void Forward(const Eigen::TensorMap<Tensor2D>& logits,
-               absl::Span<const int> targets, Eigen::TensorMap<Tensor2D>& probs,
+  void Forward(typename TTypes<T>::ConstMatrix logits,
+               absl::Span<const int> targets, typename TTypes<T>::Matrix probs,
                float* loss) {
     // logits: [B, C], targets: [B,], probs:[B, C], loss: scalar
     int B = logits.dimension(0), C = logits.dimension(1);
@@ -819,9 +806,9 @@ struct SoftmaxCrossEntropy {
     }
   }
 
-  void Backward(const Eigen::TensorMap<Tensor2D>& probs,
+  void Backward(typename TTypes<T>::ConstMatrix probs,
                 absl::Span<const int> targets,
-                Eigen::TensorMap<Tensor2D>& logits_grad) {
+                typename TTypes<T>::Matrix logits_grad) {
     // probs: [B, C], targets: [B,]
     // logits_grad: [B, C]
     int B = probs.dimension(0), C = probs.dimension(1);
@@ -841,16 +828,17 @@ struct SoftmaxCrossEntropy {
   }
 
   Reduction reduction_;
-  std::unique_ptr<Softmax> softmax_;
+  std::unique_ptr<Softmax<T>> softmax_;
 };
 
+template <typename T>
 struct VanillaCrossEntropy {
   enum Reduction { MEAN, SUM };
 
   VanillaCrossEntropy(Reduction reduction = Reduction::MEAN)
       : reduction_(reduction) {}
 
-  void Forward(const Eigen::TensorMap<Tensor2D>& probs,
+  void Forward(typename TTypes<T>::ConstMatrix probs,
                absl::Span<const int> targets, float* loss) {
     // probs:[B, C], targets: [B,] loss: scalar
     int B = probs.dimension(0), C = probs.dimension(1);
@@ -867,9 +855,9 @@ struct VanillaCrossEntropy {
     }
   }
 
-  void Backward(const Eigen::TensorMap<Tensor2D>& probs,
+  void Backward(typename TTypes<T>::ConstMatrix probs,
                 absl::Span<const int> targets,
-                Eigen::TensorMap<Tensor2D>& probs_grad) {
+                typename TTypes<T>::Matrix probs_grad) {
     // probs: [B, C], targets: [B,]
     // probs_grad: [B, C]
     int B = probs.dimension(0), C = probs.dimension(1);

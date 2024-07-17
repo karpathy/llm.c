@@ -72,10 +72,10 @@ loss.backward()
 
   // forward
   std::vector<float> y(M * K);
-  auto x1m = Eigen::TensorMap<nn::Tensor2D>(x1.data(), M, N);
-  auto x2m = Eigen::TensorMap<nn::Tensor2D>(x2.data(), N, K);
-  auto ym = Eigen::TensorMap<nn::Tensor2D>(y.data(), M, K);
-  nn::MatMul::Forward(x1m, x2m, ym);
+  auto x1m = MakeConstMatrix(x1.data(), M, N);
+  auto x2m = MakeConstMatrix(x2.data(), N, K);
+  auto ym = MakeMatrix(y.data(), M, K);
+  nn::MatMul<float>::Forward(x1m, x2m, ym);
 
   std::vector<float> expected_y = {0.556428, -0.253943, 1.119845, -1.617147,
                                    3.693071, -3.965338, 0.837917, 0.722053};
@@ -86,10 +86,10 @@ loss.backward()
   // backward
   std::vector<float> y_grad(y.size(), 1.0);
   std::vector<float> x1_grad(x1.size(), 0.0), x2_grad(x2.size(), 0.0);
-  auto y_gradm = Eigen::TensorMap<nn::Tensor2D>(y_grad.data(), M, K);
-  auto x1_gradm = Eigen::TensorMap<nn::Tensor2D>(x1_grad.data(), M, N);
-  auto x2_gradm = Eigen::TensorMap<nn::Tensor2D>(x2_grad.data(), N, K);
-  nn::MatMul::Backward(x1m, x2m, y_gradm, x1_gradm, x2_gradm);
+  auto y_gradm = MakeConstMatrix(y_grad.data(), M, K);
+  auto x1_gradm = MakeMatrix(x1_grad.data(), M, N);
+  auto x2_gradm = MakeMatrix(x2_grad.data(), N, K);
+  nn::MatMul<float>::Backward(x1m, x2m, y_gradm, x1_gradm, x2_gradm);
 
   std::vector<float> expected_x1_grad = {
       -0.579509, -0.030988, 2.139325, -0.579509, -0.030988, 2.139325,
@@ -119,15 +119,15 @@ loss.backward()
 
   nn::ManualSeed(42);
   int B = 4, in_features = 3, out_features = 2;
-  nn::Linear m(in_features, out_features, true);
+  nn::Linear<float> m(in_features, out_features, true);
   std::vector<float> x = {-1.122856, -0.186328, 2.208201,  -0.637997,
                           0.461657,  0.267351,  0.534905,  0.809357,
                           1.110290,  -1.689799, -0.988960, 0.957972};
 
   // forward
   std::vector<float> y(8);
-  auto xm = Eigen::TensorMap<nn::Tensor2D>(x.data(), B, in_features);
-  auto ym = Eigen::TensorMap<nn::Tensor2D>(y.data(), B, out_features);
+  auto xm = MakeConstMatrix(x.data(), B, in_features);
+  auto ym = MakeMatrix(y.data(), B, out_features);
   m.Forward(xm, ym);
 
   std::vector<float> expected_y = {-1.164687, 0.024384, -0.377635, -0.026553,
@@ -139,8 +139,8 @@ loss.backward()
   // backward
   std::vector<float> y_grad(y.size(), 1.0f);
   std::vector<float> x_grad(x.size(), 0.f);
-  auto y_gradm = Eigen::TensorMap<nn::Tensor2D>(y_grad.data(), B, out_features);
-  auto x_gradm = Eigen::TensorMap<nn::Tensor2D>(x_grad.data(), B, in_features);
+  auto y_gradm = MakeConstMatrix(y_grad.data(), B, out_features);
+  auto x_gradm = MakeMatrix(x_grad.data(), B, in_features);
   m.Backward(xm, y_gradm, x_gradm);
 
   std::vector<float> expected_w_grad = {-2.915748, 0.095726, 4.543815,
@@ -217,13 +217,13 @@ loss.backward()
   int batch = 4, sentence_length = 16, embedding_dim = 4;
   std::vector<float> x(batch * sentence_length * embedding_dim);
   nn::NormalFill(absl::MakeSpan(x));
-  Eigen::Map<nn::Matrix> x_m(x.data(), batch * sentence_length, embedding_dim);
+  auto x_m = MakeConstMatrix(x.data(), batch * sentence_length, embedding_dim);
   int row_size = batch * sentence_length;
   std::vector<float> y(x.size(), 0), mean(row_size, 0), rstd(row_size, 0);
-  Eigen::Map<nn::Matrix> y_m(y.data(), row_size, embedding_dim);
-  Eigen::Map<Eigen::RowVectorXf> mean_m(mean.data(), row_size),
-      rstd_m(rstd.data(), row_size);
-  auto m = nn::LayerNorm(embedding_dim);
+  auto y_m = MakeMatrix(y.data(), row_size, embedding_dim);
+  auto mean_m = MakeFlat(mean.data(), row_size);
+  auto rstd_m = MakeFlat(rstd.data(), row_size);
+  auto m = nn::LayerNorm<float>(embedding_dim);
   m.Forward(x_m, y_m, mean_m, rstd_m);
   std::vector<float> expected_y = {
       0.871568,  0.592812,  0.220889,  -1.685270, 1.343979,  -0.747299,
@@ -275,9 +275,11 @@ loss.backward()
 
   // backward
   std::vector<float> y_grad(x.size(), 1.0), x_grad(x.size(), 0);
-  Eigen::Map<nn::Matrix> y_grad_m(y_grad.data(), row_size, embedding_dim);
-  Eigen::Map<nn::Matrix> x_grad_m(x_grad.data(), row_size, embedding_dim);
-  m.Backward(x_m, y_grad_m, mean_m, rstd_m, x_grad_m);
+  auto y_grad_m = MakeConstMatrix(y_grad.data(), row_size, embedding_dim);
+  auto x_grad_m = MakeMatrix(x_grad.data(), row_size, embedding_dim);
+  auto mean_const = MakeConstFlat(mean.data(), row_size);
+  auto rstd_const = MakeConstFlat(rstd.data(), row_size);
+  m.Backward(x_m, y_grad_m, mean_const, rstd_const, x_grad_m);
 
   std::vector<float>
       expected_w_grad = {-13.071318, 11.136637, -13.703045, 15.637726},
@@ -383,15 +385,17 @@ loss.backward()
                                    -0.147006, -0.079394, 2.178409, -0.167029,
                                    0.312915,  0.161853,  0.376359, 0.639989};
   std::vector<float> y(x.size(), 0);
-  nn::NewGELU m;
-  m.Forward(x, absl::MakeSpan(y));
+  nn::NewGELU<float> m;
+  m.Forward(MakeConstFlat(x.data(), x.size()), MakeFlat(y.data(), y.size()));
   for (size_t i = 0; i < expected_y.size(); ++i) {
     EXPECT_NEAR(expected_y[i], y[i], 1e-5);
   }
 
   // backward
   std::vector<float> y_grad(x.size(), 1.0f), x_grad(x.size(), 0.f);
-  m.Backward(x, y_grad, absl::MakeSpan(x_grad));
+  m.Backward(MakeConstFlat(x.data(), x.size()),
+             MakeConstFlat(y_grad.data(), y_grad.size()),
+             MakeFlat(x_grad.data(), x_grad.size()));
   std::vector<float> expected_x_grad = {
       0.758699, 0.602206, 0.683672, 0.680552, -0.107435, 0.353047,
       1.064087, 0.054299, 0.843291, 0.708290, 0.888446,  1.023232};
@@ -426,17 +430,17 @@ loss.backward()
   nn::NormalFill(absl::MakeSpan(logits));
   std::vector<int> target = {1, 2, 1, 0};
 
-  auto logits_m = Eigen::TensorMap<nn::Tensor2D>(logits.data(), batch, dim);
-  auto probs_m = Eigen::TensorMap<nn::Tensor2D>(probs.data(), batch, dim);
+  auto logits_m = MakeConstMatrix(logits.data(), batch, dim);
+  auto probs_m = MakeMatrix(probs.data(), batch, dim);
   float loss1 = 0.0, loss2 = 0.0;
 
   // Reduction: MEAN
-  nn::SoftmaxCrossEntropy criterion1(nn::SoftmaxCrossEntropy::MEAN);
+  nn::SoftmaxCrossEntropy<float> criterion1;
   criterion1.Forward(logits_m, absl::MakeSpan(target), probs_m, &loss1);
 
-  auto logits_grad_m =
-      Eigen::TensorMap<nn::Tensor2D>(logits_grad.data(), batch, dim);
-  criterion1.Backward(probs_m, absl::MakeSpan(target), logits_grad_m);
+  auto probs_const = MakeConstMatrix(probs.data(), batch, dim);
+  auto logits_grad_m = MakeMatrix(logits_grad.data(), batch, dim);
+  criterion1.Backward(probs_const, absl::MakeSpan(target), logits_grad_m);
 
   std::vector<float> expected_logits_grad1 = {
       0.092077, -0.175206, 0.083129, 0.130367,  0.033689, -0.164056,
@@ -447,12 +451,13 @@ loss.backward()
   }
 
   // Reduction: SUM
-  nn::SoftmaxCrossEntropy criterion2(nn::SoftmaxCrossEntropy::SUM);
+  nn::SoftmaxCrossEntropy<float> criterion2(
+      nn::SoftmaxCrossEntropy<float>::SUM);
   criterion2.Forward(logits_m, absl::MakeSpan(target), probs_m, &loss2);
   EXPECT_NEAR(loss1 * batch, loss2, 1e-5);
 
   logits_grad_m.setZero();
-  criterion2.Backward(probs_m, absl::MakeSpan(target), logits_grad_m);
+  criterion2.Backward(probs_const, absl::MakeSpan(target), logits_grad_m);
   std::vector<float> expected_logits_grad2 = {
       0.368307, -0.700823, 0.332516, 0.521469,  0.134755, -0.656224,
       0.811398, -0.952886, 0.141488, -0.751628, 0.324564, 0.427064};
@@ -488,22 +493,22 @@ loss.backward()
   nn::NormalFill(absl::MakeSpan(logits));
   std::vector<int> target = {1, 2, 1, 0};
 
-  auto logits_m = Eigen::TensorMap<nn::Tensor2D>(logits.data(), batch, dim);
-  auto probs_m = Eigen::TensorMap<nn::Tensor2D>(probs.data(), batch, dim);
+  auto logits_m = MakeConstMatrix(logits.data(), batch, dim);
+  auto probs_m = MakeMatrix(probs.data(), batch, dim);
+  auto probs_const = MakeConstMatrix(probs.data(), batch, dim);
   float loss1 = 0.0, loss2 = 0.0;
 
   // Reduction: MEAN
-  nn::Softmax softmax;
-  nn::VanillaCrossEntropy criterion1(nn::VanillaCrossEntropy::MEAN);
+  nn::Softmax<float> softmax;
+  nn::VanillaCrossEntropy<float> criterion1;
   softmax.Forward(logits_m, probs_m);
-  criterion1.Forward(probs_m, absl::MakeSpan(target), &loss1);
+  criterion1.Forward(probs_const, absl::MakeSpan(target), &loss1);
 
-  auto logits_grad_m =
-      Eigen::TensorMap<nn::Tensor2D>(logits_grad.data(), batch, dim);
-  auto probs_grad_m =
-      Eigen::TensorMap<nn::Tensor2D>(probs_grad.data(), batch, dim);
-  criterion1.Backward(probs_m, absl::MakeSpan(target), probs_grad_m);
-  softmax.Backward(probs_m, probs_grad_m, logits_grad_m);
+  auto logits_grad_m = MakeMatrix(logits_grad.data(), batch, dim);
+  auto probs_grad_m = MakeMatrix(probs_grad.data(), batch, dim);
+  auto probs_grad_const = MakeConstMatrix(probs_grad.data(), batch, dim);
+  criterion1.Backward(probs_const, absl::MakeSpan(target), probs_grad_m);
+  softmax.Backward(probs_const, probs_grad_const, logits_grad_m);
 
   std::vector<float> expected_logits_grad1 = {
       0.092077, -0.175206, 0.083129, 0.130367,  0.033689, -0.164056,
@@ -514,15 +519,16 @@ loss.backward()
   }
 
   // Reduction: SUM
-  nn::VanillaCrossEntropy criterion2(nn::VanillaCrossEntropy::SUM);
+  nn::VanillaCrossEntropy<float> criterion2(
+      nn::VanillaCrossEntropy<float>::SUM);
   softmax.Forward(logits_m, probs_m);
-  criterion2.Forward(probs_m, absl::MakeSpan(target), &loss2);
+  criterion2.Forward(probs_const, absl::MakeSpan(target), &loss2);
   EXPECT_NEAR(loss1 * batch, loss2, 1e-5);
 
   logits_grad_m.setZero();
   probs_grad_m.setZero();
-  criterion2.Backward(probs_m, absl::MakeSpan(target), probs_grad_m);
-  softmax.Backward(probs_m, probs_grad_m, logits_grad_m);
+  criterion2.Backward(probs_const, absl::MakeSpan(target), probs_grad_m);
+  softmax.Backward(probs_const, probs_grad_const, logits_grad_m);
   std::vector<float> expected_logits_grad2 = {
       0.368307, -0.700823, 0.332516, 0.521469,  0.134755, -0.656224,
       0.811398, -0.952886, 0.141488, -0.751628, 0.324564, 0.427064};
