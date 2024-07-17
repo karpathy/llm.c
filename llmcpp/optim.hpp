@@ -40,8 +40,8 @@ struct AdamW {
         eps_(eps),
         weight_decay_(weight_decay) {
     for (const auto& parameter : parameters_) {
-      m_.emplace_back(parameter->size());
-      v_.emplace_back(parameter->size());
+      m_.emplace_back(std::make_unique<nn::Parameter>(parameter->size()));
+      v_.emplace_back(std::make_unique<nn::Parameter>(parameter->size()));
     }
   }
 
@@ -55,8 +55,8 @@ struct AdamW {
     for (size_t i = 0; i < parameters_.size(); ++i) {
       auto parameter = parameters_[i]->View();
       auto gradient = parameters_[i]->View(nn::Parameter::kGrad);
-      auto momentum = m_[i].View();
-      auto velocity = v_[i].View();
+      auto momentum = m_[i]->View();
+      auto velocity = v_[i]->View();
       for (size_t j = 0; j < parameter.size(); ++j) {
         float grad = gradient[j];
         float param = parameter[j];
@@ -80,8 +80,8 @@ struct AdamW {
 
  private:
   std::vector<nn::Parameter*> parameters_;
-  std::vector<nn::Parameter> m_;
-  std::vector<nn::Parameter> v_;
+  std::vector<std::unique_ptr<nn::Parameter>> m_;
+  std::vector<std::unique_ptr<nn::Parameter>> v_;
   float lr_;
   float beta1_;
   float beta2_;

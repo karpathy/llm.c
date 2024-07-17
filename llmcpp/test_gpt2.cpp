@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
   GPT2 model;
   gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
-  gpt2::GPT2 model_cpp;
+  gpt2::GPT2<float> model_cpp;
   model_cpp.BuildFromCheckpoint("gpt2_124M.bin");
 
   int C = model.config.channels;
@@ -116,10 +116,10 @@ int main(int argc, char** argv) {
                                1.3946564197540283, 0.9991465210914612,
                                0.6240804195404053, 0.37651097774505615};
 
-  auto idx = Eigen::Map<nn::MatrixInt>(x, B, T);
-  auto target = Eigen::Map<nn::MatrixInt>(y, B, T);
+  auto idx = TTypes<int>::ConstMatrix(x, B, T);
+  auto target = TTypes<int>::ConstMatrix(y, B, T);
   float* calculated_logits = (float*)malloc(B * T * V * sizeof(float));
-  auto logit_3d = Eigen::TensorMap<nn::Tensor3D>(calculated_logits, B, T, V);
+  auto logit_3d = Make3DTensor(calculated_logits, B, T, V);
   std::vector<nn::Parameter*> parameters;
   model_cpp.Parameters(&parameters);
   size_t num_parameters = 0;

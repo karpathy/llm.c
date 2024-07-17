@@ -15,6 +15,7 @@ struct GPT2Config {
   int channels;           // number of channels, e.g. 768
 };
 
+template <typename Type>
 struct GPT2 {
   void BuildFromCheckpoint(absl::string_view checkpoint_path) {
     // read in model from a checkpoint file
@@ -52,7 +53,7 @@ struct GPT2 {
     printf("num_heads: %zu\n", NH);
     printf("channels: %zu\n", C);
 
-    gpt2_ = std::make_unique<gpt::GPT>(
+    gpt2_ = std::make_unique<gpt::GPT<Type>>(
         config.max_seq_len, config.vocab_size, config.padded_vocab_size,
         config.num_layers, config.num_heads, config.channels);
     // allocate space for all the parameters and read them in
@@ -72,7 +73,8 @@ struct GPT2 {
     ApplyFn(collect_fn, config.num_layers);
   }
 
-  void Parameters(std::unordered_map<std::string , nn::Parameter*>* parameters) const {
+  void Parameters(
+      std::unordered_map<std::string, nn::Parameter*>* parameters) const {
     auto collect_fn = [&](nn::Parameter* p, const std::string& name) {
       parameters->insert({name, p});
     };
@@ -180,7 +182,7 @@ struct GPT2 {
   }
 
   GPT2Config config;
-  std::unique_ptr<gpt::GPT> gpt2_;
+  std::unique_ptr<gpt::GPT<Type>> gpt2_;
 };
 }  // namespace gpt2
 

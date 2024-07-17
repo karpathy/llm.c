@@ -42,59 +42,69 @@ namespace gpt {
           t.dimension(3) == D);                                                \
   } while (false)
 
+template <typename T>
 struct MLP {
   explicit MLP(int n_embed) : n_embed_(n_embed) {
-    c_fc_ = std::make_unique<nn::Linear>(n_embed, 4 * n_embed);
-    gelu_ = std::make_unique<nn::NewGELU>();
-    c_proj_ = std::make_unique<nn::Linear>(4 * n_embed, n_embed);
+    c_fc_ = std::make_unique<nn::Linear<T>>(n_embed, 4 * n_embed);
+    gelu_ = std::make_unique<nn::NewGELU<T>>();
+    c_proj_ = std::make_unique<nn::Linear<T>>(4 * n_embed, n_embed);
   }
 
-  void Forward(const Eigen::Map<nn::Matrix>& x, Eigen::Map<nn::Matrix>& y) {
+  void Forward(typename TTypes<T>::ConstMatrix x,
+               typename TTypes<T>::Matrix y) {
     // x: [B*T, n_embed], y: [B*T, n_embed]
-    CHECK_EQ(x.cols(), n_embed_);
+    CHECK_EQ(x.dimension(1), n_embed_);
     // x.shape == y.shape
-    CHECK_EQ(x.rows(), y.rows());
-    CHECK_EQ(x.cols(), y.cols());
+    CHECK_EQ(x.dimension(0), y.dimension(0));
+    CHECK_EQ(x.dimension(1), y.dimension(1));
 
-    LAZY_ALLOCATE_MATRIX(fch_, x.rows(), 4 * n_embed_);
-    LAZY_ALLOCATE_MATRIX(fch_gelu_, x.rows(), 4 * n_embed_);
+    LAZY_ALLOCATE_MATRIX(fch_, x.dimension(0), 4 * n_embed_);
+    LAZY_ALLOCATE_MATRIX(fch_gelu_, x.dimension(0), 4 * n_embed_);
 
     // forward
-    Eigen::Map<nn::Matrix> fch(fch_.data(), fch_.rows(), fch_.cols());
-    Eigen::Map<nn::Matrix> fch_gelu(fch_gelu_.data(), fch_gelu_.rows(),
-                                    fch_gelu_.cols());
+    auto fch = MakeMatrix(fch_.data(), fch_.rows(), fch_.cols());
+    auto fch_gelu =
+        MakeMatrix(fch_gelu_.data(), fch_gelu_.rows(), fch_gelu_.cols());
     c_fc_->Forward(x, fch);
-    gelu_->Forward(absl::MakeSpan(fch.data(), fch.size()),
-                   absl::MakeSpan(fch_gelu.data(), fch_gelu.size()));
-    c_proj_->Forward(fch_gelu, y);
+    gelu_->Forward(MakeConstFlat(fch.data(), fch.size()),
+                   MakeFlat(fch_gelu.data(), fch_gelu.size()));
+    auto fch_gelu_const =
+        MakeConstMatrix(fch_gelu_.data(), fch_gelu_.rows(), fch_gelu_.cols());
+    c_proj_->Forward(fch_gelu_const, y);
   }
 
-  void Backward(const Eigen::Map<nn::Matrix>& x,
-                const Eigen::Map<nn::Matrix>& y_grad,
-                Eigen::Map<nn::Matrix>& x_grad) {
+  void Backward(typename TTypes<T>::ConstMatrix x,
+                typename TTypes<T>::ConstMatrix y_grad,
+                typename TTypes<T>::Matrix x_grad) {
     // x: [B*T, n_embed], y_grad: [B*T, n_embed], x_grad: [B*T, n_embed]
-    CHECK_EQ(x.cols(), n_embed_);
+    CHECK_EQ(x.dimension(1), n_embed_);
     // x.shape == y_grad.shape == x_grad.shape
-    CHECK_EQ(x.rows(), y_grad.rows());
-    CHECK_EQ(x.cols(), y_grad.cols());
-    CHECK_EQ(x.rows(), x_grad.rows());
-    CHECK_EQ(x.cols(), x_grad.cols());
+    CHECK_EQ(x.dimension(0), y_grad.dimension(0));
+    CHECK_EQ(x.dimension(1), y_grad.dimension(1));
+    CHECK_EQ(x.dimension(0), x_grad.dimension(0));
+    CHECK_EQ(x.dimension(1), x_grad.dimension(1));
 
     // Lazily allocate the memory for activation
-    LAZY_ALLOCATE_MATRIX(fch_grad_, x.rows(), 4 * n_embed_);
-    LAZY_ALLOCATE_MATRIX(fch_gelu_grad_, x.rows(), 4 * n_embed_);
+    LAZY_ALLOCATE_MATRIX(fch_grad_, x.dimension(0), 4 * n_embed_);
+    LAZY_ALLOCATE_MATRIX(fch_gelu_grad_, x.dimension(0), 4 * n_embed_);
     fch_grad_.setZero();
     fch_gelu_grad_.setZero();
 
-    Eigen::Map<nn::Matrix> fch_gelu = nn::GetMatrixMap(fch_gelu_);
-    Eigen::Map<nn::Matrix> fch_gelu_grad = nn::GetMatrixMap(fch_gelu_grad_);
+    auto fch_gelu =
+        MakeConstMatrix(fch_gelu_.data(), fch_gelu_.rows(), fch_gelu_.cols());
+    auto fch_gelu_grad = MakeMatrix(
+        fch_gelu_grad_.data(), fch_gelu_grad_.rows(), fch_gelu_grad_.cols());
     c_proj_->Backward(fch_gelu, y_grad, fch_gelu_grad);
 
-    auto fch = absl::MakeSpan(fch_);
-    Eigen::Map<nn::Matrix> fch_grad = nn::GetMatrixMap(fch_grad_);
-    gelu_->Backward(fch, fch_gelu_grad, absl::MakeSpan(fch_grad));
+    auto fch = MakeConstFlat(fch_.data(), fch_.size());
+    auto fch_gelu_grad_flat =
+        MakeConstFlat(fch_gelu_grad_.data(), fch_gelu_grad_.size());
+    auto fch_grad = MakeFlat(fch_grad_.data(), fch_grad_.size());
+    gelu_->Backward(fch, fch_gelu_grad_flat, fch_grad);
 
-    c_fc_->Backward(x, fch_grad, x_grad);
+    auto fch_grad_const =
+        MakeConstMatrix(fch_grad_.data(), fch_grad_.rows(), fch_grad_.cols());
+    c_fc_->Backward(x, fch_grad_const, x_grad);
   }
 
   size_t NumParameters() const {
@@ -107,35 +117,36 @@ struct MLP {
   }
 
   int n_embed_;
-  std::unique_ptr<nn::Linear> c_fc_;
-  std::unique_ptr<nn::NewGELU> gelu_;
-  std::unique_ptr<nn::Linear> c_proj_;
+  std::unique_ptr<nn::Linear<T>> c_fc_;
+  std::unique_ptr<nn::NewGELU<T>> gelu_;
+  std::unique_ptr<nn::Linear<T>> c_proj_;
 
   // activation tensors
   nn::Matrix fch_, fch_grad_;            // [B*T, 4*C]
   nn::Matrix fch_gelu_, fch_gelu_grad_;  // [B*T, 4*C]
 };
 
+template <typename Type>
 struct CausalSelfAttention {
   CausalSelfAttention(int block_size, int n_head, int n_embed)
       : n_head_(n_head), n_embed_(n_embed) {
     CHECK_EQ(n_embed % n_head, 0);
 
     // key, query, value projections for all heads, but in a batch
-    c_attn_ = std::make_unique<nn::Linear>(n_embed, 3 * n_embed);
+    c_attn_ = std::make_unique<nn::Linear<Type>>(n_embed, 3 * n_embed);
 
     // output projection
-    c_proj_ = std::make_unique<nn::Linear>(n_embed, n_embed);
+    c_proj_ = std::make_unique<nn::Linear<Type>>(n_embed, n_embed);
 
-    softmax_ = std::make_unique<nn::Softmax>(true);
+    softmax_ = std::make_unique<nn::Softmax<Type>>();
 
     // mask
     bias_ = Eigen::MatrixXi::Ones(block_size, block_size)
                 .triangularView<Eigen::Lower>();
   }
 
-  void Forward(const Eigen::TensorMap<nn::Tensor3D>& x,
-               Eigen::TensorMap<nn::Tensor3D>& y) {
+  void Forward(typename TTypes<Type, 3>::ConstTensor x,
+               typename TTypes<Type, 3>::Tensor y) {
     const int B = x.dimension(0);  // batch size
     const int T = x.dimension(1);  // sequence length
     const int C = x.dimension(2);  // embedding dimensionality (n_embd)
@@ -154,8 +165,8 @@ struct CausalSelfAttention {
     LAZY_ALLOCATE_TENSOR4D(att_, B, NH, T, HS);
     LAZY_ALLOCATE_TENSOR4D(att2_, B, T, NH, HS);
 
-    auto _x = Eigen::Map<nn::Matrix>(x.data(), B * T, C);
-    auto qkv = Eigen::Map<nn::Matrix>(qkv_.data(), B * T, 3 * C);
+    auto _x = MakeConstMatrix(x.data(), B * T, C);
+    auto qkv = MakeMatrix(qkv_.data(), B * T, 3 * C);
     c_attn_->Forward(_x, qkv);
 
     Eigen::array<Eigen::Index, 3> offsets_q = {0, 0, 0};
@@ -181,20 +192,17 @@ struct CausalSelfAttention {
     const float factor = 1.0f / std::sqrt(static_cast<float>(HS));
     for (int b = 0; b < B; ++b) {
       for (int h = 0; h < NH; ++h) {
-        auto q2d =
-            Eigen::Map<nn::Matrix>(q_.data() + (b * NH + h) * T * HS, T, HS);
-        auto k2d =
-            Eigen::Map<nn::Matrix>(k_.data() + (b * NH + h) * HS * T, HS, T);
-        auto v2d =
-            Eigen::Map<nn::Matrix>(v_.data() + (b * NH + h) * T * HS, T, HS);
-        auto preatt2d =
-            Eigen::Map<nn::Matrix>(preatt_.data() + (b * NH + h) * T * T, T, T);
-        auto preatt_softmax2d = Eigen::Map<nn::Matrix>(
+        auto q2d = MakeConstMatrix(q_.data() + (b * NH + h) * T * HS, T, HS);
+        auto k2d = MakeConstMatrix(k_.data() + (b * NH + h) * HS * T, HS, T);
+        auto v2d = MakeMatrix(v_.data() + (b * NH + h) * T * HS, T, HS);
+        auto preatt2d = MakeMatrix(preatt_.data() + (b * NH + h) * T * T, T, T);
+        auto preatt_softmax2d = MakeConstMatrix(
             preatt_softmax_.data() + (b * NH + h) * T * T, T, T);
-        auto att2d =
-            Eigen::Map<nn::Matrix>(att_.data() + (b * NH + h) * T * HS, T, HS);
+        auto att2d = MakeMatrix(att_.data() + (b * NH + h) * T * HS, T, HS);
 
-        preatt2d.noalias() = (q2d * k2d) * factor;
+        //        preatt2d.noalias() = (q2d * k2d) * factor;
+        nn::MatMul<Type>::Forward(q2d, k2d, preatt2d);
+        preatt2d = preatt2d * factor;
         for (int i = 0; i < T; ++i) {
           for (int j = 0; j < T; ++j) {
             if (!bias_(i, j)) {
@@ -204,24 +212,30 @@ struct CausalSelfAttention {
         }
 
         // softmax
-        softmax_->Forward(preatt2d, preatt_softmax2d);
+        auto preatt2d_tensor =
+            MakeConstMatrix(preatt_.data() + (b * NH + h) * T * T, T, T);
+        auto preatt_softmax2d_tensor =
+            MakeMatrix(preatt_softmax_.data() + (b * NH + h) * T * T, T, T);
+        softmax_->Forward(preatt2d_tensor, preatt_softmax2d_tensor);
 
         // att * v
-        att2d = preatt_softmax2d * v2d;
+        //        att2d = preatt_softmax2d * v2d;
+        typename TTypes<Type>::ConstMatrix v2d_const =
+            MakeConstMatrix(v_.data() + (b * NH + h) * T * HS, T, HS);
+        nn::MatMul<Type>::Forward(preatt_softmax2d, v2d_const, att2d);
       }
     }
 
     Eigen::array<Eigen::Index, 4> shuffle_att = {0, 2, 1, 3};
     att2_ = att_.shuffle(shuffle_att);  // [B, T, NH, HS]
-    auto att2_2d = Eigen::Map<nn::Matrix>(att2_.data(), B * T, C);
-
-    auto y2d = Eigen::Map<nn::Matrix>(y.data(), B * T, C);
+    auto att2_2d = MakeConstMatrix(att2_.data(), B * T, C);
+    auto y2d = MakeMatrix(y.data(), B * T, C);
     c_proj_->Forward(att2_2d, y2d);
   }
 
-  void Backward(const Eigen::TensorMap<nn::Tensor3D>& x,
-                const Eigen::TensorMap<nn::Tensor3D>& y_grad,
-                Eigen::TensorMap<nn::Tensor3D>& x_grad) {
+  void Backward(typename TTypes<Type, 3>::ConstTensor x,
+                typename TTypes<Type, 3>::ConstTensor y_grad,
+                typename TTypes<Type, 3>::Tensor x_grad) {
     const int B = x.dimension(0);  // batch size
     const int T = x.dimension(1);  // sequence length
     const int C = x.dimension(2);  // embedding dimensionality (n_embd)
@@ -249,9 +263,9 @@ struct CausalSelfAttention {
     att2_grad_.setZero();
 
     // attproj backward
-    auto att2_2d = Eigen::Map<nn::Matrix>(att2_.data(), B * T, C);
-    auto y_grad_2d = Eigen::Map<nn::Matrix>(y_grad.data(), B * T, C);
-    auto att2_grad_2d = Eigen::Map<nn::Matrix>(att2_grad_.data(), B * T, C);
+    auto att2_2d = MakeConstMatrix(att2_.data(), B * T, C);
+    auto y_grad_2d = MakeConstMatrix(y_grad.data(), B * T, C);
+    auto att2_grad_2d = MakeMatrix(att2_grad_.data(), B * T, C);
     c_proj_->Backward(att2_2d, y_grad_2d, att2_grad_2d);
 
     // shuffle backward
@@ -259,45 +273,53 @@ struct CausalSelfAttention {
     att_grad_ = att2_grad_.shuffle(shuffle_att);  // [B, NH, T, HS]
 
     // attention backward
-    const float factor = 1.0f / std::sqrt(static_cast<float>(HS));
+    float factor = 1.0f / std::sqrt(static_cast<float>(HS));
     for (int b = 0; b < B; ++b) {
       for (int h = 0; h < NH; ++h) {
-        auto q2d =
-            Eigen::Map<nn::Matrix>(q_.data() + (b * NH + h) * T * HS, T, HS);
-        auto q_grad2d = Eigen::Map<nn::Matrix>(
-            q_grad_.data() + (b * NH + h) * T * HS, T, HS);
-        auto k2d =
-            Eigen::Map<nn::Matrix>(k_.data() + (b * NH + h) * HS * T, HS, T);
-        auto k_grad2d = Eigen::Map<nn::Matrix>(
-            k_grad_.data() + (b * NH + h) * HS * T, HS, T);
-        auto v2d =
-            Eigen::Map<nn::Matrix>(v_.data() + (b * NH + h) * T * HS, T, HS);
-        auto v_grad2d = Eigen::Map<nn::Matrix>(
-            v_grad_.data() + (b * NH + h) * T * HS, T, HS);
+        auto q2d = MakeConstMatrix(q_.data() + (b * NH + h) * T * HS, T, HS);
+        auto q_grad2d =
+            MakeMatrix(q_grad_.data() + (b * NH + h) * T * HS, T, HS);
+        auto k2d = MakeConstMatrix(k_.data() + (b * NH + h) * HS * T, HS, T);
+        auto k_grad2d =
+            MakeMatrix(k_grad_.data() + (b * NH + h) * HS * T, HS, T);
+        auto v2d = MakeConstMatrix(v_.data() + (b * NH + h) * T * HS, T, HS);
+        auto v_grad2d =
+            MakeMatrix(v_grad_.data() + (b * NH + h) * T * HS, T, HS);
         auto preatt2d =
-            Eigen::Map<nn::Matrix>(preatt_.data() + (b * NH + h) * T * T, T, T);
-        auto preatt_softmax2d = Eigen::Map<nn::Matrix>(
+            MakeConstMatrix(preatt_.data() + (b * NH + h) * T * T, T, T);
+        auto preatt_softmax2d = MakeConstMatrix(
             preatt_softmax_.data() + (b * NH + h) * T * T, T, T);
-        auto preatt_grad2d = Eigen::Map<nn::Matrix>(
-            preatt_grad_.data() + (b * NH + h) * T * T, T, T);
-        auto preatt_softmax_grad2d = Eigen::Map<nn::Matrix>(
+        auto preatt_grad2d =
+            MakeMatrix(preatt_grad_.data() + (b * NH + h) * T * T, T, T);
+        auto preatt_grad2d_const =
+            MakeConstMatrix(preatt_grad_.data() + (b * NH + h) * T * T, T, T);
+        auto preatt_softmax_grad2d = MakeMatrix(
             preatt_softmax_grad_.data() + (b * NH + h) * T * T, T, T);
-        auto att_grad2d = Eigen::Map<nn::Matrix>(
-            att_grad_.data() + (b * NH + h) * T * HS, T, HS);
+        auto preatt_softmax_grad2d_const = MakeConstMatrix(
+            preatt_softmax_grad_.data() + (b * NH + h) * T * T, T, T);
+        auto att_grad2d =
+            MakeConstMatrix(att_grad_.data() + (b * NH + h) * T * HS, T, HS);
 
         // backward: att * v
-        nn::MatMul::Backward(preatt_softmax2d, v2d, att_grad2d,
-                             preatt_softmax_grad2d, v_grad2d);
+        nn::MatMul<Type>::Backward(preatt_softmax2d, v2d, att_grad2d,
+                                   preatt_softmax_grad2d, v_grad2d);
 
         // backward: softmax
-        softmax_->Backward(preatt_softmax2d, preatt_softmax_grad2d,
+        //        auto preatt_softmax_matrix = Eigen::Map<nn::Matrix>(
+        //            preatt_softmax_.data() + (b * NH + h) * T * T, T, T);
+        //        auto preatt_softmax_grad_matrix = Eigen::Map<nn::Matrix>(
+        //            preatt_softmax_grad_.data() + (b * NH + h) * T * T, T, T);
+        //        auto preatt_grad_matrix = Eigen::Map<nn::Matrix>(
+        //            preatt_grad_.data() + (b * NH + h) * T * T, T, T);
+        softmax_->Backward(preatt_softmax2d, preatt_softmax_grad2d_const,
                            preatt_grad2d);
 
         // backward: mask
         // backward: q * k
-        nn::MatMul::Backward(q2d, k2d, preatt_grad2d, q_grad2d, k_grad2d);
-        q_grad2d.array() *= factor;
-        k_grad2d.array() *= factor;
+        nn::MatMul<Type>::Backward(q2d, k2d, preatt_grad2d_const, q_grad2d,
+                                   k_grad2d);
+        q_grad2d = q_grad2d * factor;
+        k_grad2d = k_grad2d * factor;
       }
     }
 
@@ -322,9 +344,9 @@ struct CausalSelfAttention {
         v_grad_.shuffle(shuffle_qv).reshape(shape);
 
     // backward: qkv
-    auto _x = Eigen::Map<nn::Matrix>(x.data(), B * T, C);
-    auto qkv_grad = Eigen::Map<nn::Matrix>(qkv_grad_.data(), B * T, 3 * C);
-    auto _x_grad = Eigen::Map<nn::Matrix>(x_grad.data(), B * T, C);
+    auto _x = MakeConstMatrix(x.data(), B * T, C);
+    auto qkv_grad = MakeConstMatrix(qkv_grad_.data(), B * T, 3 * C);
+    auto _x_grad = MakeMatrix(x_grad.data(), B * T, C);
     c_attn_->Backward(_x, qkv_grad, _x_grad);
   }
 
@@ -339,9 +361,9 @@ struct CausalSelfAttention {
 
   int n_head_;
   int n_embed_;
-  std::unique_ptr<nn::Linear> c_attn_;
-  std::unique_ptr<nn::Linear> c_proj_;
-  std::unique_ptr<nn::Softmax> softmax_;
+  std::unique_ptr<nn::Linear<Type>> c_attn_;
+  std::unique_ptr<nn::Linear<Type>> c_proj_;
+  std::unique_ptr<nn::Softmax<Type>> softmax_;
 
   // activation tensors
   nn::Tensor3D qkv_, qkv_grad_;                        // [B, T, 3C]
@@ -358,16 +380,18 @@ struct CausalSelfAttention {
   Eigen::MatrixXi bias_;
 };
 
+template <typename Type>
 struct Block {
   Block(int block_size, int n_head, int n_embed) {
-    ln1_ = std::make_unique<nn::LayerNorm>(n_embed);
-    attn_ = std::make_unique<CausalSelfAttention>(block_size, n_head, n_embed);
-    ln2_ = std::make_unique<nn::LayerNorm>(n_embed);
-    mlp_ = std::make_unique<MLP>(n_embed);
+    ln1_ = std::make_unique<nn::LayerNorm<Type>>(n_embed);
+    attn_ = std::make_unique<CausalSelfAttention<Type>>(block_size, n_head,
+                                                        n_embed);
+    ln2_ = std::make_unique<nn::LayerNorm<Type>>(n_embed);
+    mlp_ = std::make_unique<MLP<Type>>(n_embed);
   }
 
-  void Forward(const Eigen::TensorMap<nn::Tensor3D>& x,
-               Eigen::TensorMap<nn::Tensor3D>& y) {
+  void Forward(typename TTypes<Type, 3>::ConstTensor x,
+               typename TTypes<Type, 3>::Tensor y) {
     // x: [B, T, C], y: [B, T, C]
     const int B = x.dimension(0);  // batch size
     const int T = x.dimension(1);  // sequence length
@@ -387,39 +411,46 @@ struct Block {
     LAZY_ALLOCATE_TENSOR3D(mlp_y_, B, T, C);
 
     // LN1
-    auto x_2d = Eigen::Map<nn::Matrix>(x.data(), B * T, C);
-    auto ln1_y_2d = Eigen::Map<nn::Matrix>(ln1_y_.data(), B * T, C);
-    auto ln1_mean_1d = Eigen::Map<Eigen::RowVectorXf>(ln1_mean_.data(), B * T);
-    auto ln1_rstd_1d = Eigen::Map<Eigen::RowVectorXf>(ln1_rstd_.data(), B * T);
+    auto x_2d = MakeConstMatrix(x.data(), B * T, C);
+    auto ln1_y_2d = MakeMatrix(ln1_y_.data(), B * T, C);
+    auto ln1_mean_1d = MakeFlat(ln1_mean_.data(), B * T);
+    auto ln1_rstd_1d = MakeFlat(ln1_rstd_.data(), B * T);
     ln1_->Forward(x_2d, ln1_y_2d, ln1_mean_1d, ln1_rstd_1d);
 
     // Attention
-    auto ln1_y_3d = Eigen::TensorMap<nn::Tensor3D>(ln1_y_2d.data(), B, T, C);
-    auto att_y_3d = Eigen::TensorMap<nn::Tensor3D>(att_y_.data(), B, T, C);
+    auto ln1_y_3d = MakeConst3DTensor(ln1_y_2d.data(), B, T, C);
+    auto att_y_3d = Make3DTensor(att_y_.data(), B, T, C);
     attn_->Forward(ln1_y_3d, att_y_3d);
 
     // Residual
-    auto att_y_2d = Eigen::Map<nn::Matrix>(att_y_.data(), B * T, C);
-    nn::Residual::Forward(x_2d, att_y_2d, absl::MakeSpan(residual1_));
+    auto x_1d = MakeConstFlat(x.data(), B * T * C);
+    auto att_y_1d = MakeConstFlat(att_y_.data(), B * T * C);
+    auto residual1_1d = MakeFlat(residual1_.data(), residual1_.size());
+    nn::Residual<Type>::Forward(x_1d, att_y_1d, residual1_1d);
 
     // LN2
-    auto ln2_y_2d = Eigen::Map<nn::Matrix>(ln2_y_.data(), B * T, C);
-    auto ln2_mean_1d = Eigen::Map<Eigen::RowVectorXf>(ln2_mean_.data(), B * T);
-    auto ln2_rstd_1d = Eigen::Map<Eigen::RowVectorXf>(ln2_rstd_.data(), B * T);
-    auto residual1_2d = Eigen::Map<nn::Matrix>(residual1_.data(), B * T, C);
+    auto ln2_y_2d = MakeMatrix(ln2_y_.data(), B * T, C);
+    auto ln2_y_2d_const = MakeConstMatrix(ln2_y_.data(), B * T, C);
+    auto ln2_mean_1d = MakeFlat(ln2_mean_.data(), B * T);
+    auto ln2_rstd_1d = MakeFlat(ln2_rstd_.data(), B * T);
+    auto residual1_2d = MakeConstMatrix(residual1_.data(), B * T, C);
     ln2_->Forward(residual1_2d, ln2_y_2d, ln2_mean_1d, ln2_rstd_1d);
 
     // MLP
-    auto mlp_y_2d = Eigen::Map<nn::Matrix>(mlp_y_.data(), B * T, C);
-    mlp_->Forward(ln2_y_2d, mlp_y_2d);
+    auto mlp_y_2d = MakeMatrix(mlp_y_.data(), B * T, C);
+    mlp_->Forward(ln2_y_2d_const, mlp_y_2d);
 
     // Residual
-    nn::Residual::Forward(residual1_2d, mlp_y_2d, absl::MakeSpan(y));
+    auto residual1_1d_const =
+        MakeConstFlat(residual1_.data(), residual1_.size());
+    auto mlp_y_1d = MakeConstFlat(mlp_y_.data(), B * T * C);
+    auto y_1d = MakeFlat(y.data(), y.size());
+    nn::Residual<Type>::Forward(residual1_1d_const, mlp_y_1d, y_1d);
   }
 
-  void Backward(const Eigen::TensorMap<nn::Tensor3D>& x,
-                const Eigen::TensorMap<nn::Tensor3D>& y_grad,
-                Eigen::TensorMap<nn::Tensor3D>& x_grad) {
+  void Backward(typename TTypes<Type, 3>::ConstTensor x,
+                typename TTypes<Type, 3>::ConstTensor y_grad,
+                typename TTypes<Type, 3>::Tensor x_grad) {
     // x: [B, T, C], y_grad: [B, T, C], x_grad: [B, T, C]
     const int B = x.dimension(0);  // batch size
     const int T = x.dimension(1);  // sequence length
@@ -443,45 +474,50 @@ struct Block {
     mlp_y_grad_.setZero();
 
     // backward residual
-    nn::Residual::Backward(y_grad, absl::MakeSpan(residual1_grad_),
-                           absl::MakeSpan(mlp_y_grad_));
+    auto y_grad_1d = MakeConstFlat(y_grad.data(), y_grad.size());
+    auto residual1_grad_1d =
+        MakeFlat(residual1_grad_.data(), residual1_grad_.size());
+    auto mlp_y_grad_1d = MakeFlat(mlp_y_grad_.data(), mlp_y_grad_.size());
+    nn::Residual<Type>::Backward(y_grad_1d, residual1_grad_1d, mlp_y_grad_1d);
     //    std::cout << "mlp_y grad:\n" << mlp_y_grad_ << std::endl;
 
     // backward MLP
-    auto ln2_y_2d = Eigen::Map<nn::Matrix>(ln2_y_.data(), B * T, C);
-    auto ln2_y_grad_2d = Eigen::Map<nn::Matrix>(ln2_y_grad_.data(), B * T, C);
-    auto mlp_y_grad_2d = Eigen::Map<nn::Matrix>(mlp_y_grad_.data(), B * T, C);
+    auto ln2_y_2d = MakeConstMatrix(ln2_y_.data(), B * T, C);
+    auto ln2_y_grad_2d = MakeMatrix(ln2_y_grad_.data(), B * T, C);
+    auto mlp_y_grad_2d = MakeConstMatrix(mlp_y_grad_.data(), B * T, C);
     mlp_->Backward(ln2_y_2d, mlp_y_grad_2d, ln2_y_grad_2d);
     //    std::cout << "ln2_y grad:\n" << ln2_y_grad_2d << std::endl;
 
     // backward LN2
-    auto ln2_mean_1d = Eigen::Map<Eigen::RowVectorXf>(ln2_mean_.data(), B * T);
-    auto ln2_rstd_1d = Eigen::Map<Eigen::RowVectorXf>(ln2_rstd_.data(), B * T);
-    auto residual1_2d = Eigen::Map<nn::Matrix>(residual1_.data(), B * T, C);
-    auto residual1_grad_2d =
-        Eigen::Map<nn::Matrix>(residual1_grad_.data(), B * T, C);
-    ln2_->Backward(residual1_2d, ln2_y_grad_2d, ln2_mean_1d, ln2_rstd_1d,
+    auto ln2_mean_1d = MakeConstFlat(ln2_mean_.data(), B * T);
+    auto ln2_rstd_1d = MakeConstFlat(ln2_rstd_.data(), B * T);
+    auto residual1_2d = MakeConstMatrix(residual1_.data(), B * T, C);
+    auto ln2_y_grad_2d_const = MakeConstMatrix(ln2_y_grad_.data(), B * T, C);
+    auto residual1_grad_2d = MakeMatrix(residual1_grad_.data(), B * T, C);
+    ln2_->Backward(residual1_2d, ln2_y_grad_2d_const, ln2_mean_1d, ln2_rstd_1d,
                    residual1_grad_2d);
     //    std::cout << "residual grad:\n" << residual1_grad_2d << std::endl;
 
     // backward residual
-    nn::Residual::Backward(residual1_grad_2d, absl::MakeSpan(x_grad),
-                           absl::MakeSpan(att_y_grad_));
+    auto residual1_grad_1d_const =
+        MakeConstFlat(residual1_grad_.data(), residual1_grad_.size());
+    auto x_grad_1d = MakeFlat(x_grad.data(), x_grad.size());
+    auto att_y_grad_1d = MakeFlat(att_y_grad_.data(), att_y_grad_.size());
+    nn::Residual<Type>::Backward(residual1_grad_1d_const, x_grad_1d,
+                                 att_y_grad_1d);
 
     // backward attention
-    auto ln1_y_3d = Eigen::TensorMap<nn::Tensor3D>(ln1_y_.data(), B, T, C);
-    auto ln1_y_grad_3d =
-        Eigen::TensorMap<nn::Tensor3D>(ln1_y_grad_.data(), B, T, C);
-    auto att_y_grad_3d =
-        Eigen::TensorMap<nn::Tensor3D>(att_y_grad_.data(), B, T, C);
+    auto ln1_y_3d = MakeConst3DTensor(ln1_y_.data(), B, T, C);
+    auto ln1_y_grad_3d = Make3DTensor(ln1_y_grad_.data(), B, T, C);
+    auto att_y_grad_3d = MakeConst3DTensor(att_y_grad_.data(), B, T, C);
     attn_->Backward(ln1_y_3d, att_y_grad_3d, ln1_y_grad_3d);
 
     // backward LN1
-    auto x_2d = Eigen::Map<nn::Matrix>(x.data(), B * T, C);
-    auto ln1_mean_1d = Eigen::Map<Eigen::RowVectorXf>(ln1_mean_.data(), B * T);
-    auto ln1_rstd_1d = Eigen::Map<Eigen::RowVectorXf>(ln1_rstd_.data(), B * T);
-    auto ln1_y_grad_2d = Eigen::Map<nn::Matrix>(ln1_y_grad_.data(), B * T, C);
-    auto x_grad_2d = Eigen::Map<nn::Matrix>(x_grad.data(), B * T, C);
+    auto x_2d = MakeConstMatrix(x.data(), B * T, C);
+    auto ln1_mean_1d = MakeConstFlat(ln1_mean_.data(), B * T);
+    auto ln1_rstd_1d = MakeConstFlat(ln1_rstd_.data(), B * T);
+    auto ln1_y_grad_2d = MakeConstMatrix(ln1_y_grad_.data(), B * T, C);
+    auto x_grad_2d = MakeMatrix(x_grad.data(), B * T, C);
     ln1_->Backward(x_2d, ln1_y_grad_2d, ln1_mean_1d, ln1_rstd_1d, x_grad_2d);
   }
 
@@ -497,10 +533,10 @@ struct Block {
     mlp_->Parameters(parameters);
   }
 
-  std::unique_ptr<nn::LayerNorm> ln1_;
-  std::unique_ptr<CausalSelfAttention> attn_;
-  std::unique_ptr<nn::LayerNorm> ln2_;
-  std::unique_ptr<MLP> mlp_;
+  std::unique_ptr<nn::LayerNorm<Type>> ln1_;
+  std::unique_ptr<CausalSelfAttention<Type>> attn_;
+  std::unique_ptr<nn::LayerNorm<Type>> ln2_;
+  std::unique_ptr<MLP<Type>> mlp_;
 
   // activation tensors
   nn::Matrix ln1_y_, ln1_y_grad_;            // [B*T, C]
@@ -512,6 +548,7 @@ struct Block {
   nn::Tensor3D mlp_y_, mlp_y_grad_;          // [B, T, C]
 };
 
+template <typename Type>
 struct GPT {
   GPT(int block_size, int vocab_size, int padded_vocab_size, int n_layer,
       int n_head, int n_embed)
@@ -527,24 +564,24 @@ struct GPT {
     wte_ = std::make_unique<nn::Embedding>(padded_vocab_size, n_embed);
     wpe_ = std::make_unique<nn::Embedding>(block_size, n_embed);
     for (int i = 0; i < n_layer; ++i) {
-      h_.emplace_back(std::make_unique<Block>(block_size, n_head, n_embed));
+      h_.emplace_back(
+          std::make_unique<Block<Type>>(block_size, n_head, n_embed));
     }
-    lnf_ = std::make_unique<nn::LayerNorm>(n_embed);
+    lnf_ = std::make_unique<nn::LayerNorm<Type>>(n_embed);
 
-    lm_head_unused_ = std::make_unique<nn::Linear>(n_embed, vocab_size);
+    lm_head_unused_ = std::make_unique<nn::Linear<Type>>(n_embed, vocab_size);
     // https://paperswithcode.com/method/weight-tying
     std::memcpy(wte_->weight_->data(), lm_head_unused_->weight_->data(),
                 sizeof(float) * vocab_size * n_embed);
     std::memset(wte_->weight_->data() + vocab_size * n_embed, 0,
                 sizeof(float) * (padded_vocab_size - vocab_size) * n_embed);
     lm_head_ = wte_->weight_->data();
-    softmax_cross_entropy_ = std::make_unique<nn::SoftmaxCrossEntropy>(
-        nn::SoftmaxCrossEntropy::MEAN, true);
+    softmax_cross_entropy_ = std::make_unique<nn::SoftmaxCrossEntropy<Type>>();
   }
 
-  void Forward(const Eigen::Map<nn::MatrixInt>& idx,
-               Eigen::TensorMap<nn::Tensor3D>& logits) {
-    const int B = idx.rows(), T = idx.cols(), C = n_embed_;
+  void Forward(typename TTypes<int>::ConstMatrix idx,
+               typename TTypes<Type, 3>::Tensor logits) {
+    const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_;
     const int BT = B * T;
     CHECK(logits.dimension(0) == B && logits.dimension(1) == T &&
           logits.dimension(2) == vocab_size_)
@@ -556,21 +593,24 @@ struct GPT {
     // last position
     //    auto lnf_y_3d = Eigen::TensorMap<nn::Tensor3D>(lnf_y_.data(), B, T,
     //    C); nn::Tensor2D lnf_y_last_t = lnf_y_3d.chip(T - 1, 1);
-    auto lnf_y = Eigen::Map<nn::Matrix>(lnf_y_.data(), BT, C);
-    auto lm_head = Eigen::Map<nn::Matrix>(lm_head_, vocab_size_, C);
-    auto logits_2d = Eigen::Map<nn::Matrix>(logits.data(), BT, vocab_size_);
+    auto lnf_y = Eigen::TensorMap<nn::Tensor2D>(lnf_y_.data(), BT, C);
+    auto lm_head = Eigen::TensorMap<nn::Tensor2D>(lm_head_, vocab_size_, C);
+    auto logits_2d =
+        Eigen::TensorMap<nn::Tensor2D>(logits.data(), BT, vocab_size_);
     //    nn::MatMul::Forward(lnf_y, lm_head, logits_2d);
-    logits_2d.noalias() = lnf_y * lm_head.transpose();
+    Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
+        Eigen::IndexPair<int>(1, 1)};
+    logits_2d.device(nn::g_cpu_device) = lnf_y.contract(lm_head, product_dims);
   }
 
-  void Forward(const Eigen::Map<nn::MatrixInt>& idx,
-               const Eigen::Map<nn::MatrixInt>& targets,
-               Eigen::TensorMap<nn::Tensor3D>& logits, float* loss) {
+  void Forward(typename TTypes<int>::ConstMatrix idx,
+               typename TTypes<int>::ConstMatrix targets,
+               typename TTypes<Type, 3>::Tensor logits, float* loss) {
     // idx: [B, T], targets: [B, T]
     // logits: [B, T, vocab_size]
-    const int B = idx.rows(), T = idx.cols(), C = n_embed_;
+    const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_;
     const int BT = B * T;
-    CHECK(targets.rows() == B && targets.cols() == T);
+    CHECK(targets.dimension(0) == B && targets.dimension(1) == T);
     CHECK(logits.dimension(0) == B && logits.dimension(1) == T &&
           logits.dimension(2) == vocab_size_)
         << "B: " << B << ", T: " << T << ", vocab_size: " << vocab_size_;
@@ -578,24 +618,29 @@ struct GPT {
 
     LAZY_ALLOCATE_MATRIX(probs_, BT, vocab_size_);
 
-    auto lnf_y = Eigen::Map<nn::Matrix>(lnf_y_.data(), BT, C);
-    auto lm_head = Eigen::Map<nn::Matrix>(lm_head_, vocab_size_, n_embed_);
-    auto logits_2d = Eigen::Map<nn::Matrix>(logits.data(), BT, vocab_size_);
-    auto probs_2d = Eigen::Map<nn::Matrix>(probs_.data(), BT, vocab_size_);
+    auto lnf_y = MakeMatrix(lnf_y_.data(), BT, C);
+    auto lm_head = MakeMatrix(lm_head_, vocab_size_, n_embed_);
+    auto logits_2d = MakeMatrix(logits.data(), BT, vocab_size_);
+    auto probs_2d = MakeMatrix(probs_.data(), BT, vocab_size_);
 
     // [BT, C] x [C, vocab_size] -> [BT, vocab_size]
-    logits_2d.noalias() = lnf_y * lm_head.transpose();
-    softmax_cross_entropy_->Forward(logits_2d, targets, probs_2d, loss);
+    Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
+        Eigen::IndexPair<int>(1, 1)};
+    logits_2d.device(nn::g_cpu_device) = lnf_y.contract(lm_head, product_dims);
+
+    auto logits_2d_const = MakeConstMatrix(logits.data(), BT, vocab_size_);
+    softmax_cross_entropy_->Forward(logits_2d_const, targets, probs_2d, loss);
   }
 
-  void Backward(const Eigen::Map<nn::MatrixInt>& idx,
-                const Eigen::Map<nn::MatrixInt>& targets) {
+  void Backward(typename TTypes<int>::ConstMatrix idx,
+                typename TTypes<int>::ConstMatrix targets) {
     // idx: [B, T], targets: [B, T]
-    const int B = idx.rows(), T = idx.cols(), C = n_embed_, L = n_layer_;
+    const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_,
+              L = n_layer_;
     const int BT = B * T, TC = T * C;
     const int BTC = BT * C;
     const int LBTC = L * BTC;
-    CHECK(targets.rows() == B && targets.cols() == T);
+    CHECK(targets.dimension(0) == B && targets.dimension(1) == T);
 
     wte_->weight_->AllocateGradient();
     if (lm_head_grad_ == nullptr) {
@@ -615,29 +660,32 @@ struct GPT {
     logits_grad_.setZero();
 
     // backward cross entropy
-    auto probs_2d = Eigen::Map<nn::Matrix>(probs_.data(), BT, vocab_size_);
-    auto logits_grad_2d =
-        Eigen::Map<nn::Matrix>(logits_grad_.data(), BT, vocab_size_);
+    auto probs_2d = MakeConstMatrix(probs_.data(), BT, vocab_size_);
+    auto logits_grad_2d = MakeMatrix(logits_grad_.data(), BT, vocab_size_);
     softmax_cross_entropy_->Backward(probs_2d, targets, logits_grad_2d);
 
     // backward lm_head
-    auto lnf_y = Eigen::Map<nn::Matrix>(lnf_y_.data(), BT, C);
-    auto lnf_y_grad = Eigen::Map<nn::Matrix>(lnf_y_grad_.data(), BT, C);
-    auto lm_head = Eigen::Map<nn::Matrix>(lm_head_, vocab_size_, C);
-    auto lm_head_grad = Eigen::Map<nn::Matrix>(lm_head_grad_, vocab_size_, C);
-    lnf_y_grad +=
-        logits_grad_2d * lm_head;  // [BT, vocab_size] x [vocab_size, C]
-    lm_head_grad.array() += (logits_grad_2d.transpose() * lnf_y)
-                                .array();  // [vocab_size, BT] x [BT, C]
+    auto lnf_y = MakeMatrix(lnf_y_.data(), BT, C);
+    auto lnf_y_grad = MakeMatrix(lnf_y_grad_.data(), BT, C);
+    auto lm_head = MakeMatrix(lm_head_, vocab_size_, C);
+    auto lm_head_grad = MakeMatrix(lm_head_grad_, vocab_size_, C);
+    Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
+        Eigen::IndexPair<int>(1, 0)};
+    Eigen::array<Eigen::IndexPair<int>, 1> product_dims2 = {
+        Eigen::IndexPair<int>(0, 0)};
+    lnf_y_grad += logits_grad_2d.contract(
+        lm_head, product_dims);  // [BT, vocab_size] x [vocab_size, C]
+    lm_head_grad += logits_grad_2d.contract(
+        lnf_y, product_dims2);  // [vocab_size, BT] x [BT, C]
 
     // backward LNF
-    auto block_out_2d =
-        Eigen::Map<nn::Matrix>(block_y_.data() + (L - 1) * BTC, BT, C);
+    auto block_out_2d = MakeConstMatrix(block_y_.data() + (L - 1) * BTC, BT, C);
     auto block_out_grad_2d =
-        Eigen::Map<nn::Matrix>(block_y_grad_.data() + (L - 1) * BTC, BT, C);
-    auto lnf_mean = Eigen::Map<Eigen::RowVectorXf>(lnf_mean_.data(), BT);
-    auto lnf_rstd = Eigen::Map<Eigen::RowVectorXf>(lnf_rstd_.data(), BT);
-    lnf_->Backward(block_out_2d, lnf_y_grad, lnf_mean, lnf_rstd,
+        MakeMatrix(block_y_grad_.data() + (L - 1) * BTC, BT, C);
+    auto lnf_mean = MakeConstFlat(lnf_mean_.data(), BT);
+    auto lnf_rstd = MakeConstFlat(lnf_rstd_.data(), BT);
+    auto lnf_y_grad_2d = MakeConstMatrix(lnf_y_grad_.data(), BT, C);
+    lnf_->Backward(block_out_2d, lnf_y_grad_2d, lnf_mean, lnf_rstd,
                    block_out_grad_2d);
 
     // backward blocks
@@ -647,9 +695,9 @@ struct GPT {
       float* x_grad =
           l == 0 ? encoded_grad_.data() : block_y_grad_.data() + (l - 1) * BTC;
       float* y_grad = block_y_grad_.data() + l * BTC;
-      auto block_x_3d = Eigen::TensorMap<nn::Tensor3D>(x, B, T, C);
-      auto block_x_grad_3d = Eigen::TensorMap<nn::Tensor3D>(x_grad, B, T, C);
-      auto block_y_grad_3d = Eigen::TensorMap<nn::Tensor3D>(y_grad, B, T, C);
+      auto block_x_3d = MakeConst3DTensor(x, B, T, C);
+      auto block_x_grad_3d = Make3DTensor(x_grad, B, T, C);
+      auto block_y_grad_3d = MakeConst3DTensor(y_grad, B, T, C);
       block->Backward(block_x_3d, block_y_grad_3d, block_x_grad_3d);
     }
 
@@ -692,8 +740,9 @@ struct GPT {
   }
 
  private:
-  void DoForward(const Eigen::Map<nn::MatrixInt>& idx) {
-    const int B = idx.rows(), T = idx.cols(), C = n_embed_, L = n_layer_;
+  void DoForward(typename TTypes<int>::ConstMatrix idx) {
+    const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_,
+              L = n_layer_;
     const int BT = B * T, TC = T * C;
     const int BTC = BT * C;
     const int LBTC = L * BTC;
@@ -724,16 +773,15 @@ struct GPT {
       const auto& block = h_[l];
       float* x = l == 0 ? encoded_.data() : block_y_.data() + (l - 1) * BTC;
       float* y = block_y_.data() + l * BTC;
-      auto block_x_3d = Eigen::TensorMap<nn::Tensor3D>(x, B, T, C);
-      auto block_y_3d = Eigen::TensorMap<nn::Tensor3D>(y, B, T, C);
+      auto block_x_3d = MakeConst3DTensor(x, B, T, C);
+      auto block_y_3d = Make3DTensor(y, B, T, C);
       block->Forward(block_x_3d, block_y_3d);
     }
 
-    auto block_out_2d =
-        Eigen::Map<nn::Matrix>(block_y_.data() + (L - 1) * BTC, BT, C);
-    auto lnf_y = Eigen::Map<nn::Matrix>(lnf_y_.data(), BT, C);
-    auto lnf_mean = Eigen::Map<Eigen::RowVectorXf>(lnf_mean_.data(), BT);
-    auto lnf_rstd = Eigen::Map<Eigen::RowVectorXf>(lnf_rstd_.data(), BT);
+    auto block_out_2d = MakeConstMatrix(block_y_.data() + (L - 1) * BTC, BT, C);
+    auto lnf_y = MakeMatrix(lnf_y_.data(), BT, C);
+    auto lnf_mean = MakeFlat(lnf_mean_.data(), BT);
+    auto lnf_rstd = MakeFlat(lnf_rstd_.data(), BT);
     lnf_->Forward(block_out_2d, lnf_y, lnf_mean, lnf_rstd);
   }
 
@@ -747,12 +795,12 @@ struct GPT {
   // transformer
   std::unique_ptr<nn::Embedding> wte_;
   std::unique_ptr<nn::Embedding> wpe_;
-  std::vector<std::unique_ptr<Block>> h_;
-  std::unique_ptr<nn::LayerNorm> lnf_;
-  std::unique_ptr<nn::SoftmaxCrossEntropy> softmax_cross_entropy_;
+  std::vector<std::unique_ptr<Block<Type>>> h_;
+  std::unique_ptr<nn::LayerNorm<Type>> lnf_;
+  std::unique_ptr<nn::SoftmaxCrossEntropy<Type>> softmax_cross_entropy_;
 
   // head
-  std::unique_ptr<nn::Linear> lm_head_unused_;
+  std::unique_ptr<nn::Linear<Type>> lm_head_unused_;
   float *lm_head_, *lm_head_grad_;  // [vocal_size, C]
 
   // activation tensors and gradients
