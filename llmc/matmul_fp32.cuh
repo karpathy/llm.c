@@ -174,7 +174,7 @@ __global__ void compute_tf32gemm_async_copy(float *D,
     // Each CTA slides along the 128 x 128 tiles from the top left corner of the matrix to the
     // right and down, and selects the next tile to compute. Once there's no such tile,
     // all warps in this CTA exit.
-    for(unsigned int block_pos = blockIdx.x;; block_pos += gridDim.x) {
+    for (unsigned int block_pos = blockIdx.x;; block_pos += gridDim.x) {
         const unsigned int block_tile_i = ((block_pos * BLOCK_ROW_TILES) / N_TILES) * (BLOCK_COL_TILES);
         const unsigned int block_tile_j = (block_pos * BLOCK_COL_TILES) % N_TILES;
 
@@ -189,12 +189,12 @@ __global__ void compute_tf32gemm_async_copy(float *D,
 
         // Stream multiple C tiles to shared memory (llm.c: if beta is not 0)
         if (beta != 0.0f) {
-#pragma unroll
+            #pragma unroll
             for (int i = 0; i < N; i++) {
                 pipe.producer_acquire();
                 cuda::memcpy_async(&shmem_warp_stream_ptr[(SHMEM_STRIDE * i) + (laneId << loadStride)],
-                                    &src_gmem_warp_stream_ptr[(GLOBAL_MEM_STRIDE * i) + (laneId << loadStride)],
-                                    shape4, pipe);
+                                   &src_gmem_warp_stream_ptr[(GLOBAL_MEM_STRIDE * i) + (laneId << loadStride)],
+                                   shape4, pipe);
                 pipe.producer_commit();
             }
             // Now wait for all the above issued 8 batches to complete.
@@ -209,9 +209,9 @@ __global__ void compute_tf32gemm_async_copy(float *D,
         // Load the C matrix tiles into fragments from shared memory.
         // llm.c: if beta is 0, then don't load C, just initialize the accumulator to 0.
         if (beta == 0.0f) {
-#pragma unroll
+            #pragma unroll
             for (int i = 0; i < WARP_COL_TILES; i++) {
-#pragma unroll
+                #pragma unroll
                 for (int j = 0; j < WARP_ROW_TILES; j++) {
                     for (int t = 0; t < c[i][j].num_elements; t++) {
                         c[i][j].x[t] = 0.0f;
@@ -219,15 +219,15 @@ __global__ void compute_tf32gemm_async_copy(float *D,
                 }
             }
         } else {
-    #pragma unroll
+            #pragma unroll
             for (int i = 0; i < WARP_COL_TILES; i++) {
-    #pragma unroll
+                #pragma unroll
                 for (int j = 0; j < WARP_ROW_TILES; j++) {
                     const float *tile_ptr = shmem_warp_tile_ptr + i * SHMEM_STRIDE * N + j * N;
 
                     wmma::load_matrix_sync(c[i][j], tile_ptr, SHMEM_STRIDE, wmma::mem_row_major);
                     // Scale the C matrix.
-    #pragma unroll
+                    #pragma unroll
                     for (int t = 0; t < c[i][j].num_elements; t++) {
                         c[i][j].x[t] *= beta;
                     }
@@ -241,19 +241,18 @@ __global__ void compute_tf32gemm_async_copy(float *D,
 
         // Select what warp copies what matrix to shared memory.
         // Warps 0-3 copy the A matrix, warps 4-7 copy the B matrix.
-        const float *warp_ptr = (warpId < (WMMA_WARPS_PER_BLOCK/2)) ? (&A[block_tile_i * M * K_GLOBAL] + M * K_GLOBAL * (warpId % (WMMA_WARPS_PER_BLOCK/2)) * 2) :
-                                              (&B[block_tile_j * N * K_GLOBAL] + N * K_GLOBAL * (warpId % (WMMA_WARPS_PER_BLOCK/2)) * 2);
+        const float *warp_ptr = (warpId < (WMMA_WARPS_PER_BLOCK / 2)) ? (&A[block_tile_i * M * K_GLOBAL] + M * K_GLOBAL * (warpId % (WMMA_WARPS_PER_BLOCK / 2)) * 2) : (&B[block_tile_j * N * K_GLOBAL] + N * K_GLOBAL * (warpId % (WMMA_WARPS_PER_BLOCK / 2)) * 2);
 
-        constexpr int chunksPerLane = ((WARP_SIZE/2) / CHUNK_COPY_LINES_PER_WARP) * 2;
+        constexpr int chunksPerLane = ((WARP_SIZE / 2) / CHUNK_COPY_LINES_PER_WARP) * 2;
         const int laneLoadElem = (laneId % CHUNK_COPY_LINE_LANES) << loadStride;
         const int stridePerLaneCopy = (laneId / CHUNK_COPY_LINE_LANES);
         // Go through the global K dimension by a fixed step at a time.
-#pragma unroll
+        #pragma unroll
         for (int tile_k = 0; tile_k < K_TILES; tile_k += CHUNK_K) {
             // Copy slices of the A and B matrices to shared memory.
             // The first half of the warps in the CTA copy the A matrix, the rest copy the B matrix.
             // As for tf32 MMA  M == N we use M for warp 4-7 + shmem_idx_b_off.
-            size_t shmem_idx =  (M * (warpId % (WMMA_WARPS_PER_BLOCK/2)) * 2)  + ((warpId / (WMMA_WARPS_PER_BLOCK/2)) * shmem_idx_b_off);
+            size_t shmem_idx = (M * (warpId % (WMMA_WARPS_PER_BLOCK / 2)) * 2) + ((warpId / (WMMA_WARPS_PER_BLOCK / 2)) * shmem_idx_b_off);
             // First half of the warp copies the first row / column of the matrix,
             // the second half of the warp copies the next.
             const float *lane_ptr = (warp_ptr + tile_k * K + stridePerLaneCopy * K_GLOBAL + laneLoadElem);
@@ -261,8 +260,8 @@ __global__ void compute_tf32gemm_async_copy(float *D,
             // Shift the second half of the warp to the next row / column in the shared memory.
             shmem_idx += stridePerLaneCopy;
 
-#pragma unroll
-            for(int i = 0; i < chunksPerLane; i++) {
+            #pragma unroll
+            for (int i = 0; i < chunksPerLane; i++) {
                 // Copy 16 bytes at once in each lane.
                 pipe.producer_acquire();
                 cuda::memcpy_async(&shmem[shmem_idx][laneLoadElem], lane_ptr, shape4, pipe);
@@ -277,34 +276,34 @@ __global__ void compute_tf32gemm_async_copy(float *D,
             __syncthreads();
 
             // Compute a grid of C matrix tiles in each warp.
-#pragma unroll
+            #pragma unroll
             for (int k_step = 0; k_step < CHUNK_K; k_step++) {
                 wmma::fragment<wmma::matrix_a, M, N, K, wmma::precision::tf32, A_major> a[WARP_COL_TILES];
                 wmma::fragment<wmma::matrix_b, M, N, K, wmma::precision::tf32, B_major> b[WARP_ROW_TILES];
 
-#pragma unroll
+                #pragma unroll
                 for (int i = 0; i < WARP_COL_TILES; i++) {
                     size_t shmem_idx_a = (warpId / BLOCK_ROW_WARPS) * M * BLOCK_ROW_WARPS + (i * M);
                     const float *tile_ptr = &shmem[shmem_idx_a][k_step * K];
 
                     wmma::load_matrix_sync(a[i], tile_ptr, K * CHUNK_K + SKEW_FLOAT);
 
-#pragma unroll
+                    #pragma unroll
                     for (int t = 0; t < a[i].num_elements; t++) {
                         a[i].x[t] = wmma::__float_to_tf32(a[i].x[t]);
                     }
-#pragma unroll
+                    #pragma unroll
                     for (int j = 0; j < WARP_ROW_TILES; j++) {
                         if (i == 0) {
                             // Load the B matrix fragment once, because it is going to be reused
                             // against the other A matrix fragments.
-                            size_t shmem_idx_b = shmem_idx_b_off + (WARP_ROW_TILES * N) * (warpId%2) + (j * N);
+                            size_t shmem_idx_b = shmem_idx_b_off + (WARP_ROW_TILES * N) * (warpId % 2) + (j * N);
                             const float *tile_ptr = &shmem[shmem_idx_b][k_step * K];
 
                             wmma::load_matrix_sync(b[j], tile_ptr, K * CHUNK_K + SKEW_FLOAT);
-#pragma unroll
+                            #pragma unroll
                             for (int t = 0; t < b[j].num_elements; t++) {
-                                b[j].x[t] =  wmma::__float_to_tf32(b[j].x[t]);
+                                b[j].x[t] = wmma::__float_to_tf32(b[j].x[t]);
                             }
                         }
 
@@ -317,11 +316,11 @@ __global__ void compute_tf32gemm_async_copy(float *D,
         }
 
         // Store the D fragments to shared memory.
-    #pragma unroll
+        #pragma unroll
         for (int i = 0; i < WARP_COL_TILES; i++) {
-    #pragma unroll
+            #pragma unroll
             for (int j = 0; j < WARP_ROW_TILES; j++) {
-    #pragma unroll
+                #pragma unroll
                 // Uniform, point-wise transformations of ALL fragment elements by ALL threads in the
                 // warp are well-defined even though element indices within fragment storage are not defined.
                 for (int t = 0; t < c[i][j].num_elements; t++) {
@@ -331,19 +330,18 @@ __global__ void compute_tf32gemm_async_copy(float *D,
                 wmma::store_matrix_sync(tile_ptr, c[i][j], SHMEM_STRIDE, wmma::mem_row_major);
             }
         }
-
         __syncthreads();
 
         // Now that shared memory contains all the D tiles, stream them to global memory.
         float *dst_gmem_warp_stream_ptr = &D[gmem_idx];
 
-#pragma unroll
+        #pragma unroll
         for (int i = 0; i < N; i++) {
             // todo - adding bias in a hacky way at the last step because it made indexing easier
-            float4* out_ptr = (float4*)(dst_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) + laneId;
-            float4 shmem_data = *((float4*)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId);
+            float4 *out_ptr = (float4 *)(dst_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) + laneId;
+            float4 shmem_data = *((float4 *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId);
             if (bias != NULL) {
-                ptrdiff_t column = (ptrdiff_t)((float*)out_ptr - D) % n;
+                ptrdiff_t column = (ptrdiff_t)((float *)out_ptr - D) % n;
                 float4 bias4 = ld_vec(bias + column);
                 *out_ptr = add_float4(shmem_data, bias4);
                 // todo: __stcs doesn't seem to help in practice on H100, unsure about other GPUs?
@@ -353,7 +351,6 @@ __global__ void compute_tf32gemm_async_copy(float *D,
                 //__stcs(out_ptr, shmem_data);
             }
         }
-
         __syncthreads();
     }
 #endif
