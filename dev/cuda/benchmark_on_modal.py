@@ -3,19 +3,22 @@ Script for running benchmarks on the Modal platform.
 This is useful for folks who do not have access to expensive GPUs locally.
 Example usage for cuda kernels:
 GPU_MEM=80 modal run benchmark_on_modal.py \
-    --compile-command "nvcc -O3 --use_fast_math attention_forward.cu -o attention_forward -lcublas" \
+    --data-command="./dev/download_starter_pack.sh" \
+    --compile-command "nvcc -O3 --use_fast_math attention_forward.cu -o attention_forward -lcublas -lcublasLt" \
     --run-command "./attention_forward 1"
 OR if you want to use cuDNN etc.
 
 
 For training the gpt2 model with cuDNN use:
 GPU_MEM=80 modal run dev/cuda/benchmark_on_modal.py \
-    --compile-command "make train_gpt2cu USE_CUDNN=1"
+    --data-command="./dev/download_starter_pack.sh" \
+    --compile-command "make train_gpt2cu USE_CUDNN=1" \
     --run-command "./train_gpt2cu -i dev/data/tinyshakespeare/tiny_shakespeare_train.bin -j dev/data/tinyshakespeare/tiny_shakespeare_val.bin -v 250 -s 250 -g 144 -f shakespeare.log -b 4"
 
 
 For profiling using nsight system:
 GPU_MEM=80 modal run dev/cuda/benchmark_on_modal.py \
+    --data-command="./dev/download_starter_pack.sh" \
     --compile-command "make train_gpt2cu USE_CUDNN=1" \
     --run-command "nsys profile --cuda-graph-trace=graph --python-backtrace=cuda --cuda-memory-usage=true \
     ./train_gpt2cu -i dev/data/tinyshakespeare/tiny_shakespeare_train.bin \
@@ -110,7 +113,6 @@ def run_benchmark(data_command: str, compile_command: str, run_command: str):
     execute_command(run_command)
     # Use this section if you want to profile using nsight system and install the reports on your volume to be locally downloaded
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-
     execute_command("mkdir report1_" + timestamp)
     execute_command("mv /root/report1.nsys-rep /root/report1_" + timestamp + "/")
     execute_command("mv /root/report1.qdstrm /root/report1_" + timestamp + "/")
