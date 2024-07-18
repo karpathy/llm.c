@@ -81,6 +81,8 @@ __device__ void st_vec(float* address, float4 val) {
 
 // ----------------------------------------------------------------------------
 // functions for warp/block/row reductions (used in softmax, layernorm, etc.)
+// row reductions are a very useful primitive but limited to axis=0 with 1 row per block
+// they could be generalised and used across more kernels but this goes beyond our current scope
 
 // these structures are passed to the row/block/warp reduction functions
 // row_reduction uses operator() while warp_reduce/block_reduce only use merge()
@@ -108,6 +110,8 @@ struct SoftmaxOp : public SumOp {
 };
 
 // warp reduction for exactly 32 threads (all must be active!) with result available to all threads
+// e.g. warp_reduce<SumOp>(val) is equivalent to cg::reduce(warp, sum, cg::plus<float>{})
+// for maximum flexibility, this could be extended to shuffling a structure rather than a float
 template<typename Op>
 __device__ inline float warp_reduce(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -120,6 +124,7 @@ __device__ inline float warp_reduce(float val) {
 // (1) intra-warp (shuffle) (2) inter-warp (shared memory) (3) intra-warp (shuffle) (4) broadcast
 // requires all threads in the threadgroup to be active(!) but should work for any block size
 // uses non-dynamic shared memory so every call increases shared memory requirements by 132 bytes
+// block_reduce<SumOp>(val) is similar to cub::BlockReduce<float,block_size>(tmp_shared).Sum(val)
 template<typename Op>
 __device__ inline float block_reduce(float val, float identity=0.0f) {
     __shared__ float shared_val[WARP_SIZE];
@@ -144,7 +149,8 @@ __device__ inline float block_reduce(float val, float identity=0.0f) {
 
 // reduction for any number of elements which are stored consecutively in global or shared memory
 // requires 16B alignment due to float4 but supports a non-multiple-of-4 number of elements
-// (we could handle non-aligned pointers with preprocessing, but not needed for llm.c)
+// (we could handle non-aligned pointers with preprocessing, but it's not needed for llm.c)
+// for additional flexibility, we'd ideally want to support any axis and >1 row per block
 template<bool reverse_order = false, typename OpFunctor>
 __device__ inline float row_reduce(const float* data, int elements, const OpFunctor& op) {
     assert((reinterpret_cast<uintptr_t>(data) % 16) == 0); // input pointer must be 16B aligned
@@ -210,6 +216,9 @@ __device__ void copy_to_shared(float* out, const float* in, int elements, bool p
 
 // use of float4 leads to using 128-bit LDG / STG instructions in SASS,
 // very helpful in memory-bound kernels like encoder_forward
+// note that there is no native addition for float4 so we use our own add_float4
+// as a more flexible alternative, we could use the kernel_float library on GitHub
+// for the full version of llm.c, we created our on x128 class for maximum performance
 __global__ void encoder_forward_kernel3(float4* out,
                                const int* inp, const float4* wte, const float4* wpe,
                                int B, int T, int C) {
@@ -222,6 +231,10 @@ __global__ void encoder_forward_kernel3(float4* out,
         int t = bt % T;
         int c4 = idx % C4;
         int ix = inp[b * T + t];
+        // very good memory coalescing as "address = ... + c4" and "c4 = (... + threadIdx.x) % C4"
+        // i.e. as long as C is a multiple of 128, every warp will read 2x 512 consecutive bytes
+        // and write 512 consecutive bytes, which is the best case scenario really
+        // (+a tiny scalar read of inp[] which is very low bandwidth)
         out[b * T * C4 + t * C4 + c4] = add_float4(wte[ix * C4 + c4], wpe[t * C4 + c4]);
     }
 }
@@ -244,11 +257,15 @@ __global__ void encoder_backward_kernel(float* dwte, float* dwpe,
         float* dwte_ix = dwte + ix * C + c;
         float* dwpe_tc = dwpe + t * C + c;
 
+        // very good cacheline coalescing as "address = ... + c" and "c = (... + threadIdx.x) % C"
+        // NVIDIA atomics are pretty fast when coalesced *and* most warps have different addresses
+        // but FP32 atomics are still non-deterministic, see full llm.c for deterministic kernel
         atomicAdd(dwte_ix, *dout_btc);
         atomicAdd(dwpe_tc, *dout_btc);
     }
 }
 
+// layernorms require going over the same data multiple times, so we optimise
 __global__ void layernorm_forward_kernel(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const float*  __restrict__ inp, const float*  __restrict__ weight,
                                     const float* __restrict__ bias, int C) {
@@ -257,6 +274,8 @@ __global__ void layernorm_forward_kernel(float* __restrict__ out, float* __restr
     const float* x = inp + row * C;
 
     // calculate the mean, variance, and reciprocal standard deviation of the row
+    // we could also use the "Variance = E[x^2] - E[x]^2" formula to only go over the data once
+    // but this is easier with row_reduce() and roughly the same performance (+better numerics?)
     float m = row_reduce<false>(x, C, SumOp()) / C;
     float v = row_reduce<true>(x, C, VarianceOp(m)) / C; // reverse order to maximise cache hits
     float s = rsqrtf(v + 1e-5f); // add a small epsilon to avoid divisions by zero
@@ -277,6 +296,8 @@ __global__ void layernorm_forward_kernel(float* __restrict__ out, float* __restr
 }
 
 // all permute & unpermute kernels (used for attention) could be optimised further using float4
+// with PyTorch or cuDNN, this is handled automatically, with *some* matmul kernels able to fuse it
+// but we can't fuse this with cuBLAS and different parts need different layouts, so do it manually
 __global__ void permute_kernel(float* q, float* k, float* v,
                                const float* inp,
                                int B, int N, int NH, int d) {
@@ -376,6 +397,7 @@ __global__ void softmax_forward_kernel(float* out, float inv_temperature, const 
 }
 
 __global__ void residual_forward_kernel(float* out, const float* inp1, const float* inp2, int N) {
+    // fully optimal float4 kernel (the only way to make it faster is to fuse it with layernorm)
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
     if (idx < N) {
         const float4 inp1_float4 = __ldcs(reinterpret_cast<const float4*>(inp1 + idx));
@@ -384,20 +406,22 @@ __global__ void residual_forward_kernel(float* out, const float* inp1, const flo
     }
 }
 
+// could be optimised using float4
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 __global__ void gelu_forward_kernel(float* out, const float* inp, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) {
-        float xi = inp[i]; // could be optimised using float4
+        float xi = inp[i];
         float cube = 0.044715f * xi * xi * xi;
         out[i] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
     }
 }
 
+// could be optimised using float4
 __global__ void gelu_backward_kernel(float* dinp, const float* inp, const float* dout, const int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) {
-        float x = inp[i]; // could be optimised using float4
+        float x = inp[i];
         float cube = 0.044715f * x * x * x;
         float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
         float tanh_out = tanhf(tanh_arg);
@@ -411,6 +435,7 @@ __global__ void gelu_backward_kernel(float* dinp, const float* inp, const float*
 // this kernel performs a column-wise reduction over dout, in PyTorch equivalent to:
 // dbias = dout.sum((0,1))
 // cannot use row_reduce() as it reduces along column elements which are not consecutive in memory
+// ideally we'd have fused "transpose + row_reduce" kernels for column reduction but it's tricky
 //
 // the solution is to employ one block to reduce along several columns in parallel,
 // where each block has a width of blockIdx.x columns to ensure coalesced access.
@@ -452,7 +477,8 @@ __global__ void matmul_backward_bias_kernel5(float* dbias, const float* dout, in
 // this kernel handles multiple rows per thread block (one per warp)
 // that is to reduce the number of global memory atomics which would kill performance otherwise,
 // which is why we do not use row_reduce (it would work but require a global memory atomic per row)
-// the implementation in train_gpt2.cu is completely different in order to be fully deterministic
+// alternatively, row_reduce could be generalised to do multiple rows in parallel for 2D blocks
+// to be deterministic, the implementation in train_gpt2.cu is completely different and atomic-free
 template <int block_size = 512>
 __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* dbias,
                                            const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
@@ -461,7 +487,7 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
     float* dbias_shared = shared;
     float* dweight_shared = shared + C;
 	for(int i = threadIdx.x; i < C*2; i+= block_size){
-       shared[i] = 0.0f; // init shared memory to zero
+       shared[i] = 0.0f; // init shared memory to zero (before the out-of-bounds check)
     }
 
     int lane_id = threadIdx.x % 32;
@@ -469,7 +495,7 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
     int warps_per_block = block_size / 32;
     int idx = blockIdx.x * warps_per_block + warp_id;
     int N = B * T;
-    if(idx >= N) { return; } // thread guards
+    if(idx >= N) { return; } // out-of-bounds check after initialising shared memory
 
     int b = idx / T;
     int t = idx % T;
@@ -489,15 +515,18 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
         dnorm_mean += dnorm_i;
         dnorm_norm_mean += dnorm_i * norm_bti;
     }
+    // all reductions are at warp granularity (1 row per warp, multiple rows in parallel per block)
     dnorm_mean = warp_reduce<SumOp>(dnorm_mean) / C;
     dnorm_norm_mean = warp_reduce<SumOp>(dnorm_norm_mean) / C;
-    __syncthreads();
+    __syncthreads(); // todo - for the shared memory initialisation, ideally would use arrive/wait
 
-    // now iterate again and accumulate all the gradients
+    // now iterate again and and accumulate dbias/dweight in shared memory
+    // note that FP32 shared memory atomics are actually emulated on (all?) NVIDIA GPUs using CAS
+    // so they are even more sensitive to conflicts when memory addresses are the same, but OK here
     for (int i = lane_id; i < C; i += WARP_SIZE) {
         float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
         float dnorm_i = weight[i] * dout_bt[i];
-        // gradient contribution to bias
+        // gradient contribution to bias (all rows contribute to the same bias which is per-C)
         atomicAdd(&dbias_shared[i], dout_bt[i]);
         // gradient contribution to weight
         atomicAdd(&dweight_shared[i], norm_bti * dout_bt[i]);
@@ -512,7 +541,7 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
     __syncthreads();
 
     // add everything together in global memory (non-deterministic due to floating point atomics)
-    // if we have blocks of 512 threads with each 32 threads handling one BT element, that means
+    // if we have blocks of 512 threads with every 32 threads handling one BT element, that means
     // we only need to do 1/16th as many global memory atomics (but many shared memory atomics)
 	for(int i = threadIdx.x; i < C; i+= block_size){
         atomicAdd(&dbias[i], dbias_shared[i]);
@@ -520,6 +549,7 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
 	}
 }
 
+// todo: could be optimized with float4 but needs to handle unaligned pointers & non-multiple-of-4 elements
 __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
                                                        int B, int T, int C, float scale) {
     // go through blocks in reverse order, so the slowest block starts first
