@@ -400,6 +400,10 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
         printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
         cudaCheck(cudaMalloc((void**) &model->master_weights, shard_num_parameters * sizeof(float)));
     }
+
+    size_t free, total;
+    cudaCheck(cudaMemGetInfo(&free, &total));
+    printf0("device memory usage: %zd MiB / %zd MiB\n", (total-free) / 1024 / 1024, total / 1024 / 1024);
 }
 
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
