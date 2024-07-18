@@ -404,6 +404,14 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     size_t free, total;
     cudaCheck(cudaMemGetInfo(&free, &total));
     printf0("device memory usage: %zd MiB / %zd MiB\n", (total-free) / 1024 / 1024, total / 1024 / 1024);
+
+    // give an estimate of the maximum batch size
+    size_t bytes_per_sequence = 0;
+    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+        bytes_per_sequence += model->acts_specs[i].size * sizeof_dtype(model->acts_specs[i].type) / B;
+    }
+    printf0("memory pre sequence: %zu MiB\n", bytes_per_sequence / 1024 / 1024);
+    printf0(" -> estimated maximum batch size: %zu\n", B + free / bytes_per_sequence);
 }
 
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
