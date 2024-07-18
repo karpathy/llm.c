@@ -358,6 +358,7 @@ void gpt2_init_common(GPT2 *model, GPT2Config config) {
     // create memory for model parameters on the device
     assert(model->params_memory == nullptr && "Old model needs to be freed before loading from checkpoint again");
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
+    model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
 }
 
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -599,6 +600,12 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
         cudaCheck(cudaMalloc(((void**)&model->accumulated_mean_loss), sizeof(float)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
+
+        // initialise cpu scratch buffers for encoder backward
+        size_t num_c_groups = CEIL_DIV(model->config.channels, (WARP_SIZE * x128::size));
+        assert((size_t)(model->batch_size * model->seq_len) * num_c_groups < (1ULL<<31ULL)); // todo - maybe an issue for llama3-400B(?)
+        model->workload_indices = (int*)mallocCheck(sizeof(int) * model->batch_size * model->seq_len * num_c_groups);
+        model->bucket_info = (int4*)mallocCheck(sizeof(int4) * model->batch_size * model->seq_len * num_c_groups);
     } else {
         // validate B,T are not larger than the values used at initialisation
         // (smaller B,T are okay for inference only)
@@ -728,20 +735,6 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
 void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
     NVTX_RANGE_FN();
     bool last_step = micro_step == grad_accum_steps - 1;
-
-    // lazily allocate the memory for gradients of the weights and activations, if needed
-    if (model->grads_memory == NULL) {
-        NvtxRange rng("InitGrads");
-        // allocate buffers for weight gradients
-        printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
-        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
-        // initialise cpu scratch buffers for encoder backward
-        size_t num_c_groups = CEIL_DIV(model->config.channels, (WARP_SIZE * x128::size));
-        assert((size_t)(model->batch_size * model->seq_len) * num_c_groups < (1ULL<<31ULL)); // todo - maybe an issue for llama3-400B(?)
-        model->workload_indices = (int*)mallocCheck(sizeof(int) * model->batch_size * model->seq_len * num_c_groups);
-        model->bucket_info = (int4*)mallocCheck(sizeof(int4) * model->batch_size * model->seq_len * num_c_groups);
-    }
-
     // on the first micro-step zero the gradients, as we're about to += accumulate into them
     if (micro_step == 0) {
         // there are currently two state vars during the gradient accumulation inner loop:
@@ -1593,6 +1586,7 @@ int main(int argc, char *argv[]) {
     // more prints related to allocations from gpt2_build_from_checkpoint down here to not mess up our table above
     printf0("num_parameters: %zu => bytes: %zu\n", model.num_parameters, model.num_parameters_bytes);
     printf0("allocated %d MiB for model parameters\n", (int)round(model.num_parameters_bytes / (1024 * 1024)));
+    printf0("allocated %d MiB for parameters gradients\n", (int)round(model.num_parameters_bytes / (1024 * 1024)));
     // few more prints for gradient accumulation math up above
     printf0("batch_size B=%d * seq_len T=%d * num_processes=%d and total_batch_size=%d\n",
             B, T, multi_gpu_config.num_processes, total_batch_size);
