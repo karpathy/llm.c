@@ -206,30 +206,6 @@ typedef struct {
     floatX* scratch_btc;    // (B, T, C)
 } ActivationTensors;
 
-// enumerator to indentify the datatype of a tensor.
-enum class DType : uint8_t {
-    FP32, FP16, BF16
-};
-
-// Given a datatype enum, returns the underlying number of bytes
-// for a scalar of that type
-size_t sizeof_dtype(DType type) {
-    switch (type) {
-        case DType::FP32:
-            return sizeof(float);
-        case DType::FP16:
-            return sizeof(half);
-        case DType::BF16:
-            return sizeof(nv_bfloat16);
-        default: // handle or get compiler warning
-            fprintf(stderr, "Unknown datatype\n");
-            exit(EXIT_FAILURE);
-    }
-}
-
-DType dtype_of(float* f) { return DType::FP32; }
-DType dtype_of(nv_bfloat16 * f) { return DType::BF16; }
-DType dtype_of(half * f) { return DType::FP16; }
 
 struct TensorSpec {
     void** ptr;
