@@ -410,7 +410,7 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         bytes_per_sequence += model->acts_specs[i].size * sizeof_dtype(model->acts_specs[i].type) / B;
     }
-    printf0("memory pre sequence: %zu MiB\n", bytes_per_sequence / 1024 / 1024);
+    printf0("memory per sequence: %zu MiB\n", bytes_per_sequence / 1024 / 1024);
     printf0(" -> estimated maximum batch size: %zu\n", B + free / bytes_per_sequence);
 }
 
@@ -1605,7 +1605,6 @@ int main(int argc, char *argv[]) {
     // more prints related to allocations from gpt2_build_from_checkpoint down here to not mess up our table above
     printf0("num_parameters: %zu => bytes: %zu\n", model.num_parameters, model.num_parameters_bytes);
     printf0("allocated %d MiB for model parameters\n", (int)round(model.num_parameters_bytes / (1024 * 1024)));
-    printf0("allocated %d MiB for parameters gradients\n", (int)round(model.num_parameters_bytes / (1024 * 1024)));
     // few more prints for gradient accumulation math up above
     printf0("batch_size B=%d * seq_len T=%d * num_processes=%d and total_batch_size=%d\n",
             B, T, multi_gpu_config.num_processes, total_batch_size);
