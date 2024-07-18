@@ -469,9 +469,6 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->config.channels = model_header[6];
     model->config.padded_vocab_size = model_header[7];
 
-    // allocate space for all the parameters and read them in
-    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
-
     gpt2_allocate_weights(model);
 
     // read in all the parameters from file and copy them to device
@@ -1046,9 +1043,9 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ?  local_offset_full : local_offset_partial;
         float* m_ptr = model->m_memory + opt_state_offset;
         float* v_ptr = model->v_memory + opt_state_offset;
-        float* master_ptr = NULL;
-        if (model->master_weights != NULL) { master_ptr = model->master_weights + opt_state_offset; }
-        if(init_state) {
+        float* master_ptr = nullptr;
+        if (model->master_weights != nullptr) { master_ptr = model->master_weights + opt_state_offset; }
+        if(init_state && model->master_weights != nullptr ) {
             size_t grid_size = CEIL_DIV(shard.size, 512);
             copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, param_ptr, shard.size,
                                                                      shard.size, tensor.size);
@@ -1529,6 +1526,7 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model
     GPT2 model;
+    gpt2_init_common(&model);
     if (resuming == 1) {
         // if `-y 1` was set, then we are resuming from the latest checkpoint
         gpt2_build_from_checkpoint(&model, filename_buffer);
