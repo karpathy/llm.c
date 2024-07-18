@@ -320,8 +320,7 @@ typedef struct {
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
 } GPT2;
 
-void gpt2_init_common(GPT2 *model, GPT2Config config) {
-    model->config = config;
+void gpt2_init_common(GPT2 *model) {
     // common inits outside of the model weights
     // memory lazily initialized in forward()
     model->acts_memory = NULL;
@@ -345,10 +344,12 @@ void gpt2_init_common(GPT2 *model, GPT2Config config) {
     // other default settings
     model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
     model->use_master_weights = 1; // safe default: do keep master weights in fp32
-    model->init_state = false;
+    model->init_state = true;
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+}
 
+void gpt2_allocate_weights(GPT2 *model) {
     // fill in all the parameter tensor dimensions and types
     fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
     model->num_parameters = 0;
@@ -358,12 +359,13 @@ void gpt2_init_common(GPT2 *model, GPT2Config config) {
         model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
     }
     // create memory for model parameters on the device
-    assert(model->params_memory == nullptr && "Old model needs to be freed before loading from checkpoint again");
+    assert(model->params_memory == nullptr);
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 }
 
 void gpt2_allocate_state(GPT2 *model, int B, int T) {
     printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
+    assert(model->grads_memory == nullptr);
     model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
 
     // record the current B,T as well
@@ -388,13 +390,15 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters; // num parameters we are responsible for
     printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
     printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
+    assert(model->m_memory == nullptr);
+    assert(model->v_memory == nullptr);
     cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
     cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
 
     if (model->use_master_weights == 1) {
+        assert(model->master_weights == nullptr);
         printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
         cudaCheck(cudaMalloc((void**) &model->master_weights, shard_num_parameters * sizeof(float)));
-        model->init_state = true;
     }
 }
 
@@ -457,16 +461,18 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
         exit(EXIT_FAILURE);
     }
 
-    GPT2Config config;
     // read in hyperparameters
-    config.max_seq_len = model_header[2];
-    config.vocab_size = model_header[3];
-    config.num_layers = model_header[4];
-    config.num_heads = model_header[5];
-    config.channels = model_header[6];
-    config.padded_vocab_size = model_header[7];
+    model->config.max_seq_len = model_header[2];
+    model->config.vocab_size = model_header[3];
+    model->config.num_layers = model_header[4];
+    model->config.num_heads = model_header[5];
+    model->config.channels = model_header[6];
+    model->config.padded_vocab_size = model_header[7];
 
-    gpt2_init_common(model, config);
+    // allocate space for all the parameters and read them in
+    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
+
+    gpt2_allocate_weights(model);
 
     // read in all the parameters from file and copy them to device
     file_to_device(model->params_memory, model_file, model->num_parameters_bytes,
@@ -529,22 +535,21 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     // check the valid prexies and dispatch to the right setup function
     assert(descriptor != NULL);
     size_t len = strlen(descriptor);
-    GPT2Config config;
     if (len > 1 && descriptor[0] == 'd') {
-        gpt2_set_hyperparameters(&config, descriptor + 1); // pass along the depth str without the 'd'
+        gpt2_set_hyperparameters(&model->config, descriptor + 1); // pass along the depth str without the 'd'
     } else if (len > 6 && strncmp(descriptor, "gpt2:d", 6) == 0) {
-        gpt2_set_hyperparameters(&config, descriptor + 6); // pass along the depth str without the 'gpt2:d'
+        gpt2_set_hyperparameters(&model->config, descriptor + 6); // pass along the depth str without the 'gpt2:d'
     } else if (len > 6 && strncmp(descriptor, "gpt3:c", 6) == 0) {
-        gpt3_set_hyperparameters(&config, descriptor + 6); // pass along the channels str without the 'gpt3:c'
+        gpt3_set_hyperparameters(&model->config, descriptor + 6); // pass along the channels str without the 'gpt3:c'
     } else {
         fprintf(stderr, "Unsupported model descriptor: %s\n", descriptor); exit(EXIT_FAILURE);
     }
 
     // both GPT-2 and GPT-3 use the same tokenizer with 50257 tokens
-    config.vocab_size = 50257;
-    config.padded_vocab_size = 50304; // padded to 128 for CUDA kernel efficiency
+    model->config.vocab_size = 50257;
+    model->config.padded_vocab_size = 50304; // padded to 128 for CUDA kernel efficiency
 
-    gpt2_init_common(model, config);
+    gpt2_allocate_weights(model);
 
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
@@ -748,6 +753,10 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
 }
 
 void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
+    if(model->grads_memory == nullptr) {
+        fprintf(stderr, "Need to allocate gradients before backward");
+        exit(EXIT_FAILURE);
+    }
     NVTX_RANGE_FN();
     bool last_step = micro_step == grad_accum_steps - 1;
     // on the first micro-step zero the gradients, as we're about to += accumulate into them
@@ -998,6 +1007,11 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     // selectively weight decay some, but not all tensors :(
     // TODO: revisit and probably refactor this entire function
     NVTX_RANGE_FN();
+    if(model->grads_memory == nullptr || model->m_memory == nullptr || model->v_memory == nullptr) {
+        fprintf(stderr, "Need to allocate optimizer state before update");
+        exit(EXIT_FAILURE);
+    }
+
     bool init_state = model->init_state;
     if(init_state) {
         model->init_state = false;
