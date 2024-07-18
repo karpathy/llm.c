@@ -1219,27 +1219,18 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     // read AdamW m, v, master_weights (they are all float)
     // allocate all the needed memory as necessary
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
-    if (model->m_memory == NULL) {
-        printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
-        cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
-    }
-    if (model->v_memory == NULL) {
-        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
-        cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
-    }
     if(use_master_weights == 1 && !model->use_master_weights) {
         printf0("Warning: Master weights are present in state, but not enabled for current run.");
     } else if (use_master_weights == 0 && model->use_master_weights) {
         printf0("Error: Master weights requested, but not present in state file.");
         exit(EXIT_FAILURE);
     }
-    if (model->master_weights == NULL && use_master_weights == 1) {
-        printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
-        cudaCheck(cudaMalloc((void**)&model->master_weights, shard_num_parameters * sizeof(float)));
-    }
+    assert(model->m_memory != nullptr);
+    assert(model->v_memory != nullptr);
     file_to_device(model->m_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     file_to_device(model->v_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     if(model->use_master_weights) {
+        assert(model->master_weights != nullptr);
         file_to_device(model->master_weights, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     }
 
