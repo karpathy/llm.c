@@ -1,124 +1,10 @@
-#ifndef LLM_CPP_LLMCPP_SPAN_HPP_
-#define LLM_CPP_LLMCPP_SPAN_HPP_
+#ifndef LLM_CPP_LLMCPP_TENSOR_UTIL_HPP_
+#define LLM_CPP_LLMCPP_TENSOR_UTIL_HPP_
 
 #include "absl/container/inlined_vector.h"
 #include "tensor_types.hpp"
 
 using floatX = float;
-
-struct Span1D {
-  using T = floatX;
-  static Span1D Make(T* array, size_t size) { return Span1D(array, size); }
-
-  size_t size() const { return flat_.size(); }
-
-  TTypes<T, 1>::Tensor View1D() const { return {flat_.data(), flat_.size()}; }
-
-  TTypes<T, 2>::Tensor View2D(int rows, int cols) const {
-    return {flat_.data(), rows, cols};
-  }
-
-  TTypes<T, 3>::Tensor View3D(int dim0, int dim1, int dim2) const {
-    CHECK_EQ(dim0 * dim1 * dim2, flat_.size());
-    return {flat_.data(), dim0, dim1, dim2};
-  }
-
-  TTypes<T, 4>::Tensor View4D(int dim0, int dim1, int dim2, int dim3) const {
-    CHECK_EQ(dim0 * dim1 * dim2 * dim3, flat_.size());
-    return {flat_.data(), dim0, dim1, dim2, dim3};
-  }
-
- private:
-  Span1D(T* array, size_t size) : flat_(array, size) {}
-
-  absl::Span<T> flat_;
-};
-
-struct Span2D {
-  using T = floatX;
-  static Span2D Make(T* array, int rows, int cols) {
-    return {array, rows, cols};
-  }
-
-  size_t size() const { return flat_.size(); }
-  int rows() const { return rows_; }
-  int cols() const { return cols_; }
-
-  TTypes<T, 1>::Tensor View1D(int length) const {
-    CHECK_EQ(length, flat_.size());
-    return {flat_.data(), flat_.size()};
-  }
-
-  TTypes<T, 2>::Tensor View2D() const { return {flat_.data(), rows_, cols_}; }
-
-  TTypes<T, 3>::Tensor View3D(int dim0, int dim1, int dim2) const {
-    CHECK_EQ(dim0 * dim1 * dim2, flat_.size());
-    return {flat_.data(), dim0, dim1, dim2};
-  }
-
-  TTypes<T, 4>::Tensor View4D(int dim0, int dim1, int dim2, int dim3) const {
-    CHECK_EQ(dim0 * dim1 * dim2 * dim3, flat_.size());
-    return {flat_.data(), dim0, dim1, dim2, dim3};
-  }
-
- private:
-  Span2D(T* array, int rows, int cols)
-      : flat_(array, rows * cols), rows_(rows), cols_(cols) {
-    CHECK_GE(rows, 0);
-    CHECK_GE(cols, 0);
-  }
-
-  absl::Span<T> flat_;
-  int rows_;
-  int cols_;
-};
-
-struct Span3D {
-  using T = floatX;
-  static Span3D Make(T* array, int dim0, int dim1, int dim2) {
-    return {array, dim0, dim1, dim2};
-  }
-
-  size_t size() const { return flat_.size(); }
-  int dim0() const { return dim0_; }
-  int dim1() const { return dim1_; }
-  int dim2() const { return dim2_; }
-
-  TTypes<T, 1>::Tensor View1D(int length) const {
-    CHECK_EQ(length, flat_.size());
-    return {flat_.data(), flat_.size()};
-  }
-
-  TTypes<T, 2>::Tensor View2D(int rows, int cols) const {
-    CHECK_EQ(rows * cols, flat_.size());
-    return {flat_.data(), rows, cols};
-  }
-
-  TTypes<T, 3>::Tensor View3D() const {
-    return {flat_.data(), dim0_, dim1_, dim2_};
-  }
-
-  TTypes<T, 4>::Tensor View4D(int dim0, int dim1, int dim2, int dim3) const {
-    CHECK_EQ(dim0 * dim1 * dim2 * dim3, flat_.size());
-    return {flat_.data(), dim0, dim1, dim2, dim3};
-  }
-
- private:
-  Span3D(T* array, int dim0, int dim1, int dim2)
-      : flat_(array, dim0 * dim1 * dim2),
-        dim0_(dim0),
-        dim1_(dim1),
-        dim2_(dim2) {
-    CHECK_GE(dim0, 0);
-    CHECK_GE(dim1, 0);
-    CHECK_GE(dim2, 0);
-  }
-
-  absl::Span<T> flat_;
-  int dim0_;
-  int dim1_;
-  int dim2_;
-};
 
 // Raw pointer -> Flat
 template <typename T>
@@ -410,4 +296,4 @@ typename TTypes<T, 3>::ConstTensor shaped(typename TTypes<T, 4>::ConstTensor t,
   return {t.data(), dim0, dim1, dim2};
 }
 
-#endif  // LLM_CPP_LLMCPP_SPAN_HPP_
+#endif  // LLM_CPP_LLMCPP_TENSOR_UTIL_HPP_

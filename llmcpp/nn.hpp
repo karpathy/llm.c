@@ -14,7 +14,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "llmc/rand.h"
-#include "span.hpp"
+#include "tensor_util.hpp"
 #include "unsupported/Eigen/CXX11/ThreadPool"
 
 namespace nn {
@@ -48,17 +48,252 @@ std::pair<int, int> SplitRange(int total, int idx, int n) {
 
 using Matrix =
     Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-using MatrixInt =
-    Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
-using Tensor1D = Eigen::Tensor<float, 1, Eigen::RowMajor>;
-using Tensor2D = Eigen::Tensor<float, 2, Eigen::RowMajor>;
 using Tensor3D = Eigen::Tensor<float, 3, Eigen::RowMajor>;
 using Tensor4D = Eigen::Tensor<float, 4, Eigen::RowMajor>;
 
 Eigen::ThreadPool g_thread_pool(16 /* number of threads in pool */);
 Eigen::ThreadPoolDevice g_cpu_device(&g_thread_pool,
                                      12 /* number of threads to use */);
+
+enum DataType : int { DT_FLOAT = 1, DT_HALF = 2, DT_INT32 = 3 };
+
+// Validates type T for whether it is a supported DataType.
+template <class T>
+struct IsValidDataType;
+
+// DataTypeToEnum<T>::v() and DataTypeToEnum<T>::value are the DataType
+// constants for T, e.g. DataTypeToEnum<float>::v() is DT_FLOAT.
+template <class T>
+struct DataTypeToEnum {
+  static_assert(IsValidDataType<T>::value, "Specified Data Type not supported");
+};  // Specializations below
+
+// EnumToDataType<VALUE>::Type is the type for DataType constant VALUE, e.g.
+// EnumToDataType<DT_FLOAT>::Type is float.
+template <DataType VALUE>
+struct EnumToDataType {};  // Specializations below
+
+// Template specialization for both DataTypeToEnum and EnumToDataType.
+#define MATCH_TYPE_AND_ENUM(TYPE, ENUM)     \
+  template <>                               \
+  struct DataTypeToEnum<TYPE> {             \
+    static DataType v() { return ENUM; }    \
+    static constexpr DataType value = ENUM; \
+  };                                        \
+  template <>                               \
+  struct IsValidDataType<TYPE> {            \
+    static constexpr bool value = true;     \
+  };                                        \
+  template <>                               \
+  struct EnumToDataType<ENUM> {             \
+    typedef TYPE Type;                      \
+  }
+
+MATCH_TYPE_AND_ENUM(float, DT_FLOAT);
+MATCH_TYPE_AND_ENUM(Eigen::half, DT_HALF);
+MATCH_TYPE_AND_ENUM(int, DT_INT32);
+
+// Parameter weight and its corresponding gradient
+struct Parameter2 {
+  Parameter2(const Parameter2&) = delete;
+  Parameter2& operator=(const Parameter2&) = delete;
+
+  explicit Parameter2(DataType dtype, int64_t num_element = 0)
+      : dtype_(dtype),
+        num_element_(num_element),
+        data_(nullptr),
+        grad_(nullptr) {
+    if (num_element) {
+      LazyAllocate(num_element);
+    }
+  }
+
+  ~Parameter2() {
+    g_cpu_device.deallocate(data_);
+    g_cpu_device.deallocate(grad_);
+  }
+
+  int64_t size() const { return num_element_; }
+
+  void LazyAllocate(int num_element) {
+    if (data_ == nullptr) {
+      data_ = Allocate(dtype_, num_element);
+      Zero(data_, dtype_, num_element);
+      num_element_ = num_element;
+    }
+    CHECK_EQ(num_element, num_element_);
+  }
+
+  void LazyAllocateGradient() {
+    if (grad_ == nullptr) {
+      CHECK_GT(num_element_, 0);
+      grad_ = Allocate(dtype_, num_element_);
+      Zero(grad_, dtype_, num_element_);
+    }
+  }
+
+  void ZeroData() {
+    if (data_ != nullptr) {
+      Zero(data_, dtype_, num_element_);
+    }
+  }
+
+  void ZeroGrad() {
+    if (grad_ != nullptr) {
+      Zero(grad_, dtype_, num_element_);
+    }
+  }
+
+  template <typename T>
+  T* data() const {
+    return static_cast<T*>(data_);
+  }
+
+  template <typename T>
+  T* grad() const {
+    return static_cast<T*>(grad_);
+  }
+
+  template <typename T>
+  typename TTypes<T>::Flat flat() const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    return {data<T>(), num_element_};
+  }
+  template <typename T>
+  typename TTypes<T>::ConstFlat const_flat() const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    return {data<T>(), num_element_};
+  }
+
+  template <typename T>
+  typename TTypes<T>::Matrix matrix(int rows, int cols) const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    CHECK_EQ(rows * cols, num_element_);
+    return {data<T>(), rows, cols};
+  }
+  template <typename T>
+  typename TTypes<T>::ConstMatrix const_matrix(int rows, int cols) const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    CHECK_EQ(rows * cols, num_element_);
+    return {data<T>(), rows, cols};
+  }
+
+  template <typename T>
+  typename TTypes<T, 3>::Tensor tensor_3d(int dim0, int dim1, int dim2) const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    CHECK_EQ(dim0 * dim1 * dim2, num_element_);
+    return {data<T>(), dim0, dim1, dim2};
+  }
+  template <typename T>
+  typename TTypes<T, 3>::ConstTensor const_tensor_3d(int dim0, int dim1,
+                                                     int dim2) const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    CHECK_EQ(dim0 * dim1 * dim2, num_element_);
+    return {data<T>(), dim0, dim1, dim2};
+  }
+
+  template <typename T>
+  typename TTypes<T, 4>::Tensor tensor_4d(int dim0, int dim1, int dim2,
+                                          int dim3) const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    CHECK_EQ(dim0 * dim1 * dim2 * dim3, num_element_);
+    return {data<T>(), dim0, dim1, dim2, dim3};
+  }
+  template <typename T>
+  typename TTypes<T, 4>::ConstTensor const_tensor_4d(int dim0, int dim1,
+                                                     int dim2, int dim3) const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    CHECK_EQ(dim0 * dim1 * dim2 * dim3, num_element_);
+    return {data<T>(), dim0, dim1, dim2, dim3};
+  }
+
+  template <typename T>
+  typename TTypes<T>::Flat flat_grad() const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    return {grad<T>(), num_element_};
+  }
+  template <typename T>
+  typename TTypes<T>::ConstFlat const_flat_grad() const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    return {grad<T>(), num_element_};
+  }
+
+  template <typename T>
+  typename TTypes<T>::Matrix matrix_grad(int rows, int cols) const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    CHECK_EQ(rows * cols, num_element_);
+    return {grad<T>(), rows, cols};
+  }
+  template <typename T>
+  typename TTypes<T>::ConstMatrix const_matrix_grad(int rows, int cols) const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    CHECK_EQ(rows * cols, num_element_);
+    return {grad<T>(), rows, cols};
+  }
+
+  template <typename T>
+  typename TTypes<T, 3>::Tensor tensor_3d_grad(int dim0, int dim1,
+                                               int dim2) const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    CHECK_EQ(dim0 * dim1 * dim2, num_element_);
+    return {grad<T>(), dim0, dim1, dim2};
+  }
+  template <typename T>
+  typename TTypes<T, 3>::ConstTensor const_tensor_3d_grad(int dim0, int dim1,
+                                                          int dim2) const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    CHECK_EQ(dim0 * dim1 * dim2, num_element_);
+    return {grad<T>(), dim0, dim1, dim2};
+  }
+
+  template <typename T>
+  typename TTypes<T, 4>::Tensor tensor_4d_grad(int dim0, int dim1, int dim2,
+                                               int dim3) const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    CHECK_EQ(dim0 * dim1 * dim2 * dim3, num_element_);
+    return {grad<T>(), dim0, dim1, dim2, dim3};
+  }
+
+  template <typename T>
+  typename TTypes<T, 4>::ConstTensor const_tensor_4d_grad(int dim0, int dim1,
+                                                          int dim2,
+                                                          int dim3) const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    CHECK_EQ(dim0 * dim1 * dim2 * dim3, num_element_);
+    return {grad<T>(), dim0, dim1, dim2, dim3};
+  }
+
+ private:
+  static void* Allocate(DataType dtype, int64_t num_element) {
+    if (dtype == DT_FLOAT) {
+      return g_cpu_device.allocate(sizeof(float) * num_element);
+    } else if (dtype == DT_HALF) {
+      return g_cpu_device.allocate(sizeof(Eigen::half) * num_element);
+    } else {
+      throw std::invalid_argument("invalid data type: " +
+                                  std::to_string(dtype));
+    }
+  }
+
+  static void Zero(void* data, DataType dtype, int64_t num_element) {
+    if (dtype == DT_FLOAT) {
+      g_cpu_device.memset(data, 0, sizeof(float) * num_element);
+    } else if (dtype == DT_HALF) {
+      g_cpu_device.memset(data, 0, sizeof(Eigen::half) * num_element);
+    } else {
+      throw std::invalid_argument("invalid data type: " +
+                                  std::to_string(dtype));
+    }
+  }
+
+  DataType dtype_;
+  int64_t num_element_;
+  void* data_;
+  void* grad_;
+};
+
+using Activation = Parameter2;
 
 // Parameter weight and its corresponding gradient
 struct Parameter {
@@ -100,64 +335,6 @@ struct Parameter {
     LOG_IF(FATAL, type == kGrad && grad_ == nullptr)
         << "Gradient memory has not been allocated!";
     return {type == kValue ? value_ : grad_, static_cast<size_t>(length_)};
-  }
-
-  Eigen::Map<Eigen::RowVectorXf> View(int length,
-                                      DataType type = DataType::kValue) const {
-    LOG_IF(FATAL, type == kGrad && grad_ == nullptr)
-        << "Gradient memory has not been allocated!";
-    CHECK_EQ(length, length_);
-    return {type == kValue ? value_ : grad_,
-            static_cast<Eigen::Index>(length_)};
-  }
-
-  TTypes<T, 1>::Tensor View1D(int length) const {
-    CHECK_EQ(length, length_);
-    return {value_, length_};
-  }
-
-  TTypes<T, 1>::Tensor ViewGrad1D(int length) const {
-    LOG_IF(FATAL, grad_ == nullptr)
-        << "Gradient memory has not been allocated!";
-    CHECK_EQ(length, length_);
-    return {grad_, length_};
-  }
-
-  TTypes<T, 2>::Tensor View2D(int rows, int cols) const {
-    CHECK_EQ(length_, rows * cols);
-    return {value_, rows, cols};
-  }
-
-  TTypes<T, 2>::Tensor ViewGrad2D(int rows, int cols) const {
-    LOG_IF(FATAL, grad_ == nullptr)
-        << "Gradient memory has not been allocated!";
-    CHECK_EQ(length_, rows * cols);
-    return {grad_, rows, cols};
-  }
-
-  TTypes<T, 3>::Tensor View3D(int dim0, int dim1, int dim2) const {
-    CHECK_EQ(length_, dim0 * dim1 * dim2);
-    return {value_, dim0, dim1, dim2};
-  }
-
-  TTypes<T, 3>::Tensor ViewGrad3D(int dim0, int dim1, int dim2) const {
-    LOG_IF(FATAL, grad_ == nullptr)
-        << "Gradient memory has not been allocated!";
-    CHECK_EQ(length_, dim0 * dim1 * dim2);
-    return {grad_, dim0, dim1, dim2};
-  }
-
-  TTypes<T, 4>::Tensor View4D(int dim0, int dim1, int dim2, int dim3) const {
-    CHECK_EQ(length_, dim0 * dim1 * dim2 * dim3);
-    return {value_, dim0, dim1, dim2, dim3};
-  }
-
-  TTypes<T, 4>::Tensor ViewGrad4D(int dim0, int dim1, int dim2,
-                                  int dim3) const {
-    LOG_IF(FATAL, grad_ == nullptr)
-        << "Gradient memory has not been allocated!";
-    CHECK_EQ(length_, dim0 * dim1 * dim2 * dim3);
-    return {grad_, dim0, dim1, dim2, dim3};
   }
 
  private:
@@ -269,13 +446,12 @@ struct Linear {
     CHECK_EQ(y.dimension(1), out_features_);
     CHECK_EQ(x.dimension(0), y.dimension(0));
 
-    auto weight = Eigen::TensorMap<Tensor2D>(weight_->data(), out_features_,
-                                             in_features_);
+    auto weight = MakeMatrix(weight_->data(), out_features_, in_features_);
     // y = x * w^T + b
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
         Eigen::IndexPair<int>(1, 1)};
     if (has_bias_) {
-      auto bias = Eigen::TensorMap<Tensor1D>(bias_->data(), out_features_);
+      auto bias = MakeFlat(bias_->data(), out_features_);
       Eigen::array<int, 2> broadcast_dims = {static_cast<int>(y.dimension(0)),
                                              1};
       y.device(g_cpu_device) =
@@ -296,13 +472,8 @@ struct Linear {
 
     // Lazily allocate the memory for gradients
     weight_->AllocateGradient();
-    //    auto weight = weight_->View(out_features_, in_features_);
-    auto weight = Eigen::TensorMap<nn::Tensor2D>(weight_->data(), out_features_,
-                                                 in_features_);
-    //    auto weight_grad =
-    //        weight_->View(out_features_, in_features_, Parameter::kGrad);
-    auto weight_grad = Eigen::TensorMap<nn::Tensor2D>(
-        weight_->grad(), out_features_, in_features_);
+    auto weight = MakeMatrix(weight_->data(), out_features_, in_features_);
+    auto weight_grad = MakeMatrix(weight_->grad(), out_features_, in_features_);
 
     // x_grad = dL/dy * dy/dx
     //        = y_grad(B, out_features) * W(out_features, in_features)
@@ -323,12 +494,7 @@ struct Linear {
       //        = \sum_i^(B)(y_grad(B, out_features))
       //        = [out_features,]
       bias_->AllocateGradient();
-
-      //      auto bias_grad = bias_->View(out_features_, Parameter::kGrad);
-      //      auto y_grad_matrix = Eigen::Map<nn::Matrix>(
-      //          y_grad.data(), y_grad.dimension(0), y_grad.dimension(1));
-      //      bias_grad.noalias() += y_grad_matrix.colwise().sum();
-      auto bias_grad = Eigen::TensorMap<Tensor1D>(bias_->grad(), out_features_);
+      auto bias_grad = MakeFlat(bias_->grad(), out_features_);
       Eigen::array<Eigen::Index, 1> along_batch = {0};
       bias_grad.device(g_cpu_device) = y_grad.sum(along_batch);
     }
@@ -457,8 +623,6 @@ struct LayerNorm {
             .sqrt()
             .inverse();
 
-    auto weight = weight_->View(normalized_shape_);
-    auto bias = bias_->View(normalized_shape_);
     // normalize: (x - mean) / std
     // && scale:  (x - mean) / std * weight
     // && shift:  (x - mean) / std * weight + bias
@@ -474,9 +638,8 @@ struct LayerNorm {
         bias.array();
     */
 
-    auto weight_1d =
-        Eigen::TensorMap<Tensor1D>(weight_->data(), normalized_shape_);
-    auto bias_1d = Eigen::TensorMap<Tensor1D>(bias_->data(), normalized_shape_);
+    auto weight_1d = MakeFlat(weight_->data(), normalized_shape_);
+    auto bias_1d = MakeFlat(bias_->data(), normalized_shape_);
     y.device(g_cpu_device) =
         (x - mean.reshape(batch_by_one).broadcast(one_by_class)) *
             rstd.reshape(batch_by_one).broadcast(one_by_class) *
@@ -508,17 +671,10 @@ struct LayerNorm {
     // Lazily allocate the memory for gradients
     weight_->AllocateGradient();
     bias_->AllocateGradient();
-    auto weight = weight_->View(normalized_shape_);
-    auto weight_grad = weight_->View(normalized_shape_, Parameter::kGrad);
-    auto bias = bias_->View(normalized_shape_);
-    auto bias_grad = bias_->View(normalized_shape_, Parameter::kGrad);
-    auto weight_1d =
-        Eigen::TensorMap<Tensor1D>(weight_->data(), normalized_shape_);
-    auto weight_grad_1d =
-        Eigen::TensorMap<Tensor1D>(weight_->grad(), normalized_shape_);
-    auto bias_1d = Eigen::TensorMap<Tensor1D>(bias_->data(), normalized_shape_);
-    auto bias_grad_1d =
-        Eigen::TensorMap<Tensor1D>(bias_->grad(), normalized_shape_);
+    auto weight_1d = MakeFlat(weight_->data(), normalized_shape_);
+    auto weight_grad_1d = MakeFlat(weight_->grad(), normalized_shape_);
+    auto bias_1d = MakeFlat(bias_->data(), normalized_shape_);
+    auto bias_grad_1d = MakeFlat(bias_->grad(), normalized_shape_);
 
     // x_grad = dL/dy * dy/dnorm
     //                * [dnorm/dxmean * dxmean/dx
@@ -541,15 +697,16 @@ struct LayerNorm {
         rstd.transpose().array();
     */
 
-    Tensor2D norm_2d =
+    Eigen::Tensor<float, 2, Eigen::RowMajor> norm_2d =
         (x - mean.reshape(batch_by_one).broadcast(one_by_class)) *
         rstd.reshape(batch_by_one).broadcast(one_by_class);  // [B, D]
-    Tensor2D dnorm_2d =
+    Eigen::Tensor<float, 2, Eigen::RowMajor> dnorm_2d =
         y_grad *
         weight_1d.reshape(one_by_class).broadcast(batch_by_one);  // [B, D]
     Eigen::array<Eigen::Index, 1> along_class = {1};
-    Tensor1D dnorm_mean_1d = dnorm_2d.mean(along_class);  // [B,]
-    Tensor1D dnorm_norm_mean_1d =
+    Eigen::Tensor<float, 1, Eigen::RowMajor> dnorm_mean_1d =
+        dnorm_2d.mean(along_class);  // [B,]
+    Eigen::Tensor<float, 1, Eigen::RowMajor> dnorm_norm_mean_1d =
         (dnorm_2d * norm_2d).mean(along_class);  // [B,]
     x_grad.device(g_cpu_device) +=
         ((dnorm_2d -
