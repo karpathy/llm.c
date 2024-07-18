@@ -4,21 +4,101 @@ Only used in train_gpt2fp32.cu (rather than the main train_gpt2.cu)
 */
 #include <mma.h>
 #include <cuda/pipeline>
-#include <algorithm>
 
-// enable to use "compute_tf32gemm_async_copy" instead of "matmul_forward_kernel4"
-// todo - maybe want to add back a cuBLAS path for comparison?
-#define ENABLE_TF32_WMMA_MATMUL
+// use "./train_gpt2fp32cu -c 1" for the custom TF32 kernel and "-c 3" for the custom FP32 kernel
+// c=0/1 will also force all non-forward matmul kernels to be TF32, while c=2/3 will force FP32
+// for test_gpt2fp32cu, cuBLAS FP32 will always be used (no command line options)
+// if you want to force cuBLAS or custom TF32/FP32 kernels, change the values below
+constexpr bool FORCE_FORWARD_MATMUL_CUBLAS = false;
+constexpr bool FORCE_FORWARD_MATMUL_TF32 = false; // incompatible with pre-A100 GPUs
+constexpr bool FORCE_FORWARD_MATMUL_FP32= false;
 
 // -----------------------------------------------------------------------------------
-// kernels
+// FP32 non-Tensor Core Kernel (baseline)
 
+// note that this kernel is effectively row-major while cuBLAS is column-major
+// so we need to pass "A as B" and "B as A" in order to get the same C/D layout as cuBLAS
+__global__ void __launch_bounds__(16*16, 2) matmul_forward_kernel4(float* out,
+                                                                   const float* inp, const float* weight, const float* bias,
+                                                                   int C, int OC) {
+    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
+    // inp is (B,T,C), weight is (OC, C), bias is (OC)
+    // each thread handles 8x8 elements; each block 128 by 128 elements.
+    int oc = 8*(blockIdx.y * blockDim.y + threadIdx.y);
+
+    // buffers to cache chunks of the input matrices
+    __shared__ float lhs_s[128][32];
+    __shared__ float rhs_s[128][32];
+
+    // adjust our pointers for the current block
+    inp += 128 * blockIdx.x * C;
+    weight += 128 * blockIdx.y * C;
+    out += 128 * blockIdx.x * OC + 128 * blockIdx.y;
+
+    float vals[8][8] = {};
+    if(bias != NULL) {
+        for (int i = 0; i < 8; i++) {
+            for (int j = 0; j < 8; j += 4) {
+                float4 b = ld_vec(bias + oc + j);
+                vals[i][j+0] = b.x;
+                vals[i][j+1] = b.y;
+                vals[i][j+2] = b.z;
+                vals[i][j+3] = b.w;
+            }
+        }
+    }
+
+    int si_start = 4*(16 * threadIdx.y + threadIdx.x);
+    for (int so = 0; so < C; so += 32) {
+        __syncthreads();
+        int xmod8 = threadIdx.x % 8;
+        int xby8 = threadIdx.x / 8;
+        int xo = 4 * xmod8;
+        for(int y = 2 * threadIdx.y + xby8; y < 128; y += 32) {
+            st_vec(&lhs_s[y][xo], ld_vec(inp + y * C + so + xo));
+            st_vec(&rhs_s[y][xo], ld_vec(weight + y * C + so + xo));
+        }
+        __syncthreads();
+
+        for (int si = si_start; si < si_start + 32; si += 4) {
+            float4 rhs[8];
+            for (int u = 0; u < 8; ++u) {
+                rhs[u] = ld_vec(&rhs_s[u + 8 * threadIdx.y][si % 32]);
+            }
+
+            for (int ii = 0; ii < 8; ++ii) {
+                float4 lhs = ld_vec(&lhs_s[ii + 8 * threadIdx.x][si % 32]);
+                for (int ji = 0; ji < 8; ++ji) {
+                    vals[ii][ji] += lhs.x * rhs[ji].x;
+                    vals[ii][ji] += lhs.y * rhs[ji].y;
+                    vals[ii][ji] += lhs.z * rhs[ji].z;
+                    vals[ii][ji] += lhs.w * rhs[ji].w;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 8; j += 4) {
+            float4 result;
+            result.x = vals[i][j + 0];
+            result.y = vals[i][j + 1];
+            result.z = vals[i][j + 2];
+            result.w = vals[i][j + 3];
+            st_vec(out + (8*threadIdx.x+i) * OC + 8*threadIdx.y + j, result);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------------
+// TF32 WMMA Tensor Core Kernel
 // this is a port of NVIDIA's CUDA 12.4 sample "tf32TensorCoreGemm" for llm.c
 // https://github.com/NVIDIA/cuda-samples/tree/v12.4/Samples/3_CUDA_Features/tf32TensorCoreGemm
+
 // keeping similar define names except M/N/K which cannot exist at global scope to avoid conflicts
 // various defines have also been replaced by variables derived from function parameters m/n/k
-#define WARPS_PER_BLOCK 8
-#define THREADS_PER_BLOCK (WARP_SIZE * WARPS_PER_BLOCK)
+#define WMMA_WARPS_PER_BLOCK 8
+#define WMMA_THREADS_PER_BLOCK (WARP_SIZE * WMMA_WARPS_PER_BLOCK)
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 8
@@ -36,8 +116,21 @@ Only used in train_gpt2fp32.cu (rather than the main train_gpt2.cu)
 #define SHMEM_STRIDE (WMMA_N * BLOCK_ROW_TILES)
 #define SHMEM_OFFSET (WMMA_N * WARP_ROW_TILES)
 #define SKEW_FLOAT 8
-#define C_LAYOUT wmma::mem_row_major
 
+// shared memory size required for each block by the TF32 WMMA kernel
+// 70KiB+ for default settings => 2 blocks on A100 but only 1 on GA102/AD102 unfortunately...
+constexpr int WMMA_SHMEM_SIZE1 = (BLOCK_COL_TILES * WMMA_M) * (CHUNK_K * WMMA_K + SKEW_FLOAT) * 2;
+constexpr int WMMA_SHMEM_SIZE2 = (WMMA_M * (BLOCK_ROW_WARPS * WARP_ROW_TILES) * WMMA_N * (BLOCK_COL_WARPS * WARP_COL_TILES));
+constexpr int WMMA_SHMEM_SIZE = (WMMA_SHMEM_SIZE1 > WMMA_SHMEM_SIZE2 ? WMMA_SHMEM_SIZE1 : WMMA_SHMEM_SIZE2) * sizeof(float);
+
+// transpose for WMMA (equivalent to cuBLAS_OP_T etc.)
+// note that this kernel is effectively row-major while cuBLAS is column-major
+// so we need to pass "A as B" and "B as A" in order to get the same C/D layout as cuBLAS
+// but the transposes should be the same (cuBLAS: A=inp^T / B=weight - WMMA: A=weight^T / B=inp)
+using WMMA_T =  nvcuda::wmma::row_major;
+using WMMA_NT = nvcuda::wmma::col_major;
+
+template <typename A_major=WMMA_T, typename B_major=WMMA_NT>
 __global__ void compute_tf32gemm_async_copy(float *D,
                                             const float *A, const float *B, const float *C, const float *bias,
                                             const float alpha, float beta, int m, int n, int k) {
@@ -132,7 +225,7 @@ __global__ void compute_tf32gemm_async_copy(float *D,
                 for (int j = 0; j < WARP_ROW_TILES; j++) {
                     const float *tile_ptr = shmem_warp_tile_ptr + i * SHMEM_STRIDE * N + j * N;
 
-                    wmma::load_matrix_sync(c[i][j], tile_ptr, SHMEM_STRIDE, C_LAYOUT);
+                    wmma::load_matrix_sync(c[i][j], tile_ptr, SHMEM_STRIDE, wmma::mem_row_major);
                     // Scale the C matrix.
     #pragma unroll
                     for (int t = 0; t < c[i][j].num_elements; t++) {
@@ -148,8 +241,8 @@ __global__ void compute_tf32gemm_async_copy(float *D,
 
         // Select what warp copies what matrix to shared memory.
         // Warps 0-3 copy the A matrix, warps 4-7 copy the B matrix.
-        const float *warp_ptr = (warpId < (WARPS_PER_BLOCK/2)) ? (&A[block_tile_i * M * K_GLOBAL] + M * K_GLOBAL * (warpId % (WARPS_PER_BLOCK/2)) * 2) :
-                                              (&B[block_tile_j * N * K_GLOBAL] + N * K_GLOBAL * (warpId % (WARPS_PER_BLOCK/2)) * 2);
+        const float *warp_ptr = (warpId < (WMMA_WARPS_PER_BLOCK/2)) ? (&A[block_tile_i * M * K_GLOBAL] + M * K_GLOBAL * (warpId % (WMMA_WARPS_PER_BLOCK/2)) * 2) :
+                                              (&B[block_tile_j * N * K_GLOBAL] + N * K_GLOBAL * (warpId % (WMMA_WARPS_PER_BLOCK/2)) * 2);
 
         constexpr int chunksPerLane = ((WARP_SIZE/2) / CHUNK_COPY_LINES_PER_WARP) * 2;
         const int laneLoadElem = (laneId % CHUNK_COPY_LINE_LANES) << loadStride;
@@ -160,7 +253,7 @@ __global__ void compute_tf32gemm_async_copy(float *D,
             // Copy slices of the A and B matrices to shared memory.
             // The first half of the warps in the CTA copy the A matrix, the rest copy the B matrix.
             // As for tf32 MMA  M == N we use M for warp 4-7 + shmem_idx_b_off.
-            size_t shmem_idx =  (M * (warpId % (WARPS_PER_BLOCK/2)) * 2)  + ((warpId / (WARPS_PER_BLOCK/2)) * shmem_idx_b_off);
+            size_t shmem_idx =  (M * (warpId % (WMMA_WARPS_PER_BLOCK/2)) * 2)  + ((warpId / (WMMA_WARPS_PER_BLOCK/2)) * shmem_idx_b_off);
             // First half of the warp copies the first row / column of the matrix,
             // the second half of the warp copies the next.
             const float *lane_ptr = (warp_ptr + tile_k * K + stridePerLaneCopy * K_GLOBAL + laneLoadElem);
@@ -186,8 +279,8 @@ __global__ void compute_tf32gemm_async_copy(float *D,
             // Compute a grid of C matrix tiles in each warp.
 #pragma unroll
             for (int k_step = 0; k_step < CHUNK_K; k_step++) {
-                wmma::fragment<wmma::matrix_a, M, N, K, wmma::precision::tf32, wmma::row_major> a[WARP_COL_TILES];
-                wmma::fragment<wmma::matrix_b, M, N, K, wmma::precision::tf32, wmma::col_major> b[WARP_ROW_TILES];
+                wmma::fragment<wmma::matrix_a, M, N, K, wmma::precision::tf32, A_major> a[WARP_COL_TILES];
+                wmma::fragment<wmma::matrix_b, M, N, K, wmma::precision::tf32, B_major> b[WARP_ROW_TILES];
 
 #pragma unroll
                 for (int i = 0; i < WARP_COL_TILES; i++) {
@@ -235,7 +328,7 @@ __global__ void compute_tf32gemm_async_copy(float *D,
                     c[i][j].x[t] *= alpha;
                 }
                 float *tile_ptr = shmem_warp_tile_ptr + i * SHMEM_STRIDE * N + j * N;
-                wmma::store_matrix_sync(tile_ptr, c[i][j], SHMEM_STRIDE, C_LAYOUT);
+                wmma::store_matrix_sync(tile_ptr, c[i][j], SHMEM_STRIDE, wmma::mem_row_major);
             }
         }
 
@@ -250,12 +343,14 @@ __global__ void compute_tf32gemm_async_copy(float *D,
             float4* out_ptr = (float4*)(dst_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) + laneId;
             float4 shmem_data = *((float4*)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId);
             if (bias != NULL) {
-                ptrdiff_t diff = (float*)out_ptr - D;
-                ptrdiff_t column = diff % n;
+                ptrdiff_t column = (ptrdiff_t)((float*)out_ptr - D) % n;
                 float4 bias4 = ld_vec(bias + column);
                 *out_ptr = add_float4(shmem_data, bias4);
+                // todo: __stcs doesn't seem to help in practice on H100, unsure about other GPUs?
+                //__stcs(out_ptr, add_float4(shmem_data, bias4));
             } else {
                 *out_ptr = shmem_data;
+                //__stcs(out_ptr, shmem_data);
             }
         }
 
@@ -264,78 +359,18 @@ __global__ void compute_tf32gemm_async_copy(float *D,
 #endif
 }
 
-__global__ void __launch_bounds__(16*16, 2) matmul_forward_kernel4(float* out,
-                                                                   const float* inp, const float* weight, const float* bias,
-                                                                   int C, int OC) {
-    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
-    // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    // each thread handles 8x8 elements; each block 128 by 128 elements.
-    int oc = 8*(blockIdx.y * blockDim.y + threadIdx.y);
+// -----------------------------------------------------------------------------------
+// cuBLAS baseline for forward pass with separate bias kernel
+// cuBLASLt allows merging this which would significantly improve performance
 
-    // buffers to cache chunks of the input matrices
-    __shared__ float lhs_s[128][32];
-    __shared__ float rhs_s[128][32];
-
-    // adjust our pointers for the current block
-    inp += 128 * blockIdx.x * C;
-    weight += 128 * blockIdx.y * C;
-    out += 128 * blockIdx.x * OC + 128 * blockIdx.y;
-
-    float vals[8][8] = {};
-    if(bias != NULL) {
-        for (int i = 0; i < 8; i++) {
-            for (int j = 0; j < 8; j += 4) {
-                float4 b = ld_vec(bias + oc + j);
-                vals[i][j+0] = b.x;
-                vals[i][j+1] = b.y;
-                vals[i][j+2] = b.z;
-                vals[i][j+3] = b.w;
-            }
-        }
-    }
-
-    int si_start = 4*(16 * threadIdx.y + threadIdx.x);
-    for (int so = 0; so < C; so += 32) {
-        __syncthreads();
-        int xmod8 = threadIdx.x % 8;
-        int xby8 = threadIdx.x / 8;
-        int xo = 4 * xmod8;
-        for(int y = 2 * threadIdx.y + xby8; y < 128; y += 32) {
-            st_vec(&lhs_s[y][xo], ld_vec(inp + y * C + so + xo));
-            st_vec(&rhs_s[y][xo], ld_vec(weight + y * C + so + xo));
-        }
-        __syncthreads();
-
-        for (int si = si_start; si < si_start + 32; si += 4) {
-            float4 rhs[8];
-            for (int u = 0; u < 8; ++u) {
-                rhs[u] = ld_vec(&rhs_s[u + 8 * threadIdx.y][si % 32]);
-            }
-
-            for (int ii = 0; ii < 8; ++ii) {
-                float4 lhs = ld_vec(&lhs_s[ii + 8 * threadIdx.x][si % 32]);
-                for (int ji = 0; ji < 8; ++ji) {
-                    vals[ii][ji] += lhs.x * rhs[ji].x;
-                    vals[ii][ji] += lhs.y * rhs[ji].y;
-                    vals[ii][ji] += lhs.z * rhs[ji].z;
-                    vals[ii][ji] += lhs.w * rhs[ji].w;
-                }
-            }
-        }
-    }
-
-    for (int i = 0; i < 8; ++i) {
-        for (int j = 0; j < 8; j += 4) {
-            float4 result;
-            result.x = vals[i][j + 0];
-            result.y = vals[i][j + 1];
-            result.z = vals[i][j + 2];
-            result.w = vals[i][j + 3];
-            st_vec(out + (8*threadIdx.x+i) * OC + 8*threadIdx.y + j, result);
-        }
+__global__ void add_bias(float* out, float* bias, int B, int T, int OC) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = idx; i < B*T*OC; i += stride) {
+        int col = i % OC;
+        out[i] += bias[col];
     }
 }
-
 
 // -----------------------------------------------------------------------------------
 // launchers
@@ -346,19 +381,36 @@ void matmul_forward(float* out,
     // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
 
-#ifdef ENABLE_TF32_WMMA_MATMUL
-    constexpr int M = WMMA_M, N = WMMA_N, K = WMMA_K;
-    size_t SHMEM_SZ = std::max(sizeof(float) * (BLOCK_COL_TILES * M) * (CHUNK_K * K + SKEW_FLOAT) * 2,  M * (BLOCK_ROW_WARPS * WARP_ROW_TILES) * N * (BLOCK_COL_WARPS * WARP_COL_TILES) * sizeof(float));
-    cudaCheck(cudaFuncSetAttribute(compute_tf32gemm_async_copy, cudaFuncAttributeMaxDynamicSharedMemorySize, SHMEM_SZ));
+    if (!FORCE_FORWARD_MATMUL_FP32 && !FORCE_FORWARD_MATMUL_TF32) {
+        if (custom_matmul_kernel == 0 || custom_matmul_kernel == 2 || FORCE_FORWARD_MATMUL_CUBLAS) {
+            // cuBLAS is column-major like FORTRAN, while our kernels are row-major, so A/B are reversed
+            const float one = 1.0f, zero = 0.0f;
+            cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &one, weight, C, inp, C, &zero, out, OC));
+            if (bias != NULL) {
+                add_bias<<<min(4096, CEIL_DIV(B*T*OC, 256)), 256>>>(out, bias, B, T, OC);
+                cudaCheck(cudaGetLastError());
+            }
+            return;
+        }
+    }
 
-    compute_tf32gemm_async_copy<<<deviceProp.multiProcessorCount*2, THREADS_PER_BLOCK, SHMEM_SZ>>>(out, inp, weight, out, bias, 1.0f, 0.0f, B*T, OC, C);
-    cudaCheck(cudaGetLastError());
-#else
+    if (!FORCE_FORWARD_MATMUL_FP32) {
+        // TF32 WMMA and async require A100+ GPUs -> fallback to FP32 kernel if not available
+        if ((custom_matmul_kernel == 1 || FORCE_FORWARD_MATMUL_TF32) && deviceProp.major >= 8)
+        {
+            cudaCheck(cudaFuncSetAttribute(compute_tf32gemm_async_copy<WMMA_T,WMMA_NT>, cudaFuncAttributeMaxDynamicSharedMemorySize, WMMA_SHMEM_SIZE));
+            compute_tf32gemm_async_copy<WMMA_T,WMMA_NT><<<deviceProp.multiProcessorCount*2, WMMA_THREADS_PER_BLOCK, WMMA_SHMEM_SIZE>>>
+                                                    (out, inp, weight, out, bias, 1.0f, 0.0f, B*T, OC, C);
+            cudaCheck(cudaGetLastError());
+            return;
+        }
+    }
+
+    // safe fallback: custom FP32 kernel
     int sqrt_block_size = 16;
     dim3 gridDim(CEIL_DIV(B * T, 8*sqrt_block_size), CEIL_DIV(OC, 8*sqrt_block_size));
     dim3 blockDim(sqrt_block_size, sqrt_block_size);
 
     matmul_forward_kernel4<<<gridDim, blockDim>>>(out, inp, weight, bias, C, OC);
     cudaCheck(cudaGetLastError());
-#endif
 }

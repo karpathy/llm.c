@@ -60,7 +60,7 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 }
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
 
-static cublasComputeType_t cublas_compute_type;
+int custom_matmul_kernel = 0; // 0=cuBLAS TF32, 1=TF32, 2=cuBLAS FP32, 3=FP32
 cublasHandle_t cublas_handle;
 cudaDeviceProp deviceProp;
 
@@ -668,6 +668,8 @@ void attention_forward(float* out, float* qkvr, float* att,
     cudaCheck(cudaGetLastError());
 
     // batched matrix multiply with cuBLAS
+    // todo - could use compute_tf32gemm_async_copy but tricky to get the layouts right etc...
+    // + would need to add support for strided batched (easy given it's using persistent threads?)
     const float alpha = 1.0f;
     const float beta = 0.0f;
     float* preatt = inp;
@@ -720,6 +722,7 @@ void gelu_backward(float* dinp, const float* inp, const float* dout, const int N
 void matmul_backward(float* dinp, float* dweight, float* dbias,
                      float* dout, float* inp, float* weight,
                      int B, int T, int C, int OC) {
+    // todo - could use compute_tf32gemm_async_copy but tricky to get the layouts right etc...
     float one = 1.0f;
     float zero = 0.0f;
     // backward to input, uses = in the backward pass (set the gradient)
@@ -1469,6 +1472,7 @@ void error_usage() {
     fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
+    fprintf(stderr, "  -c <int>    custom forward matmul (0=default cuBLAS TF32, 1=TF32, 2=cuBLAS FP32, 3=FP32\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1502,6 +1506,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'c') { custom_matmul_kernel = atoi(argv[i+1]); }
         else { error_usage(); }
     }
     printf("+-----------------------+----------------------------------------------------+\n");
@@ -1517,6 +1522,7 @@ int main(int argc, char *argv[]) {
     printf("| val_max_steps         | %-50d |\n", val_max_steps);
     printf("| sample_every          | %-50d |\n", sample_every);
     printf("| genT                  | %-50d |\n", genT);
+    printf("| custom matmul         | %-50d |\n", custom_matmul_kernel);
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // set up the device
@@ -1526,8 +1532,7 @@ int main(int argc, char *argv[]) {
     // setup cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
-    int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
-    cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    int enable_tf32 = (deviceProp.major >= 8 ? 1 : 0) && (custom_matmul_kernel <= 1);
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
     printf("| device                | %-50s |\n", deviceProp.name);
