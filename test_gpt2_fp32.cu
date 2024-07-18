@@ -29,7 +29,6 @@ int main(int argc, char *argv[]) {
     // set up the device
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
-    cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
     printf("[System]\n");
     printf("Device %d: %s\n", deviceIdx, deviceProp.name);
