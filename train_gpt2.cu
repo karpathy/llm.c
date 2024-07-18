@@ -319,7 +319,8 @@ typedef struct {
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
 } GPT2;
 
-void gpt2_init_common(GPT2 *model) {
+void gpt2_init_common(GPT2 *model, GPT2Config config) {
+    model->config = config;
     // common inits outside of the model weights
     // memory lazily initialized in forward()
     model->acts_memory = NULL;
@@ -345,6 +346,18 @@ void gpt2_init_common(GPT2 *model) {
     model->use_master_weights = 1; // safe default: do keep master weights in fp32
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+
+    // fill in all the parameter tensor dimensions and types
+    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
+    model->num_parameters = 0;
+    model->num_parameters_bytes = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        model->num_parameters += model->param_elements[i];
+        model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
+    }
+    // create memory for model parameters on the device
+    assert(model->params_memory == nullptr && "Old model needs to be freed before loading from checkpoint again");
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 }
 
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -406,27 +419,16 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
         exit(EXIT_FAILURE);
     }
 
+    GPT2Config config;
     // read in hyperparameters
-    model->config.max_seq_len = model_header[2];
-    model->config.vocab_size = model_header[3];
-    model->config.num_layers = model_header[4];
-    model->config.num_heads = model_header[5];
-    model->config.channels = model_header[6];
-    model->config.padded_vocab_size = model_header[7];
+    config.max_seq_len = model_header[2];
+    config.vocab_size = model_header[3];
+    config.num_layers = model_header[4];
+    config.num_heads = model_header[5];
+    config.channels = model_header[6];
+    config.padded_vocab_size = model_header[7];
 
-    // allocate space for all the parameters and read them in
-    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
-
-    model->num_parameters = 0;
-    model->num_parameters_bytes = 0;
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        model->num_parameters += model->param_elements[i];
-        model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
-    }
-
-    // create memory for model parameters on the device
-    assert(model->params_memory == nullptr && "Old model needs to be freed before loading from checkpoint again");
-    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
+    gpt2_init_common(model, config);
 
     // read in all the parameters from file and copy them to device
     file_to_device(model->params_memory, model_file, model->num_parameters_bytes,
@@ -489,30 +491,22 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     // check the valid prexies and dispatch to the right setup function
     assert(descriptor != NULL);
     size_t len = strlen(descriptor);
+    GPT2Config config;
     if (len > 1 && descriptor[0] == 'd') {
-        gpt2_set_hyperparameters(&model->config, descriptor + 1); // pass along the depth str without the 'd'
+        gpt2_set_hyperparameters(&config, descriptor + 1); // pass along the depth str without the 'd'
     } else if (len > 6 && strncmp(descriptor, "gpt2:d", 6) == 0) {
-        gpt2_set_hyperparameters(&model->config, descriptor + 6); // pass along the depth str without the 'gpt2:d'
+        gpt2_set_hyperparameters(&config, descriptor + 6); // pass along the depth str without the 'gpt2:d'
     } else if (len > 6 && strncmp(descriptor, "gpt3:c", 6) == 0) {
-        gpt3_set_hyperparameters(&model->config, descriptor + 6); // pass along the channels str without the 'gpt3:c'
+        gpt3_set_hyperparameters(&config, descriptor + 6); // pass along the channels str without the 'gpt3:c'
     } else {
         fprintf(stderr, "Unsupported model descriptor: %s\n", descriptor); exit(EXIT_FAILURE);
     }
 
     // both GPT-2 and GPT-3 use the same tokenizer with 50257 tokens
-    model->config.vocab_size = 50257;
-    model->config.padded_vocab_size = 50304; // padded to 128 for CUDA kernel efficiency
+    config.vocab_size = 50257;
+    config.padded_vocab_size = 50304; // padded to 128 for CUDA kernel efficiency
 
-    // fill in all the parameter tensor dimensions and types
-    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
-    model->num_parameters = 0;
-    model->num_parameters_bytes = 0;
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        model->num_parameters += model->param_elements[i];
-        model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
-    }
-    // create memory for model parameters on the device
-    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
+    gpt2_init_common(model, config);
 
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
@@ -1524,7 +1518,6 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model
     GPT2 model;
-    gpt2_init_common(&model);
     if (resuming == 1) {
         // if `-y 1` was set, then we are resuming from the latest checkpoint
         gpt2_build_from_checkpoint(&model, filename_buffer);
