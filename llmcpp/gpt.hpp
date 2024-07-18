@@ -727,9 +727,9 @@ struct GPT {
         Eigen::IndexPair<int>(1, 0)};
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims2 = {
         Eigen::IndexPair<int>(0, 0)};
-    lnf_y_grad += logits_grad_2d.contract(
+    lnf_y_grad.device(nn::g_cpu_device) += logits_grad_2d.contract(
         lm_head, product_dims);  // [BT, vocab_size] x [vocab_size, C]
-    lm_head_grad += logits_grad_2d.contract(
+    lm_head_grad.device(nn::g_cpu_device) += logits_grad_2d.contract(
         lnf_y, product_dims2);  // [vocab_size, BT] x [BT, C]
 
     // backward LNF
@@ -758,15 +758,12 @@ struct GPT {
     }
 
     // backward tok_emb, pos_emb
-    auto encoded_grad = Eigen::Map<nn::Matrix>(encoded_->grad<Type>(), B, TC);
-    auto tok_emb_grad = Eigen::Map<nn::Matrix>(tok_emb_->grad<Type>(), B, TC);
-    auto pos_emb_grad =
-        Eigen::Map<Eigen::RowVectorXf>(pos_emb_->grad<Type>(), TC);
-    tok_emb_grad.noalias() = encoded_grad;
-    pos_emb_grad.noalias() = tok_emb_grad.colwise().sum();
-    //    for (int b = 0; b < B; ++b) {
-    //      pos_emb_grad.array() += tok_emb_grad.row(b).array();
-    //    }
+    auto encoded_grad = encoded_->matrix_grad<Type>(B, TC);
+    auto tok_emb_grad = tok_emb_->matrix_grad<Type>(B, TC);
+    auto pos_emb_grad = pos_emb_->flat_grad<Type>();
+    Eigen::array<Eigen::Index, 1> along_batch = {0};
+    tok_emb_grad.device(nn::g_cpu_device) = encoded_grad;
+    pos_emb_grad.device(nn::g_cpu_device) = tok_emb_grad.sum(along_batch);
 
     // backward wte, wpe
     std::vector<int> pos(T);
@@ -822,10 +819,13 @@ struct GPT {
     wpe_->Forward(pos,
                   absl::MakeSpan(pos_emb_->data<Type>(), pos_emb_->size()));
 
-    auto tok_emb = Eigen::Map<nn::Matrix>(tok_emb_->data<Type>(), B, TC);
-    auto pos_emb = Eigen::Map<Eigen::RowVectorXf>(pos_emb_->data<Type>(), TC);
-    auto encoded = Eigen::Map<nn::Matrix>(encoded_->data<Type>(), B, TC);
-    encoded.array() = tok_emb.array().rowwise() + pos_emb.array();
+    auto tok_emb = tok_emb_->matrix<Type>(B, TC);
+    auto pos_emb = pos_emb_->flat<Type>();
+    auto encoded = encoded_->matrix<Type>(B, TC);
+    Eigen::array<Eigen::Index, 2> batch_by_one = {B, 1};
+    Eigen::array<Eigen::Index, 2> one_by_class = {1, TC};
+    encoded.device(nn::g_cpu_device) =
+        tok_emb + pos_emb.reshape(one_by_class).broadcast(batch_by_one);
 
     for (int l = 0; l < n_layer_; ++l) {
       const auto& block = h_[l];
