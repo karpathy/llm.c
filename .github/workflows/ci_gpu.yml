@@ -22,7 +22,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libomp-dev
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
 
       - name: Run preprocessing
         run: python dev/data/tinyshakespeare.py
