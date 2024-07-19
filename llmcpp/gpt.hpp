@@ -50,8 +50,9 @@ struct MLP {
     c_proj_ = std::make_unique<nn::Linear<T>>(4 * n_embed, n_embed);
 
     // activation
-    fch_ = std::make_unique<nn::Parameter2>(nn::DataTypeToEnum<T>::value);
-    fch_gelu_ = std::make_unique<nn::Parameter2>(nn::DataTypeToEnum<T>::value);
+    auto dtype = nn::DataTypeToEnum<T>::value;
+    fch_ = std::make_unique<nn::Activation>(dtype);
+    fch_gelu_ = std::make_unique<nn::Activation>(dtype);
   }
 
   void Forward(typename TTypes<T>::ConstMatrix x,
@@ -610,11 +611,12 @@ struct GPT {
 
     lm_head_unused_ = std::make_unique<nn::Linear<Type>>(n_embed, vocab_size);
     // https://paperswithcode.com/method/weight-tying
-    std::memcpy(wte_->weight_->data(), lm_head_unused_->weight_->data(),
+    std::memcpy(wte_->weight_->data<Type>(),
+                lm_head_unused_->weight_->template data<Type>(),
                 sizeof(float) * vocab_size * n_embed);
-    std::memset(wte_->weight_->data() + vocab_size * n_embed, 0,
+    std::memset(wte_->weight_->data<Type>() + vocab_size * n_embed, 0,
                 sizeof(float) * (padded_vocab_size - vocab_size) * n_embed);
-    lm_head_ = wte_->weight_->data();
+    lm_head_ = wte_->weight_->data<Type>();
     softmax_cross_entropy_ = std::make_unique<nn::SoftmaxCrossEntropy<Type>>();
 
     // activation
@@ -694,9 +696,9 @@ struct GPT {
     const int LBTC = L * BTC;
     CHECK(targets.dimension(0) == B && targets.dimension(1) == T);
 
-    wte_->weight_->AllocateGradient();
+    wte_->weight_->LazyAllocateGradient();
     if (lm_head_grad_ == nullptr) {
-      lm_head_grad_ = wte_->weight_->grad();
+      lm_head_grad_ = wte_->weight_->grad<Type>();
     }
 
     tok_emb_->LazyAllocateGradient();

@@ -60,7 +60,7 @@ struct GPT2 {
     printf("num_parameters: %zu\n", gpt2_->NumParameters());
 
     auto restore_fn = [&](nn::Parameter* p, const std::string& name) {
-      freadCheck(p->data(), sizeof(float), p->size(), model_file);
+      freadCheck(p->data<Type>(), sizeof(float), p->size(), model_file);
     };
     ApplyFn(restore_fn, L);
     fcloseCheck(model_file);

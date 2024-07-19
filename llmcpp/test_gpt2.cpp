@@ -189,7 +189,7 @@ int main(int argc, char** argv) {
         int total = 0;
         for (int l = 0; l < L; ++l) {
           auto key = name + "-L" + std::to_string(l);
-          auto grad = name_to_parameter[key]->grad();
+          auto grad = name_to_parameter[key]->grad<float>();
           int num = name_to_parameter[key]->size();
           CHECK_EQ(C, num);
           std::memcpy(concated + l * C, grad, sizeof(float) * C);
@@ -200,9 +200,9 @@ int main(int argc, char** argv) {
       };
       // finally check all the gradients
       int gradoks[16];
-      gradoks[0] = check_tensor(model_cpp.gpt2_->wte_->weight_->grad(),
+      gradoks[0] = check_tensor(model_cpp.gpt2_->wte_->weight_->grad<float>(),
                                 expected_grads.wte, V * C, "dwte");
-      gradoks[1] = check_tensor(model_cpp.gpt2_->wpe_->weight_->grad(),
+      gradoks[1] = check_tensor(model_cpp.gpt2_->wpe_->weight_->grad<float>(),
                                 expected_grads.wpe, maxT * C, "dwpe");
       auto ln1w = get_concated_grad("ln1w", L * C);
       gradoks[2] = check_tensor(ln1w, expected_grads.ln1w, L * C, "dln1w");
@@ -235,9 +235,9 @@ int main(int argc, char** argv) {
       auto fcprojb = get_concated_grad("fcprojb", L * C);
       gradoks[13] =
           check_tensor(fcprojb, expected_grads.fcprojb, L * C, "dfcprojb");
-      gradoks[14] = check_tensor(model_cpp.gpt2_->lnf_->weight_->grad(),
+      gradoks[14] = check_tensor(model_cpp.gpt2_->lnf_->weight_->grad<float>(),
                                  expected_grads.lnfw, C, "dlnfw");
-      gradoks[15] = check_tensor(model_cpp.gpt2_->lnf_->bias_->grad(),
+      gradoks[15] = check_tensor(model_cpp.gpt2_->lnf_->bias_->grad<float>(),
                                  expected_grads.lnfb, C, "dlnfb");
       for (int i = 0; i < 16; i++) {
         allok = allok && gradoks[i];

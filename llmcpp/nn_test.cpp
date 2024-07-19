@@ -151,10 +151,10 @@ loss.backward()
       0.971767, 0.352706, -0.018753, 0.971767, 0.352706, -0.018753};
 
   for (size_t i = 0; i < expected_w_grad.size(); ++i) {
-    EXPECT_NEAR(expected_w_grad[i], m.weight_->grad()[i], 1e-5);
+    EXPECT_NEAR(expected_w_grad[i], m.weight_->grad<float>()[i], 1e-5);
   }
   for (size_t i = 0; i < expected_b_grad.size(); ++i) {
-    EXPECT_NEAR(expected_b_grad[i], m.bias_->grad()[i], 1e-5);
+    EXPECT_NEAR(expected_b_grad[i], m.bias_->grad<float>()[i], 1e-5);
   }
   for (size_t i = 0; i < expected_x_grad.size(); ++i) {
     EXPECT_NEAR(expected_x_grad[i], x_grad[i], 1e-5);
@@ -196,7 +196,7 @@ loss.backward()
   m.Backward(idx, absl::MakeSpan(grad_embedding));
 
   for (size_t i = 0; i < expected_w_grad.size(); ++i) {
-    EXPECT_NEAR(expected_w_grad[i], m.weight_->grad()[i], 1e-5);
+    EXPECT_NEAR(expected_w_grad[i], m.weight_->grad<float>()[i], 1e-5);
   }
 }
 
@@ -350,10 +350,10 @@ loss.backward()
           1.192093e-07,  0.000000e+00,  1.192093e-07,  0.000000e+00,
           0.000000e+00,  0.000000e+00,  0.000000e+00,  0.000000e+00};
   for (size_t i = 0; i < expected_w_grad.size(); ++i) {
-    EXPECT_NEAR(expected_w_grad[i], m.weight_->grad()[i], 1e-5);
+    EXPECT_NEAR(expected_w_grad[i], m.weight_->grad<float>()[i], 1e-5);
   }
   for (size_t i = 0; i < expected_b_grad.size(); ++i) {
-    EXPECT_NEAR(expected_b_grad[i], m.bias_->grad()[i], 1e-5);
+    EXPECT_NEAR(expected_b_grad[i], m.bias_->grad<float>()[i], 1e-5);
   }
   for (size_t i = 0; i < expected_x_grad.size(); ++i) {
     EXPECT_NEAR(expected_x_grad[i], x_grad[i], 1e-5);

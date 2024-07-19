@@ -46,12 +46,6 @@ std::pair<int, int> SplitRange(int total, int idx, int n) {
   }
 }
 
-using Matrix =
-    Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-
-using Tensor3D = Eigen::Tensor<float, 3, Eigen::RowMajor>;
-using Tensor4D = Eigen::Tensor<float, 4, Eigen::RowMajor>;
-
 Eigen::ThreadPool g_thread_pool(16 /* number of threads in pool */);
 Eigen::ThreadPoolDevice g_cpu_device(&g_thread_pool,
                                      12 /* number of threads to use */);
@@ -95,11 +89,11 @@ MATCH_TYPE_AND_ENUM(Eigen::half, DT_HALF);
 MATCH_TYPE_AND_ENUM(int, DT_INT32);
 
 // Parameter weight and its corresponding gradient
-struct Parameter2 {
-  Parameter2(const Parameter2&) = delete;
-  Parameter2& operator=(const Parameter2&) = delete;
+struct Parameter {
+  Parameter(const Parameter&) = delete;
+  Parameter& operator=(const Parameter&) = delete;
 
-  explicit Parameter2(DataType dtype, int64_t num_element = 0)
+  explicit Parameter(DataType dtype, int64_t num_element = 0)
       : dtype_(dtype),
         num_element_(num_element),
         data_(nullptr),
@@ -109,7 +103,7 @@ struct Parameter2 {
     }
   }
 
-  ~Parameter2() {
+  ~Parameter() {
     g_cpu_device.deallocate(data_);
     g_cpu_device.deallocate(grad_);
   }
@@ -153,6 +147,18 @@ struct Parameter2 {
   template <typename T>
   T* grad() const {
     return static_cast<T*>(grad_);
+  }
+
+  template <typename T>
+  absl::Span<T> span() const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    return {data<T>(), static_cast<size_t>(num_element_)};
+  }
+
+  template <typename T>
+  absl::Span<T> span_grad() const {
+    CHECK_EQ(DataTypeToEnum<T>::value, dtype_);
+    return {grad<T>(), static_cast<size_t>(num_element_)};
   }
 
   template <typename T>
@@ -293,55 +299,7 @@ struct Parameter2 {
   void* grad_;
 };
 
-using Activation = Parameter2;
-
-// Parameter weight and its corresponding gradient
-struct Parameter {
-  using T = floatX;
-  enum DataType { kValue, kGrad };
-
-  Parameter(const Parameter&) = delete;
-  Parameter& operator=(const Parameter&) = delete;
-
-  Parameter(int64_t length) : length_(length) {
-    value_ = static_cast<T*>(g_cpu_device.allocate(sizeof(T) * length));
-    g_cpu_device.memset(value_, 0, sizeof(T) * length);
-    grad_ = nullptr;
-  }
-
-  ~Parameter() {
-    g_cpu_device.deallocate(value_);
-    g_cpu_device.deallocate(grad_);
-  }
-
-  int64_t size() const { return length_; }
-  T* data() const { return value_; }
-  T* grad() const { return grad_; }
-
-  void AllocateGradient() {
-    if (grad_ == nullptr) {
-      grad_ = static_cast<T*>(g_cpu_device.allocate(sizeof(T) * length_));
-      g_cpu_device.memset(grad_, 0, sizeof(T) * length_);
-    }
-  }
-
-  void ZeroGrad() {
-    if (grad_ != nullptr) {
-      g_cpu_device.memset(grad_, 0, sizeof(T) * length_);
-    }
-  }
-
-  absl::Span<T> View(DataType type = DataType::kValue) const {
-    LOG_IF(FATAL, type == kGrad && grad_ == nullptr)
-        << "Gradient memory has not been allocated!";
-    return {type == kValue ? value_ : grad_, static_cast<size_t>(length_)};
-  }
-
- private:
-  T* value_;
-  T* grad_;
-  int64_t length_;
-};
+using Activation = Parameter;
 
 template <typename T>
 struct MatMul {
@@ -430,12 +388,13 @@ struct Linear {
       : in_features_(in_features),
         out_features_(out_features),
         has_bias_(bias) {
-    weight_ = std::make_unique<Parameter>(out_features * in_features);
-    KaimingUniformFill(weight_->View(), in_features);
+    auto dtype = DataTypeToEnum<T>::value;
+    weight_ = std::make_unique<Parameter>(dtype, out_features * in_features);
+    KaimingUniformFill(weight_->span<T>(), in_features);
     if (bias) {
-      bias_ = std::make_unique<Parameter>(out_features);
+      bias_ = std::make_unique<Parameter>(dtype, out_features);
       const float bound = 1.0f / std::sqrt(static_cast<float>(in_features));
-      UniformFill(bias_->View(), -bound, bound);
+      UniformFill(bias_->span<T>(), -bound, bound);
     }
   }
 
@@ -446,12 +405,12 @@ struct Linear {
     CHECK_EQ(y.dimension(1), out_features_);
     CHECK_EQ(x.dimension(0), y.dimension(0));
 
-    auto weight = MakeMatrix(weight_->data(), out_features_, in_features_);
+    auto weight = MakeMatrix(weight_->data<T>(), out_features_, in_features_);
     // y = x * w^T + b
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
         Eigen::IndexPair<int>(1, 1)};
     if (has_bias_) {
-      auto bias = MakeFlat(bias_->data(), out_features_);
+      auto bias = MakeFlat(bias_->data<T>(), out_features_);
       Eigen::array<int, 2> broadcast_dims = {static_cast<int>(y.dimension(0)),
                                              1};
       y.device(g_cpu_device) =
@@ -471,9 +430,10 @@ struct Linear {
     CHECK_EQ(x.dimension(0), x_grad.dimension(0));
 
     // Lazily allocate the memory for gradients
-    weight_->AllocateGradient();
-    auto weight = MakeMatrix(weight_->data(), out_features_, in_features_);
-    auto weight_grad = MakeMatrix(weight_->grad(), out_features_, in_features_);
+    weight_->LazyAllocateGradient();
+    auto weight = MakeMatrix(weight_->data<T>(), out_features_, in_features_);
+    auto weight_grad =
+        MakeMatrix(weight_->grad<T>(), out_features_, in_features_);
 
     // x_grad = dL/dy * dy/dx
     //        = y_grad(B, out_features) * W(out_features, in_features)
@@ -493,8 +453,8 @@ struct Linear {
       // b_grad = dL/dy * dy/db
       //        = \sum_i^(B)(y_grad(B, out_features))
       //        = [out_features,]
-      bias_->AllocateGradient();
-      auto bias_grad = MakeFlat(bias_->grad(), out_features_);
+      bias_->LazyAllocateGradient();
+      auto bias_grad = MakeFlat(bias_->grad<T>(), out_features_);
       Eigen::array<Eigen::Index, 1> along_batch = {0};
       bias_grad.device(g_cpu_device) = y_grad.sum(along_batch);
     }
@@ -526,8 +486,9 @@ struct Linear {
 struct Embedding {
   Embedding(int num_embeddings, int embedding_dim)
       : num_embeddings_(num_embeddings), embedding_dim_(embedding_dim) {
-    weight_ = std::make_unique<Parameter>(num_embeddings * embedding_dim);
-    NormalFill(weight_->View());
+    weight_ =
+        std::make_unique<Parameter>(DT_FLOAT, num_embeddings * embedding_dim);
+    NormalFill(weight_->span<float>());
   }
 
   void Forward(absl::Span<const int> idx, absl::Span<float> embedding) const {
@@ -535,7 +496,7 @@ struct Embedding {
     for (size_t i = 0; i < idx.size(); ++i) {
       CHECK_LT(idx[i], num_embeddings_);
       void* dst = embedding.data() + i * embedding_dim_;
-      void* src = weight_->data() + idx[i] * embedding_dim_;
+      void* src = weight_->data<float>() + idx[i] * embedding_dim_;
       std::memcpy(dst, src, sizeof(float) * embedding_dim_);
     }
   }
@@ -545,12 +506,12 @@ struct Embedding {
     CHECK_EQ(grad_embedding.size(), idx.size() * embedding_dim_);
 
     // Lazily allocate the memory for gradients
-    weight_->AllocateGradient();
+    weight_->LazyAllocateGradient();
 
     for (size_t i = 0; i < idx.size(); ++i) {
       CHECK_LT(idx[i], num_embeddings_);
       const float* g = grad_embedding.data() + i * embedding_dim_;
-      float* grad = weight_->grad() + idx[i] * embedding_dim_;
+      float* grad = weight_->grad<float>() + idx[i] * embedding_dim_;
       for (int j = 0; j < embedding_dim_; ++j) {
         grad[j] += g[j];
       }
@@ -572,11 +533,12 @@ template <typename T>
 struct LayerNorm {
   LayerNorm(int normalized_shape)
       : normalized_shape_(normalized_shape), eps_(1e-5) {
-    weight_ = std::make_unique<Parameter>(normalized_shape);
-    auto w = weight_->View();
+    auto dtype = DataTypeToEnum<T>::value;
+    weight_ = std::make_unique<Parameter>(dtype, normalized_shape);
+    auto w = weight_->span<T>();
     absl::c_fill(w, 1.0f);
-    bias_ = std::make_unique<Parameter>(normalized_shape);
-    auto b = bias_->View();
+    bias_ = std::make_unique<Parameter>(dtype, normalized_shape);
+    auto b = bias_->span<T>();
     absl::c_fill(b, 0.0f);
   }
 
@@ -638,8 +600,8 @@ struct LayerNorm {
         bias.array();
     */
 
-    auto weight_1d = MakeFlat(weight_->data(), normalized_shape_);
-    auto bias_1d = MakeFlat(bias_->data(), normalized_shape_);
+    auto weight_1d = MakeFlat(weight_->data<T>(), normalized_shape_);
+    auto bias_1d = MakeFlat(bias_->data<T>(), normalized_shape_);
     y.device(g_cpu_device) =
         (x - mean.reshape(batch_by_one).broadcast(one_by_class)) *
             rstd.reshape(batch_by_one).broadcast(one_by_class) *
@@ -669,12 +631,12 @@ struct LayerNorm {
     Eigen::array<Eigen::Index, 2> one_by_class = {1, num_class};
 
     // Lazily allocate the memory for gradients
-    weight_->AllocateGradient();
-    bias_->AllocateGradient();
-    auto weight_1d = MakeFlat(weight_->data(), normalized_shape_);
-    auto weight_grad_1d = MakeFlat(weight_->grad(), normalized_shape_);
-    auto bias_1d = MakeFlat(bias_->data(), normalized_shape_);
-    auto bias_grad_1d = MakeFlat(bias_->grad(), normalized_shape_);
+    weight_->LazyAllocateGradient();
+    bias_->LazyAllocateGradient();
+    auto weight_1d = MakeFlat(weight_->data<T>(), normalized_shape_);
+    auto weight_grad_1d = MakeFlat(weight_->grad<T>(), normalized_shape_);
+    auto bias_1d = MakeFlat(bias_->data<T>(), normalized_shape_);
+    auto bias_grad_1d = MakeFlat(bias_->grad<T>(), normalized_shape_);
 
     // x_grad = dL/dy * dy/dnorm
     //                * [dnorm/dxmean * dxmean/dx

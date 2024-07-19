@@ -17,8 +17,8 @@ struct SGD {
 
   void Step() {
     for (nn::Parameter* parameter : parameters_) {
-      auto param = parameter->View();
-      auto grad = parameter->View(nn::Parameter::kGrad);
+      auto param = parameter->span<float>();
+      auto grad = parameter->span_grad<float>();
       for (size_t i = 0; i < param.size(); ++i) {
         param[i] -= lr_ * grad[i];
       }
@@ -40,8 +40,10 @@ struct AdamW {
         eps_(eps),
         weight_decay_(weight_decay) {
     for (const auto& parameter : parameters_) {
-      m_.emplace_back(std::make_unique<nn::Parameter>(parameter->size()));
-      v_.emplace_back(std::make_unique<nn::Parameter>(parameter->size()));
+      m_.emplace_back(
+          std::make_unique<nn::Parameter>(nn::DT_FLOAT, parameter->size()));
+      v_.emplace_back(
+          std::make_unique<nn::Parameter>(nn::DT_FLOAT, parameter->size()));
     }
   }
 
@@ -53,10 +55,10 @@ struct AdamW {
 
   void Step(int t) {
     for (size_t i = 0; i < parameters_.size(); ++i) {
-      auto parameter = parameters_[i]->View();
-      auto gradient = parameters_[i]->View(nn::Parameter::kGrad);
-      auto momentum = m_[i]->View();
-      auto velocity = v_[i]->View();
+      auto parameter = parameters_[i]->span<float>();
+      auto gradient = parameters_[i]->span_grad<float>();
+      auto momentum = m_[i]->span<float>();
+      auto velocity = v_[i]->span<float>();
       for (size_t j = 0; j < parameter.size(); ++j) {
         float grad = gradient[j];
         float param = parameter[j];
