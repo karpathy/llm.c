@@ -5,10 +5,10 @@ Compile example:
 nvcc -O3 -lcublas -lcublasLt -std=c++17 matmul_backward_bias.cu -lineinfo -o matmul_backward_bias
 
 ./matmul_backward_bias 1
-./matmul_backward_bias 2
-./matmul_backward_bias 3
-./matmul_backward_bias 4
-./matmul_backward_bias 5
+........................
+./matmul_backward_bias 9
+
+101/102/104/108/116 correspond to kernel 10 with blockDim.x of 1/2/4/8/16
 
 ncu:
 sudo ncu --set full --import-source yes -o bias -f ./matmul_backward_bias 1
@@ -435,6 +435,83 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
     }
 }
 
+// (extra-long explanation for /dev/cuda/ only)
+//
+// this is really a general purpose column reduction kernel, it's not just for bias!
+// it could easily be generalised if we needed this for something else in the future...
+//
+// this kernel performs a column-wise reduction over dout, in PyTorch equivalent to:
+// dbias = dout.sum((0,1))
+// we want our memory loads to be coalesced, but the data we need is not contiguous.
+// the solution is to employ one block to reduce along several columns in parallel,
+// each block is responsible for (blockIdx.x * x128::size) columns.
+//
+// NVIDIA has 32B L1 cache sectors, 64B DRAM accesses, and 128B L1/L2 cachelines.
+// with x128, we load 16B per thread, so we need blockIdx.x to be between 2 and 8.
+// i.e. we process 16 to 64 columns per block with BF16.
+//
+// we also process blockIdx.y rows in parallel to maximise GPU utilization,
+// we need to do this rather than just loop across BT in every thread because
+// OC can be as low as 768 for some ops on GPT2 124M, which would starve the GPU!
+// e.g. 768/16 = 48 (for BF16 and blockIdx.x=2) so only 48 of 132 SMs active on H100
+//
+// at the end we combine the reductions of these rows using shared memory.
+// with a block size of 1024, that means e.g. blockIdx.x=8 and blockIdx.y=128
+// ==> 64 columns (for BF16) and 128 rows processed in parallel in a single block
+//
+// in total, there are OC columns and B*T rows to process, so we need to launch
+// "OC / (blockIdx.x * x128::size)" blocks per grid.
+// we try to adjust blockIdx.x according to some heuristics in the launcher function.
+// block dimensions are given at compile time via templating to enable loop unrolling
+//
+// (end of extra-long explanation for /dev/cuda/ only)
+
+// OC columns and B*T rows ==> per-column sum reduction with OC outputs in dbias
+// each block handles (blockIdx.x * x128::size) columns and (blockIdx.y) rows
+// data is contiguous along rows, 128B coalesced loads with BF16 require blockIdx.x >= 8
+// for small OC, we want smaller blockIdx.x to get more blocks and better GPU utilisation
+template <int block_dim_x=2, int block_dim_y=256, typename OutFloat=floatX>
+__global__ void matmul_backward_bias_kernel10(OutFloat* dbias, const floatX* dout, int B, int T, int OC) {
+    constexpr int block_size = block_dim_x * block_dim_y;
+    __shared__ float smem[block_size * x128::size];
+
+    float column_sum[x128::size] = {0.0f}; // per-thread (partial column) FP32 accumulator
+    int column_idx = (blockIdx.x * block_dim_x + threadIdx.x) * x128::size;
+    int smem_idx = threadIdx.x + threadIdx.y * block_dim_x; // smem idx for this thread with k=0
+
+    for (int row = threadIdx.y; row < B * T; row += block_dim_y) {
+        x128 packed_dout = load128(dout + column_idx + row * OC);
+        for (int k = 0; k < x128::size; k++) {
+            column_sum[k] += (float)packed_dout[k];
+        }
+    }
+    // todo - currently don't use x128 for smem, so we stride by block_size to avoid bank conflicts
+    for (int k = 0; k < x128::size; k++) {
+        smem[smem_idx + k * block_size] = column_sum[k]; // write column partial sums to shared mem
+    }
+
+    // blockDim.y threads are all processing the same column, so we need to add up their sums
+    // i.e. we calculate (blockDim.x * x128::size) final sums in parallel (one per column)
+    // so with blockDim.x = 8, we avoid the parts of the reduction with only 1/2/4 active threads
+    for (int stride = block_size/2; stride >= block_dim_x; stride /= 2) {
+        __syncthreads();
+        if (threadIdx.y * block_dim_x < stride) {
+            for (int k = 0; k < x128::size; k++) {
+                int smem_idx_k = smem_idx + k * block_size;
+                smem[smem_idx_k] = smem[smem_idx_k] + smem[smem_idx_k + stride];
+            }
+        }
+    } // no __syncthreads() needed because smem read below was written by the same thread
+
+    if (threadIdx.y == 0) {
+        // accumulate the sums in global memory (one bias parameter gradient per column/OC)
+        // += because of potential gradient accumulation (multiple micro-batches per batch)
+        for (int k = 0; k < x128::size; k++) {
+            dbias[column_idx + k] = (OutFloat)((float)dbias[column_idx + k] + smem[threadIdx.x + k * block_size]);
+        }
+    }
+}
+
 
 // ----------------------------------------------------------------------------
 // kernel launcher
@@ -555,6 +632,25 @@ void matmul_backward_bias9(floatX* dbias, const floatX* dout,
     }
 }
 
+template <int bs_x=2> // aka block_size.x
+void matmul_backward_bias10(floatX* dbias, const floatX* dout,
+                            int B, int T, int OC, int desired_block_size) {
+    const dim3 grid_size = dim3(OC / (bs_x * x128::size)); // block_size.x columns are processed per block
+    assert(OC % (bs_x * x128::size) == 0); // should always be true for sensible values of block_size.x
+
+    switch (desired_block_size) {
+        case 32: matmul_backward_bias_kernel10<bs_x, 32/bs_x><<<grid_size, dim3(bs_x, 32/bs_x)>>>(dbias, dout, B, T, OC); break;
+        case 64: matmul_backward_bias_kernel10<bs_x, 64/bs_x><<<grid_size, dim3(bs_x, 64/bs_x)>>>(dbias, dout, B, T, OC); break;
+        case 128: matmul_backward_bias_kernel10<bs_x, 128/bs_x><<<grid_size, dim3(bs_x, 128/bs_x)>>>(dbias, dout, B, T, OC); break;
+        case 256: matmul_backward_bias_kernel10<bs_x, 256/bs_x><<<grid_size, dim3(bs_x, 256/bs_x)>>>(dbias, dout, B, T, OC); break;
+        case 512: matmul_backward_bias_kernel10<bs_x, 512/bs_x><<<grid_size, dim3(bs_x, 512/bs_x)>>>(dbias, dout, B, T, OC); break;
+        case 768: matmul_backward_bias_kernel10<bs_x, 768/bs_x><<<grid_size, dim3(bs_x, 768/bs_x)>>>(dbias, dout, B, T, OC); break;
+        case 1024: matmul_backward_bias_kernel10<bs_x, 1024/bs_x><<<grid_size, dim3(bs_x, 1024/bs_x)>>>(dbias, dout, B, T, OC); break;
+        default: break;
+    }
+    cudaCheck(cudaGetLastError());
+}
+
 void matmul_backward_bias(int kernel_num, floatX* dbias, floatX* dout,
                      int B, int T, int OC, int block_size) {
     switch (kernel_num) {
@@ -587,6 +683,22 @@ void matmul_backward_bias(int kernel_num, floatX* dbias, floatX* dout,
         case 9:
             matmul_backward_bias9(dbias, dout, B, T, OC, block_size);
             break;
+        case 101:
+            matmul_backward_bias10<1>(dbias, dout, B, T, OC, block_size);
+            break;
+        case 102:
+            matmul_backward_bias10<2>(dbias, dout, B, T, OC, block_size);
+            break;
+        case 104:
+            matmul_backward_bias10<4>(dbias, dout, B, T, OC, block_size);
+            break;
+        case 108:
+            matmul_backward_bias10<8>(dbias, dout, B, T, OC, block_size);
+            break;
+        case 116:
+            matmul_backward_bias10<16>(dbias, dout, B, T, OC, block_size);
+            break;
+
         default:
             printf("Invalid kernel number\n");
             exit(1);
@@ -598,10 +710,10 @@ void matmul_backward_bias(int kernel_num, floatX* dbias, floatX* dout,
 int main(int argc, char **argv) {
     setup_main();
 
-    int B = 8;
+    int B = 4;
     int T = 1024;
     int C = 768;
-    int OC = 768 * 4; // expansion of 4, e.g. in the MLP
+    int OC = 12288 * 8; // expansion of 4, e.g. in the MLP
 
     // read kernel_num from command line
     int kernel_num = 1;
@@ -632,7 +744,7 @@ int main(int argc, char **argv) {
     // matmul_backward_bias(kernel_num, NULL, NULL, d_dbias, d_dout, NULL, NULL, NULL, B, T, C, OC, block_size_debug);
     // exit(EXIT_SUCCESS);
 
-    int block_sizes[] = {32, 64, 128, 256, 512, 768, 1024};
+    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
 
     // calculate the CPU reference
     matmul_backward_bias_cpu(NULL, NULL, dbias, dout, NULL, NULL, B, T, C, OC);
