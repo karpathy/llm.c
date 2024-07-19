@@ -45,8 +45,8 @@ for _ in range(10):
     sgd.Step();
   }
 
-  auto weight = m.weight_->View();
-  auto bias = m.bias_->View();
+  auto weight = m.weight_->span<float>();
+  auto bias = m.bias_->span<float>();
   std::vector<float> expected_weight = {0.732981, 0.469633,  -0.589639,
                                         0.821935, -0.136072, -0.337878};
   std::vector<float> expected_bias = {-0.681086, -0.060932};
@@ -103,8 +103,8 @@ for _ in range(10):
     adam_w.Step(i + 1);
   }
 
-  auto weight = m.weight_->View();
-  auto bias = m.bias_->View();
+  auto weight = m.weight_->span<float>();
+  auto bias = m.bias_->span<float>();
   std::vector<float> expected_weight = {0.541358, 0.379162,  -0.235239,
                                         0.630303, -0.226482, 0.016497};
   std::vector<float> expected_bias = {-0.381053, 0.239038};

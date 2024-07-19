@@ -17,11 +17,9 @@ struct SGD {
 
   void Step() {
     for (nn::Parameter* parameter : parameters_) {
-      auto param = parameter->View();
-      auto grad = parameter->View(nn::Parameter::kGrad);
-      for (size_t i = 0; i < param.size(); ++i) {
-        param[i] -= lr_ * grad[i];
-      }
+      auto param = parameter->flat<float>();
+      auto grad = parameter->flat_grad<float>();
+      param.device(nn::g_cpu_device) -= lr_ * grad;
     }
   }
 
@@ -40,8 +38,10 @@ struct AdamW {
         eps_(eps),
         weight_decay_(weight_decay) {
     for (const auto& parameter : parameters_) {
-      m_.emplace_back(std::make_unique<nn::Parameter>(parameter->size()));
-      v_.emplace_back(std::make_unique<nn::Parameter>(parameter->size()));
+      m_.emplace_back(
+          std::make_unique<nn::Parameter>(nn::DT_FLOAT, parameter->size()));
+      v_.emplace_back(
+          std::make_unique<nn::Parameter>(nn::DT_FLOAT, parameter->size()));
     }
   }
 
@@ -53,28 +53,22 @@ struct AdamW {
 
   void Step(int t) {
     for (size_t i = 0; i < parameters_.size(); ++i) {
-      auto parameter = parameters_[i]->View();
-      auto gradient = parameters_[i]->View(nn::Parameter::kGrad);
-      auto momentum = m_[i]->View();
-      auto velocity = v_[i]->View();
-      for (size_t j = 0; j < parameter.size(); ++j) {
-        float grad = gradient[j];
-        float param = parameter[j];
-        float& m = momentum[j];
-        float& v = velocity[j];
-        // update the first moment (momentum)
-        m = beta1_ * m + (1.0f - beta1_) * grad;
-        // update the second moment (RMSprop)
-        v = beta2_ * v + (1.0f - beta2_) * grad * grad;
+      auto parameter = parameters_[i]->flat<float>();
+      auto grad = parameters_[i]->flat_grad<float>();
+      auto m = m_[i]->flat<float>();
+      auto v = v_[i]->flat<float>();
 
-        // bias-correct both moments
-        float m_hat = m / (1.0f - std::pow(beta1_, t));
-        float v_hat = v / (1.0f - std::pow(beta2_, t));
+      // update the first moment (momentum)
+      m.device(nn::g_cpu_device) = beta1_ * m + (1.0f - beta1_) * grad;
+      // update the second moment (RMSprop)
+      v.device(nn::g_cpu_device) = beta2_ * v + (1.0f - beta2_) * grad * grad;
+      // bias-correct both moments
+      auto m_hat = m / (1.0f - static_cast<float>(std::pow(beta1_, t)));
+      auto v_hat = v / (1.0f - static_cast<float>(std::pow(beta2_, t)));
 
-        // update
-        parameter[j] -=
-            lr_ * (m_hat / (std::sqrt(v_hat) + eps_) + weight_decay_ * param);
-      }
+      // update
+      parameter.device(nn::g_cpu_device) -=
+          lr_ * (m_hat / (v_hat.sqrt() + eps_) + weight_decay_ * parameter);
     }
   }
 

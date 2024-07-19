@@ -192,18 +192,19 @@ logits, loss = gpt2(idx)
   nn::ManualSeed(42);
   int block_size = 4, n_embd = 6, n_head = 2, n_layer = 12, vocab_size = 10;
   int B = 2, T = block_size, C = n_embd, nh = n_head, hs = n_embd / nh;
-  gpt::GPT<float> gpt(block_size, vocab_size, vocab_size, n_layer, n_head, n_embd);
+  gpt::GPT<float> gpt(block_size, vocab_size, vocab_size, n_layer, n_head,
+                      n_embd);
 
   std::vector<int> idx = {1, 2, 4, 5, 4, 3, 2, 9};
   auto idx_m = TTypes<int>::ConstMatrix(idx.data(), B, T);
   std::vector<float> logits(B * T * vocab_size);
   //  auto logits_2d = Eigen::Map<nn::Matrix>(logits.data(), B * T, vocab_size);
-  auto logits_3d =
-      Make3DTensor(logits.data(), B, T, vocab_size);
+  auto logits_3d = Make3DTensor(logits.data(), B, T, vocab_size);
 
   // Without targets
   gpt.Forward(idx_m, logits_3d);
-  nn::Tensor2D logits_last_t = logits_3d.chip(T - 1, 1);
+  Eigen::Tensor<float, 2, Eigen::RowMajor> logits_last_t =
+      logits_3d.chip(T - 1, 1);
   auto logits_last_t_span =
       absl::MakeSpan(logits_last_t.data(), B * vocab_size);
   std::vector<float> expected_logits_last_t = {
@@ -216,7 +217,7 @@ logits, loss = gpt2(idx)
 
   // With targets
   std::vector<int> target = {2, 4, 5, 6, 3, 2, 9, 0};
-  auto target_m = TTypes<int>::ConstMatrix (target.data(), B, T);
+  auto target_m = TTypes<int>::ConstMatrix(target.data(), B, T);
   float loss = 0.0;
   gpt.Forward(idx_m, target_m, logits_3d, &loss);
 
@@ -242,8 +243,8 @@ logits, loss = gpt2(idx)
 
   // Backward
   gpt.Backward(idx_m, target_m);
-  auto wte_grad = gpt.wte_->weight_->View(nn::Parameter::kGrad);
-  auto wpe_grad = gpt.wpe_->weight_->View(nn::Parameter::kGrad);
+  auto wte_grad = gpt.wte_->weight_->span_grad<float>();
+  auto wpe_grad = gpt.wpe_->weight_->span_grad<float>();
 
   std::vector<float> expected_wte_grad = {
       -1.274265e-01, -7.693546e-02, 1.870265e-01,  1.102872e-01,
