@@ -6,7 +6,7 @@ nvcc -O3 -lcublas -lcublasLt -std=c++17 matmul_backward_bias.cu -lineinfo -o mat
 
 ./matmul_backward_bias 1
 ........................
-./matmul_backward_bias 9
+./matmul_backward_bias 10
 
 101/102/104/108/116 correspond to kernel 10 with blockDim.x of 1/2/4/8/16
 
@@ -683,6 +683,29 @@ void matmul_backward_bias(int kernel_num, floatX* dbias, floatX* dout,
         case 9:
             matmul_backward_bias9(dbias, dout, B, T, OC, block_size);
             break;
+        case 10:
+            {
+                // same heuristic as in llm.c for blockDim.x:
+                // 1 block per SM and blockIdx.x=2 ==> need (2*2*x128::size) columns per SM ==> 16 at BF16
+                // 768/16 ==> 48 SMs (out of 132 on H100) active for small bias kernels on 124M GPT2 models
+                // 3072/16 ==> 192 which is good but 96 with blockIdx.x=4 is faster due to better coalescing
+                // ===>
+                // Set block_size_x = 8. If we get less than 0.5 or 0.25 blocks per SM, reduce to 4 or 2.
+                int block_size_x = 8;
+                int total_blocks = OC / (block_size_x * x128::size);
+                if (total_blocks <= cuda_num_SMs / 4) { block_size_x = 2, total_blocks *= 4; }
+                else if (total_blocks <= cuda_num_SMs / 2) { block_size_x = 4, total_blocks *= 2; }
+                assert(OC == total_blocks * block_size_x * x128::size);
+
+                switch (block_size_x) {
+                    case 2: matmul_backward_bias10<2>(dbias, dout, B, T, OC, block_size); break;
+                    case 4: matmul_backward_bias10<4>(dbias, dout, B, T, OC, block_size); break;
+                    case 8: matmul_backward_bias10<8>(dbias, dout, B, T, OC, block_size); break;
+                    default: break;
+                }
+            }
+            break;
+            // 101 to 116: kernel 10 but with specific forced blockDim.x values
         case 101:
             matmul_backward_bias10<1>(dbias, dout, B, T, OC, block_size);
             break;
@@ -713,7 +736,7 @@ int main(int argc, char **argv) {
     int B = 4;
     int T = 1024;
     int C = 768;
-    int OC = 12288 * 8; // expansion of 4, e.g. in the MLP
+    int OC = 768 * 4; // expansion of 4, e.g. in the MLP
 
     // read kernel_num from command line
     int kernel_num = 1;
