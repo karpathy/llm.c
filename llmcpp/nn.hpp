@@ -361,9 +361,6 @@ struct Residual {
     CHECK(N == Fx.size() && N == Hx.size());
 
     // H(x) = x + F(x) -> F(x) = H(x) - x
-    //    for (int i = 0; i < N; ++i) {
-    //      Hx[i] = x[i] + Fx[i];
-    //    }
     Hx.device(g_cpu_device) = x + Fx;
   }
 
@@ -373,10 +370,6 @@ struct Residual {
     int N = Hx_grad.size();
     CHECK(N == x_grad.size() && N == Fx_grad.size());
 
-    //    for (int i = 0; i < N; ++i) {
-    //      x_grad[i] += Hx_grad[i];
-    //      Fx_grad[i] += Hx_grad[i];
-    //    }
     x_grad.device(g_cpu_device) += Hx_grad;
     Fx_grad.device(g_cpu_device) += Hx_grad;
   }
@@ -497,7 +490,7 @@ struct Embedding {
       CHECK_LT(idx[i], num_embeddings_);
       void* dst = embedding.data() + i * embedding_dim_;
       void* src = weight_->data<float>() + idx[i] * embedding_dim_;
-      std::memcpy(dst, src, sizeof(float) * embedding_dim_);
+      g_cpu_device.memcpy(dst, src, sizeof(float) * embedding_dim_);
     }
   }
 
@@ -512,9 +505,9 @@ struct Embedding {
       CHECK_LT(idx[i], num_embeddings_);
       const float* g = grad_embedding.data() + i * embedding_dim_;
       float* grad = weight_->grad<float>() + idx[i] * embedding_dim_;
-      for (int j = 0; j < embedding_dim_; ++j) {
-        grad[j] += g[j];
-      }
+      auto g_1d = MakeConstFlat(g, embedding_dim_);
+      auto grad_1d = MakeFlat(grad, embedding_dim_);
+      grad_1d.device(g_cpu_device) += g_1d;
     }
   }
 
@@ -540,6 +533,12 @@ struct LayerNorm {
     bias_ = std::make_unique<Parameter>(dtype, normalized_shape);
     auto b = bias_->span<T>();
     absl::c_fill(b, 0.0f);
+
+    // activation gradient tensor
+    norm_ = std::make_unique<Parameter>(dtype);             // [B, D]
+    dnorm_ = std::make_unique<Parameter>(dtype);            // [B, D]
+    dnorm_mean_ = std::make_unique<Parameter>(dtype);       // [B,]
+    dnorm_norm_mean_ = std::make_unique<Parameter>(dtype);  // [B,]
   }
 
   void Forward(typename TTypes<T>::ConstMatrix x, typename TTypes<T>::Matrix y,
@@ -554,10 +553,6 @@ struct LayerNorm {
     CHECK_EQ(mean.size(), B);
     CHECK_EQ(rstd.size(), B);
 
-    /*
-    mean.noalias() = x.rowwise().mean();
-    */
-
     Eigen::array<Eigen::Index, 1> along_class = {1};
     mean.device(g_cpu_device) = x.mean(along_class);
 
@@ -566,13 +561,6 @@ struct LayerNorm {
     // var(B,) = x_zero_centered_square.rowwise().mean()
     // std(B,) = (var + eps).sqrt()
     // rstd(B,) = 1.f / std;
-
-    /*
-    rstd = 1.f /
-           ((x.colwise() - mean.transpose()).array().square().rowwise().mean() +
-            eps_)
-               .sqrt();
-    */
 
     int batch_size = x.dimension(0), num_class = x.dimension(1);
     Eigen::array<Eigen::Index, 2> batch_by_one = {batch_size, 1};
@@ -588,17 +576,6 @@ struct LayerNorm {
     // normalize: (x - mean) / std
     // && scale:  (x - mean) / std * weight
     // && shift:  (x - mean) / std * weight + bias
-
-    /*
-    y = (((x.colwise() - mean.transpose()).array().colwise() *
-          rstd.transpose().array())
-             .array()
-             .rowwise() *
-         weight.array())
-            .array()
-            .rowwise() +
-        bias.array();
-    */
 
     auto weight_1d = MakeFlat(weight_->data<T>(), normalized_shape_);
     auto bias_1d = MakeFlat(bias_->data<T>(), normalized_shape_);
@@ -620,7 +597,7 @@ struct LayerNorm {
     CHECK_EQ(x_grad.dimension(1), normalized_shape_);
     CHECK_EQ(x.dimension(0), y_grad.dimension(0));
     CHECK_EQ(x.dimension(0), x_grad.dimension(0));
-    int B = x.dimension(0);
+    int B = x.dimension(0), D = x.dimension(1);
 
     // mean: [B,], rstd: [B,]
     CHECK_EQ(mean.size(), B);
@@ -644,31 +621,24 @@ struct LayerNorm {
     //                  + dnorm/dstd * dstd/dx
     //                  ]
 
-    /*
-    nn::Matrix norm = (x.colwise() - mean.transpose()).array().colwise() *
-                      rstd.transpose().array();                    // [B,D]
-    nn::Matrix dnorm = y_grad.array().rowwise() * weight.array();  // [B,D]
-    Eigen::RowVectorXf dnorm_mean = dnorm.rowwise().mean();        //[B,]
-    Eigen::RowVectorXf dnorm_norm_mean =
-        (dnorm.array() * norm.array()).rowwise().mean();  // [B,]
-    x_grad.array() +=
-        ((dnorm.array().colwise() - dnorm_mean.transpose().array()).array() -
-         (norm.array().colwise() * dnorm_norm_mean.transpose().array()))
-            .array()
-            .colwise() *
-        rstd.transpose().array();
-    */
-
-    Eigen::Tensor<float, 2, Eigen::RowMajor> norm_2d =
+    // Eigen::Tensor<float, 2, Eigen::RowMajor>
+    norm_->LazyAllocate(B * D);
+    dnorm_->LazyAllocate(B * D);
+    dnorm_mean_->LazyAllocate(B);
+    dnorm_norm_mean_->LazyAllocate(B);
+    auto norm_2d = norm_->matrix<T>(B, D);
+    auto dnorm_2d = dnorm_->matrix<T>(B, D);
+    auto dnorm_mean_1d = dnorm_mean_->flat<T>();
+    auto dnorm_norm_mean_1d = dnorm_norm_mean_->flat<T>();
+    norm_2d.device(g_cpu_device) =
         (x - mean.reshape(batch_by_one).broadcast(one_by_class)) *
         rstd.reshape(batch_by_one).broadcast(one_by_class);  // [B, D]
-    Eigen::Tensor<float, 2, Eigen::RowMajor> dnorm_2d =
+    dnorm_2d.device(g_cpu_device) =
         y_grad *
         weight_1d.reshape(one_by_class).broadcast(batch_by_one);  // [B, D]
     Eigen::array<Eigen::Index, 1> along_class = {1};
-    Eigen::Tensor<float, 1, Eigen::RowMajor> dnorm_mean_1d =
-        dnorm_2d.mean(along_class);  // [B,]
-    Eigen::Tensor<float, 1, Eigen::RowMajor> dnorm_norm_mean_1d =
+    dnorm_mean_1d.device(g_cpu_device) = dnorm_2d.mean(along_class);  // [B,]
+    dnorm_norm_mean_1d.device(g_cpu_device) =
         (dnorm_2d * norm_2d).mean(along_class);  // [B,]
     x_grad.device(g_cpu_device) +=
         ((dnorm_2d -
@@ -680,15 +650,6 @@ struct LayerNorm {
     // w_grad = dL/dy * dy/dw
     //        = dL/dy * x_norm(B,D)
     //        = \sum_i^B [y_grad(B, D) \elewise_dot x_norm(B, D)]
-    /*
-    weight_grad.array() +=
-        (y_grad.array() * ((x.colwise() - mean.transpose()).array().colwise() *
-                           rstd.transpose().array())
-                              .array())
-            .colwise()
-            .sum()
-            .array();
-    */
 
     Eigen::array<Eigen::Index, 1> along_batch = {0};
     weight_grad_1d.device(g_cpu_device) += (y_grad * norm_2d).sum(along_batch);
@@ -696,8 +657,6 @@ struct LayerNorm {
     // b_grad = dL/dy * dy/db
     //        = \sum_i^(B)(y_grad(B, D))
     //        = [D,]
-
-    //    bias_grad.noalias() += y_grad.colwise().sum();
 
     bias_grad_1d.device(g_cpu_device) += y_grad.sum(along_batch);
   }
@@ -713,6 +672,12 @@ struct LayerNorm {
   float eps_;
   std::unique_ptr<Parameter> weight_;
   std::unique_ptr<Parameter> bias_;
+
+  // activation gradient tensor
+  std::unique_ptr<Parameter> norm_;             // [B, D]
+  std::unique_ptr<Parameter> dnorm_;            // [B, D]
+  std::unique_ptr<Parameter> dnorm_mean_;       // [B,]
+  std::unique_ptr<Parameter> dnorm_norm_mean_;  // [B,]
 };
 
 // Careful there are a few versions of GeLU, this one is the exact one used by
@@ -724,12 +689,6 @@ struct NewGELU {
     const float sqrt_2_over_pi = std::sqrt(M_2_PI);
 
     // y = 0.5 * x * (1.0 + tanh[sqrt(2/pi) * (x + 0.044715 * x^3)])
-    //    for (size_t i = 0; i < x.size(); ++i) {
-    //      float _x = x[i];
-    //      float cube = 0.044715f * _x * _x * _x;
-    //      y[i] = 0.5f * _x * (1.0f + std::tanh(sqrt_2_over_pi * (_x + cube)));
-    //    }
-
     float coeff = 0.044715f;
     y.device(g_cpu_device) =
         0.5 * x * (1.0 + ((sqrt_2_over_pi * (x + coeff * x * x * x)).tanh()));
@@ -748,18 +707,6 @@ struct NewGELU {
     //                           *  (sqrt(2/pi) * (1 + 0.044715 * 3 * x^2))
     //                             )
     //                 ]
-
-    //    for (size_t i = 0; i < x.size(); ++i) {
-    //      float _x = x[i];
-    //      float cube = 0.044715f * _x * _x * _x;
-    //      float tanh_arg = sqrt_2_over_pi * (_x + cube);
-    //      float tanh_out = std::tanh(tanh_arg);
-    //      float dydx = 0.5f * (1.0f + tanh_out) +
-    //                   0.5f * _x * (1.0f - tanh_out * tanh_out) *
-    //                       (sqrt_2_over_pi * (1.0f + 3.f * 0.044715f * _x *
-    //                       _x));
-    //      x_grad[i] += y_grad[i] * dydx;
-    //    }
 
     const float sqrt_2_over_pi = std::sqrt(M_2_PI);
     float coeff = 0.044715f;
@@ -788,9 +735,6 @@ struct Softmax {
     Eigen::array<Eigen::Index, 2> batch_by_one = {batch_size, 1};
     Eigen::array<Eigen::Index, 2> one_by_class = {1, num_class};
 
-    //      auto x_exp = (x.colwise() - x.rowwise().maxCoeff()).array().exp();
-    //      y = x_exp.array().colwise() / x_exp.rowwise().sum().array();
-
     y.device(g_cpu_device) = (x - x.maximum(along_class)
                                       .eval()
                                       .reshape(batch_by_one)
@@ -801,44 +745,6 @@ struct Softmax {
                                      .eval()
                                      .reshape(batch_by_one)
                                      .broadcast(one_by_class);
-
-    /*
-    int B = x.dimension(0), V = x.dimension(1);
-    int thread_num = g_cpu_device.numThreads();
-    auto fn = [&x, &y, V](int begin, int end) {
-      for (int b = begin; b < end; b++) {
-        // probs <- softmax(logits)
-        const float* logits_bt = x.data() + b * V;
-        float* probs_bt = y.data() + b * V;
-
-        // maxval is only calculated and subtracted for numerical
-        // stability
-        float maxval = -10000.0f;  // TODO something better
-        for (int i = 0; i < V; i++) {
-          if (logits_bt[i] > maxval) {
-            maxval = logits_bt[i];
-          }
-        }
-        float sum = 0.0f;
-        for (int i = 0; i < V; i++) {
-          probs_bt[i] = expf(logits_bt[i] - maxval);
-          sum += probs_bt[i];
-        }
-        // note we only loop to V, leaving the padded dimensions
-        for (int i = 0; i < V; i++) {
-          probs_bt[i] /= sum;
-        }
-      }
-    };
-
-    Eigen::Barrier barrier(thread_num);
-    for (int t = 0; t < thread_num; ++t) {
-      auto range = SplitRange(B, t, thread_num);
-      g_cpu_device.enqueue_with_barrier(&barrier, fn, range.first,
-                                        range.second);
-    }
-    barrier.Wait();
-    */
   }
 
   void Backward(typename TTypes<T>::ConstMatrix y,
