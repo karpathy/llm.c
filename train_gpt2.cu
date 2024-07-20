@@ -462,16 +462,20 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool r
         fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
         exit(EXIT_FAILURE);
     }
-    if (PRECISION_MODE == PRECISION_BF16 && version != 5) {
-        fprintf(stderr, "Precision is configured as BF16 but model at %s is not.\n", checkpoint_path);
-        fprintf(stderr, "---> HINT: are you sure you're loading a _bf16.bin file?\n");
-        exit(EXIT_FAILURE);
-    }
-    if (PRECISION_MODE == PRECISION_FP32 && version != 3) {
-        fprintf(stderr, "Precision is configured as FP32 but model at %s is not.\n", checkpoint_path);
-        fprintf(stderr, "---> HINT: to turn on FP32 you have to compile like: `make train_gpt2cu PRECISION=FP32`\n");
-        fprintf(stderr, "---> HINT: are you sure you're loading a .bin file without any _bf16 in the name?\n");
-        exit(EXIT_FAILURE);
+
+    // check if the precision mode matches the model (don't care if restoring from master weights!)
+    if (!resuming || !model->use_master_weights) {
+        if (PRECISION_MODE == PRECISION_BF16 && version != 5) {
+            fprintf(stderr, "Precision is configured as BF16 but model at %s is not.\n", checkpoint_path);
+            fprintf(stderr, "---> HINT: are you sure you're loading a _bf16.bin file?\n");
+            exit(EXIT_FAILURE);
+        }
+        if (PRECISION_MODE == PRECISION_FP32 && version != 3) {
+            fprintf(stderr, "Precision is configured as FP32 but model at %s is not.\n", checkpoint_path);
+            fprintf(stderr, "---> HINT: to turn on FP32 you have to compile like: `make train_gpt2cu PRECISION=FP32`\n");
+            fprintf(stderr, "---> HINT: are you sure you're loading a .bin file without any _bf16 in the name?\n");
+            exit(EXIT_FAILURE);
+        }
     }
 
     // read in hyperparameters
