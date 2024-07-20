@@ -61,6 +61,26 @@ __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg
                  );
 }
 
+template <typename Tp>
+__global__ void params_from_master_kernel(Tp* params_memory, float* master_params_memory, size_t num_parameters, unsigned int seed, bool check_identical) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_parameters) { return; }  // guard
+
+    Tp rounded_param;
+    float param = master_params_memory[idx];
+    stochastic_rounding(param, &rounded_param, seed);
+
+    if (check_identical) {
+        // check if the rounded parameter is identical to the master parameter (for debugging only)
+        if (params_memory[idx] != rounded_param) {
+            printf("Mismatch restoring master weights at index %zu (of %zu): %.32f != %.32f\n", idx, num_parameters, (float)params_memory[idx], (float)rounded_param);
+            assert(false);
+        }
+    }
+
+    params_memory[idx] = rounded_param;
+}
+
 template <typename Tp, typename Tg>
 void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                   ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride,  int num_slices, float learning_rate, float beta1, float beta2, int t, float eps, float weight_decay,
@@ -74,5 +94,13 @@ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memo
                                                          m_memory, v_memory, num_parameters, w_stride, g_stride, s_stride,
                                                          learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
                                                          grad_scale, seed);
+    cudaCheck(cudaGetLastError());
+}
+
+template <typename Tp>
+void params_from_master(Tp* params_memory, float* master_params_memory, size_t num_parameters, unsigned int seed, bool check_identical=false) {
+    int block_size = 512; // must match block size of adamw_update so that RNG also matches
+    int num_blocks = CEIL_DIV(num_parameters, block_size);
+    params_from_master_kernel<<<num_blocks, block_size>>>(params_memory, master_params_memory, num_parameters, seed, check_identical);
     cudaCheck(cudaGetLastError());
 }

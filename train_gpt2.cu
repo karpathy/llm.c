@@ -311,7 +311,8 @@ typedef struct {
     float* accumulated_mean_loss; // GPU buffer used to accumulate loss across micro-steps
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
-    int use_master_weights;     // keep master weights copy in float for optim update? 0|1
+    unsigned long long rng_state_last_update; // RNG before last gpt2_update() to re-round identically from master weights
+    int use_master_weights; // keep master weights copy in float for optim update? 0|1
     bool init_state;   // set to true if master weights need to be initialized
     int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
     int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
@@ -438,7 +439,7 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     fcloseCheck(model_file);
 }
 
-void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
+void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool resuming=false) {
 
     if (PRECISION_MODE == PRECISION_FP16) {
         // TODO for later perhaps, would require us dynamically converting the
@@ -483,9 +484,12 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     gpt2_allocate_weights(model);
 
-    // read in all the parameters from file and copy them to device
-    file_to_device(model->params_memory, model_file, model->num_parameters_bytes,
-                   IO_BUF_SIZE, main_stream);
+    // read in all the parameters from file and copy them to device (if we need them)
+    if (resuming && model->use_master_weights) {
+        printf("Resuming from master weights, ignoring model weights in checkpoint...\n");
+    } else {
+        file_to_device(model->params_memory, model_file, model->num_parameters_bytes, IO_BUF_SIZE, main_stream);
+    }
     fcloseCheck(model_file);
 
     // only return from this function once we are certain the params are ready on the GPU
@@ -1008,7 +1012,7 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
     return grad_norm_cpu;
 }
 
-void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_scale, int t, MultiGpuConfig* multi_gpu_config) {
+void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_scale, int t, MultiGpuConfig* multi_gpu_config, bool init_from_master_only=false) {
     // update the model parameters using the AdamW optimizer
     // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
     // so we may not be responsible for the entire parameter tensor
@@ -1028,6 +1032,10 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         cudaCheck(cudaMemset(model->m_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->v_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
     }
+
+    // save RNG state at this point so we can round from master weights identically when restoring from a checkpoint
+    model->rng_state_last_update = model->rng_state;
+
     // AdamW update
     // handle adamw for all the transformer blocks
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -1064,12 +1072,19 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
             cudaCheck(cudaGetLastError());
         }
 
-        // ok finally call the kernel
-        adamw_update(param_ptr, master_ptr, grad_ptr,
-                     m_ptr, v_ptr,
-                     shard.size, tensor.size, tensor.size, shard.size, num_layers,
-                     learning_rate,
-                     beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+        if (init_from_master_only) {
+            // this is only run when resuming training from a checkpoint with master weights
+            // it allows us to restart training with a different precision amongst other things
+            assert(master_ptr != NULL);
+            params_from_master(param_ptr, master_ptr, shard.size, seed, true);
+        } else {
+            // ok finally call the kernel to update the weights with AdamW
+            adamw_update(param_ptr, master_ptr, grad_ptr,
+                        m_ptr, v_ptr,
+                        shard.size, tensor.size, tensor.size, shard.size, num_layers,
+                        learning_rate,
+                        beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+        }
         cudaCheck(cudaGetLastError());
 
         if (multi_gpu_config->zero_stage == 1) {
@@ -1189,6 +1204,7 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     state_header[10] = step; // step of the optimization
     // model rng state, start at 20 to leave some padding
     *((unsigned long long*)&state_header[20]) = model->rng_state; // random number generator state
+    *((unsigned long long*)&state_header[22]) = model->rng_state_last_update; // last gpt2_update
     // dataloader state, start at 30 to leave some padding
     *((size_t*)&state_header[30]) = loader->current_shard_idx; // shard of the dataset
     *((size_t*)&state_header[32]) = loader->current_sample_idx; // position in shard
@@ -1225,6 +1241,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     int should_shuffle = state_header[5]; // shuffle state of the dataloader
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
+    model->rng_state_last_update = *((unsigned long long*)&state_header[22]); // last gpt2_update
     size_t current_shard_idx = *((size_t*)&state_header[30]); // shard index
     size_t current_sample_idx = *((size_t*)&state_header[32]); // position in shard
 
@@ -1244,6 +1261,10 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     if(model->use_master_weights) {
         assert(model->master_weights != nullptr);
         file_to_device(model->master_weights, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+        // restore weights from the master weights using the RNG state before last weight update
+        model->rng_state = model->rng_state_last_update;
+        gpt2_update(model, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, &multi_gpu_config, /* init_from_master_only*/ true);
+        model->rng_state = *((unsigned long long*)&state_header[20]); // use final RNG state from checkpoint after this
     }
 
     model->init_state = false;      // we just got the state from file, no need to do first-touch init
@@ -1535,7 +1556,7 @@ int main(int argc, char *argv[]) {
         gpt2_build_from_checkpoint(&model, filename_buffer);
     } else if (ends_with_bin(load_filename)) {
         // otherwise, if this is a .bin file, we assume it's a model, let's init from it
-        gpt2_build_from_checkpoint(&model, load_filename);
+        gpt2_build_from_checkpoint(&model, load_filename, true);
     } else {
         // if it's not .bin, it could be a "special descriptor". This descriptor is used to
         // construct GPT-2 / GPT-3 models in a convenient format. See the function for docs.
