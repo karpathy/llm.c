@@ -1016,7 +1016,8 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
     return grad_norm_cpu;
 }
 
-void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_scale, int t, MultiGpuConfig* multi_gpu_config, bool init_from_master_only=false) {
+void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_scale, int t,
+                 MultiGpuConfig* multi_gpu_config, bool init_from_master_only=false) {
     // update the model parameters using the AdamW optimizer
     // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
     // so we may not be responsible for the entire parameter tensor
@@ -1077,9 +1078,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         }
 
         if (init_from_master_only) {
-            // when resuming training from a checkpoint with master weights
-            init_from_master(param_ptr, master_ptr,
-                             shard.size, tensor.size, shard.size, num_layers, seed, main_stream);
+            // when resuming training from a checkpoint with master weights (allows changing precision)
+            init_from_master(param_ptr, master_ptr, shard.size, tensor.size, shard.size, num_layers, seed, main_stream);
         } else {
             // ok finally call the kernel to update the weights with AdamW
             adamw_update(param_ptr, master_ptr, grad_ptr,
@@ -1088,7 +1088,6 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                         learning_rate,
                         beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
         }
-        cudaCheck(cudaGetLastError());
 
         if (multi_gpu_config->zero_stage == 1) {
 #if MULTI_GPU

@@ -62,18 +62,13 @@ __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg
 }
 
 template <typename Tp>
-__global__ void params_from_master_kernel(Tp* params_memory, float* master_params_memory, size_t num_parameters,
+__global__ void init_from_master_kernel(Tp* params_memory, float* master_params_memory, size_t num_parameters,
                                           ptrdiff_t w_stride, ptrdiff_t s_stride, unsigned int seed, bool check_identical) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_parameters) { return; }
     params_memory += blockIdx.y * w_stride; // adjust for layer offset
     master_params_memory += blockIdx.y * s_stride;
-
-    Tp rounded_param;
-    float param = master_params_memory[idx];
-    stochastic_rounding(param, &rounded_param, seed);
-    assert(!check_identical || params_memory[idx] == rounded_param); // for debugging only (needs non-master params to be loaded as well)
-    params_memory[idx] = rounded_param;
+    stochastic_rounding(master_params_memory[idx], &params_memory[idx], seed);
 }
 
 template <typename Tp, typename Tg>
@@ -93,11 +88,11 @@ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memo
 }
 
 template <typename Tp>
-void params_from_master(Tp* params_memory, float* master_params_memory, size_t num_parameters,
+void init_from_master(Tp* params_memory, float* master_params_memory, size_t num_parameters,
                         ptrdiff_t w_stride, ptrdiff_t s_stride, int num_slices, unsigned int seed, cudaStream_t stream, bool check_identical=false) {
     int block_size = 512; // must match block size of adamw_update so that RNG also matches
     int num_blocks = CEIL_DIV(num_parameters, block_size);
-    params_from_master_kernel<<<dim3(num_blocks, num_slices), block_size, 0, stream>>>
+    init_from_master_kernel<<<dim3(num_blocks, num_slices), block_size, 0, stream>>>
                              (params_memory, master_params_memory, num_parameters, w_stride, s_stride, seed, check_identical);
     cudaCheck(cudaGetLastError());
 }
