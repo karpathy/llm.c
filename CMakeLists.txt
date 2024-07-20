@@ -44,7 +44,7 @@ target_link_libraries(test_gpt2 m ${OpenMP_CXX_LIBRARIES})
 # llm.c GPU
 find_package(CUDA)
 if (CUDA_FOUND)
-#    add_compile_definitions(EIGEN_USE_GPU)
+    #    add_compile_definitions(EIGEN_USE_GPU)
     #SET(CMAKE_CUDA_FLAGS ${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr)
     add_compile_definitions(ENABLE_FP32)
     add_executable(train_gpt2cu train_gpt2.cu)
@@ -55,15 +55,29 @@ if (CUDA_FOUND)
     target_link_libraries(train_gpt2cu ${CUDA_LIBRARIES} cublas cublasLt)
 
     add_executable(test_eigen_gpu llmcpp/test_eigen_gpu.cu)
+    target_compile_definitions(test_eigen_gpu PUBLIC EIGEN_USE_GPU)
     set_target_properties(test_eigen_gpu PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
             CUDA_ARCHITECTURES "70;75"
     )
     target_link_libraries(test_eigen_gpu
             absl::strings absl::log absl::check
-#            ${CUDA_LIBRARIES} cublas cublasLt
+            #            ${CUDA_LIBRARIES} cublas cublasLt
     )
-#    target_compile_options(test_eigen_gpu PRIVATE -Xcompiler=-Ofast,-march=native)
+    #    target_compile_options(test_eigen_gpu PRIVATE -Xcompiler=-Ofast,-march=native)
+
+    # nn_test_cu
+    add_executable(nn_test_cu llmcpp/nn_test.cu)
+    target_compile_definitions(nn_test_cu PRIVATE EIGEN_USE_GPU)
+    set_target_properties(nn_test_cu PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_ARCHITECTURES "70;75"
+    )
+    target_link_libraries(nn_test_cu
+            absl::strings absl::log absl::check
+            GTest::gtest_main
+            ${CUDA_LIBRARIES}
+    )
 endif ()
 
 

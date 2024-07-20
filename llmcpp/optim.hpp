@@ -19,7 +19,7 @@ struct SGD {
     for (nn::Parameter* parameter : parameters_) {
       auto param = parameter->flat<float>();
       auto grad = parameter->flat_grad<float>();
-      param.device(nn::g_cpu_device) -= lr_ * grad;
+      param.device(nn::g_device) -= lr_ * grad;
     }
   }
 
@@ -59,15 +59,15 @@ struct AdamW {
       auto v = v_[i]->flat<float>();
 
       // update the first moment (momentum)
-      m.device(nn::g_cpu_device) = beta1_ * m + (1.0f - beta1_) * grad;
+      m.device(nn::g_device) = beta1_ * m + (1.0f - beta1_) * grad;
       // update the second moment (RMSprop)
-      v.device(nn::g_cpu_device) = beta2_ * v + (1.0f - beta2_) * grad * grad;
+      v.device(nn::g_device) = beta2_ * v + (1.0f - beta2_) * grad * grad;
       // bias-correct both moments
       auto m_hat = m / (1.0f - static_cast<float>(std::pow(beta1_, t)));
       auto v_hat = v / (1.0f - static_cast<float>(std::pow(beta2_, t)));
 
       // update
-      parameter.device(nn::g_cpu_device) -=
+      parameter.device(nn::g_device) -=
           lr_ * (m_hat / (v_hat.sqrt() + eps_) + weight_decay_ * parameter);
     }
   }
