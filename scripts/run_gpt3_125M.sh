@@ -1,14 +1,14 @@
-# GPT-3 (124M) repro on FineWeb
-# 124M parameter model on 300B tokens
+# GPT-3 (125M) repro, but using FineWeb
+# 125M parameter model on 300B tokens
 # note context length: 1024 -> 2048 for GPT-3
-# => 6 * 124e6 * 300e9 = 7.44e18 ~= 2.2e20 capability model
-# 565,950 steps of 524,288 tokens/step
-# on 8X A100 80GB SXM ($14/hr) steps in ~300ms/iter
-# => training time 565,950 * 300ms ~= 47 hours ~= $658
+# => 6 * 125e6 * 300e9 = ~= 2.25e20 capability model
+# 572,204 steps of 524,288 tokens/step => 300B
+# on 8X A100 80GB SXM ($14/hr) steps in ~150ms/iter
+# => training time 572,204 * 150ms ~= 24 hours ~= $336
 
 make train_gpt2cu USE_CUDNN=1
-out_dir="log_gpt3_124M"
-done_file="$out_dir/DONE_00565950"
+out_dir="log_gpt3_125M"
+done_file="$out_dir/DONE_00572204"
 
 while true; do
 
@@ -18,8 +18,6 @@ while true; do
         break
     fi
 
-    # run python dev/data/fineweb.py --version 10B to prepro data
-    # run python dev/data/hellaswag.py to prepro hellaswag eval
     mpirun -np 8 ./train_gpt2cu \
                 -i "dev/data/fineweb100B/fineweb_train_*.bin" \
                 -j "dev/data/fineweb100B/fineweb_val_*.bin" \
@@ -32,12 +30,17 @@ while true; do
                 -z 1 \
                 -c 0.1 \
                 -l 0.0006 \
-                -q 0.0 \
+                -q 0.1 \
                 -u 700 \
                 -n 10000 \
+                -nk 5 \
+                -nm 50000 \
+                -ge 1 \
+                -sl 7.0 \
+                -sg 7.0 \
                 -y 1 \
-                -x 565950 \
-                -e "d12"
+                -x 572204 \
+                -e "gpt3:c768"
 
     sleep 1
 done

@@ -98,7 +98,7 @@ int main(int argc, char *argv[]) {
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
     float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
-    cudaMemcpy(logits_cpu, model.acts.output, B * T * Vp * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaCheck(cudaMemcpy(logits_cpu, model.acts.output, B * T * Vp * sizeof(float), cudaMemcpyDeviceToHost));
 
     // compare the output logits from the forward pass
     // also careful that we don't access and compare the padded columns of logits
@@ -196,16 +196,16 @@ int main(int argc, char *argv[]) {
 
     // expected losses are as follows, from Python
     float expected_losses[10] = {
-        5.270007133483887,
-        4.059706687927246,
-        3.3751230239868164,
-        2.8007826805114746,
-        2.315382242202759,
-        1.8490285873413086,
-        1.3946564197540283,
-        0.9991465210914612,
-        0.6240804195404053,
-        0.37651097774505615
+        5.270007133483887f,
+        4.059706687927246f,
+        3.3751230239868164f,
+        2.8007826805114746f,
+        2.315382242202759f,
+        1.8490285873413086f,
+        1.3946564197540283f,
+        0.9991465210914612f,
+        0.6240804195404053f,
+        0.37651097774505615f
     };
 
     // compare

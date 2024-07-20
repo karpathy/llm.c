@@ -444,7 +444,7 @@ void layernorm_forward(floatX* out, float* mean, float* rstd,
     // this may fail, in which case we fall back to the smem free implementation.
     cudaCheck(cudaGetLastError());
     auto status = cudaFuncSetAttribute(layernorm_forward_kernel6, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaGetLastError();
+    cudaCheck(cudaGetLastError());
     if (status == cudaSuccess) {
         layernorm_forward_kernel6<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
     } else {
@@ -477,7 +477,7 @@ void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, floa
     // this may fail, in which case we fall back to the smem free implementation.
     cudaCheck(cudaGetLastError());
     auto status = cudaFuncSetAttribute(fused_residual_forward_kernel5, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaGetLastError();
+    cudaCheck(cudaGetLastError());
     if(status == cudaSuccess) {
         fused_residual_forward_kernel5<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(residual, normed,
                                                                                               mean, rstd, inp1, inp2,
