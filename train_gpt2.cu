@@ -1076,7 +1076,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
             // this is only run when resuming training from a checkpoint with master weights
             // it allows us to restart training with a different precision amongst other things
             assert(master_ptr != NULL);
-            params_from_master(param_ptr, master_ptr, shard.size, seed, true);
+            params_from_master(param_ptr, master_ptr,
+                               shard.size, tensor.size, shard.size, num_layers, seed, main_stream);
         } else {
             // ok finally call the kernel to update the weights with AdamW
             adamw_update(param_ptr, master_ptr, grad_ptr,
@@ -1553,10 +1554,10 @@ int main(int argc, char *argv[]) {
     gpt2_init_common(&model);
     if (resuming == 1) {
         // if `-y 1` was set, then we are resuming from the latest checkpoint
-        gpt2_build_from_checkpoint(&model, filename_buffer);
+        gpt2_build_from_checkpoint(&model, filename_buffer, true);
     } else if (ends_with_bin(load_filename)) {
         // otherwise, if this is a .bin file, we assume it's a model, let's init from it
-        gpt2_build_from_checkpoint(&model, load_filename, true);
+        gpt2_build_from_checkpoint(&model, load_filename);
     } else {
         // if it's not .bin, it could be a "special descriptor". This descriptor is used to
         // construct GPT-2 / GPT-3 models in a convenient format. See the function for docs.
