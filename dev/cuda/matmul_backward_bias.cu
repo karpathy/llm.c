@@ -437,6 +437,7 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 
 // (extra-long explanation for /dev/cuda/ only)
 //
+// (in the description below, we assume "column major" layout like cuBLAS/FORTRAN)
 // this is really a general purpose column reduction kernel, it's not just for bias!
 // it could easily be generalised if we needed this for something else in the future...
 //
@@ -465,13 +466,19 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 // block dimensions are given at compile time via templating to enable loop unrolling
 //
 // (end of extra-long explanation for /dev/cuda/ only)
-
-// OC columns and B*T rows ==> per-column sum reduction with OC outputs in dbias
+//
+// (in the description below, we assume "column major" layout like cuBLAS/FORTRAN but unlike C/C++)
+// general reduction kernel for any minor axis, could be used for other things than bias backward!
+// bias backward: OC columns and B*T rows ==> per-column sum reduction with OC outputs in dbias
 // each block handles (blockIdx.x * x128::size) columns and (blockIdx.y) rows
-// data is contiguous along rows, 128B coalesced loads with BF16 require blockIdx.x >= 8
-// for small OC, we want smaller blockIdx.x to get more blocks and better GPU utilisation
-template <int block_dim_x=2, int block_dim_y=256, typename OutFloat=floatX>
-__global__ void matmul_backward_bias_kernel10(OutFloat* dbias, const floatX* dout, int B, int T, int OC) {
+// data layout is column major => contiguous for column X and X+1 (row_stride elements across rows)
+// ==> 128B coalesced loads with BF16 require blockIdx.x >= 8 (64 columns per block)
+// with few columns (OC), we want smaller blockIdx.x to get more blocks and better GPU utilisation
+template <int block_dim_x=2, int block_dim_y=512, bool accumulate=true, typename OutFloat=floatX>
+__global__ void column_reduction_kernel(OutFloat* output, const floatX* input,
+                                        int num_rows, int num_columns, int row_stride) {
+    //assert(block_dim_x == blockDim.x && block_dim_y == blockDim.y); // check template parameters
+    //assert(num_columns == gridDim.x * block_dim_x * x128::size); // must match, no partial blocks
     constexpr int block_size = block_dim_x * block_dim_y;
     __shared__ float smem[block_size * x128::size];
 
@@ -479,13 +486,14 @@ __global__ void matmul_backward_bias_kernel10(OutFloat* dbias, const floatX* dou
     int column_idx = (blockIdx.x * block_dim_x + threadIdx.x) * x128::size;
     int smem_idx = threadIdx.x + threadIdx.y * block_dim_x; // smem idx for this thread with k=0
 
-    for (int row = threadIdx.y; row < B * T; row += block_dim_y) {
-        x128 packed_dout = load128(dout + column_idx + row * OC);
+    #pragma unroll 4
+    for (int row = threadIdx.y; row < num_rows; row += block_dim_y) {
+        x128 packed_dout = load128(input + column_idx + row * row_stride);
         for (int k = 0; k < x128::size; k++) {
             column_sum[k] += (float)packed_dout[k];
         }
     }
-    // todo - currently don't use x128 for smem, so we stride by block_size to avoid bank conflicts
+    // todo - currently don't use f128 for smem, so we stride by block_size to avoid bank conflicts
     for (int k = 0; k < x128::size; k++) {
         smem[smem_idx + k * block_size] = column_sum[k]; // write column partial sums to shared mem
     }
@@ -504,14 +512,15 @@ __global__ void matmul_backward_bias_kernel10(OutFloat* dbias, const floatX* dou
     } // no __syncthreads() needed because smem read below was written by the same thread
 
     if (threadIdx.y == 0) {
-        // accumulate the sums in global memory (one bias parameter gradient per column/OC)
-        // += because of potential gradient accumulation (multiple micro-batches per batch)
+        // accumulate if necessary (e.g. gradient accumulation for multiple micro-batches per batch)
+        // one output per column (e.g. 1 bias parameter gradient per OC)
+        x128 output128 = accumulate ? load128(output + column_idx) : x128::zeros();
         for (int k = 0; k < x128::size; k++) {
-            dbias[column_idx + k] = (OutFloat)((float)dbias[column_idx + k] + smem[threadIdx.x + k * block_size]);
+            output128[k] = (OutFloat)((float)output128[k] + smem[threadIdx.x + k * block_size]);
         }
+        store128(output + column_idx, output128);
     }
 }
-
 
 // ----------------------------------------------------------------------------
 // kernel launcher
@@ -639,13 +648,13 @@ void matmul_backward_bias10(floatX* dbias, const floatX* dout,
     assert(OC % (bs_x * x128::size) == 0); // should always be true for sensible values of block_size.x
 
     switch (desired_block_size) {
-        case 32: matmul_backward_bias_kernel10<bs_x, 32/bs_x><<<grid_size, dim3(bs_x, 32/bs_x)>>>(dbias, dout, B, T, OC); break;
-        case 64: matmul_backward_bias_kernel10<bs_x, 64/bs_x><<<grid_size, dim3(bs_x, 64/bs_x)>>>(dbias, dout, B, T, OC); break;
-        case 128: matmul_backward_bias_kernel10<bs_x, 128/bs_x><<<grid_size, dim3(bs_x, 128/bs_x)>>>(dbias, dout, B, T, OC); break;
-        case 256: matmul_backward_bias_kernel10<bs_x, 256/bs_x><<<grid_size, dim3(bs_x, 256/bs_x)>>>(dbias, dout, B, T, OC); break;
-        case 512: matmul_backward_bias_kernel10<bs_x, 512/bs_x><<<grid_size, dim3(bs_x, 512/bs_x)>>>(dbias, dout, B, T, OC); break;
-        case 768: matmul_backward_bias_kernel10<bs_x, 768/bs_x><<<grid_size, dim3(bs_x, 768/bs_x)>>>(dbias, dout, B, T, OC); break;
-        case 1024: matmul_backward_bias_kernel10<bs_x, 1024/bs_x><<<grid_size, dim3(bs_x, 1024/bs_x)>>>(dbias, dout, B, T, OC); break;
+        case 32: column_reduction_kernel<bs_x, 32/bs_x><<<grid_size, dim3(bs_x, 32/bs_x)>>>(dbias, dout, B*T, OC, OC); break;
+        case 64: column_reduction_kernel<bs_x, 64/bs_x><<<grid_size, dim3(bs_x, 64/bs_x)>>>(dbias, dout, B*T, OC, OC); break;
+        case 128: column_reduction_kernel<bs_x, 128/bs_x><<<grid_size, dim3(bs_x, 128/bs_x)>>>(dbias, dout, B*T, OC, OC); break;
+        case 256: column_reduction_kernel<bs_x, 256/bs_x><<<grid_size, dim3(bs_x, 256/bs_x)>>>(dbias, dout, B*T, OC, OC); break;
+        case 512: column_reduction_kernel<bs_x, 512/bs_x><<<grid_size, dim3(bs_x, 512/bs_x)>>>(dbias, dout, B*T, OC, OC); break;
+        case 768: column_reduction_kernel<bs_x, 768/bs_x><<<grid_size, dim3(bs_x, 768/bs_x)>>>(dbias, dout, B*T, OC, OC); break;
+        case 1024: column_reduction_kernel<bs_x, 1024/bs_x><<<grid_size, dim3(bs_x, 1024/bs_x)>>>(dbias, dout, B*T, OC, OC); break;
         default: break;
     }
     cudaCheck(cudaGetLastError());
