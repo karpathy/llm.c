@@ -1077,11 +1077,9 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         }
 
         if (init_from_master_only) {
-            // this is only run when resuming training from a checkpoint with master weights
-            // it allows us to restart training with a different precision amongst other things
-            assert(master_ptr != NULL);
-            params_from_master(param_ptr, master_ptr,
-                               shard.size, tensor.size, shard.size, num_layers, seed, main_stream);
+            // when resuming training from a checkpoint with master weights
+            init_from_master(param_ptr, master_ptr,
+                             shard.size, tensor.size, shard.size, num_layers, seed, main_stream);
         } else {
             // ok finally call the kernel to update the weights with AdamW
             adamw_update(param_ptr, master_ptr, grad_ptr,

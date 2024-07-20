@@ -66,23 +66,13 @@ __global__ void params_from_master_kernel(Tp* params_memory, float* master_param
                                           ptrdiff_t w_stride, ptrdiff_t s_stride, unsigned int seed, bool check_identical) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_parameters) { return; }
-
-    // adjust for layer offset
-    params_memory += blockIdx.y * w_stride;
+    params_memory += blockIdx.y * w_stride; // adjust for layer offset
     master_params_memory += blockIdx.y * s_stride;
 
     Tp rounded_param;
     float param = master_params_memory[idx];
     stochastic_rounding(param, &rounded_param, seed);
-
-    if (check_identical) {
-        // check if the rounded parameter is identical to the master parameter (debugging only)
-        if (params_memory[idx] != rounded_param) {
-            printf("Mismatch restoring master weights at index %llu (of %llu): %.20f != %.20f\n",
-                   idx, num_parameters, (float)params_memory[idx], (float)rounded_param);
-            assert(false);
-        }
-    }
+    assert(!check_identical || params_memory[idx] == rounded_param); // for debugging only (needs non-master params to be loaded as well)
     params_memory[idx] = rounded_param;
 }
 
