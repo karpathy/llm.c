@@ -477,8 +477,8 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 template <int block_dim_x=2, int block_dim_y=512, bool accumulate=true, typename OutFloat=floatX>
 __global__ void column_reduction_kernel(OutFloat* output, const floatX* input,
                                         int num_rows, int num_columns, int row_stride) {
-    //assert(block_dim_x == blockDim.x && block_dim_y == blockDim.y); // check template parameters
-    //assert(num_columns == gridDim.x * block_dim_x * x128::size); // must match, no partial blocks
+    assert(block_dim_x == blockDim.x && block_dim_y == blockDim.y); // check template parameters
+    assert(num_columns == gridDim.x * block_dim_x * x128::size); // must match, no partial blocks
     constexpr int block_size = block_dim_x * block_dim_y;
     __shared__ float smem[block_size * x128::size];
 
