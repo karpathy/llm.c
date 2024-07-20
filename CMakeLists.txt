@@ -50,7 +50,7 @@ if (CUDA_FOUND)
     add_executable(train_gpt2cu train_gpt2.cu)
     set_target_properties(train_gpt2cu PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
-            CUDA_ARCHITECTURES "70;75"
+            CUDA_ARCHITECTURES "61;70;75"
     )
     target_link_libraries(train_gpt2cu ${CUDA_LIBRARIES} cublas cublasLt)
 
@@ -58,7 +58,7 @@ if (CUDA_FOUND)
     target_compile_definitions(test_eigen_gpu PUBLIC EIGEN_USE_GPU)
     set_target_properties(test_eigen_gpu PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
-            CUDA_ARCHITECTURES "70;75"
+            CUDA_ARCHITECTURES "61;70;75"
     )
     target_link_libraries(test_eigen_gpu
             absl::strings absl::log absl::check
@@ -71,7 +71,7 @@ if (CUDA_FOUND)
     target_compile_definitions(nn_test_cu PRIVATE EIGEN_USE_GPU)
     set_target_properties(nn_test_cu PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
-            CUDA_ARCHITECTURES "70;75"
+            CUDA_ARCHITECTURES "61;70;75"
     )
     target_link_libraries(nn_test_cu
             absl::strings absl::log absl::check

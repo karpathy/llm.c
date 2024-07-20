@@ -467,7 +467,7 @@ loss.backward()
   }
 }
 
-TEST(VanillaCrossEntropy, ForwardAndBackward) {
+TEST(CrossEntropy, ForwardAndBackward) {
   /*
 
 import torch
@@ -500,7 +500,7 @@ loss.backward()
 
   // Reduction: MEAN
   nn::Softmax<float> softmax;
-  nn::VanillaCrossEntropy<float> criterion1;
+  nn::CrossEntropy<float> criterion1;
   softmax.Forward(logits_m, probs_m);
   criterion1.Forward(probs_const, absl::MakeSpan(target), &loss1);
 
@@ -519,8 +519,7 @@ loss.backward()
   }
 
   // Reduction: SUM
-  nn::VanillaCrossEntropy<float> criterion2(
-      nn::VanillaCrossEntropy<float>::SUM);
+  nn::CrossEntropy<float> criterion2(nn::CrossEntropy<float>::SUM);
   softmax.Forward(logits_m, probs_m);
   criterion2.Forward(probs_const, absl::MakeSpan(target), &loss2);
   EXPECT_NEAR(loss1 * batch, loss2, 1e-5);

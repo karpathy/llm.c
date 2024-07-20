@@ -32,6 +32,16 @@ mt19937_state g_mt19937_state;
 
 void ManualSeed(unsigned int seed) { manual_seed(&g_mt19937_state, seed); }
 
+void ConstantFill(absl::Span<float> weight, float C) {
+#ifdef EIGEN_USE_GPU
+  std::vector<float> w(weight.size(), C);
+  g_device.memcpyHostToDevice(weight.data(), w.data(),
+                              sizeof(float) * w.size());
+#else
+  absl::c_fill(weight, C);
+#endif
+}
+
 void UniformFill(absl::Span<float> weight, float from = 0.0, float to = 1.0) {
 #ifdef EIGEN_USE_GPU
   std::vector<float> w(weight.size());
@@ -44,12 +54,26 @@ void UniformFill(absl::Span<float> weight, float from = 0.0, float to = 1.0) {
 }
 
 void NormalFill(absl::Span<float> weight, float mean = 0.0, float std = 1.0) {
+#ifdef EIGEN_USE_GPU
+  std::vector<float> w(weight.size());
+  normal_(w.data(), w.size(), mean, std, &g_mt19937_state);
+  g_device.memcpyHostToDevice(weight.data(), w.data(),
+                              sizeof(float) * w.size());
+#else
   normal_(weight.data(), weight.size(), mean, std, &g_mt19937_state);
+#endif
 }
 
 void KaimingUniformFill(absl::Span<float> weight, int in_features) {
   const float bound = std::sqrt(1.0f / in_features);
+#ifdef EIGEN_USE_GPU
+  std::vector<float> w(weight.size());
+  uniform_(w.data(), w.size(), -bound, bound, &g_mt19937_state);
+  g_device.memcpyHostToDevice(weight.data(), w.data(),
+                              sizeof(float) * w.size());
+#else
   uniform_(weight.data(), weight.size(), -bound, bound, &g_mt19937_state);
+#endif
 }
 
 std::pair<int, int> SplitRange(int total, int idx, int n) {
@@ -541,10 +565,10 @@ struct LayerNorm {
     auto dtype = DataTypeToEnum<T>::value;
     weight_ = std::make_unique<Parameter>(dtype, normalized_shape);
     auto w = weight_->span<T>();
-    absl::c_fill(w, 1.0f);
+    ConstantFill(w, 1.0f);
     bias_ = std::make_unique<Parameter>(dtype, normalized_shape);
     auto b = bias_->span<T>();
-    absl::c_fill(b, 0.0f);
+    ConstantFill(b, 0.0f);
 
     // activation gradient tensor
     norm_ = std::make_unique<Parameter>(dtype);             // [B, D]
@@ -869,11 +893,10 @@ struct SoftmaxCrossEntropy {
 };
 
 template <typename T>
-struct VanillaCrossEntropy {
+struct CrossEntropy {
   enum Reduction { MEAN, SUM };
 
-  VanillaCrossEntropy(Reduction reduction = Reduction::MEAN)
-      : reduction_(reduction) {}
+  CrossEntropy(Reduction reduction = Reduction::MEAN) : reduction_(reduction) {}
 
   void Forward(typename TTypes<T>::ConstMatrix probs,
                absl::Span<const int> targets, float* loss) {
