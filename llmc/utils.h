@@ -16,9 +16,6 @@
 #ifndef _WIN32
 #include <dirent.h>
 #include <arpa/inet.h>
-#else
-#pragma comment(lib, "Ws2_32.lib")  // Link Ws2_32.lib for socket functions
-#include <winsock2.h>
 #endif
 
 // ----------------------------------------------------------------------------
