@@ -98,6 +98,27 @@ __global__ void adamw_kernel3_absmax(Tp* params_memory, float* master_params_mem
                  );
 }
 
+template <typename Tp>
+__global__ void init_from_master_kernel(Tp* params_memory, float* master_params_memory, size_t num_parameters,
+                                          ptrdiff_t w_stride, ptrdiff_t s_stride, unsigned int seed, __grid_constant__ const param_absmax_for_adam_t absmax_params) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_parameters) { return; }
+    float scale = absmax_params.scale_factor[blockIdx.y] ? *absmax_params.scale_factor[blockIdx.y] : 1.0f; // for fp8 (absmax scaling)
+    params_memory += blockIdx.y * w_stride; // adjust for layer offset
+    master_params_memory += blockIdx.y * s_stride;
+    stochastic_rounding(master_params_memory[idx] * scale, &params_memory[idx], seed);
+}
+
+template <typename Tp>
+void init_from_master(Tp* params_memory, float* master_params_memory, size_t num_parameters,
+                        ptrdiff_t w_stride, ptrdiff_t s_stride, int num_slices, unsigned int seed, cudaStream_t stream, const param_absmax_for_adam_t absmax_params) {
+    int block_size = 512; // must match block size of adamw_update so that RNG also matches
+    int num_blocks = CEIL_DIV(num_parameters, block_size);
+    init_from_master_kernel<<<dim3(num_blocks, num_slices), block_size, 0, stream>>>
+                             (params_memory, master_params_memory, num_parameters, w_stride, s_stride, seed, absmax_params);
+    cudaCheck(cudaGetLastError());
+}
+
 template <typename Tp, typename Tg>
 void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                   ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride,  int num_slices, float learning_rate, float beta1, float beta2, int t, float eps, float weight_decay,
@@ -118,15 +139,22 @@ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memo
         // Pass the scale factors and absmax output pointers as function arguments
         // (CUDA supports up to 4KiB pre-12.1 and 64KiB after, so it's fine, although not very flexible due to fixed size)
         for (int i = 0; i < num_slices; i++) {
+            global_current_layer = num_slices > 1 ? i+1 : 0;
             Tp* layer_params_memory = params_memory + i * num_parameters;
-            float *calculated_from_absmax = absmax_tracker.get_absmax_data(layer_params_memory, num_parameters, NULL, SCALE_FP8_WEIGHTS);
+            float *calculated_from_absmax = absmax_tracker.get_absmax_data("adamw", layer_params_memory, num_parameters, NULL, SCALE_FP8_WEIGHTS, true, true);
             absmax_params.scale_factor[i] = calculated_from_absmax + SCALE_OFFSET;
-            absmax_params.absmax_output[i] = absmax_tracker.next_absmax_ptr(layer_params_memory, num_parameters, NULL);
+            absmax_params.absmax_output[i] = absmax_tracker.next_absmax_ptr(layer_params_memory, num_parameters, NULL, 0.0f, false);
         }
+        global_current_layer = 0;
         adamw_kernel3_absmax<<<dim3(num_blocks, num_slices), block_size, 0, stream>>>(params_memory, master_params_memory, grads_memory,
                                                             m_memory, v_memory, num_parameters, w_stride, g_stride, s_stride,
                                                             learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
                                                             grad_scale, seed, absmax_params);
+
+        // HACK - WIP - this updates the scale based on the latest update, then writes the parameters again reading from master weights
+        // we need a more general solution that supports multi-GPU (the entire tensor needs to have the same scaling factor!)
+        absmax_tracker.update_all_absmax(stream, 1.0f, false);
+        init_from_master(params_memory, master_params_memory, num_parameters, w_stride, s_stride, num_slices, seed, stream, absmax_params);
     } else {
         adamw_kernel3<<<dim3(num_blocks, num_slices), block_size, 0, stream>>>(params_memory, master_params_memory, grads_memory,
                                                             m_memory, v_memory, num_parameters, w_stride, g_stride, s_stride,

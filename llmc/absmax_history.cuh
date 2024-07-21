@@ -12,7 +12,7 @@
 #include "cuda_common.h"
 #include "cuda_utils.cuh"
 
-constexpr uint8_t ABSMAX_HISTORY_SIZE = 16; // todo - need to tune this
+constexpr uint8_t ABSMAX_HISTORY_SIZE = 128; // todo - need to tune this
 #define ALWAYS_UPDATE_ABSMAX false // slow, for sanity checking only
 #define SKIP_UPDATE_ZERO_ABSMAX true // do not update the scale/descale if max absmax is 0
 
@@ -27,7 +27,7 @@ enum CalculatedValueOffset {
 
 class TensorAbsMaxTracker {
 public:
-    static constexpr size_t INITIAL_TENSOR_COUNT = 1024;
+    static constexpr size_t INITIAL_TENSOR_COUNT = 8192;
     static constexpr float  DEFAULT_FUDGE_FACTOR = 1.0f;
 
     TensorAbsMaxTracker()
@@ -41,22 +41,26 @@ public:
     }
 
     template<typename T>
-    float* get_absmax_data(const T* tensor_address, size_t size,
+    float* get_absmax_data(const char* name, const T* tensor_address, size_t size,
                            const void* associated_tensor = nullptr,
-                           float scale_factor = 0.0f, bool calculate_if_needed=true) {
+                           float scale_factor = 0.0f, bool calculate_if_needed=true, bool never_warn=false) {
         bool is_new;
         TensorInfo& info = get_tensor_info(tensor_address, size, associated_tensor, scale_factor, is_new);
 
-        if (!is_new && info.call_count == 0 && info.previous_call_count == 0) {
-            printf("Warning: get_absmax_data() with call_count=0 and previous_call_count=0 for existing tensor at %p (size %lu)\n",
-                info.call_count, tensor_address, size);
+        if (info.layer == -1 && strlen(name)) {
+            info.layer = global_current_layer;
+            info.name = name;
         }
+        //if (!never_warn && !is_new && info.call_count == 0 && info.previous_call_count == 0) {
+        //    printf("Warning: get_absmax_data() for '%s' (layer %d, called name: '%s') ==> call_count=0 and previous_call_count=0 for existing tensor at %p (size %lu)\n",
+        //        info.name, global_current_layer, name, tensor_address, size);
+        //}
 
         #if ALWAYS_UPDATE_ABSMAX == true // slow, for sanity checking only
         if (calculate_if_needed) {
-            float* absmax_memory = next_absmax_ptr(tensor_address, size, calculate_if_needed);
+            float* absmax_memory = next_absmax_ptr(tensor_address, size, associated_tensor, scale_factor);
             get_absmax(absmax_memory, tensor_address, size);
-            update_single_absmax(tensor_address, size, calculate_if_needed, 1.0f);
+            update_single_absmax(tensor_address, size, associated_tensor, 1.0f);
             return (float*)(d_storage + get_storage_offset(info.index) + ABSMAX_HISTORY_SIZE);
         }
         #endif
@@ -72,9 +76,9 @@ public:
     }
 
     template <typename T>
-    float* get_descale_ptr(const T* tensor_address, size_t size, const void* associated_tensor = nullptr, bool calculate_if_needed=false, bool must_be_fp8=false) {
+    float* get_descale_ptr(const T* tensor_address, size_t size, const void* associated_tensor = nullptr, bool calculate_if_needed=false, bool must_be_fp8=false, bool never_warn=false) {
         if constexpr (std::is_same<T, __nv_fp8_e4m3>::value || std::is_same<T, __nv_fp8_e5m2>::value) {
-            float* data = get_absmax_data(tensor_address, size, associated_tensor, 0.0f, calculate_if_needed);
+            float* data = get_absmax_data("descale", tensor_address, size, associated_tensor, 0.0f, calculate_if_needed, never_warn);
             assert(data);
             return (data + DESCALE_OFFSET);
         }
@@ -84,15 +88,17 @@ public:
 
     template<typename T>
     float* next_absmax_ptr(const T* tensor_address, size_t size,
-                           const void* associated_tensor = nullptr, float scale_factor = 0.0f) {
+                           const void* associated_tensor = nullptr, float scale_factor = 0.0f,
+                           bool reset_call_count=false, bool ignore_current_index_for_scale=false) {
         bool is_new;
         TensorInfo& info = get_tensor_info(tensor_address, size, associated_tensor, scale_factor, is_new);
 
-        info.call_count++;
-        if (info.call_count > 1) {
-            printf("Warning: next_absmax_ptr() called %zu times for tensor at %p (size %lu) since last update_all_absmax() [previous call count: %d]\n",
-                info.call_count, tensor_address, size, info.previous_call_count);
-        }
+        //size_t old_call_count = info.call_count;
+        info.call_count = reset_call_count ? 1 : (info.call_count + 1);
+        //if (info.call_count > 1) {
+        //    printf(" next_absmax_ptr() called %lu times for tensor '%s' (layer %d) at %p (size %lu) [old count: %lu, previous count: %lu] (current layer: %d) ==> h_current_indices[info.index]: %d\n",
+        //        info.call_count, info.name, info.layer, tensor_address, size, old_call_count, info.previous_call_count, global_current_layer, h_current_indices[info.index]);
+        //}
 
         uint8_t currentIndex = h_current_indices[info.index];
         h_current_indices[info.index] = (currentIndex + 1) % ABSMAX_HISTORY_SIZE;
@@ -111,7 +117,7 @@ public:
         cudaCheck(cudaMemcpy(d_storage + offset, &scale_factor, sizeof(float), cudaMemcpyHostToDevice));
     }
 
-    void update_all_absmax(cudaStream_t stream = 0, float fudge_factor = DEFAULT_FUDGE_FACTOR);
+    void update_all_absmax(cudaStream_t stream = 0, float fudge_factor = DEFAULT_FUDGE_FACTOR, bool reset_call_counts = true);
 
     template<typename T>
     void update_single_absmax(const T* tensor_address, size_t size, const void* associated_tensor,
@@ -178,6 +184,8 @@ private:
         float scale_factor;
         size_t call_count;
         size_t previous_call_count;
+        const char* name;
+        int layer;
     };
 
     size_t current_tensor_count;
@@ -212,6 +220,8 @@ private:
         cudaCheck(cudaMalloc(&new_indices, new_max_tensor_count * sizeof(uint8_t)));
         cudaCheck(cudaMemset(new_indices, 0, new_max_tensor_count * sizeof(uint8_t)));
         if (d_storage) {
+            assert(false); // todo - this is nearly certainly broken, just give up for now
+
             cudaCheck(cudaMemcpy(new_storage, d_storage,
                                  max_tensor_count * (ABSMAX_HISTORY_SIZE + ABSMAX_VALUES_COUNT) * sizeof(float),
                                  cudaMemcpyDeviceToDevice));
@@ -255,7 +265,7 @@ private:
             h_current_indices[newIndex] = 0;
 
             float actualScaleFactor = scale_factor == 0.0f ? get_default_scale_factor<T>() : scale_factor;
-            it = tensor_info_map.emplace(key, TensorInfo{newIndex, actualScaleFactor, 0, 0}).first;
+            it = tensor_info_map.emplace(key, TensorInfo{newIndex, actualScaleFactor, 0, 0, "unknown", -1}).first;
 
             float allValues[ABSMAX_VALUES_COUNT] = {0.0f, 1.0f, 1.0f, actualScaleFactor};
             cudaCheck(cudaMemcpy(d_storage + get_storage_offset(newIndex) + ABSMAX_HISTORY_SIZE,
@@ -316,7 +326,7 @@ __global__ void update_single_absmax_kernel(float* data, uint8_t* currentIndex, 
     data[ABSMAX_HISTORY_SIZE + DESCALE_OFFSET] = maxVal * fudgeFactor * scale_factor;
 }
 
-void TensorAbsMaxTracker::update_all_absmax(cudaStream_t stream, float fudgeFactor) {
+void TensorAbsMaxTracker::update_all_absmax(cudaStream_t stream, float fudgeFactor, bool reset_call_counts) {
     if (current_tensor_count == 0) {
         return;
     }
@@ -328,7 +338,10 @@ void TensorAbsMaxTracker::update_all_absmax(cudaStream_t stream, float fudgeFact
     update_all_absmax_kernel<<<grid_size, block_size, 0, stream>>>
                             (d_storage, d_current_indices, current_tensor_count, fudgeFactor);
     cudaCheck(cudaGetLastError());
-    reset_all_call_counts();  // Reset call counts after updating
+
+    if (reset_call_counts) {
+        reset_all_call_counts();  // Reset call counts after updating
+    }
 }
 
 // this is literally just a single thread, this should not trigger after the 1st step! (outside of testing)
@@ -347,20 +360,20 @@ void TensorAbsMaxTracker::update_single_absmax(const T* tensor_address, size_t s
     update_single_absmax_kernel<<<1, 1, 0, stream>>>(d_storage + offset, d_current_indices + index, fudgeFactor);
     cudaCheck(cudaGetLastError());
 
-    // reset call count after updating
+    // reset call count after updating (to 1 so we know it has been calculated)
     it->second.previous_call_count = it->second.call_count;
-    it->second.call_count = 0;
+    it->second.call_count = 1;
 }
 
 template<typename T>
 float* TensorAbsMaxTracker::calculate_manual_absmax(const T* tensor_address, size_t size,
                                                     const void* associated_tensor, cudaStream_t stream) {
-    float* absmax_memory = next_absmax_ptr(tensor_address, size, associated_tensor);
+    float* absmax_memory = next_absmax_ptr(tensor_address, size, associated_tensor, 0.0f, true);
     get_absmax(absmax_memory, tensor_address, size, stream);
 
     // Use a fudge factor of 1.0f because we are using the real absmax rather than a prediction
     update_single_absmax(tensor_address, size, associated_tensor, 1.0f, stream);
-    return get_absmax_data(tensor_address, size, associated_tensor);
+    return get_absmax_data("", tensor_address, size, associated_tensor);
 }
 
 TensorAbsMaxTracker absmax_tracker;

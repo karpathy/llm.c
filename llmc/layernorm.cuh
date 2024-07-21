@@ -471,10 +471,10 @@ void layernorm_forward(Tn* out, float* mean, float* rstd,
     bool recompute_due_to_absmax = false;
 
     if (std::is_same<Tn, __nv_fp8_e4m3>::value) {
-        float *calculated_from_absmax = absmax_tracker.get_absmax_data(out, B*T*C, mean, SCALE_FORWARD_B, false);
+        float *calculated_from_absmax = absmax_tracker.get_absmax_data("layernorm", out, B*T*C, mean, SCALE_FORWARD_B, false);
         if (!calculated_from_absmax) {
             recompute_due_to_absmax = true; // will need to do the matmul twice :(
-            calculated_from_absmax = absmax_tracker.get_absmax_data(out, B*T*C, mean, SCALE_FORWARD_B);
+            calculated_from_absmax = absmax_tracker.get_absmax_data("layernorm_1st", out, B*T*C, mean, SCALE_FORWARD_B, false, true);
         }
         scale_normed = calculated_from_absmax + SCALE_OFFSET;
         next_absmax_normed = absmax_tracker.next_absmax_ptr(out, B*T*C, mean);
@@ -530,10 +530,10 @@ void fused_residual_forward5(floatX* residual, Tn* normed, float* mean, float* r
     bool recompute_due_to_absmax = false;
 
     if (std::is_same<Tn, __nv_fp8_e4m3>::value) {
-        float *calculated_from_absmax = absmax_tracker.get_absmax_data(normed, N*C, mean, SCALE_FORWARD_B, false);
+        float *calculated_from_absmax = absmax_tracker.get_absmax_data("fused_residual", normed, N*C, mean, SCALE_FORWARD_B, false);
         if (!calculated_from_absmax) {
             recompute_due_to_absmax = true; // will need to do the matmul twice :(
-            calculated_from_absmax = absmax_tracker.get_absmax_data(normed, N*C, mean, SCALE_FORWARD_B);
+            calculated_from_absmax = absmax_tracker.get_absmax_data("fused_residual_1st", normed, N*C, mean, SCALE_FORWARD_B, false, true);
         }
         scale_normed = calculated_from_absmax + SCALE_OFFSET;
         next_absmax_normed = absmax_tracker.next_absmax_ptr(normed, N*C, mean);

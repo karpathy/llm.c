@@ -3,9 +3,9 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 
 // todo - make into proper makefile config options
-#define FORCE_FP8_MATMUL false
-#define FORCE_FP8_WEIGHTS false // not compatible with existing checkpoints
-#define FORCE_FP8_ACTIVATIONS false // compatible with existing checkpoints
+#define FORCE_FP8_MATMUL true
+#define FORCE_FP8_WEIGHTS true // not compatible with existing checkpoints
+#define FORCE_FP8_ACTIVATIONS true // compatible with existing checkpoints
 
 // todo - make command line parameters for tuning
 // 1.0/448.0f would be the most aggressive setting for e4m3
@@ -20,6 +20,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 
 // to make it easy to compare BF16 vs FP8 for layernorm output
 #define floatNorm floatN
+
+int global_current_layer = -1;
 
 #include <unistd.h>
 #include <stdio.h>
@@ -630,6 +632,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     NVTX_RANGE_FN();
     // todo - this is not ideal, gets rid of our history for the backward pass!
     absmax_tracker.update_all_absmax(main_stream);
+    global_current_layer = 0;
 
     // we must be careful and use size_t instead of int, otherwise
     // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
@@ -686,6 +689,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
+        global_current_layer = l+1;
 
         floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
@@ -714,8 +718,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
         floatN* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
-        floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
-        floatN* scratchN = (floatN*)acts.output; // potentially FP8 version of the scratch buffer
+        floatN* scratch = (floatN*)acts.output; // (potentially FP8) used for fcproj, attproj, etc.
         float* associated_ln1_mean = acts.ln1_mean + l * B * T; // todo - hack - layernorm/fused_residual "associate" with the mean for FP8 absmax stats
 
         // now do the forward pass
@@ -727,14 +730,14 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_att = acts.att + l * B * NH * T * T;
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream, (floatX*)NULL, 0, associated_ln1_mean);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
+        matmul_forward_cublaslt((floatX*)scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream, (floatX*)NULL, 0, associated_ln1_mean);
+        attention_forward(l_atty, l_qkvr, l_att, (floatX*)scratch, B, T, C, NH, main_stream);
         #endif
 
-        matmul_forward_cublaslt(scratchN, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+        matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, l_attprojw, main_stream);
         matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion, l_ln2_mean);
-        matmul_forward_cublaslt(scratchN, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream, (floatN*)NULL, 0, l_fcw);
+        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream, (floatN*)NULL, 0, l_fcw);
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatNorm* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : (floatNorm*)acts.lnf;
@@ -742,14 +745,15 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
             float* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
             const floatX* l_ln1b = params.ln1b + (l + 1) * C;
-            fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratchN, l_ln1w, l_ln1b,
+            fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
                                     B * T, C, l_fcprojw, main_stream);
         } else {
-            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratchN,
+            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
                                     params.lnfw, params.lnfb,
                                     B * T, C, l_fcprojw, main_stream);
         }
     }
+    global_current_layer = L+1;
     matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -788,6 +792,7 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
 void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
     NVTX_RANGE_FN();
     bool last_step = micro_step == grad_accum_steps - 1;
+    global_current_layer = model->config.num_layers + 1;
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
@@ -858,6 +863,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
         NvtxRange layer_range("Layer", l);
+        global_current_layer = l+1;
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
@@ -958,6 +964,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
         }
     }
+    global_current_layer = 0;
     encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
                      dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
 
