@@ -235,7 +235,7 @@ void matmul_forward_cublaslt(floatX* out,
     // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
     if (gelu_fusion < 1 && pre_gelu) {
         matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
-        gelu_forward(out, pre_gelu, B*T*OC, stream);
+        gelu_forward(out, pre_gelu, use_kv, kv_offset, B, T, OC, stream);
     } else {
         matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
     }
