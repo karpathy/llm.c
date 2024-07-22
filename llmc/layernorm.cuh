@@ -432,11 +432,11 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
 // similar to `fused_residual_forward5`
 void layernorm_forward(floatX* out, float* mean, float* rstd,
                        floatX* inp, const floatX* weight, const floatX* bias,
-                       int B, int T, int C, cudaStream_t stream) {
+                       int use_kv, int kv_offset, int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
-    const int N = B * T;
+    const int N = B * (use_kv ? 1 : T);
     const int grid_size = CEIL_DIV(N, block_y);
     size_t smem = (2 + block_y) * C * sizeof(floatX);
 
