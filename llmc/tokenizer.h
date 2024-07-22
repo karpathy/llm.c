@@ -23,7 +23,7 @@ typedef struct {
 } Tokenizer;
 
 void safe_printf(const char *piece) {
-    // the tokens are raw bytes, and we we only want to print the printable ones
+    // the tokens are raw bytes, and we only want to print the printable ones
     // many bytes can be various control codes, backspace, etc.
     if (piece == NULL) { return; }
     if (piece[0] == '\0') { return; }
