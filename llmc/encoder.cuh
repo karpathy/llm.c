@@ -167,6 +167,13 @@ void encoder_forward(floatX* out,
     const int N = B * (use_kv ? 1 : T) * C;
     const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
     encoder_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, inp, wte, wpe, B, T, C, use_kv);
+
+    if (use_kv) {
+        inp -= kv_offset;
+        wpe -= kv_offset * C;
+        out -= kv_offset * C;
+    }
+
     cudaCheck(cudaGetLastError());
 }
 
