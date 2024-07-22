@@ -1637,6 +1637,9 @@ int main(int argc, char *argv[]) {
     // set up the Tokenizer
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+    if (tokenizer.init_ok == 0) {
+        exit(EXIT_FAILURE);  // error message already printed inside tokenizer_init
+    }
 
     // set up learning rate scheduler
     LearningRateScheduler lr_scheduler;
@@ -1757,14 +1760,8 @@ int main(int argc, char *argv[]) {
                 float coin = random_f32(&sample_rng_state);
                 int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
-                if (tokenizer.init_ok) {
-                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
-                    safe_printf(token_str);
-                } else {
-                    // fall back to printing the token id
-                    printf("%d ", next_token);
-                }
+                const char* token_str = tokenizer_decode(&tokenizer, next_token);
+                safe_printf(token_str);
                 fflush(stdout);
             }
             printf("\n---\n");
