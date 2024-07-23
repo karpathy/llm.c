@@ -13,7 +13,7 @@ Attention, as a fallback when we do not use the Flash Attention from cuDNN
 // inputs floatX, outputs FP32 (for current FP32-only activation path for this WIP)
 __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
                                const floatX* inp,
-                               int B, int N, int NH, int d) {
+                               int use_kv, int kv_offset, int B, int N, int NH, int d) {
     // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
     // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -25,6 +25,8 @@ __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
     int nh_ = rest / (N * d);
     rest = rest % (N * d);
     int n = rest / d;
+    // TODO: quick hack, we should instead reduce the number of threads & modify computation here
+    if (use_kv && n != kv_offset) { return; }
     int d_ = rest % d;
     int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
     q[idx] = __ldcs(&inp[inp_idx]);
@@ -51,8 +53,9 @@ __global__ void permute_kernel_backward(floatX* dinp,
     dinp[inp_idx + 2 * (NH * d)] = dv[idx];
 }
 
-__global__ void unpermute_kernel(floatX* inp, floatX *out, int B, int N, int NH, int d) {
-   // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
+// TODO(gordicaleksa): out should be first in the argument list, that's the convention we use
+__global__ void unpermute_kernel(floatX* inp, floatX *out, int use_kv, int kv_offset, int B, int N, int NH, int d) {
+   // inp has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
 
     int idx = (blockIdx.x * blockDim.x + threadIdx.x);
     // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
@@ -63,6 +66,8 @@ __global__ void unpermute_kernel(floatX* inp, floatX *out, int B, int N, int NH,
     int nh_ = rest / (N * d);
     rest = rest % (N * d);
     int n = rest / d;
+    // TODO: quick hack, we should instead reduce the number of threads & modify computation here
+    if (use_kv && n != kv_offset) { return; }
     int d_ = rest % d;
     int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
     out[other_idx] = __ldcs(&inp[idx]);
@@ -194,7 +199,7 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
 
 void attention_forward(floatX* out, floatX* qkvr, floatX* att,
                        floatX* inp,
-                       int B, int T, int C, int NH, cudaStream_t stream) {
+                       int use_kv, int kv_offset, int B, int T, int C, int NH, cudaStream_t stream) {
     NVTX_RANGE_FN();
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
     // Its contents will be overwritten by this function.
@@ -212,7 +217,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     v = qkvr + 2 * B * T * C;
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
-    permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, B, T, NH, HS);
+    permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, use_kv, kv_offset, B, T, NH, HS);
 
     floatX* preatt = inp; // reuse inp as scratch buffer
     matmul_cublaslt(preatt, k, q, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
@@ -230,7 +235,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size, 0, stream>>>(vaccum, out, B, T, NH, HS);
+    unpermute_kernel<<<num_blocks, block_size, 0, stream>>>(vaccum, out, use_kv, kv_offset, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
 
