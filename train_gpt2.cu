@@ -655,7 +655,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
     // first layernorm isn't fused
     layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, model->use_kv, model->kv_offset, B, T, C, main_stream);
-
+    static int cnt = 0;
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
 
@@ -707,7 +707,24 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, model->use_kv, model->kv_offset, B, T, C, C, main_stream);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, model->use_kv, model->kv_offset, B, T, C, main_stream);
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, model->use_kv, model->kv_offset, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+        // if (cnt == 1) {
+        //     // Create a CPU B*T*C size buffer and memcopy the out tensor to it
+        //     floatX* out_cpu = (floatX*)malloc(B*T*C * sizeof(floatX));
+        //     cudaCheck(cudaMemcpy(out_cpu, l_ln2, B*T*C * sizeof(floatX), cudaMemcpyDeviceToHost));
+        //     // copy over to out_cpu_fp32 buffer
+        //     float* out_cpu_fp32 = (float*)malloc(B*T*C * sizeof(float));
+        //     for (int i = 0; i < B*T*C; i++) {
+        //         out_cpu_fp32[i] = (float)out_cpu[i];
+        //     }
+        //     char filename[100];
+        //     sprintf(filename, "/home/aleksa/Documents/llm.c/llmc/test_dir/ln2_forward_%d_%d.bin", l, model->use_kv);
+        //     FILE* f = fopen(filename, "wb");
+        //     fwrite(out_cpu_fp32, sizeof(float), B*T*C, f);
+        //     fclose(f);
+        //     free(out_cpu_fp32);
+        //     free(out_cpu);
+        // }
+        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, model->use_kv, model->kv_offset, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion, cnt, l);
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, model->use_kv, model->kv_offset, B, T, 4*C, C, main_stream);
         // OK, fusion across blocks.
         if(l+1 != L) {
@@ -727,6 +744,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
     matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, model->use_kv, model->kv_offset, B, T, C, Vp, main_stream);
     cudaCheck(cudaDeviceSynchronize());
+    cnt += 1;
 }
 
 

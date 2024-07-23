@@ -61,12 +61,14 @@ void gelu_forward(floatX* out, const floatX* inp, int use_kv, int kv_offset, int
 
     if (use_kv) {
         inp += kv_offset * C;
+        out += kv_offset * C;
     }
 
     gelu_forward_kernel2<<<grid_size, block_size, 0, stream>>>(out, inp, use_kv, B, T, C);
 
     if (use_kv) {
         inp -= kv_offset * C;
+        out -= kv_offset * C;
     }
 
     cudaCheck(cudaGetLastError());

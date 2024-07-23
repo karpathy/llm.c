@@ -159,7 +159,6 @@ void encoder_forward(floatX* out,
                      int use_kv, int kv_offset, int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
-    static int cnt = 0;
     if (use_kv) {
         inp += kv_offset;
         wpe += kv_offset * C;
