@@ -371,7 +371,41 @@ void gpt2_allocate_weights(GPT2 *model) {
 void gpt2_allocate_state(GPT2 *model, int B, int T) {
     printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
     assert(model->grads_memory == nullptr);
-    model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
+
+    if(multi_gpu_config.zero_stage == 2) {
+        // Allocate parameter buffers for the current layers active "wave" of computation
+        size_t param_elements[NUM_PARAMETER_TENSORS];
+        size_t param_sizeof[NUM_PARAMETER_TENSORS];
+        GPT2Config wave_config = model->config;
+        wave_config.num_layers = 1;
+        fill_in_parameter_sizes(param_elements, param_sizeof, wave_config);
+        size_t alloc_bytes = 0;
+        for(int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+            alloc_bytes += param_sizeof[i] * param_elements[i];
+        }
+        printf0("allocating %d MiB for ZeRO-2 active gradients\n",
+                (int) round(alloc_bytes / (1024 * 1024)));
+        model->grads_memory = malloc_and_point_parameters(&model->grads, param_elements, param_sizeof);
+        model->grads_bytes = alloc_bytes;
+
+        // next, allocate memory for the local gradient shards
+        alloc_bytes = 0;
+        fill_in_parameter_sizes(param_elements, param_sizeof, model->config);
+        for(int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+            param_elements[i] /= multi_gpu_config.num_processes;
+            alloc_bytes += param_sizeof[i] * param_elements[i];
+        }
+        printf0("allocating %d MiB for ZeRO-2 gradient shards\n",
+                (int) round(alloc_bytes / (1024 * 1024)));
+        model->grad_shards_memory = malloc_and_point_parameters(&model->grad_shards, param_elements, param_sizeof);
+        model->grad_shards_bytes = alloc_bytes;
+    } else {
+        printf0("allocating %d MiB for parameter gradients\n",
+                (int) round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
+        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements,
+                                                          model->param_sizeof);
+        model->grads_bytes = model->num_parameters * sizeof(floatX);
+    }
 
     // record the current B,T as well
     model->batch_size = B;
@@ -1077,10 +1111,13 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
         global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, 0, 1, max_num_block_sums, true, main_stream);
         global_sum_deterministic(grad_norm_squared, grad_norm_squared, max_num_block_sums, main_stream);
     } else if(multi_gpu_config->zero_stage == 2) {
+#if MULTI_GPU
         // our gradient shards are contiguous in memory, so taking a (partial) global norm is easy
-        global_norm_squared(grad_norm_squared, (floatX*)model->grad_shards_memory, model->num_parameters / multi_gpu_config->num_processes, 0, 1, true, main_stream);
-        cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
-        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
+        global_norm_squared(grad_norm_squared, (floatX*)model->grad_shards_memory, model->num_parameters / multi_gpu_config->num_processes,
+                            0, 1, max_num_block_sums, true, main_stream);
+        global_sum_deterministic(grad_norm_squared, grad_norm_squared, max_num_block_sums, main_stream);
+        ncclCheck(ncclAllReduce(grad_norm_squared, grad_norm_squared, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, main_stream));
+#endif
     }
 
     cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
