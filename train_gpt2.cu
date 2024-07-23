@@ -369,7 +369,6 @@ void gpt2_allocate_weights(GPT2 *model) {
 }
 
 void gpt2_allocate_state(GPT2 *model, int B, int T) {
-    printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
     assert(model->grads_memory == nullptr);
 
     if(multi_gpu_config.zero_stage == 2) {
