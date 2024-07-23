@@ -812,7 +812,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // 1) the losses accumulate += into acts.losses, reset here
         // 2) the gradients accumulate += into grads_memory, reset here
         cudaCheck(cudaMemsetAsync(model->acts.losses, 0, model->batch_size * model->seq_len * sizeof(float), main_stream));
-        cudaCheck(cudaMemsetAsync(model->grads_memory, 0, model->num_parameters * sizeof(floatX), main_stream));
+        cudaCheck(cudaMemsetAsync(model->grads_memory, 0, model->grads_bytes, main_stream));
         if(model->grad_shards_memory != NULL) {
             cudaCheck(cudaMemset(model->grad_shards_memory, 0, model->grad_shards_bytes));
         }
