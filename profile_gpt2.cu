@@ -59,7 +59,7 @@ int main(int argc, char *argv[]) {
     set_zero_configs(&multi_gpu_config, 0, model.num_parameters);
 
     // do a training step
-    gpt2_forward(&model, x, B, T);
+    gpt2_forward(&model, x, B, T, NULL);
     gpt2_backward_and_reduce(&model, x, y, 1, 0);
     float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
     float grad_scale = (grad_norm > 1.0f) ? 1.0f / grad_norm : 1.0f;

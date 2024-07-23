@@ -45,6 +45,11 @@ extern cudaDeviceProp deviceProp;
 constexpr std::bool_constant<true> True;
 constexpr std::bool_constant<true> False;
 
+// Forward kernel configuration, add any parameters that are needed to modulate the kernel behavior
+typedef struct {
+    int high_perf_mode;
+} ForwardKernelConfig;
+
 // ----------------------------------------------------------------------------
 // Error checking
 
