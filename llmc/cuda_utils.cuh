@@ -140,14 +140,6 @@ __global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n, ptrdiff_t
     }
 }
 
-template<class Td, class Ts>
-__global__ void vector_add(Td* dst, const Ts* src, size_t n) {
-    ptrdiff_t idx = (ptrdiff_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        dst[idx] = (Td)((float)dst[idx] + (float)src[idx]);
-    }
-}
-
 // ----------------------------------------------------------------------------
 // Warp/Block communication primitives
 
@@ -266,6 +258,15 @@ __device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigne
 }
 __device__ __forceinline__ void stochastic_rounding(float in, float *out, unsigned int random) {
     *out = in; // dummy function for when floatX is float (FP32 mode)
+}
+
+// Add two (potentially low-precision) vectors of size `n` together using stochastic rounding
+template<class Td, class Ts>
+__global__ void vector_add(Td* dst, const Ts* src, size_t n, unsigned seed) {
+    ptrdiff_t idx = (ptrdiff_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        stochastic_rounding((float)dst[idx] + (float)src[idx], dst + idx, seed + idx);
+    }
 }
 
 #endif

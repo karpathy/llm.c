@@ -376,6 +376,8 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
         size_t param_elements[NUM_PARAMETER_TENSORS];
         size_t param_sizeof[NUM_PARAMETER_TENSORS];
         GPT2Config wave_config = model->config;
+        // to prevent having to wait for comms to complete, we need to double-buffer gradients, so we need to
+        // allocate as if we had a two-layer network
         wave_config.num_layers = 2;
         fill_in_parameter_sizes(param_elements, param_sizeof, wave_config);
         size_t alloc_bytes = 0;
@@ -995,7 +997,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
                     g.fcprojw, g.fcprojb
                 };
 
-                zero2_accumulate_grad(dst_ptr, pointers, nelem, l, main_stream);
+                unsigned int seed = random_u32(&model->rng_state);
+                zero2_accumulate_grad(dst_ptr, pointers, nelem, l, seed, main_stream);
             }
         }
     }
@@ -1024,7 +1027,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
                     g.wte, g.wpe,
                     g.lnfw, g.lnfb,
             };
-            zero2_accumulate_grad(dst_ptr, pointers, nelem, 0, main_stream);
+            unsigned int seed = random_u32(&model->rng_state);
+            zero2_accumulate_grad(dst_ptr, pointers, nelem, 0, seed, main_stream);
 #endif
         }
     }
