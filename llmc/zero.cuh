@@ -593,5 +593,17 @@ float multi_gpu_cpu_float_sum(float value, MultiGpuConfig* config) {
 #endif
 }
 
+template<int N>
+void zero2_accumulate_grad(floatX* const (&dst)[N], floatX* const (&src)[N], const size_t (&nelem)[N], int layer, cudaStream_t stream) {
+    for(int i = 0; i < N; ++i) {
+        size_t n = nelem[i] / multi_gpu_config.num_processes;
+        vector_add<<<CEIL_DIV(n, 512), 512, 0, stream>>>(dst[i] + layer * n,
+                                                              src[i] + multi_gpu_config.process_rank * n,
+                                                              n);
+        cudaCheck(cudaGetLastError());
+        cudaCheck(cudaMemset(src[i], 0, nelem[i] * sizeof(floatX)));
+    }
+}
+
 #endif
 

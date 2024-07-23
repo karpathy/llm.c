@@ -980,8 +980,6 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
 
             if(multi_gpu_config.zero_stage == 2) {
-#if MULTI_GPU
-
                 // and scatter-add it to the local shard buffers
                 // why can't we just scatter-add into the shard buffer directly?
                 // because that would overwrite any existing values there, which
@@ -997,15 +995,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
                     g.fcprojw, g.fcprojb
                 };
 
-                for(int i = 0; i < sizeof(nelem)/sizeof(nelem[0]); ++i) {
-                    size_t n = nelem[i] / multi_gpu_config.num_processes;
-                    vector_add<<<CEIL_DIV(n, 512), 512, 0, main_stream>>>(dst_ptr[i] + l * n,
-                                                           pointers[i] + multi_gpu_config.process_rank * n,
-                                                           n);
-                    cudaCheck(cudaGetLastError());
-                    cudaCheck(cudaMemset(pointers[i], 0, nelem[i] * sizeof(floatX)));
-                }
-#endif
+                zero2_accumulate_grad(dst_ptr, pointers, nelem, l, main_stream);
             }
         }
     }
@@ -1031,18 +1021,10 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             cudaCheck(cudaStreamSynchronize(multi_gpu_config.nccl_stream));
             ParameterTensors g = model->grad_shards;
             floatX* const dst_ptr[] = {
-                g.wte, g.wpe,
-                g.lnfw, g.lnfb,
+                    g.wte, g.wpe,
+                    g.lnfw, g.lnfb,
             };
-
-            for(int i = 0; i < sizeof(nelem)/sizeof(nelem[0]); ++i) {
-                size_t n = nelem[i] / multi_gpu_config.num_processes;
-                vector_add<<<CEIL_DIV(n, 512), 512, 0, main_stream>>>(dst_ptr[i],
-                                                       pointers[i] + multi_gpu_config.process_rank * n,
-                                                       n);
-                cudaCheck(cudaGetLastError());
-                cudaCheck(cudaMemset(pointers[i], 0, nelem[i] * sizeof(floatX)));
-            }
+            zero2_accumulate_grad(dst_ptr, pointers, nelem, 0, main_stream);
 #endif
         }
     }
