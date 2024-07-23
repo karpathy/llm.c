@@ -1744,7 +1744,7 @@ int main(int argc, char *argv[]) {
             }
             // now sample from the model autoregressively
             printf("generating:\n---\n");
-            model.use_kv = 0; // we need to use the KV cache for generation
+            model.use_kv = 1; // we need to use the KV cache for generation
             for (int t = 1; t < genT; t++) {
                 NvtxRange generation_range("Generation step", t);
                 // we try not to be too wasteful for inference by not calculating all of B,T
