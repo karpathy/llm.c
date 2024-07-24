@@ -86,7 +86,7 @@ __global__ void unpermute_kernel_backward(floatX* dinp, const floatX *dout, int 
     dinp[idx] = (floatX)dout[other_idx];
 }
 
-__global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, const floatX* inp, int N, int T) {
+__global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, const floatX* inp, int use_kv, int kv_offset, int N, int T) {
     // inp, out shape: (N, T, T), where N = B * NH
     // fuses the multiplication by scale inside attention
     // directly autoregressive, so we only compute the lower triangular part
@@ -102,13 +102,14 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     // matmul operation that immediately follows.
     // int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank(); // forward order
     int idx = (gridDim.x - blockIdx.x - 1) * num_warps + warp_id; // backward order
-    if(idx >= N * T) {
+    if(idx >= N * (use_kv ? 1 : T)) {
         return;
     }
-    int own_pos = idx % T;
+    int own_pos = use_kv ? kv_offset : idx % T;
     int pos_by_4 = own_pos / 4;
 
     // one row of inp, i.e. inp[idx, :] of shape (T,)
+    idx = use_kv ? kv_offset + idx * T : idx;
     const floatX* x = inp + idx * T;
 
     // not INF, so we don't get NaNs accidentally when subtracting two values.
@@ -223,8 +224,8 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 
     // multiply all elements of preatt elementwise by scale
     float scale = 1.f / sqrtf(HS);
-    int grid_size = CEIL_DIV(B * NH * T * WARP_SIZE, block_size);
-    softmax_forward_kernel5<<<grid_size, block_size, 0, stream>>>(att, scale, preatt, B * NH, T);
+    int grid_size = CEIL_DIV(B * NH * (use_kv ? 1 : T) * WARP_SIZE, block_size);
+    softmax_forward_kernel5<<<grid_size, block_size, 0, stream>>>(att, scale, preatt, use_kv, kv_offset, B * NH, T);
 
     // new approach: first cuBLAS another batched matmul
     floatX* vaccum = inp;
