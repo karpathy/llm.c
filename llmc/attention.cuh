@@ -13,25 +13,25 @@ Attention, as a fallback when we do not use the Flash Attention from cuDNN
 // inputs floatX, outputs FP32 (for current FP32-only activation path for this WIP)
 __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
                                const floatX* inp,
-                               int use_kv, int kv_offset, int B, int N, int NH, int d) {
-    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
-    // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
+                               int use_kv, int kv_offset, int B, int T, int NH, int HS) {
+    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, T, HS)
+    // but instead, we have a single tensor QKV (inp) of shape (B, T, 3, NH, HS)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * NH * N * d) { return; }
+    int T_new = use_kv ? 1 : T;
+    if (idx >= B * NH * T_new * HS) { return; }
 
-    // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
-    int b = idx / (NH * N * d);
-    int rest = idx % (NH * N * d);
-    int nh_ = rest / (N * d);
-    rest = rest % (N * d);
-    int n = rest / d;
-    // TODO: quick hack, we should instead reduce the number of threads & modify computation here
-    if (use_kv && n != kv_offset) { return; }
-    int d_ = rest % d;
-    int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
+    // Q[b][nh][t][hs] = inp[b][t][0][nh][hs]
+    int b = idx / (NH * T_new * HS);
+    int rest = idx % (NH * T_new * HS);
+    int nh = rest / (T_new * HS);
+    rest = rest % (T_new * HS);
+    int t = use_kv ? kv_offset : rest / HS;
+    int hs = rest % HS;
+    int inp_idx = (b * T * 3 * NH * HS) + (t * 3 * NH * HS) + (0 * NH * HS) + (nh * HS) + hs;
+    idx = use_kv ? b * NH * T * HS + nh * T * HS + t * HS + hs : idx;
     q[idx] = __ldcs(&inp[inp_idx]);
-    k[idx] = __ldcs(&inp[inp_idx + NH * d]);
-    v[idx] = __ldcs(&inp[inp_idx + 2 * (NH * d)]);
+    k[idx] = __ldcs(&inp[inp_idx + NH * HS]);
+    v[idx] = __ldcs(&inp[inp_idx + 2 * (NH * HS)]);
 }
 
 __global__ void permute_kernel_backward(floatX* dinp,
@@ -214,7 +214,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     q = qkvr + 0 * B * T * C;
     k = qkvr + 1 * B * T * C;
     v = qkvr + 2 * B * T * C;
-    int total_threads = B * NH * T * HS;
+    int total_threads = B * NH * (use_kv ? 1 : T) * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, use_kv, kv_offset, B, T, NH, HS);
 
