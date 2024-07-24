@@ -90,8 +90,8 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
     if(idx >= N) { return; } // guard
 
     // adjust pointers to current token
-    inp += idx * C * (use_kv ? T : 1) + kv_offset * C;
-    out += idx * C * (use_kv ? T : 1) + kv_offset * C;
+    inp += idx * C * (use_kv ? T : 1) + (use_kv ? kv_offset * C : 0);
+    out += idx * C * (use_kv ? T : 1) + (use_kv ? kv_offset * C : 0);
 
     const float eps = 1e-5f;
     float sum = 0.0f;
@@ -167,10 +167,10 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     if(idx >= N) return;
 
     // adjust pointers to current token
-    residual += idx * C * (use_kv ? T : 1) + kv_offset * C;
-    normed += idx * C * (use_kv ? T : 1) + kv_offset * C;
-    inp1 += idx * C * (use_kv ? T : 1) + kv_offset * C;
-    inp2 += idx * C * (use_kv ? T : 1) + kv_offset * C;
+    residual += idx * C * (use_kv ? T : 1) + (use_kv ? kv_offset * C : 0);
+    normed += idx * C * (use_kv ? T : 1) + (use_kv ? kv_offset * C : 0);
+    inp1 += idx * C * (use_kv ? T : 1) + (use_kv ? kv_offset * C : 0);
+    inp2 += idx * C * (use_kv ? T : 1) + (use_kv ? kv_offset * C : 0);
 
     const float eps = 1e-5f;
     float sum = 0.0f;
