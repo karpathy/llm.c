@@ -18,14 +18,14 @@ In the backward pass, the gradients flow to both, handled by different kernels
 
 __global__ void encoder_forward_kernel3(floatX* out,
                                const int* inp, const floatX* wte, const floatX* wpe,
-                               int B, int T, int C, int use_kv) {
+                               int B, int T, int C, int use_kv, int kv_offset) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     int N = B * (use_kv ? 1 : T) * C;
     if (idx >= N) { return; }
 
     int bt = idx / C;
     int b = bt / (use_kv ? 1 : T);
-    int t = use_kv ? 0 : bt % T;
+    int t = use_kv ? kv_offset : bt % T;
     int c = idx % C;
 
     int ix = inp[b * T + t];
@@ -159,21 +159,9 @@ void encoder_forward(floatX* out,
                      int use_kv, int kv_offset, int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
-    if (use_kv) {
-        inp += kv_offset;
-        wpe += kv_offset * C;
-        out += kv_offset * C;
-    }
     const int N = B * (use_kv ? 1 : T) * C;
     const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
-    encoder_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, inp, wte, wpe, B, T, C, use_kv);
-
-    if (use_kv) {
-        inp -= kv_offset;
-        wpe -= kv_offset * C;
-        out -= kv_offset * C;
-    }
-
+    encoder_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, inp, wte, wpe, B, T, C, use_kv, kv_offset);
     cudaCheck(cudaGetLastError());
 }
 

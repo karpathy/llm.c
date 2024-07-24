@@ -724,7 +724,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         //     free(out_cpu_fp32);
         //     free(out_cpu);
         // }
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, model->use_kv, model->kv_offset, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion, cnt, l);
+        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, model->use_kv, model->kv_offset, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, model->use_kv, model->kv_offset, B, T, 4*C, C, main_stream);
         // OK, fusion across blocks.
         if(l+1 != L) {
