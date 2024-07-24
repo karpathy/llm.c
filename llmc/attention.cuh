@@ -53,22 +53,22 @@ __global__ void permute_kernel_backward(floatX* dinp,
     dinp[inp_idx + 2 * (NH * d)] = dv[idx];
 }
 
-__global__ void unpermute_kernel(floatX *out, floatX* inp, int use_kv, int kv_offset, int B, int N, int NH, int d) {
-   // inp has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
+__global__ void unpermute_kernel(floatX *out, floatX* inp, int use_kv, int kv_offset, int B, int T, int NH, int HS) {
+   // inp has shape (B, NH, T, HS) but we need to unpermute it to (B, T, NH, HS)
 
     int idx = (blockIdx.x * blockDim.x + threadIdx.x);
-    // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
-    if (idx >= B * NH * N * d) { return; }
+    // out[b][t][nh][hs] <- inp[b][nh][t][hs]
+    if (idx >= B * NH * T * HS) { return; }
 
-    int b = idx / (NH * N * d);
-    int rest = idx % (NH * N * d);
-    int nh_ = rest / (N * d);
-    rest = rest % (N * d);
-    int n = rest / d;
+    int b = idx / (NH * T * HS);
+    int rest = idx % (NH * T * HS);
+    int nh = rest / (T * HS);
+    rest = rest % (T * HS);
+    int t = rest / HS;
     // TODO: quick hack, we should instead reduce the number of threads & modify computation here
-    if (use_kv && n != kv_offset) { return; }
-    int d_ = rest % d;
-    int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
+    if (use_kv && t != kv_offset) { return; }
+    int hs = rest % HS;
+    int other_idx = (b * NH * T * HS) + (t * NH * HS) + (nh * HS) + hs;
     out[other_idx] = __ldcs(&inp[idx]);
 }
 
