@@ -1620,7 +1620,7 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // pretty print in a table the multi-gpu configuration as well
-    set_zero_configs(&multi_gpu_config, zero_stage, model.num_parameters);
+    set_zero_configs(&multi_gpu_config, zero_stage, model.num_parameters, model.high_perf_mode);
     printf0("| num_processes         | %-50d |\n", multi_gpu_config.num_processes);
     printf0("| zero_stage            | %-50d |\n", multi_gpu_config.zero_stage);
     printf0("+-----------------------+----------------------------------------------------+\n");
