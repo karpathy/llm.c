@@ -14,7 +14,7 @@ Attention, as a fallback when we do not use the Flash Attention from cuDNN
 __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
                                const floatX* inp,
                                int use_kv, int kv_offset, int B, int T, int NH, int HS) {
-    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, T, HS)
+    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, T, HS) or (B, NH, 1, HS) for Q if use_kv is true
     // but instead, we have a single tensor QKV (inp) of shape (B, T, 3, NH, HS)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int T_new = use_kv ? 1 : T;
@@ -28,10 +28,11 @@ __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
     int t = use_kv ? kv_offset : rest / HS;
     int hs = rest % HS;
     int inp_idx = (b * T * 3 * NH * HS) + (t * 3 * NH * HS) + (0 * NH * HS) + (nh * HS) + hs;
-    idx = use_kv ? b * NH * T * HS + nh * T * HS + t * HS + hs : idx;
-    q[idx] = __ldcs(&inp[inp_idx]);
-    k[idx] = __ldcs(&inp[inp_idx + NH * HS]);
-    v[idx] = __ldcs(&inp[inp_idx + 2 * (NH * HS)]);
+    int idx_kv_new = use_kv ? b * NH * T * HS + nh * T * HS + t * HS + hs : idx;
+    int idx_q_new = use_kv ? b * NH * T * HS + nh * T * HS + 0 * HS + hs : idx;
+    q[idx_q_new] = __ldcs(&inp[inp_idx]);
+    k[idx_kv_new] = __ldcs(&inp[inp_idx + NH * HS]);
+    v[idx_kv_new] = __ldcs(&inp[inp_idx + 2 * (NH * HS)]);
 }
 
 __global__ void permute_kernel_backward(floatX* dinp,
@@ -55,6 +56,7 @@ __global__ void permute_kernel_backward(floatX* dinp,
 
 __global__ void unpermute_kernel(floatX *out, floatX* inp, int use_kv, int kv_offset, int B, int T, int NH, int HS) {
    // inp has shape (B, NH, T, HS) but we need to unpermute it to (B, T, NH, HS)
+   // if use_kv inp has shape (B, NH, 1, HS) but we need to unpermute it to (B, T, NH, HS)
 
     int idx = (blockIdx.x * blockDim.x + threadIdx.x);
     int T_new = use_kv ? 1 : T;
@@ -68,7 +70,7 @@ __global__ void unpermute_kernel(floatX *out, floatX* inp, int use_kv, int kv_of
     int t = use_kv ? kv_offset : rest / HS;
     int hs = rest % HS;
     int other_idx = (b * NH * T * HS) + (t * NH * HS) + (nh * HS) + hs;
-    idx = use_kv ? b * NH * T * HS + nh * T * HS + t * HS + hs : idx;
+    idx = use_kv ? b * NH * 1 * HS + nh * 1 * HS + 0 * HS + hs : idx;
     out[other_idx] = __ldcs(&inp[idx]);
 }
 
@@ -109,7 +111,6 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     int pos_by_4 = own_pos / 4;
 
     // one row of inp, i.e. inp[idx, :] of shape (T,)
-    idx = use_kv ? kv_offset + idx * T : idx;
     const floatX* x = inp + idx * T;
 
     // not INF, so we don't get NaNs accidentally when subtracting two values.
@@ -210,7 +211,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // output is (B, T, C)
     const int HS = C / NH; // head size
 
-    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
+    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS) or (B, NH, 1, HS) for q if use_kv
     floatX *q, *k, *v;
     q = qkvr + 0 * B * T * C;
     k = qkvr + 1 * B * T * C;
@@ -220,8 +221,9 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, use_kv, kv_offset, B, T, NH, HS);
 
     floatX* preatt = inp; // reuse inp as scratch buffer
-    matmul_cublaslt(preatt, k, q, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
+    matmul_cublaslt(preatt, k, q, nullptr, T, use_kv ? 1 : T, HS, stream, true, false, B * NH, T * HS, use_kv ? 1 * HS : T * HS, use_kv ? 1 * T : T * T);
 
+    // if use_kv preatt Q @ K^T -> (B, NH, 1, HS) @ (B, NH, HS, T) -> (B, NH, 1, T)
     // multiply all elements of preatt elementwise by scale
     float scale = 1.f / sqrtf(HS);
     int grid_size = CEIL_DIV(B * NH * (use_kv ? 1 : T) * WARP_SIZE, block_size);
@@ -230,7 +232,8 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // new approach: first cuBLAS another batched matmul
     floatX* vaccum = inp;
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    matmul_cublaslt(vaccum, v, att, nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
+    // if use_kv y = att @ v # (B, nh, 1, T) @ (B, nh, T, hs) -> (B, nh, 1, hs)
+    matmul_cublaslt(vaccum, v, att, nullptr, HS, use_kv ? 1 : T, T, stream, false, false, B * NH, T * HS, use_kv ? 1 * T : T * T, use_kv ? 1 * HS : T * HS);
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
