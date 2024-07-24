@@ -53,8 +53,7 @@ __global__ void permute_kernel_backward(floatX* dinp,
     dinp[inp_idx + 2 * (NH * d)] = dv[idx];
 }
 
-// TODO(gordicaleksa): out should be first in the argument list, that's the convention we use
-__global__ void unpermute_kernel(floatX* inp, floatX *out, int use_kv, int kv_offset, int B, int N, int NH, int d) {
+__global__ void unpermute_kernel(floatX *out, floatX* inp, int use_kv, int kv_offset, int B, int N, int NH, int d) {
    // inp has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
 
     int idx = (blockIdx.x * blockDim.x + threadIdx.x);
@@ -235,7 +234,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size, 0, stream>>>(vaccum, out, use_kv, kv_offset, B, T, NH, HS);
+    unpermute_kernel<<<num_blocks, block_size, 0, stream>>>(out, vaccum, use_kv, kv_offset, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
 
