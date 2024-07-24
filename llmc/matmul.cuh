@@ -111,7 +111,8 @@ template <typename Td=floatX, typename Ta=floatX, typename Tb=floatX>
 void matmul_cublaslt(Td* d, const Ta* a, const Tb* b, const floatX* bias,
                      int m, int n, int k, cudaStream_t stream=0, bool transA=true, bool transB=false,
                      int batch_count=0, size_t strideA=0, size_t strideB=0, size_t strideOut=0,
-                     bool accumulate=false, void* pre_gelu=NULL, bool backward=false, float* absmax_a=NULL, float* absmax_b=NULL)
+                     bool accumulate=false, void* pre_gelu=NULL, bool backward=false, float* absmax_a=NULL, float* absmax_b=NULL,
+                     void* associated_with_a=NULL, float* absmax_pre_gelu=NULL)
 {
     NVTX_RANGE_FN();
     bool has_bias = (bias != NULL);
@@ -130,34 +131,52 @@ void matmul_cublaslt(Td* d, const Ta* a, const Tb* b, const floatX* bias,
     int returnedResults = 0;
     cublasLtMatmulPreference_t preference;
     cublasLtMatmulHeuristicResult_t heuristic;
+    bool release_scratch_a = false;
+    bool release_scratch_b = false;
     auto a_precision = CUBLAS_LOWP;
     auto b_precision = CUBLAS_LOWP;
     auto d_precision = CUBLAS_LOWP;
-    bool recompute_due_to_d_absmax = false; // sigh
     Ta* a_converted = (Ta*)a;
     Tb* b_converted = (Tb*)b;
 
     #if FORCE_FP8_MATMUL
+    bool recompute_due_to_d_absmax = false;
+
     // hack - todo - only skip embedding matmul (end of forward, start of backward)
     bool allow_fp8 = (m < 50000 && n < 50000 && k < 50000);
 
     if (batch_count == 0 && allow_fp8) {
         a_precision = CUDA_R_8F_E4M3;
-        if (!std::is_same<Ta, __nv_fp8_e4m3>::value) {
-            __nv_fp8_e4m3* a_fp8 = CudaScratchAllocator::getMemory<__nv_fp8_e4m3>(m*k);
-
-            float *calculated_from_absmax = absmax_tracker.get_absmax_data("matmul_a", a, k*m, b, SCALE_A, true, true);
-            float *next_absmax = absmax_tracker.next_absmax_ptr(a, k*m, b, 0.0f, true);
-            copy_or_transpose<true> (!transA, a_fp8, a, m, k, NULL, calculated_from_absmax+DESCALE_OFFSET, (unsigned int*)next_absmax);
+        if constexpr (!std::is_same<Ta, __nv_fp8_e4m3>::value) {
+            __nv_fp8_e4m3* a_fp8 = NULL;
+            float *calculated_from_absmax = absmax_tracker.get_absmax_data("matmul_a", a, k*m, associated_with_a ? associated_with_a : b, SCALE_A, true, true);
             absmax_a = (float*)calculated_from_absmax+DESCALE_OFFSET;
+
+            if (!transA && backward && use_act_transpose_cache) {
+                a_fp8 = g_transposed_cache.getTransposed<Ta, __nv_fp8_e4m3>(a, m, k, /* compute */ false, /* find_only*/ true);
+            }
+            if (a_fp8 == NULL) {
+                release_scratch_a = true;
+                a_fp8 = CudaScratchAllocator::getMemory<__nv_fp8_e4m3>(m*k);
+                float *next_absmax = absmax_tracker.next_absmax_ptr(a, k*m, associated_with_a ? associated_with_a : b, 0.0f, true);
+                copy_or_transpose<true> (!transA, a_fp8, a, m, k, NULL, calculated_from_absmax+DESCALE_OFFSET, (unsigned int*)next_absmax);
+            }
             a_converted = (Ta*)a_fp8;
         } else {
-            assert(transA);
+            if (!transA) {
+                if (use_weights_transpose_cache) {
+                    a_converted = g_transposed_cache.getTransposed(a, m, k);
+                } else {
+                    a_converted = CudaScratchAllocator::getMemory<__nv_fp8_e4m3>(m*k);
+                    copy_or_transpose<false> (true, a_converted, a, m, k, NULL, NULL, NULL);
+                    release_scratch_a = true;
+                }
+            }
         }
 
         if (backward) {
             b_precision = CUDA_R_8F_E5M2;
-            if (!std::is_same<Tb, __nv_fp8_e5m2>::value) {
+            if constexpr (!std::is_same<Tb, __nv_fp8_e5m2>::value) {
                 __nv_fp8_e5m2* b_fp8 = CudaScratchAllocator::getMemory<__nv_fp8_e5m2>(n*k);
 
                 float *calculated_from_absmax = absmax_tracker.get_absmax_data("matmul_b_e5", b, k*n, a, SCALE_BACKWARDS_B, true, true);
@@ -165,19 +184,25 @@ void matmul_cublaslt(Td* d, const Ta* a, const Tb* b, const floatX* bias,
                 copy_or_transpose<true> (transB, b_fp8, b, n, k, NULL, calculated_from_absmax+DESCALE_OFFSET, (unsigned int*)next_absmax);
                 absmax_b = (float*)calculated_from_absmax+DESCALE_OFFSET;
                 b_converted = (Tb*)b_fp8;
+                release_scratch_b = true;
             } else {
                 assert(!transB);
             }
         } else {
             b_precision = CUDA_R_8F_E4M3;
-            if (!std::is_same<Tb, __nv_fp8_e4m3>::value) {
+            if constexpr (!std::is_same<Tb, __nv_fp8_e4m3>::value) {
                 __nv_fp8_e4m3* b_fp8 = CudaScratchAllocator::getMemory<__nv_fp8_e4m3>(n*k);
-
                 float *calculated_from_absmax = absmax_tracker.get_absmax_data("matmul_b_e4", b, k*n, a, SCALE_FORWARD_B, true, true);
                 float *next_absmax = absmax_tracker.next_absmax_ptr(b, k*n, a, 0.0f, true);
-                copy_or_transpose<true> (transB, b_fp8, b, n, k, NULL, calculated_from_absmax+DESCALE_OFFSET, (unsigned int*)next_absmax);
                 absmax_b = (float*)calculated_from_absmax+DESCALE_OFFSET;
+                if (use_act_transpose_cache) {
+                    __nv_fp8_e4m3* transposed = g_transposed_cache.getTransposed<Tb, __nv_fp8_e4m3>(b, n, k, /* compute */ false);
+                    copy_and_transpose<true> (transposed, b_fp8, b, n, k, NULL, calculated_from_absmax+DESCALE_OFFSET, (unsigned int*)next_absmax);
+                } else {
+                    copy_or_transpose<true> (transB, b_fp8, b, n, k, NULL, calculated_from_absmax+DESCALE_OFFSET, (unsigned int*)next_absmax);
+                }
                 b_converted = (Tb*)b_fp8;
+                release_scratch_b = true;
             } else {
                 assert(!transB);
             }
@@ -268,7 +293,7 @@ void matmul_cublaslt(Td* d, const Ta* a, const Tb* b, const floatX* bias,
         cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD, &gelu_ld, sizeof(gelu_ld)));
         cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER, &pre_gelu, sizeof(pre_gelu)));
         if (backward) {
-            assert(!has_bias); // we shouldn't have any backward matmuls that use both GELU and bias
+            assert(!has_bias); // we shouldn't have any backward matmuls that use both GELU and bias (if needed, disable GELU fusion)
             epilogue = CUBLASLT_EPILOGUE_DGELU;
         } else {
             epilogue = has_bias ? CUBLASLT_EPILOGUE_GELU_AUX_BIAS : CUBLASLT_EPILOGUE_GELU_AUX;
@@ -332,8 +357,8 @@ void matmul_cublaslt(Td* d, const Ta* a, const Tb* b, const floatX* bias,
     cudaCheck(cudaGetLastError());
 
     // these will only do anything if they are currently allocated in our scratch allocator
-    CudaScratchAllocator::releaseMemory(a_converted);
-    CudaScratchAllocator::releaseMemory(b_converted);
+    if (release_scratch_a) { CudaScratchAllocator::releaseMemory(a_converted); }
+    if (release_scratch_b) { CudaScratchAllocator::releaseMemory(b_converted); }
 }
 
 // small wrapper around matmul_cublaslt for the forward pass (keeping historical order of arguments)
@@ -366,14 +391,14 @@ void matmul_forward_cublaslt(Td* out,
             if (!out_from_absmax) {
                 // do it once just to get the correct absmax for the next step
                 out_from_absmax = absmax_tracker.get_absmax_data("matmul_forward_out_1st", out, B*T*OC, weight, SCALE_FORWARD_B, false, true);
-                copy_advanced<false, gelu_forward_elementwise, false>(out, pre_gelu, B*T*OC, pre_gelu_descale, NULL, out_next_absmax, false, stream);
+                copy_advanced<false, gelu_forward_elementwise, false>(out, pre_gelu, B*T*OC, pre_gelu_descale, NULL, out_next_absmax, stream);
                 absmax_tracker.update_single_absmax(out, B*T*OC, weight, 1.0f, stream);
             }
 
             float *out_scale = out_from_absmax + SCALE_OFFSET;
-            copy_advanced<false, gelu_forward_elementwise, false>(out, pre_gelu, B*T*OC, pre_gelu_descale, out_scale, out_next_absmax, false, stream);
+            copy_advanced<false, gelu_forward_elementwise, false>(out, pre_gelu, B*T*OC, pre_gelu_descale, out_scale, out_next_absmax, stream);
         } else {
-            copy_advanced<false, gelu_forward_elementwise>(out, pre_gelu, B*T*OC, NULL, NULL, NULL, false, stream);
+            copy_advanced<false, gelu_forward_elementwise>(out, pre_gelu, B*T*OC, NULL, NULL, NULL, stream);
         }
     } else {
         matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false, weight_descale, inp_descale);
@@ -389,28 +414,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
                      void* inp_associated_tensor=(void*)NULL) { // hack - todo - for FP8 to find fch_gelu history)
     NVTX_RANGE_FN();
 
-    #if FORCE_FP8_MATMUL == true
-    bool transposed_inp = false;
-    float* inp_descale = NULL;
-    Ti *inp_converted = inp;
-    if constexpr (std::is_same<Ti, __nv_fp8_e4m3>::value) {
-        inp_descale = absmax_tracker.get_descale_ptr(inp, B*T*C, inp_associated_tensor);
-
-        inp_converted = CudaScratchAllocator::getMemory<Ti>(B*T*C);
-        copy_or_transpose<false> (true, inp_converted, inp, C, B*T, NULL, NULL, NULL);
-        transposed_inp = true;
-    }
-    bool transposed_weight = false;
-    float *weight_descale = NULL;
-    Tw *weight_converted = weight;
-    if (std::is_same<Tw, __nv_fp8_e4m3>::value) {
-        weight_descale = absmax_tracker.get_descale_ptr(weight, C*OC, NULL, false, false, true);
-
-        weight_converted = CudaScratchAllocator::getMemory<Tw>(C*OC);
-        copy_or_transpose<false> (true, weight_converted, weight, C, OC, NULL, NULL, NULL);
-        transposed_weight = true;
-    }
-    #endif
+    inp_associated_tensor = inp_associated_tensor ? inp_associated_tensor : inp;
 
     // backward to bias, if given, does a +=
     if (dbias != NULL) {
@@ -451,13 +455,16 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
         float *dout_descale_ptr = calculated_from_absmax + DESCALE_OFFSET;
         copy_and_transpose<true> (dout_transposed_fp8, dout_fp8, dout, OC, B*T, NULL, dout_descale_ptr, (unsigned int*)next_absmax);
 
+        float* inp_descale = absmax_tracker.get_descale_ptr(inp, B*T*C, inp_associated_tensor);
+        float* weight_descale = absmax_tracker.get_descale_ptr(weight, C*OC, NULL, false, false, true);
+
         // backward to input, uses = in the backward pass (set the gradient)
-        matmul_cublaslt(dinp, weight_converted, dout_fp8, NULL, C, B*T, OC, stream, transposed_weight, false, 0, 0, 0, 0, false,
+        matmul_cublaslt(dinp, weight, dout_fp8, NULL, C, B*T, OC, stream, false, false, 0, 0, 0, 0, false,
                         gelu_fusion >= 2 ? pre_gelu : NULL, true, weight_descale, dout_descale_ptr);
 
         // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
-        matmul_cublaslt(dweight, inp_converted, dout_transposed_fp8, NULL /*dbias*/, C, OC, B*T, stream, transposed_inp, false, 0, 0, 0, 0,
-                        true /* accumulate */, NULL, true, inp_descale, dout_descale_ptr);
+        matmul_cublaslt(dweight, inp, dout_transposed_fp8, NULL /*dbias*/, C, OC, B*T, stream, false, false, 0, 0, 0, 0,
+                        true /* accumulate */, NULL, true, inp_descale, dout_descale_ptr, inp_associated_tensor);
 
         CudaScratchAllocator::releaseMemory(dout_transposed_fp8);
         CudaScratchAllocator::releaseMemory(dout_fp8);
@@ -478,9 +485,4 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
         float* pre_gelu_descale = absmax_tracker.get_descale_ptr(pre_gelu, B*T*C, inp_associated_tensor);
         gelu_backward_inplace(dinp, pre_gelu, B*T*C, stream, pre_gelu_descale);
     }
-
-    #if FORCE_FP8_MATMUL == true
-    CudaScratchAllocator::releaseMemory(inp_converted);
-    CudaScratchAllocator::releaseMemory(weight_converted);
-    #endif
 }

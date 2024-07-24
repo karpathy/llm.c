@@ -50,7 +50,9 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
 
         // update our low precision version of the parameters using stochastic rounding
         // this will be used in the next forward pass
-        stochastic_rounding(param * scale, &params_memory[idx], seed);
+        if (params_memory != NULL) {
+            stochastic_rounding(param * scale, &params_memory[idx], seed);
+        }
 
         // write the full, float version of the param into our master copy, if we maintain one
         // this will be used in the next update
@@ -141,9 +143,9 @@ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memo
         for (int i = 0; i < num_slices; i++) {
             global_current_layer = num_slices > 1 ? i+1 : 0;
             Tp* layer_params_memory = params_memory + i * num_parameters;
-            float *calculated_from_absmax = absmax_tracker.get_absmax_data("adamw", layer_params_memory, num_parameters, NULL, SCALE_FP8_WEIGHTS, true, true);
+            float *calculated_from_absmax = absmax_tracker.get_absmax_data("adamw", layer_params_memory, num_parameters, NULL, SCALE_FP8_WEIGHTS, false, true);
             absmax_params.scale_factor[i] = calculated_from_absmax + SCALE_OFFSET;
-            absmax_params.absmax_output[i] = absmax_tracker.next_absmax_ptr(layer_params_memory, num_parameters, NULL, 0.0f, false);
+            absmax_params.absmax_output[i] = absmax_tracker.next_absmax_ptr(layer_params_memory, num_parameters, NULL, 0.0f, false, true);
         }
         global_current_layer = 0;
         adamw_kernel3_absmax<<<dim3(num_blocks, num_slices), block_size, 0, stream>>>(params_memory, master_params_memory, grads_memory,
@@ -151,10 +153,19 @@ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memo
                                                             learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
                                                             grad_scale, seed, absmax_params);
 
+        /*
+        for (int i = 0; i < num_slices; i++) {
+            // get absmax and print it using cudaMemcpy
+            float absmax;
+            cudaMemcpy(&absmax, absmax_params.absmax_output[i], sizeof(float), cudaMemcpyDeviceToHost);
+            printf("layer %d - absmax: %f\n", i, absmax);
+        }
+        */
+
         // HACK - WIP - this updates the scale based on the latest update, then writes the parameters again reading from master weights
         // we need a more general solution that supports multi-GPU (the entire tensor needs to have the same scaling factor!)
-        absmax_tracker.update_all_absmax(stream, 1.0f, false);
-        init_from_master(params_memory, master_params_memory, num_parameters, w_stride, s_stride, num_slices, seed, stream, absmax_params);
+        //absmax_tracker.update_all_absmax(stream, 1.0f, false);
+        //init_from_master(params_memory, master_params_memory, num_parameters, w_stride, s_stride, num_slices, seed, stream, absmax_params);
     } else {
         adamw_kernel3<<<dim3(num_blocks, num_slices), block_size, 0, stream>>>(params_memory, master_params_memory, grads_memory,
                                                             m_memory, v_memory, num_parameters, w_stride, g_stride, s_stride,

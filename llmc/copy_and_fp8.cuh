@@ -35,12 +35,18 @@ __device__ void store_same_length(ElementType* target, Packed128<ElementType> va
 // for elementwise kernels that require metadata (e.g. layernorm forward with known mean/std),
 // we could maybe store it in constant buffers rather than in yet-another-function-parameter...
 using elementwise_func_t = float (*) (float);
-__host__ __device__ float nothing_elementwise(float x) {
+__device__ float nothing_elementwise(float x) {
     return x;
 }
-__host__ __device__ float gelu_forward_elementwise(float x) {
+__device__ float gelu_forward_elementwise(float x) {
     float cube = 0.044715f * x * x * x;
-    return 0.5f * x * (1.0f + tanhf(sqrtf(2.0f / M_PI) * (x + cube)));
+
+    float tanh_out;
+    float tanh_arg = tanhf(sqrtf(2.0f / M_PI) * (x + cube));
+    asm ("tanh.approx.f32 %0,%1;" : "=f"(tanh_out) : "f"(tanh_arg));
+
+    return 0.5f * x * (1.0f + tanh_out);
+    //return 0.5f * x * (1.0f + tanhf(sqrtf(2.0f / M_PI) * (x + cube)));
 }
 
 // updates the absmax for the entire threadgroup
@@ -266,7 +272,7 @@ void copy_simple(T1 *copy, const T2 *input, size_t N, float* scale_pointer=NULL,
 }
 
 template <bool reversed_order=false, elementwise_func_t elementwise_func=nothing_elementwise, bool reciprocal=true, typename T1, typename T2>
-void copy_advanced(T1 *copy, const T2 *input, size_t N, float* descale_pointer=NULL, float* scale_pointer=NULL, void* absmax_output=NULL, bool memset_absmax=true, cudaStream_t stream=0, const size_t block_size=512) {
+void copy_advanced(T1 *copy, const T2 *input, size_t N, float* descale_pointer=NULL, float* scale_pointer=NULL, void* absmax_output=NULL, /*bool memset_absmax=true,*/ cudaStream_t stream=0, const size_t block_size=512) {
     size_t fewest_elements = min(Packed128<T1>::size, Packed128<T2>::size);
     const dim3 grid_size(CEIL_DIV(N, block_size * fewest_elements));
     assert((N % fewest_elements) == 0);
@@ -275,9 +281,9 @@ void copy_advanced(T1 *copy, const T2 *input, size_t N, float* descale_pointer=N
     unsigned int* absmax_uint = (unsigned int*)absmax_output;
 
     if (absmax_output) {
-        if (memset_absmax) {
+        /*if (memset_absmax) {
             cudaMemset(absmax_output, 0, sizeof(unsigned int));
-        }
+        }*/
         if (scale_pointer || descale_pointer) {
             copy_advanced_kernel<reciprocal, true, reversed_order, elementwise_func, absmax_factor><<<grid_size, dim3(block_size), 0, stream>>>(copy, input, N, descale_pointer, scale_pointer, absmax_uint);
         } else {
@@ -299,7 +305,7 @@ void copy_advanced(T1 *copy, const T2 *input, size_t N, float* descale_pointer=N
 template <bool write_absmax=false, elementwise_func_t elementwise_func=nothing_elementwise, bool reciprocal=true,
           bool enable_copy=false, typename T1, typename T2> // advanced template options, usually don't need to be changed
 void transpose(T1 *transposed, const T2 *input, size_t w, size_t h, float* descale_pointer=NULL, float* scale_pointer=NULL, void* absmax_output=NULL,
-               bool memset_absmax=true, cudaStream_t stream=0, const size_t block_size=64, T1 *copy=NULL) { // advanced parameters
+               /*bool memset_absmax=true,*/ cudaStream_t stream=0, const size_t block_size=64, T1 *copy=NULL) { // advanced parameters
     assert((w % TRANSPOSE_TILE_SIZE) == 0 && (h % TRANSPOSE_TILE_SIZE) == 0);
     cudaCheck(cudaGetLastError());
 
@@ -311,9 +317,9 @@ void transpose(T1 *transposed, const T2 *input, size_t w, size_t h, float* desca
 
     constexpr uint absmax_factor = write_absmax ? 1 : 0;
     unsigned int* absmax_uint = (unsigned int*)absmax_output;
-    if (write_absmax && memset_absmax) {
+    /*if (write_absmax && memset_absmax) {
         cudaMemset(absmax_output, 0, sizeof(unsigned int));
-    }
+    }*/
 
     switch (block_size_y) {
         case 32: transpose_kernel<32, TRANSPOSE_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, descale_pointer, scale_pointer, absmax_uint); break;
@@ -329,23 +335,23 @@ void transpose(T1 *transposed, const T2 *input, size_t w, size_t h, float* desca
 
 // wrapper so the parameters of the standard transpose function are less messy
 template <bool write_absmax=false, elementwise_func_t elementwise_func=nothing_elementwise, bool reciprocal=true, typename T1, typename T2>
-void copy_and_transpose(T1 *transposed, T1 *copy, const T2 *input, size_t w, size_t h, float* descale_pointer=NULL, float* scale_pointer=NULL, unsigned int* absmax_output=NULL, bool memset_absmax=true, cudaStream_t stream=0, const size_t block_size=64) {
-    transpose<write_absmax, elementwise_func, reciprocal, true, T1, T2>(transposed, input, w, h, descale_pointer, scale_pointer, absmax_output, memset_absmax, stream, block_size, copy);
+void copy_and_transpose(T1 *transposed, T1 *copy, const T2 *input, size_t w, size_t h, float* descale_pointer=NULL, float* scale_pointer=NULL, unsigned int* absmax_output=NULL, /*bool memset_absmax=true,*/ cudaStream_t stream=0, const size_t block_size=64) {
+    transpose<write_absmax, elementwise_func, reciprocal, true, T1, T2>(transposed, input, w, h, descale_pointer, scale_pointer, absmax_output, /*memset_absmax,*/ stream, block_size, copy);
 }
 
 template <bool write_absmax=false, elementwise_func_t elementwise_func=nothing_elementwise, bool reciprocal=true, typename T1, typename T2>
-void copy_or_transpose(bool transposing, T1 *output, const T2 *input, size_t w, size_t h, float* descale_pointer=NULL, float* scale_pointer=NULL, unsigned int* absmax_output=NULL, bool memset_absmax=true, cudaStream_t stream=0, const size_t block_size=64) {
+void copy_or_transpose(bool transposing, T1 *output, const T2 *input, size_t w, size_t h, float* descale_pointer=NULL, float* scale_pointer=NULL, unsigned int* absmax_output=NULL, /*bool memset_absmax=true,*/ cudaStream_t stream=0, const size_t block_size=64) {
     if (transposing) {
-        transpose<write_absmax, elementwise_func, reciprocal, false, T1, T2>(output, input, w, h, descale_pointer, scale_pointer, absmax_output, memset_absmax, stream, block_size);
+        transpose<write_absmax, elementwise_func, reciprocal, false, T1, T2>(output, input, w, h, descale_pointer, scale_pointer, absmax_output, /*memset_absmax,*/ stream, block_size);
     } else {
-        copy_advanced<false, elementwise_func, reciprocal>(output, input, w*h, descale_pointer, scale_pointer, absmax_output, memset_absmax, stream, block_size);
+        copy_advanced<false, elementwise_func, reciprocal>(output, input, w*h, descale_pointer, scale_pointer, absmax_output, /*memset_absmax,*/ stream, block_size);
     }
     cudaCheck(cudaGetLastError());
 }
 
 template <typename T>
 void get_absmax(void* absmax_output, const T* inp, size_t N, cudaStream_t stream=0, float* descale_pointer=NULL,
-                bool memset_absmax=true, unsigned int absmax_factor=1, size_t block_size=512) { // advanced parameters
+                /*bool memset_absmax=true,*/ unsigned int absmax_factor=1, size_t block_size=512) { // advanced parameters
 
     // find the largest block size that divides N
     while ((N % (block_size * Packed128<T>::size * ABSMAX_ITERATIONS_PER_THREAD)) != 0) {
@@ -354,9 +360,9 @@ void get_absmax(void* absmax_output, const T* inp, size_t N, cudaStream_t stream
     }
     const dim3 grid_size(CEIL_DIV(N, block_size * ABSMAX_ITERATIONS_PER_THREAD * Packed128<T>::size));
     absmax_factor = absmax_factor ? absmax_factor : 1;
-    if (memset_absmax) {
+    /*if (memset_absmax) {
         cudaMemset(absmax_output, 0, sizeof(unsigned int));
-    }
+    }*/
     if (descale_pointer != NULL) {
         get_absmax_kernel<true><<<grid_size, dim3(block_size), 0, stream>>>((unsigned int*)absmax_output, inp, N, absmax_factor, descale_pointer);
     } else {
@@ -387,7 +393,7 @@ private:
 
 public:
     template<typename T>
-    static T* getMemory(size_t count) {
+    static T* getMemory(size_t count, bool exact=false) {
         size_t size = count * sizeof(T);
 
         // Find the smallest free allocation that fits the requested size
@@ -396,17 +402,17 @@ public:
                 return !a.in_use && a.size >= size && (b.in_use || b.size < size || a.size < b.size);
             });
 
-        if (it != allocations.end() && !it->in_use && it->size >= size) {
+        if (it != allocations.end() && !it->in_use && it->size >= size && (!exact || it->size == size)) {
             it->in_use = true;
             return reinterpret_cast<T*>(it->ptr);
         }
 
         // If no suitable allocation found, create a new one
-        printf("Allocating CUDA scratch memory: %lu bytes\n", size);
         void* new_ptr;
         cudaMalloc(&new_ptr, size);
         allocations.emplace_back(new_ptr, size);
         allocations.back().in_use = true;
+        printf("Allocated CUDA scratch memory: %lu bytes (%p)\n", size, new_ptr);
         return reinterpret_cast<T*>(new_ptr);
     }
 
@@ -429,5 +435,49 @@ public:
     }
 };
 std::vector<CudaScratchAllocator::Allocation> CudaScratchAllocator::allocations;
+
+// ----------------------------------------------------------------------------
+// Transposed Cache (for FP8 weights)
+
+class TransposedCache {
+private:
+    struct CacheEntry {
+        void* ptr;
+        size_t size;
+    };
+
+    std::unordered_map<uint64_t, CacheEntry> cache;
+
+public:
+    template<typename T, typename Tout=T>
+    Tout* getTransposed(const T* original, size_t m, size_t k, bool compute=true, bool find_only=false) {
+        uint64_t key = reinterpret_cast<uint64_t>(original);
+        size_t size = m * k * sizeof(T);
+
+        auto it = cache.find(key);
+        if (it != cache.end() && it->second.size == size) {
+            return reinterpret_cast<Tout*>(it->second.ptr);
+        }
+        if (find_only) {
+            return nullptr;
+        }
+
+        Tout* transposed = CudaScratchAllocator::getMemory<Tout>(m * k, true);
+        if (compute) {
+            copy_or_transpose<false>(true, transposed, original, m, k, nullptr, nullptr, nullptr);
+        }
+
+        cache[key] = {transposed, size};
+        return transposed;
+    }
+
+    void clearCache() {
+        for (const auto& entry : cache) {
+            CudaScratchAllocator::releaseMemory(entry.second.ptr);
+        }
+        cache.clear();
+    }
+};
+TransposedCache g_transposed_cache;
 
 #endif
