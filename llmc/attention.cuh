@@ -57,18 +57,18 @@ __global__ void unpermute_kernel(floatX *out, floatX* inp, int use_kv, int kv_of
    // inp has shape (B, NH, T, HS) but we need to unpermute it to (B, T, NH, HS)
 
     int idx = (blockIdx.x * blockDim.x + threadIdx.x);
+    int T_new = use_kv ? 1 : T;
     // out[b][t][nh][hs] <- inp[b][nh][t][hs]
-    if (idx >= B * NH * T * HS) { return; }
+    if (idx >= B * NH * T_new * HS) { return; }
 
-    int b = idx / (NH * T * HS);
-    int rest = idx % (NH * T * HS);
-    int nh = rest / (T * HS);
-    rest = rest % (T * HS);
-    int t = rest / HS;
-    // TODO: quick hack, we should instead reduce the number of threads & modify computation here
-    if (use_kv && t != kv_offset) { return; }
+    int b = idx / (NH * T_new * HS);
+    int rest = idx % (NH * T_new * HS);
+    int nh = rest / (T_new * HS);
+    rest = rest % (T_new * HS);
+    int t = use_kv ? kv_offset : rest / HS;
     int hs = rest % HS;
     int other_idx = (b * NH * T * HS) + (t * NH * HS) + (nh * HS) + hs;
+    idx = use_kv ? b * NH * T * HS + nh * T * HS + t * HS + hs : idx;
     out[other_idx] = __ldcs(&inp[idx]);
 }
 
@@ -233,7 +233,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-    num_blocks = CEIL_DIV(B * T * C, block_size);
+    num_blocks = CEIL_DIV(B * (use_kv ? 1 : T) * C, block_size);
     unpermute_kernel<<<num_blocks, block_size, 0, stream>>>(out, vaccum, use_kv, kv_offset, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
