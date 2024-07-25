@@ -16,9 +16,7 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int use_kv,
     if (use_kv) {
         int b = idx / C;
         int c = idx % C;
-        idx = b * T * C + c;
-        inp += kv_offset * C;
-        out += kv_offset * C;
+        idx = b * T * C + kv_offset * C + c;
     }
 
     x128 packed_out;
