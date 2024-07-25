@@ -254,17 +254,17 @@ __global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ c
 
 
 
-/*
+
 // transpose + copy + format conversion (+ elementwise + absmax) kernel
 template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=TRANSPOSE_TILE_SIZE, bool reciprocal_scale=true, bool enable_copy=false, bool scaling=true,
          uint absmax_factor=0, elementwise_func_t elementwise_func=nothing_elementwise, typename T1, typename T2>
-__global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ copy, const T2* __restrict__ input,
+__global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ copy, const T2* __restrict__ input, int height,
                                  const float* __restrict__ descale_pointer=(float*)NULL, const float* __restrict__ scale_pointer=(float*)NULL,
                                  unsigned int* absmax_output=(unsigned int*)NULL, const void** meta=NULL)
 {
     __shared__ T1 tile[TILE_DIM][TILE_DIM];
     int width  = gridDim.x * TILE_DIM;
-    int height = gridDim.y * TILE_DIM;
+    height = gridDim.y * TILE_DIM;
 
     constexpr size_t T1_elements = 16 / sizeof(T1);
     constexpr size_t T2_elements = 16 / sizeof(T2);
@@ -343,12 +343,13 @@ __global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ c
         }
     }
 }
-*/
 
+
+/*
 // best I could come up with (without using TMA) - no bank conflicts, but 64B reads/writes not ideal
 // Z_DIM=2 improves perf by ~2% partly by improving L2 hit rates for the writes as far as I can tell
 template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=TRANSPOSE_TILE_SIZE, bool reciprocal_scale=true, bool enable_copy=false, bool scaling=true,
-         uint absmax_factor=0, elementwise_func_t elementwise_func=nothing_elementwise, int Z_DIM=2, typename T1, typename T2>
+         uint absmax_factor=0, elementwise_func_t elementwise_func=nothing_elementwise, int Z_DIM=1, typename T1, typename T2>
 __global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ copy, const T2* __restrict__ input, int height,
                                  const float* __restrict__ descale_pointer=(float*)NULL, const float* __restrict__ scale_pointer=(float*)NULL,
                                  unsigned int* absmax_output=(unsigned int*)NULL, const void** meta=NULL)
@@ -417,7 +418,6 @@ __global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ c
     } else {
         __syncthreads();
     }
-    if (y >= height) { return; }
 
     // reduce the number of threads for the write if T1_elements > T2_elements
     // we want to keep all 32 threads in a warp active, so we try to eliminate in y dimension first
@@ -440,9 +440,11 @@ __global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ c
     x = blockIdx.y * TILE_DIM * Z_DIM + threadIdx.z * TILE_DIM + adjusted_tid_x * T1_elements;
     y = blockIdx.x * TILE_DIM + (adjusted_tid_y*in_parallel);
 
+    if (x >= height) { return; }
+
     #pragma unroll
     for (int j = 0; j < TILE_DIM / in_parallel; j += BLOCK_ROWS) {
-        if ((j+adjusted_tid_y) * in_parallel >= TILE_DIM) { return; }
+        if ((j+adjusted_tid_y) * in_parallel * ratio >= TILE_DIM) { return; }
 
         // we need more instructions for the write than the read if T2_elements > T1_elements
         #pragma unroll
@@ -466,7 +468,7 @@ __global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ c
         }
     }
 }
-
+*/
 
 // only calculate absmax of the input tensor (non-fused)
 template <bool descale=false, typename T>
@@ -539,15 +541,15 @@ void copy_advanced(T1 *copy, const T2 *input, size_t N, float* descale_pointer=N
 template <bool write_absmax=false, elementwise_func_t elementwise_func=nothing_elementwise, bool reciprocal=true,
           bool enable_copy=false, typename T1, typename T2> // advanced template options, usually don't need to be changed
 void transpose(T1 *transposed, const T2 *input, size_t w, size_t h, float* descale_pointer=NULL, float* scale_pointer=NULL, void* absmax_output=NULL,
-               /*bool memset_absmax=true,*/ cudaStream_t stream=0, size_t block_size=256, T1 *copy=NULL) { // advanced parameters
+               /*bool memset_absmax=true,*/ cudaStream_t stream=0, size_t block_size=128, T1 *copy=NULL) { // advanced parameters
     assert((w % TRANSPOSE_TILE_SIZE) == 0 && (h % TRANSPOSE_TILE_SIZE) == 0);
     cudaCheck(cudaGetLastError());
-    constexpr int DIM_Z = 2;
-    block_size /= 2;
+    constexpr int DIM_Z = 1;
+    block_size /= DIM_Z;
 
     size_t block_size_x = (TRANSPOSE_TILE_SIZE * sizeof(T2)) / 16;
     size_t block_size_y = min(TRANSPOSE_TILE_SIZE, block_size / block_size_x);
-    dim3 grid_size(w / TRANSPOSE_TILE_SIZE, h / TRANSPOSE_TILE_SIZE);
+    dim3 grid_size(w / TRANSPOSE_TILE_SIZE, h / (TRANSPOSE_TILE_SIZE * DIM_Z));
     dim3 block_size_dim(block_size_x, block_size_y, DIM_Z);
 
     constexpr uint absmax_factor = write_absmax ? 1 : 0;

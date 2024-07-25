@@ -103,6 +103,13 @@ typedef __nv_fp8_e4m3 floatN;
 typedef floatX floatN;
 #endif
 
+#if FORCE_FP8_MATMUL == true && FORCE_FP8_GRADIENTS == true
+typedef __nv_fp8_e5m2 floatG;
+#else
+typedef floatX floatN;
+#endif
+
+
 // ----------------------------------------------------------------------------
 // Load and store with streaming cache hints
 // Older nvcc does not provide __ldcs and __stcs for bfloat16, despite these

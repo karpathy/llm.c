@@ -6,6 +6,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #define FORCE_FP8_MATMUL true
 #define FORCE_FP8_WEIGHTS true // not compatible with existing checkpoints
 #define FORCE_FP8_ACTIVATIONS true // compatible with existing checkpoints
+#define FORCE_FP8_GRADIENTS true // activation gradients directly output in FP8
 bool use_weights_transpose_cache = true; // cached across gradient accumulation steps (same weight)
 bool use_act_transpose_cache = true; // usually l_atty with BF16 attention, disabled during inference
 
@@ -14,11 +15,10 @@ bool use_act_transpose_cache = true; // usually l_atty with BF16 attention, disa
 // (if next step has a bigger maximum, it will overflow)
 // Transformer Engine presentations implies that's what they use
 // but not sure that's actually true, will need to check their code
-#define SCALE_A 1.0f/256.0f
-#define SCALE_FORWARD_B 1.0f/256.0f
-#define SCALE_BACKWARDS_B 1.0f/8192.0f
-#define SCALE_FP8_WEIGHTS 1.0f/2048.0f
-#define DESCALE_FP8_WEIGHTS (1.0f/SCALE_FP8_WEIGHTS)
+#define SCALE_A 1.0f/448.0f
+#define SCALE_FORWARD_B 1.0f/448.0f
+#define SCALE_BACKWARDS_B 1.0f/114688.0f
+#define SCALE_FP8_WEIGHTS 1.0f/448.0f
 
 // to make it easy to compare BF16 vs FP8 for layernorm output
 #define floatNorm floatN
