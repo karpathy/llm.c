@@ -1791,12 +1791,12 @@ int main(int argc, char *argv[]) {
             // backward pass. all model params accumulate gradients with += inside this inner loop
             gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
         }
-        float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss)); // loss z-score
+        float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss, (double)skip_update_lossz)); // loss z-score
         // fetch the next learning rate
         float step_learning_rate = get_learning_rate(&lr_scheduler, step);
         // calculate the gradient norm and how much we wish to scale the gradient
         float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
-        float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
+        float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm, (double)skip_update_gradz)); // grad z-score
         // update the model parameters
         if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) {
             printf0("skipping update due to loss z-score of %f\n", zloss);
