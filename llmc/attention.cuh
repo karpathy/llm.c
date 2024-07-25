@@ -29,7 +29,7 @@ __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
     int hs = rest % HS;
     int inp_idx = (b * T * 3 * NH * HS) + (t * 3 * NH * HS) + (0 * NH * HS) + (nh * HS) + hs;
     int idx_kv_new = use_kv ? b * NH * T * HS + nh * T * HS + t * HS + hs : idx;
-    int idx_q_new = use_kv ? b * NH * T * HS + nh * T * HS + 0 * HS + hs : idx;
+    int idx_q_new = use_kv ? b * NH * 1 * HS + nh * 1 * HS + 0 * HS + hs : idx;
     q[idx_q_new] = __ldcs(&inp[inp_idx]);
     k[idx_kv_new] = __ldcs(&inp[inp_idx + NH * HS]);
     v[idx_kv_new] = __ldcs(&inp[inp_idx + 2 * (NH * HS)]);
@@ -69,7 +69,7 @@ __global__ void unpermute_kernel(floatX *out, floatX* inp, int use_kv, int kv_of
     rest = rest % (T_new * HS);
     int t = use_kv ? kv_offset : rest / HS;
     int hs = rest % HS;
-    int other_idx = (b * NH * T * HS) + (t * NH * HS) + (nh * HS) + hs;
+    int other_idx = (b * T * NH * HS) + (t * NH * HS) + (nh * HS) + hs;
     idx = use_kv ? b * NH * 1 * HS + nh * 1 * HS + 0 * HS + hs : idx;
     out[other_idx] = __ldcs(&inp[idx]);
 }
