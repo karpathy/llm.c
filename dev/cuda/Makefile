@@ -30,7 +30,7 @@ MPI_PATHS = -I/usr/lib/x86_64-linux-gnu/openmpi/include -L/usr/lib/x86_64-linux-
 	$(NVCC) $(CFLAGS) $(NVCCFLAGS) $< -o $@
 
 # Build all targets
-TARGETS = adamw attention_backward attention_forward classifier_fused crossentropy_forward crossentropy_softmax_backward encoder_backward encoder_forward gelu_backward gelu_forward layernorm_backward layernorm_forward matmul_backward matmul_backward_bias matmul_forward nccl_all_reduce residual_forward softmax_forward trimat_forward fused_residual_forward  global_norm
+TARGETS = adamw attention_backward attention_forward classifier_fused crossentropy_forward crossentropy_softmax_backward encoder_backward encoder_forward gelu_backward gelu_forward layernorm_backward layernorm_forward matmul_backward matmul_backward_bias matmul_forward nccl_all_reduce residual_forward softmax_forward trimat_forward fused_residual_forward  global_norm permute
 all: $(TARGETS)
 all_ptx:  $(TARGETS:%=%.ptx)
 all_sass: $(TARGETS:%=%.sass)
@@ -63,6 +63,8 @@ matmul_backward: matmul_backward.cu
 # Update kernels
 adamw: adamw.cu
 global_norm: global_norm.cu
+
+permute: permute.cu
 
 # NCCL communication kernels
 nccl_all_reduce: nccl_all_reduce.cu
