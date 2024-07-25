@@ -489,9 +489,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool r
     gpt2_allocate_weights(model);
 
     // read in all the parameters from file and copy them to device (if we need them)
-    if (resuming && model->use_master_weights) {
-        printf("Resuming from master weights, ignoring model weights in checkpoint...\n");
-    } else {
+    // if we are restoring with master weights, ignore these weights and init from master instead
+    if (!resuming || !model->use_master_weights) {
         file_to_device(model->params_memory, model_file, model->num_parameters_bytes, IO_BUF_SIZE, main_stream);
     }
     fcloseCheck(model_file);
@@ -1256,6 +1255,8 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         printf0("Error: Master weights requested, but not present in state file.");
         exit(EXIT_FAILURE);
     }
+
+    model->init_state = false;      // we just got the state from file, no need to do first-touch init
     assert(model->m_memory != nullptr);
     assert(model->v_memory != nullptr);
     file_to_device(model->m_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
@@ -1268,8 +1269,6 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         gpt2_update(model, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, &multi_gpu_config, /* init_from_master_only*/ true);
         model->rng_state = *((unsigned long long*)&state_header[20]); // use final RNG state from checkpoint after this
     }
-
-    model->init_state = false;      // we just got the state from file, no need to do first-touch init
 
     // revive the DataLoader object and its state
     loader->should_shuffle = should_shuffle;
