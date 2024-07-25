@@ -6,16 +6,18 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #define FORCE_FP8_MATMUL true
 #define FORCE_FP8_WEIGHTS true // not compatible with existing checkpoints
 #define FORCE_FP8_ACTIVATIONS true // compatible with existing checkpoints
+bool use_weights_transpose_cache = true; // cached across gradient accumulation steps (same weight)
+bool use_act_transpose_cache = true; // usually l_atty with BF16 attention, disabled during inference
 
 // todo - make command line parameters for tuning
 // 1.0/448.0f would be the most aggressive setting for e4m3
 // (if next step has a bigger maximum, it will overflow)
 // Transformer Engine presentations implies that's what they use
 // but not sure that's actually true, will need to check their code
-#define SCALE_A 1.0f/2.0f
-#define SCALE_FORWARD_B 1.0f/2.0f
-#define SCALE_BACKWARDS_B 1.0f/64.0f
-#define SCALE_FP8_WEIGHTS 1.0f/128.0f
+#define SCALE_A 1.0f/256.0f
+#define SCALE_FORWARD_B 1.0f/256.0f
+#define SCALE_BACKWARDS_B 1.0f/8192.0f
+#define SCALE_FP8_WEIGHTS 1.0f/2048.0f
 #define DESCALE_FP8_WEIGHTS (1.0f/SCALE_FP8_WEIGHTS)
 
 // to make it easy to compare BF16 vs FP8 for layernorm output
@@ -630,7 +632,6 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
 // right now, this function is fully synchronous with the host
 void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     NVTX_RANGE_FN();
-    // todo - this is not ideal, gets rid of our history for the backward pass!
     absmax_tracker.update_all_absmax(main_stream);
     global_current_layer = 0;
 
@@ -667,7 +668,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
-        if (B != model->batch_size || T != model->seq_len) {
+        if (B > model->batch_size || T != model->seq_len) {
             printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, (int)B, (int)T);
             exit(EXIT_FAILURE);
         }
@@ -1097,6 +1098,16 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         init_master_weights = true;
     }
 
+    // todo - the absmax update could be done in parallel with global_norm?
+#ifdef MULTI_GPU
+    // share absmax for all tensors (descale_factor will be wrong but updated before read again)
+    ncclCheck(ncclAllReduce(absmax_tracker.d_storage, absmax_tracker.d_storage,
+                            absmax_tracker.current_tensor_count * ABSMAX_DSTORAGE_PER_TENSOR,
+                            ncclFloat, ncclMax, multi_gpu_config->nccl_comm, main_stream));
+#endif
+    // update absmax_tracker for weights only
+    absmax_tracker.update_all_absmax(main_stream, 1.0f, true, true);
+
     // AdamW update
     // handle adamw for all the transformer blocks
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -1194,6 +1205,9 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 #endif
         }
     }
+
+    // clear transposed weights cache since it's no longer up to date
+    g_transposed_cache.clearCache();
 
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -1818,6 +1832,12 @@ int main(int argc, char *argv[]) {
             for(int i = 0; i < B * T; ++i) {
                 gen_tokens[i] = eot_token;
             }
+            // todo - hack - effectively delete every additional tensor tracked in absmax after this
+            // this is partly because it's useless, but mostly it only runs for the first rank
+            // and we want absmax_tracker to be the same across all GPUs
+            size_t tensor_count = absmax_tracker.current_tensor_count;
+            bool used_act_transpose_cache = use_act_transpose_cache;
+            use_act_transpose_cache = false; // only  for running backwards
             // now sample from the model autoregressively
             printf("generating:\n---\n");
             for (int t = 1; t < genT; t++) {
@@ -1826,7 +1846,7 @@ int main(int argc, char *argv[]) {
                 // we re-calculate the forward pass for all of (B,T) positions from scratch
                 // but the inference here is just for sanity checking anyway
                 // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, B, T);
+                gpt2_forward(&model, gen_tokens, 1, T);
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
@@ -1852,6 +1872,9 @@ int main(int argc, char *argv[]) {
                 }
                 fflush(stdout);
             }
+            // todo - hack - restore the tensor count to what it was before
+            absmax_tracker.current_tensor_count = tensor_count;
+            use_act_transpose_cache = used_act_transpose_cache;
             printf("\n---\n");
         }
 
@@ -1911,6 +1934,29 @@ int main(int argc, char *argv[]) {
             float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
             gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
         }
+
+        size_t act_bytes = 0;
+        for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+            act_bytes += model.acts_specs[i].size * sizeof_dtype(model.acts_specs[i].type);
+        }
+        size_t num_grad_bytes = 0;
+        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            num_grad_bytes += model.param_elements[i] * max(2UL, model.param_sizeof[i]);
+        }
+
+        std::vector<TensorBasePointer> base_pointers = {
+            {model.params_memory, model.num_parameters_bytes},
+            {model.acts_memory, act_bytes},
+            {model.grads_memory, num_grad_bytes}
+        };
+
+        //if (step <= 2) {
+        //    absmax_tracker.save_to_file("absmax.txt", base_pointers);
+        //}
+
+        // restore
+        //absmax_tracker.restore_from_file("absmax.txt", base_pointers);
+
         cudaCheck(cudaEventRecord(end));
         cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
         // --------------- TRAINING SECTION END -------------------

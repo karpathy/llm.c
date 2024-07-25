@@ -119,6 +119,10 @@ Usage example: ./advanced_copy_transpose 12
 #define FUSED_RESCALE_IN_PLACE false
 #endif
 
+#if !defined(DEFAULT_Z_DIM)
+#define DEFAULT_Z_DIM 2
+#endif
+
 // ----------------------------------------------------------------------------
 // these are passed as default kernel parameters to avoid making everything too messy
 unsigned int* d_absmax_estimate = NULL;
@@ -150,7 +154,19 @@ __host__ __device__ float nothing_elementwise(float in, const void** __restrict_
 __host__ __device__ float gelu_forward_elementwise(float in, const void** __restrict__ metadata, uint x, uint y, uint w, uint h) {
     (void)x; (void)y; (void)w; (void)h; (void)metadata;
     float cube = 0.044715f * in * in * in;
-    return 0.5f * in * (1.0f + tanhf(sqrtf(2.0f / M_PI) * (in + cube)));
+
+    float tanh_out;
+    float tanh_arg = sqrtf(2.0f / M_PI) * (in + cube);
+    // only use asm if this is the device
+#if defined(__CUDA_ARCH__)
+    asm ("tanh.approx.f32 %0,%1;" : "=f"(tanh_out) : "f"(tanh_arg));
+#else
+    tanh_out = tanhf(tanh_arg);
+#endif
+
+    // the following uses FMUL+FMA instead of FMUL+FADD+FMUL for "0.5f * x * (1.0f + tanh_out)"
+    float half_in = 0.5f * in;
+    return half_in * tanh_out + half_in;
 }
 
 // ----------------------------------------------------------------------------
@@ -199,8 +215,8 @@ template<class OriginalType, class ElementType>
 __device__ void store_same_length(ElementType* target, Packed128<ElementType> value) {
     int4 bits = value.get_bits();
     switch (sizeof(OriginalType) / sizeof(ElementType)) {
-        case 0: *reinterpret_cast<int4*>(target) = bits; // smaller
-        case 1: *reinterpret_cast<int4*>(target) = bits; // same size
+        case 0: *reinterpret_cast<int4*>(target) = bits; break; // smaller
+        case 1: *reinterpret_cast<int4*>(target) = bits; break; // same size
         case 2: *reinterpret_cast<int2*>(target) = make_int2(bits.x, bits.y); break;
         case 4: *reinterpret_cast<int*>(target) = bits.x; break;
         default: break; //assert(false);
@@ -210,10 +226,10 @@ __device__ void store_same_length(ElementType* target, Packed128<ElementType> va
 // updates the absmax for the entire threadgroup
 // requires all warps in threadblock to be active
 // caller can rely on there always being a __syncthreads() for other work
-template <bool is2D=false> // templating to avoid useless calculations for 1D (no support for 3D)
+template <bool is2D=false, bool is3D=false> // templating to avoid useless calculations for 1D
 __device__ void update_global_absmax(unsigned int* absmax_output, unsigned int absmax_uint) {
-    uint bidY = is2D ? blockDim.y : 1;
-    uint tidY = is2D ? threadIdx.y : 0;
+    uint bidY = (is2D ? blockDim.y : 1) * (is3D ? blockDim.z : 1);
+    uint tidY = (is2D ? threadIdx.y : 0) + (is3D ? threadIdx.z * blockDim.y : 0);
     uint tidXY = threadIdx.x + blockDim.x * tidY;
     uint num_warps = (blockDim.x * bidY) / 32;
     uint lane_id = tidXY % 32;
@@ -493,7 +509,128 @@ __global__ void transpose_kernel2(T1* __restrict__ transposed, T1* __restrict__ 
             }
             store128<T1>(transposed + x + (o * blockDim.x * out128.size) + (y+j)*h, out128);
         }
-    }}
+    }
+}
+
+// best I could come up with (without using TMA) - no bank conflicts, but 64B reads/writes not ideal
+// Z_DIM=2 improves perf by ~2% partly by improving L2 hit rates for the writes as far as I can tell
+template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=DEFAULT_TILE, bool scaling=SCALING, bool enable_copy=TRANSPOSE_AND_COPY,
+         uint absmax_factor=ABSMAX_FACTOR, elementwise_func_t elementwise_func=DEFAULT_ELEMENTWISE, int Z_DIM=DEFAULT_Z_DIM,
+         typename T1, typename T2>
+__global__ void transpose_kernel3(T1* __restrict__ transposed, T1* __restrict__ copy, const T2* __restrict__ input,
+                                  const float* __restrict__ scale_pointer=d_scaling_factor, unsigned int* absmax_output=d_absmax_estimate,
+                                  const void** meta=NULL, int height=HEIGHT)
+{
+    constexpr int in_parallel = 4/sizeof(T1);
+
+    constexpr size_t TILE_DIM_PADDED = (TILE_DIM * 33) / 32;
+    __shared__ T1 tile[Z_DIM][TILE_DIM][TILE_DIM_PADDED];
+    int w  = gridDim.x * TILE_DIM;
+
+    constexpr size_t T1_elements = 16 / sizeof(T1);
+    constexpr size_t T2_elements = 16 / sizeof(T2);
+    constexpr size_t copy_vectors = (sizeof(T1) >= sizeof(T2)) ? (sizeof(T1) / sizeof(T2)) : 1;
+
+    float scale_factor = scaling ? *scale_pointer : 1.0f;
+    int x = blockIdx.x * TILE_DIM + (threadIdx.x * T2_elements);
+    int y = blockIdx.y * TILE_DIM * Z_DIM + threadIdx.z * TILE_DIM + threadIdx.y;
+
+    uint absmax_uint = 0;
+    if (y < height) {
+        #pragma unroll
+        for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+            Packed128<T1> copy128[copy_vectors];
+
+            int4 payload;
+            const int4* address = reinterpret_cast<const int4*>(input + x + (y+j)*w);
+            asm volatile("ld.global.L2::128B.v4.s32 {%0, %1, %2, %3}, [%4];"
+                        : "=r"(payload.x), "=r"(payload.y), "=r"(payload.z), "=r"(payload.w)
+                        : "l"(address));
+            Packed128<T2> in128(payload);
+
+            #pragma unroll
+            for (int k = 0; k < in128.size; k++) {
+                T2 in = in128[k];
+                float out_float = elementwise_func((float)in, meta, x+k, y+j, w, height);
+
+                T1 out = (T1)(out_float * scale_factor);
+                copy128[k/T1_elements][k%T1_elements] = out; // optimised away by compiler if unused
+                update_local_absmax(absmax_uint, out_float, absmax_factor); // optional absmax
+            }
+
+            #pragma unroll
+            for (int o = 0; o < copy_vectors; o++) {
+                if constexpr (enable_copy) {
+                    store_same_length<T2,T1>(copy + x + (y+j)*w + o*T1_elements, copy128[o]);
+                }
+
+                size_t offset_x = (threadIdx.x * T2_elements) + (o * T1_elements);
+                size_t offset_y = (threadIdx.y + j) * TILE_DIM;
+                offset_y += (offset_y / (128/sizeof(T1))) * in_parallel;
+
+                int* one_bank = reinterpret_cast<int*>(&tile[threadIdx.z][0][0] + offset_x + offset_y);
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    one_bank[k] = *(int*)(&copy128[o][k*4/sizeof(T1)]);
+                }
+            }
+        }
+    }
+
+    if constexpr (absmax_factor != 0) {
+        update_global_absmax<true, true>(absmax_output, absmax_uint);
+    } else {
+        __syncthreads();
+    }
+    if (y >= height) { return; }
+
+    // reduce the number of threads for the write if T1_elements > T2_elements
+    // we want to keep all 32 threads in a warp active, so we try to eliminate in y dimension first
+    // so we create fake/adjusted tid.x/tid.y where "extra" threadIdx.x adds to the effective tid.y
+    constexpr size_t block_size_x = (TILE_DIM * sizeof(T2)) / 16;
+    constexpr size_t block_size_y = BLOCK_ROWS;
+    constexpr size_t desired_ratio = (sizeof(T2) >= sizeof(T1)) ? (sizeof(T2) / sizeof(T1)) : 1;
+    constexpr size_t ratio = (desired_ratio <= block_size_y) ? desired_ratio : block_size_y;
+    constexpr size_t block_size_x_div_r = block_size_x / ratio;
+    constexpr size_t block_size_y_div_r = block_size_y / ratio;
+
+    int adjusted_tid_x = threadIdx.x % block_size_x_div_r;
+    int adjusted_tid_y = (threadIdx.y * ratio) + (threadIdx.x / block_size_x_div_r);
+    if (threadIdx.y >= block_size_y_div_r) { return; }
+
+    // if we cannot reduce block_size.y enough, also reduce x (hurting perf with partial warps)
+    if (ratio != desired_ratio && adjusted_tid_x >= TILE_DIM / T1_elements) { return; }
+
+    // x/y for final write to global memory
+    x = blockIdx.y * TILE_DIM * Z_DIM + threadIdx.z * TILE_DIM + adjusted_tid_x * T1_elements;
+    y = blockIdx.x * TILE_DIM + (adjusted_tid_y*in_parallel);
+
+    #pragma unroll
+    for (int j = 0; j < TILE_DIM / in_parallel; j += BLOCK_ROWS) {
+        if ((j+adjusted_tid_y) * in_parallel >= TILE_DIM) { return; }
+
+        // we need more instructions for the write than the read if T2_elements > T1_elements
+        #pragma unroll
+        for (int o = 0; o < copy_vectors; o++) {
+            Packed128<T1> out128[in_parallel];
+            #pragma unroll
+            for (int k = 0; k < Packed128<T1>::size; k++) {
+                int offset_x = (adjusted_tid_y + j) * in_parallel;
+                int offset_y = ((adjusted_tid_x + o * blockDim.x) * Packed128<T1>::size + k) * TILE_DIM;
+                offset_y += (offset_y / (128/sizeof(T1))) * in_parallel;
+
+                int in32 = *(int*)(&tile[threadIdx.z][0][0] + offset_x + offset_y);
+                for (int p = 0; p < in_parallel; p++) {
+                    out128[p][k] = ((T1*)&in32)[p];
+                }
+            }
+            #pragma unroll
+            for (int p = 0; p < in_parallel; p++) {
+                store128<T1>(transposed + x + (o * blockDim.x * Packed128<T1>::size) + (y+p + j * in_parallel) * height, out128[p]);
+            }
+        }
+    }
+}
 
 // ----------------------------------------------------------------------------
 // GPU kernels for absmax
@@ -733,7 +870,6 @@ __global__ void __launch_bounds__(1024, 2) fused_absmax_scale_persistent(TOut* _
     #endif
 }
 
-
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -807,6 +943,26 @@ void transpose2(T1 *transposed, const T2 *input, size_t width, size_t height, co
         case 4: transpose_kernel2<4, DEFAULT_TILE, SCALING, TRANSPOSE_AND_COPY><<<grid_size, block_size_>>>(transposed, copy, input); break;
         case 2: transpose_kernel2<2, DEFAULT_TILE, SCALING, TRANSPOSE_AND_COPY><<<grid_size, block_size_>>>(transposed, copy, input); break;
         case 1: transpose_kernel2<1, DEFAULT_TILE, SCALING, TRANSPOSE_AND_COPY><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        default: printf("Invalid block size: %lu\n", block_size_y); exit(1);
+    }
+}
+
+template <typename T1, typename T2>
+void transpose3(T1 *transposed, const T2 *input, size_t width, size_t height, const size_t block_size, T1 *copy=NULL) {
+    size_t block_size_x = (DEFAULT_TILE * sizeof(T2)) / 16;
+    size_t block_size_y = min(DEFAULT_TILE, block_size / block_size_x);
+    dim3 grid_size(width / (DEFAULT_TILE), height / (DEFAULT_TILE*DEFAULT_Z_DIM), 1);
+    dim3 block_size_(block_size_x, block_size_y, DEFAULT_Z_DIM);
+
+    switch (block_size_y) {
+        case 128: transpose_kernel3<128, DEFAULT_TILE, SCALING, TRANSPOSE_AND_COPY><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 64: transpose_kernel3<64, DEFAULT_TILE, SCALING, TRANSPOSE_AND_COPY><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 32: transpose_kernel3<32, DEFAULT_TILE, SCALING, TRANSPOSE_AND_COPY><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 16: transpose_kernel3<16, DEFAULT_TILE, SCALING, TRANSPOSE_AND_COPY><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 8: transpose_kernel3<8, DEFAULT_TILE, SCALING, TRANSPOSE_AND_COPY><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 4: transpose_kernel3<4, DEFAULT_TILE, SCALING, TRANSPOSE_AND_COPY><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 2: transpose_kernel3<2, DEFAULT_TILE, SCALING, TRANSPOSE_AND_COPY><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 1: transpose_kernel3<1, DEFAULT_TILE, SCALING, TRANSPOSE_AND_COPY><<<grid_size, block_size_>>>(transposed, copy, input); break;
         default: printf("Invalid block size: %lu\n", block_size_y); exit(1);
     }
 }
@@ -905,6 +1061,9 @@ void run_advanced(int kernel_num,
             // our best transpose with the most features
             transpose2(transposed, input, width, height, block_size, copy);
             break;
+        case 13:
+            transpose3(transposed, input, width, height, block_size, copy);
+            break;
         case 20:
             get_absmax(input, width * height, block_size, true);
             break;
@@ -981,11 +1140,11 @@ int main(int argc, const char **argv) {
     cudaCheck(cudaMemset(d_absmax_actual, 0, sizeof(unsigned int)));
 
     // time the kernel at different block sizes
-    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+    int block_sizes[] = {64, 128, 256, 512, 1024};
 
     // kernel 12 specifically does not support all block sizes, so act accordingly
     size_t num_block_sizes = sizeof(block_sizes) / sizeof(int);
-    if (kernel_num == 12) {
+    if (kernel_num == 12 || kernel_num == 13) {
         size_t block_size_x = (DEFAULT_TILE * sizeof(OUT_TYPE)) / 16;
         size_t block_size_y = min(DEFAULT_TILE, 1024 / block_size_x);
         size_t max_block_size = block_size_y * block_size_x;
@@ -1049,7 +1208,7 @@ int main(int argc, const char **argv) {
         // napkin math: estimate the memory bandwidth achieved
         size_t memory_ops = W * H * (sizeof(IN_TYPE) + sizeof(OUT_TYPE));
         #if TRANSPOSE_AND_COPY == true
-        if (kernel_num >= FIRST_TRANSPOSE_KERNE && kernel_num < FIRST_ABSMAX_ONLY_KERNE) {
+        if (kernel_num >= FIRST_TRANSPOSE_KERNEL && kernel_num < FIRST_ABSMAX_ONLY_KERNEL) {
             memory_ops += W * H * sizeof(OUT_TYPE);
         }
         #endif
