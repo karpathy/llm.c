@@ -451,7 +451,7 @@ void layernorm_forward(floatX* out, float* mean, float* rstd,
         layernorm_forward_kernel6<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(out, mean, rstd, inp, weight, bias, use_kv, kv_offset, B, T, C);
     } else {
         if (use_kv) {
-            fprintf(stderr, "KV cache: layernorm_forward_kernel6 failed to set shared memory size - exiting.\n");
+            fprintf(stderr, "KV cache not used for suboptimal branches: layernorm_forward_kernel6 failed to set shared memory size - exiting.\n");
             exit(EXIT_FAILURE);
         }
         // fall back to the version without shared memory
@@ -491,7 +491,7 @@ void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, floa
                                                                                               weight, bias, use_kv, kv_offset, B, T, C);
     } else {
         if (use_kv) {
-            fprintf(stderr, "KV cache: fused_residual_forward_kernel5 failed to set shared memory size - exiting.\n");
+            fprintf(stderr, "KV cache not used for suboptimal branches: fused_residual_forward_kernel5 failed to set shared memory size - exiting.\n");
             exit(EXIT_FAILURE);
         }
         residual_forward(residual, inp1, inp2, N*C, stream);

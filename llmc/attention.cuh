@@ -28,11 +28,11 @@ __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
     int t = use_kv ? kv_offset : rest / HS;
     int hs = rest % HS;
     int inp_idx = (b * T * 3 * NH * HS) + (t * 3 * NH * HS) + (0 * NH * HS) + (nh * HS) + hs;
-    int idx_kv_new = use_kv ? b * NH * T * HS + nh * T * HS + t * HS + hs : idx;
-    int idx_q_new = use_kv ? b * NH * 1 * HS + nh * 1 * HS + 0 * HS + hs : idx;
-    q[idx_q_new] = __ldcs(&inp[inp_idx]);
-    k[idx_kv_new] = __ldcs(&inp[inp_idx + NH * HS]);
-    v[idx_kv_new] = __ldcs(&inp[inp_idx + 2 * (NH * HS)]);
+    int idx_kv = use_kv ? b * NH * T * HS + nh * T * HS + t * HS + hs : idx;
+    int idx_q = use_kv ? b * NH * 1 * HS + nh * 1 * HS + 0 * HS + hs : idx;
+    q[idx_q] = __ldcs(&inp[inp_idx]);
+    k[idx_kv] = __ldcs(&inp[inp_idx + NH * HS]);
+    v[idx_kv] = __ldcs(&inp[inp_idx + 2 * (NH * HS)]);
 }
 
 __global__ void permute_kernel_backward(floatX* dinp,
@@ -56,7 +56,7 @@ __global__ void permute_kernel_backward(floatX* dinp,
 
 __global__ void unpermute_kernel(floatX *out, floatX* inp, int use_kv, int kv_offset, int B, int T, int NH, int HS) {
    // inp has shape (B, NH, T, HS) but we need to unpermute it to (B, T, NH, HS)
-   // if use_kv inp has shape (B, NH, 1, HS) but we need to unpermute it to (B, T, NH, HS)
+   // note: if use_kv inp is true we do (B, NH, 1, HS) -> (B, 1, NH, HS)
 
     int idx = (blockIdx.x * blockDim.x + threadIdx.x);
     int T_new = use_kv ? 1 : T;
@@ -211,7 +211,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // output is (B, T, C)
     const int HS = C / NH; // head size
 
-    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS) or (B, NH, 1, HS) for q if use_kv
+    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS) or (B, NH, 1, HS) for Q if use_kv is true
     floatX *q, *k, *v;
     q = qkvr + 0 * B * T * C;
     k = qkvr + 1 * B * T * C;
@@ -223,7 +223,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     floatX* preatt = inp; // reuse inp as scratch buffer
     matmul_cublaslt(preatt, k, q, nullptr, T, use_kv ? 1 : T, HS, stream, true, false, B * NH, T * HS, use_kv ? 1 * HS : T * HS, use_kv ? 1 * T : T * T);
 
-    // if use_kv preatt Q @ K^T -> (B, NH, 1, HS) @ (B, NH, HS, T) -> (B, NH, 1, T)
+    // if use_kv is true preatt Q @ K^T -> (B, NH, 1, HS) @ (B, NH, HS, T) -> (B, NH, 1, T)
     // multiply all elements of preatt elementwise by scale
     float scale = 1.f / sqrtf(HS);
     int grid_size = CEIL_DIV(B * NH * (use_kv ? 1 : T) * WARP_SIZE, block_size);
@@ -231,8 +231,8 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 
     // new approach: first cuBLAS another batched matmul
     floatX* vaccum = inp;
-    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    // if use_kv y = att @ v # (B, nh, 1, T) @ (B, nh, T, hs) -> (B, nh, 1, hs)
+    // y = att @ v # (B, NH, T, T) @ (B, NH, T, HS) -> (B, NH, T, HS)
+    // if use_kv is true y = att @ v # (B, NH, 1, T) @ (B, NH, T, HS) -> (B, NH, 1, HS)
     matmul_cublaslt(vaccum, v, att, nullptr, HS, use_kv ? 1 : T, T, stream, false, false, B * NH, T * HS, use_kv ? 1 * T : T * T, use_kv ? 1 * HS : T * HS);
 
     // now unpermute

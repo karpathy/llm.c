@@ -655,7 +655,6 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
     // first layernorm isn't fused
     layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, model->use_kv, model->kv_offset, B, T, C, main_stream);
-    static int cnt = 0;
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
 
@@ -690,9 +689,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
         // now do the forward pass
         #ifdef ENABLE_CUDNN
-        assert(0); // TODO: cuDNN is not supported for KV for now
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, 0, 0, B, T, C, 3*C, main_stream);
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
@@ -707,23 +705,6 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, model->use_kv, model->kv_offset, B, T, C, C, main_stream);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, model->use_kv, model->kv_offset, B, T, C, main_stream);
-        // if (cnt == 1) {
-        //     // Create a CPU B*T*C size buffer and memcopy the out tensor to it
-        //     floatX* out_cpu = (floatX*)malloc(B*T*C * sizeof(floatX));
-        //     cudaCheck(cudaMemcpy(out_cpu, l_ln2, B*T*C * sizeof(floatX), cudaMemcpyDeviceToHost));
-        //     // copy over to out_cpu_fp32 buffer
-        //     float* out_cpu_fp32 = (float*)malloc(B*T*C * sizeof(float));
-        //     for (int i = 0; i < B*T*C; i++) {
-        //         out_cpu_fp32[i] = (float)out_cpu[i];
-        //     }
-        //     char filename[100];
-        //     sprintf(filename, "/home/aleksa/Documents/llm.c/llmc/test_dir/ln2_forward_%d_%d.bin", l, model->use_kv);
-        //     FILE* f = fopen(filename, "wb");
-        //     fwrite(out_cpu_fp32, sizeof(float), B*T*C, f);
-        //     fclose(f);
-        //     free(out_cpu_fp32);
-        //     free(out_cpu);
-        // }
         matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, model->use_kv, model->kv_offset, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, model->use_kv, model->kv_offset, B, T, 4*C, C, main_stream);
         // OK, fusion across blocks.
@@ -744,7 +725,6 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
     matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, model->use_kv, model->kv_offset, B, T, C, Vp, main_stream);
     cudaCheck(cudaDeviceSynchronize());
-    cnt += 1;
 }
 
 
@@ -1420,8 +1400,8 @@ void error_usage() {
 // main training loop
 int main(int argc, char *argv[]) {
     // read in the (optional) command line arguments
-    const char* train_data_pattern = "/hdd/llmc/fineweb/bin/fineweb_train_*.bin";
-    const char* val_data_pattern = "/hdd/llmc/fineweb/bin/fineweb_val_*.bin";
+    const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+    const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* lr_scheduler_type = "cosine";
     const char* output_log_dir = NULL;
@@ -1438,9 +1418,9 @@ int main(int argc, char *argv[]) {
     float weight_decay = 0.0f;
     float skip_update_lossz = 0.0f; // skip update if loss goes above this in zscore
     float skip_update_gradz = 0.0f; // skip update if grad_norm goes above this in zscore
-    int val_loss_every = 0; // every how many steps do we eval validation loss?
+    int val_loss_every = 20; // every how many steps do we eval validation loss?
     int val_max_steps = 20; // how many batches max do we eval for validation loss?
-    int sample_every = 1; // every how many steps to do inference?
+    int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
     int max_steps = -1;
@@ -1750,9 +1730,8 @@ int main(int argc, char *argv[]) {
         }
 
         // once in a while do model inference to print generated text (only rank 0)
-        // TODO(gordicaleksa): tmp set step to >= 0 to always generate
         if (multi_gpu_config.process_rank == 0 && sample_every > 0 &&
-           (step >= 0 && (step % sample_every) == 0 || last_step)) {
+           (step > 0 && (step % sample_every) == 0 || last_step)) {
             NvtxRange generation_range("generation");
             unsigned long long sample_rng_state = 1337;
             // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
@@ -1763,6 +1742,9 @@ int main(int argc, char *argv[]) {
             // now sample from the model autoregressively
             printf("generating:\n---\n");
             model.use_kv = 1; // we need to use the KV cache for generation
+            #ifdef ENABLE_CUDNN
+            model.use_cudnn = 0; // KV cache not supported for cuDNN
+            #endif
             for (int t = 1; t < genT; t++) {
                 NvtxRange generation_range("Generation step", t);
                 // we try not to be too wasteful for inference by not calculating all of B,T
