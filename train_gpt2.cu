@@ -1743,7 +1743,7 @@ int main(int argc, char *argv[]) {
             printf("generating:\n---\n");
             model.use_kv = 1; // we need to use the KV cache for generation
             #ifdef ENABLE_CUDNN
-            model.use_cudnn = 0; // KV cache not supported for cuDNN
+            model.use_kv = 0; // KV cache not supported for cuDNN
             #endif
             for (int t = 1; t < genT; t++) {
                 NvtxRange generation_range("Generation step", t);
