@@ -1,25 +1,39 @@
-#include "nn.hpp"
 #include "gtest/gtest.h"
+#include "nn.hpp"
+
+using nn::DT_FLOAT;
+using nn::Parameter;
 
 TEST(Random, UniformFill) {
   nn::ManualSeed(42);
   std::vector<float> expected_num = {0.882269, 0.915004, 0.382864, 0.959306,
                                      0.390448, 0.600895, 0.256572, 0.793641,
                                      0.940771, 0.133186};
-  std::vector<float> num(10);
-  nn::UniformFill(absl::MakeSpan(num));
+  auto& gpu_device = nn::g_device;
+  size_t length = expected_num.size();
+  float* d_num = (float*)gpu_device.allocate(sizeof(float) * length);
+  nn::UniformFill(absl::MakeSpan(d_num, length));
+  std::vector<float> num(length);
+  gpu_device.memcpyDeviceToHost(num.data(), d_num, sizeof(float) * length);
+  gpu_device.synchronize();
   for (size_t i = 0; i < expected_num.size(); ++i) {
     EXPECT_NEAR(expected_num[i], num[i], 1e-5);
   }
+  gpu_device.deallocate(d_num);
 }
 
 TEST(Random, NormalFill) {
   nn::ManualSeed(42);
+  auto& gpu_device = nn::g_device;
   std::vector<float> expected_num = {0.336690,  0.128809,  0.234462, 0.230333,
                                      -1.122856, -0.186328, 2.208201, -0.637997,
                                      0.461657,  0.267351};
-  std::vector<float> num(10);
-  nn::NormalFill(absl::MakeSpan(num));
+  size_t length = expected_num.size();
+  float* d_num = (float*)gpu_device.allocate(sizeof(float) * length);
+  nn::NormalFill(absl::MakeSpan(d_num, length));
+  std::vector<float> num(length);
+  gpu_device.memcpyDeviceToHost(num.data(), d_num, sizeof(float) * length);
+  gpu_device.synchronize();
   for (size_t i = 0; i < expected_num.size(); ++i) {
     EXPECT_NEAR(expected_num[i], num[i], 1e-5);
   }
@@ -31,24 +45,37 @@ TEST(Random, NormalFill) {
                   0.034912,  0.321103,  1.573600,  -0.845467, -1.274151,
                   2.122785,  -1.234653, -0.487914, -1.418060, 0.896268,
                   0.049905,  2.266718};
-  num.resize(32);
-  nn::NormalFill(absl::MakeSpan(num));
+  length = expected_num.size();
+  float* d_num2 = (float*)gpu_device.allocate(sizeof(float) * length);
+  nn::NormalFill(absl::MakeSpan(d_num2, length));
+  num.resize(length);
+  gpu_device.memcpyDeviceToHost(num.data(), d_num2, sizeof(float) * length);
+  gpu_device.synchronize();
   for (size_t i = 0; i < expected_num.size(); ++i) {
     EXPECT_NEAR(expected_num[i], num[i], 1e-5);
   }
+
+  gpu_device.deallocate(d_num);
+  gpu_device.deallocate(d_num2);
 }
 
 TEST(Random, KaimingUniformFill) {
   nn::ManualSeed(42);
+  auto& gpu_device = nn::g_device;
   int in_features = 4, out_features = 3, num_samples = 12;
   std::vector<float> expected_num = {0.382269,  0.415004,  -0.117136, 0.459306,
                                      -0.109552, 0.100895,  -0.243428, 0.293641,
                                      0.440771,  -0.366814, 0.434598,  0.093580};
+  float* d_num = (float*)gpu_device.allocate(sizeof(float) * num_samples);
+  nn::KaimingUniformFill(absl::MakeSpan(d_num, num_samples), in_features);
   std::vector<float> num(num_samples);
-  nn::KaimingUniformFill(absl::MakeSpan(num), in_features);
+  gpu_device.memcpyDeviceToHost(num.data(), d_num, sizeof(float) * num_samples);
+  gpu_device.synchronize();
   for (size_t i = 0; i < expected_num.size(); ++i) {
     EXPECT_NEAR(expected_num[i], num[i], 1e-5);
   }
+
+  gpu_device.deallocate(d_num);
 }
 
 TEST(MatMul, ForwardAndBackward) {
@@ -65,31 +92,47 @@ loss.backward()
   */
 
   nn::ManualSeed(42);
+  auto& gpu_device = nn::g_device;
   int M = 4, N = 3, K = 2;
-  std::vector<float> x1(M * N), x2(N * K);
-  nn::NormalFill(absl::MakeSpan(x1));
-  nn::NormalFill(absl::MakeSpan(x2));
+  auto x1_gpu = nn::Parameter(nn::DT_FLOAT, M * N);
+  auto x2_gpu = nn::Parameter(nn::DT_FLOAT, N * K);
+  nn::NormalFill(x1_gpu.span<float>());
+  nn::NormalFill(x2_gpu.span<float>());
 
   // forward
-  std::vector<float> y(M * K);
-  auto x1m = MakeConstMatrix(x1.data(), M, N);
-  auto x2m = MakeConstMatrix(x2.data(), N, K);
-  auto ym = MakeMatrix(y.data(), M, K);
-  nn::MatMul<float>::Forward(x1m, x2m, ym);
+  auto y_gpu = nn::Parameter(nn::DT_FLOAT, M * K);
+  auto x1_2d = x1_gpu.const_matrix<float>(M, N);
+  auto x2_2d = x2_gpu.const_matrix<float>(N, K);
+  auto y_2d = y_gpu.matrix<float>(M, K);
+  gpu_device.synchronize();
+  nn::MatMul<float>::Forward(x1_2d, x2_2d, y_2d);
 
   std::vector<float> expected_y = {0.556428, -0.253943, 1.119845, -1.617147,
                                    3.693071, -3.965338, 0.837917, 0.722053};
+  std::vector<float> y_cpu(expected_y.size(), 100.f);
+  gpu_device.memcpyDeviceToHost(y_cpu.data(), y_gpu.data<float>(),
+                                sizeof(float) * y_cpu.size());
+  gpu_device.synchronize();
+
   for (size_t i = 0; i < expected_y.size(); ++i) {
-    EXPECT_NEAR(expected_y[i], y[i], 1e-5);
+    EXPECT_NEAR(expected_y[i], y_cpu[i], 1e-5);
   }
 
   // backward
-  std::vector<float> y_grad(y.size(), 1.0);
-  std::vector<float> x1_grad(x1.size(), 0.0), x2_grad(x2.size(), 0.0);
-  auto y_gradm = MakeConstMatrix(y_grad.data(), M, K);
-  auto x1_gradm = MakeMatrix(x1_grad.data(), M, N);
-  auto x2_gradm = MakeMatrix(x2_grad.data(), N, K);
-  nn::MatMul<float>::Backward(x1m, x2m, y_gradm, x1_gradm, x2_gradm);
+  std::vector<float> y_grad_cpu(y_2d.size(), 1.0);
+  std::vector<float> x1_grad_cpu(x1_2d.size(), 0.0),
+      x2_grad_cpu(x2_2d.size(), 0.0);
+  auto y_grad_gpu = Parameter(DT_FLOAT, y_2d.size());
+  auto x1_grad_gpu = Parameter(DT_FLOAT, x1_2d.size());
+  auto x2_grad_gpu = Parameter(DT_FLOAT, x2_2d.size());
+  gpu_device.memcpyHostToDevice(y_grad_gpu.data<float>(), y_grad_cpu.data(),
+                                sizeof(float) * y_grad_cpu.size());
+  gpu_device.synchronize();
+
+  auto y_grad_2d = y_grad_gpu.const_matrix<float>(M, K);
+  auto x1_grad_2d = x1_grad_gpu.matrix<float>(M, N);
+  auto x2_grad_2d = x2_grad_gpu.matrix<float>(N, K);
+  nn::MatMul<float>::Backward(x1_2d, x2_2d, y_grad_2d, x1_grad_2d, x2_grad_2d);
 
   std::vector<float> expected_x1_grad = {
       -0.579509, -0.030988, 2.139325, -0.579509, -0.030988, 2.139325,
@@ -97,11 +140,16 @@ loss.backward()
   std::vector<float> expected_x2_grad = {3.042576,  3.042576, -1.097139,
                                          -1.097139, 1.319149, 1.319149};
 
+  gpu_device.memcpyDeviceToHost(x1_grad_cpu.data(), x1_grad_gpu.data<float>(),
+                                sizeof(float) * x1_grad_cpu.size());
+  gpu_device.memcpyDeviceToHost(x2_grad_cpu.data(), x2_grad_gpu.data<float>(),
+                                sizeof(float) * x2_grad_cpu.size());
+  gpu_device.synchronize();
   for (size_t i = 0; i < expected_x1_grad.size(); ++i) {
-    EXPECT_NEAR(expected_x1_grad[i], x1_grad[i], 1e-5);
+    EXPECT_NEAR(expected_x1_grad[i], x1_grad_cpu[i], 1e-5);
   }
   for (size_t i = 0; i < expected_x2_grad.size(); ++i) {
-    EXPECT_NEAR(expected_x2_grad[i], x2_grad[i], 1e-5);
+    EXPECT_NEAR(expected_x2_grad[i], x2_grad_cpu[i], 1e-5);
   }
 }
 
@@ -118,30 +166,54 @@ loss.backward()
   */
 
   nn::ManualSeed(42);
+  auto& gpu_device = nn::g_device;
   int B = 4, in_features = 3, out_features = 2;
   nn::Linear<float> m(in_features, out_features, true);
   std::vector<float> x = {-1.122856, -0.186328, 2.208201,  -0.637997,
                           0.461657,  0.267351,  0.534905,  0.809357,
                           1.110290,  -1.689799, -0.988960, 0.957972};
+  Parameter d_x(DT_FLOAT, x.size());
+  gpu_device.memcpyHostToDevice(d_x.data<float>(), x.data(),
+                                sizeof(float) * x.size());
+  gpu_device.synchronize();
 
   // forward
-  std::vector<float> y(8);
-  auto xm = MakeConstMatrix(x.data(), B, in_features);
-  auto ym = MakeMatrix(y.data(), B, out_features);
+  Parameter d_y(DT_FLOAT, 8);
+  auto xm = d_x.const_matrix<float>(B, in_features);
+  auto ym = d_y.matrix<float>(B, out_features);
   m.Forward(xm, ym);
 
   std::vector<float> expected_y = {-1.164687, 0.024384, -0.377635, -0.026553,
                                    0.192698,  0.649730, -1.630462, -0.320424};
+  std::vector<float> y(8);
+  gpu_device.memcpyDeviceToHost(y.data(), d_y.data<float>(),
+                                sizeof(float) * y.size());
+  gpu_device.synchronize();
   for (size_t i = 0; i < expected_y.size(); ++i) {
     EXPECT_NEAR(expected_y[i], y[i], 1e-4);
   }
 
   // backward
+  Parameter d_y_grad(DT_FLOAT, y.size());
+  Parameter d_x_grad(DT_FLOAT, x.size());
   std::vector<float> y_grad(y.size(), 1.0f);
   std::vector<float> x_grad(x.size(), 0.f);
-  auto y_gradm = MakeConstMatrix(y_grad.data(), B, out_features);
-  auto x_gradm = MakeMatrix(x_grad.data(), B, in_features);
+  gpu_device.memcpyHostToDevice(d_y_grad.data<float>(), y_grad.data(),
+                                sizeof(float) * y_grad.size());
+  gpu_device.memcpyHostToDevice(d_x_grad.data<float>(), x_grad.data(),
+                                sizeof(float) * x_grad.size());
+  gpu_device.synchronize();
+  auto y_gradm = d_y_grad.const_matrix<float>(B, out_features);
+  auto x_gradm = d_x_grad.matrix<float>(B, in_features);
   m.Backward(xm, y_gradm, x_gradm);
+  gpu_device.memcpyDeviceToHost(x_grad.data(), d_x_grad.data<float>(),
+                                sizeof(float) * x_grad.size());
+  std::vector<float> weight_grad(m.weight_->size()), bias_grad(m.bias_->size());
+  gpu_device.memcpyDeviceToHost(weight_grad.data(), m.weight_->grad<float>(),
+                                sizeof(float) * weight_grad.size());
+  gpu_device.memcpyDeviceToHost(bias_grad.data(), m.bias_->grad<float>(),
+                                sizeof(float) * bias_grad.size());
+  gpu_device.synchronize();
 
   std::vector<float> expected_w_grad = {-2.915748, 0.095726, 4.543815,
                                         -2.915748, 0.095726, 4.543815};
@@ -151,10 +223,10 @@ loss.backward()
       0.971767, 0.352706, -0.018753, 0.971767, 0.352706, -0.018753};
 
   for (size_t i = 0; i < expected_w_grad.size(); ++i) {
-    EXPECT_NEAR(expected_w_grad[i], m.weight_->grad<float>()[i], 1e-5);
+    EXPECT_NEAR(expected_w_grad[i], weight_grad[i], 1e-5);
   }
   for (size_t i = 0; i < expected_b_grad.size(); ++i) {
-    EXPECT_NEAR(expected_b_grad[i], m.bias_->grad<float>()[i], 1e-5);
+    EXPECT_NEAR(expected_b_grad[i], bias_grad[i], 1e-5);
   }
   for (size_t i = 0; i < expected_x_grad.size(); ++i) {
     EXPECT_NEAR(expected_x_grad[i], x_grad[i], 1e-5);
@@ -173,13 +245,18 @@ loss.backward()
 */
 
   nn::ManualSeed(42);
+  auto& gpu_device = nn::g_device;
   int vocab_size = 10, dim = 3;
   nn::Embedding m(vocab_size, dim);
 
   std::vector<int> idx = {1, 2, 4, 5, 4, 3, 2, 9};
-  std::vector<float> embedding(idx.size() * dim);
-  m.Forward(idx, absl::MakeSpan(embedding));
+  nn::Parameter embedding_gpu(DT_FLOAT, idx.size() * dim);
+  m.Forward(idx, embedding_gpu.span<float>());
 
+  std::vector<float> embedding(idx.size() * dim);
+  gpu_device.memcpyDeviceToHost(embedding.data(), embedding_gpu.data<float>(),
+                                sizeof(float) * embedding.size());
+  gpu_device.synchronize();
   std::vector<float> expected_embedding = {
       -2.105521, 0.678418,  -1.234545, -0.043067, -1.604667, -0.752135,
       -0.727881, -0.559430, -2.316923, -0.216805, -1.384674, -0.871236,
@@ -193,10 +270,19 @@ loss.backward()
                                         1., 1., 2., 2., 2., 1., 1., 1., 0., 0.,
                                         0., 0., 0., 0., 0., 0., 0., 1., 1., 1.};
   std::vector<float> grad_embedding(idx.size() * dim, 1.0f);
-  m.Backward(idx, absl::MakeSpan(grad_embedding));
+  nn::Parameter grad_embedding_gpu(DT_FLOAT, idx.size() * dim);
+  gpu_device.memcpyHostToDevice(grad_embedding_gpu.data<float>(),
+                                grad_embedding.data(),
+                                sizeof(float) * grad_embedding.size());
+  gpu_device.synchronize();
+  m.Backward(idx, grad_embedding_gpu.span<float>());
 
+  std::vector<float> weight_grad(m.weight_->size());
+  gpu_device.memcpyDeviceToHost(weight_grad.data(), m.weight_->grad<float>(),
+                                sizeof(float) * weight_grad.size());
+  gpu_device.synchronize();
   for (size_t i = 0; i < expected_w_grad.size(); ++i) {
-    EXPECT_NEAR(expected_w_grad[i], m.weight_->grad<float>()[i], 1e-5);
+    EXPECT_NEAR(expected_w_grad[i], weight_grad[i], 1e-5);
   }
 }
 
@@ -214,15 +300,18 @@ loss.backward()
   */
 
   nn::ManualSeed(42);
+  auto& gpu_device = nn::g_device;
   int batch = 4, sentence_length = 16, embedding_dim = 4;
-  std::vector<float> x(batch * sentence_length * embedding_dim);
-  nn::NormalFill(absl::MakeSpan(x));
-  auto x_m = MakeConstMatrix(x.data(), batch * sentence_length, embedding_dim);
+  Parameter x(DT_FLOAT, batch * sentence_length * embedding_dim);
+  nn::NormalFill(x.span<float>());
+  auto x_m =
+      MakeConstMatrix(x.data<float>(), batch * sentence_length, embedding_dim);
   int row_size = batch * sentence_length;
-  std::vector<float> y(x.size(), 0), mean(row_size, 0), rstd(row_size, 0);
-  auto y_m = MakeMatrix(y.data(), row_size, embedding_dim);
-  auto mean_m = MakeFlat(mean.data(), row_size);
-  auto rstd_m = MakeFlat(rstd.data(), row_size);
+  Parameter y(DT_FLOAT, x.size()), mean(DT_FLOAT, row_size),
+      rstd(DT_FLOAT, row_size);
+  auto y_m = MakeMatrix(y.data<float>(), row_size, embedding_dim);
+  auto mean_m = MakeFlat(mean.data<float>(), row_size);
+  auto rstd_m = MakeFlat(rstd.data<float>(), row_size);
   auto m = nn::LayerNorm<float>(embedding_dim);
   m.Forward(x_m, y_m, mean_m, rstd_m);
   std::vector<float> expected_y = {
@@ -269,16 +358,26 @@ loss.backward()
       -1.304491, 0.800871,  -0.622824, 1.126445,  -1.064767, -0.092131,
       -0.467621, 1.624519,  1.057049,  -1.618052, 0.511932,  0.049071,
       0.590086,  0.777018,  0.343934,  -1.711037};
+  std::vector<float> y_cpu(y.size());
+  gpu_device.memcpyDeviceToHost(y_cpu.data(), y.data<float>(),
+                                sizeof(float) * y.size());
+  gpu_device.synchronize();
   for (size_t i = 0; i < expected_y.size(); ++i) {
-    EXPECT_NEAR(expected_y[i], y[i], 1e-5);
+    EXPECT_NEAR(expected_y[i], y_cpu[i], 1e-5);
   }
 
   // backward
   std::vector<float> y_grad(x.size(), 1.0), x_grad(x.size(), 0);
-  auto y_grad_m = MakeConstMatrix(y_grad.data(), row_size, embedding_dim);
-  auto x_grad_m = MakeMatrix(x_grad.data(), row_size, embedding_dim);
-  auto mean_const = MakeConstFlat(mean.data(), row_size);
-  auto rstd_const = MakeConstFlat(rstd.data(), row_size);
+  Parameter y_grad_gpu(DT_FLOAT, x.size()), x_grad_gpu(DT_FLOAT, x.size());
+  gpu_device.memcpyHostToDevice(y_grad_gpu.data<float>(), y_grad.data(),
+                                sizeof(float) * y_grad.size());
+  gpu_device.memcpyHostToDevice(x_grad_gpu.data<float>(), x_grad.data(),
+                                sizeof(float) * x_grad.size());
+  auto y_grad_m =
+      MakeConstMatrix(y_grad_gpu.data<float>(), row_size, embedding_dim);
+  auto x_grad_m = MakeMatrix(x_grad_gpu.data<float>(), row_size, embedding_dim);
+  auto mean_const = MakeConstFlat(mean.data<float>(), row_size);
+  auto rstd_const = MakeConstFlat(rstd.data<float>(), row_size);
   m.Backward(x_m, y_grad_m, mean_const, rstd_const, x_grad_m);
 
   std::vector<float>
@@ -349,11 +448,17 @@ loss.backward()
           0.000000e+00,  0.000000e+00,  0.000000e+00,  0.000000e+00,
           1.192093e-07,  0.000000e+00,  1.192093e-07,  0.000000e+00,
           0.000000e+00,  0.000000e+00,  0.000000e+00,  0.000000e+00};
+  std::vector<float> weight_grad(m.weight_->size()), bias_grad(m.bias_->size());
+  gpu_device.memcpyDeviceToHost(weight_grad.data(), m.weight_->grad<float>(),
+                                weight_grad.size() * sizeof(float));
+  gpu_device.memcpyDeviceToHost(bias_grad.data(), m.bias_->grad<float>(),
+                                bias_grad.size() * sizeof(float));
+  gpu_device.synchronize();
   for (size_t i = 0; i < expected_w_grad.size(); ++i) {
-    EXPECT_NEAR(expected_w_grad[i], m.weight_->grad<float>()[i], 1e-5);
+    EXPECT_NEAR(expected_w_grad[i], weight_grad[i], 1e-5);
   }
   for (size_t i = 0; i < expected_b_grad.size(); ++i) {
-    EXPECT_NEAR(expected_b_grad[i], m.bias_->grad<float>()[i], 1e-5);
+    EXPECT_NEAR(expected_b_grad[i], bias_grad[i], 1e-5);
   }
   for (size_t i = 0; i < expected_x_grad.size(); ++i) {
     EXPECT_NEAR(expected_x_grad[i], x_grad[i], 1e-5);
@@ -377,6 +482,7 @@ loss = torch.sum(y)
 loss.backward()
   */
 
+  auto& gpu_device = nn::g_device;
   // forward
   std::vector<float> x = {0.336690,  0.128809,  0.234462, 0.230333,
                           -1.122856, -0.186328, 2.208201, -0.637997,
@@ -385,187 +491,35 @@ loss.backward()
                                    -0.147006, -0.079394, 2.178409, -0.167029,
                                    0.312915,  0.161853,  0.376359, 0.639989};
   std::vector<float> y(x.size(), 0);
+  Parameter x_gpu(DT_FLOAT, x.size()), y_gpu(DT_FLOAT, y.size());
+  gpu_device.memcpyHostToDevice(x_gpu.data<float>(), x.data(),
+                                sizeof(float) * x.size());
+  gpu_device.synchronize();
   nn::NewGELU<float> m;
-  m.Forward(MakeConstFlat(x.data(), x.size()), MakeFlat(y.data(), y.size()));
+  m.Forward(x_gpu.const_flat<float>(), y_gpu.flat<float>());
+  gpu_device.memcpyDeviceToHost(y.data(), y_gpu.data<float>(),
+                                sizeof(float) * y.size());
   for (size_t i = 0; i < expected_y.size(); ++i) {
     EXPECT_NEAR(expected_y[i], y[i], 1e-5);
   }
 
   // backward
   std::vector<float> y_grad(x.size(), 1.0f), x_grad(x.size(), 0.f);
-  m.Backward(MakeConstFlat(x.data(), x.size()),
-             MakeConstFlat(y_grad.data(), y_grad.size()),
-             MakeFlat(x_grad.data(), x_grad.size()));
+  Parameter y_grad_gpu(DT_FLOAT, y_grad.size()),
+      x_grad_gpu(DT_FLOAT, x_grad.size());
+  gpu_device.memcpyHostToDevice(y_grad_gpu.data<float>(), y_grad.data(),
+                                sizeof(float) * y_grad.size());
+  gpu_device.memcpyHostToDevice(x_grad_gpu.data<float>(), x_grad.data(),
+                                sizeof(float) * x_grad.size());
+  m.Backward(x_gpu.const_flat<float>(), y_grad_gpu.const_flat<float>(),
+             x_grad_gpu.flat<float>());
+  gpu_device.memcpyDeviceToHost(x_grad.data(), x_grad_gpu.data<float>(),
+                                sizeof(float) * x_grad.size());
+  gpu_device.synchronize();
   std::vector<float> expected_x_grad = {
       0.758699, 0.602206, 0.683672, 0.680552, -0.107435, 0.353047,
       1.064087, 0.054299, 0.843291, 0.708290, 0.888446,  1.023232};
   for (size_t i = 0; i < expected_x_grad.size(); ++i) {
     EXPECT_NEAR(expected_x_grad[i], x_grad[i], 1e-5);
-  }
-}
-
-TEST(SoftmaxCrossEntropy, ForwardAndBackward) {
-  /*
-
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-torch.manual_seed(42)
-torch.set_printoptions(precision=6)
-batch, dim = 4, 3
-x = torch.randn(batch, dim)
-x = nn.Parameter(x)
-target = torch.LongTensor([1, 2, 1, 0])
-l = nn.CrossEntropyLoss()
-loss = l(x, target)
-loss.backward()
-
-  */
-
-  nn::ManualSeed(42);
-  int batch = 4, dim = 3;
-  // forward
-  std::vector<float> logits(batch * dim), probs(batch * dim),
-      logits_grad(batch * dim, 0);
-  nn::NormalFill(absl::MakeSpan(logits));
-  std::vector<int> target = {1, 2, 1, 0};
-
-  auto logits_m = MakeConstMatrix(logits.data(), batch, dim);
-  auto probs_m = MakeMatrix(probs.data(), batch, dim);
-  float loss1 = 0.0, loss2 = 0.0;
-
-  // Reduction: MEAN
-  nn::SoftmaxCrossEntropy<float> criterion1;
-  criterion1.Forward(logits_m, absl::MakeSpan(target), probs_m, &loss1);
-
-  auto probs_const = MakeConstMatrix(probs.data(), batch, dim);
-  auto logits_grad_m = MakeMatrix(logits_grad.data(), batch, dim);
-  criterion1.Backward(probs_const, absl::MakeSpan(target), logits_grad_m);
-
-  std::vector<float> expected_logits_grad1 = {
-      0.092077, -0.175206, 0.083129, 0.130367,  0.033689, -0.164056,
-      0.202850, -0.238222, 0.035372, -0.187907, 0.081141, 0.106766};
-
-  for (size_t i = 0; i < expected_logits_grad1.size(); ++i) {
-    EXPECT_NEAR(expected_logits_grad1[i], logits_grad[i], 1e-5);
-  }
-
-  // Reduction: SUM
-  nn::SoftmaxCrossEntropy<float> criterion2(
-      nn::SoftmaxCrossEntropy<float>::SUM);
-  criterion2.Forward(logits_m, absl::MakeSpan(target), probs_m, &loss2);
-  EXPECT_NEAR(loss1 * batch, loss2, 1e-5);
-
-  logits_grad_m.setZero();
-  criterion2.Backward(probs_const, absl::MakeSpan(target), logits_grad_m);
-  std::vector<float> expected_logits_grad2 = {
-      0.368307, -0.700823, 0.332516, 0.521469,  0.134755, -0.656224,
-      0.811398, -0.952886, 0.141488, -0.751628, 0.324564, 0.427064};
-
-  for (size_t i = 0; i < expected_logits_grad2.size(); ++i) {
-    EXPECT_NEAR(expected_logits_grad2[i], logits_grad[i], 1e-5);
-  }
-}
-
-TEST(SoftmaxCrossEntropy, ForwardAndBackward2) {
-  nn::ManualSeed(42);
-  int batch = 4, dim = 3;
-  // forward
-  std::vector<float> logits(batch * dim), labels(batch * dim, 0),
-      logits_grad(batch * dim, 0), scratch(batch, 0), loss(batch, 0);
-  nn::NormalFill(absl::MakeSpan(logits));
-  std::vector<int> target = {1, 2, 1, 0};
-  auto logit_2d = MakeConstMatrix(logits.data(), batch, dim);
-  auto label_2d = MakeConstMatrix(labels.data(), batch, dim);
-  auto mutable_label_2d = MakeMatrix(labels.data(), batch, dim);
-  auto scratch_1d = MakeFlat(scratch.data(), batch);
-  auto loss_1d = MakeFlat(loss.data(), batch);
-  auto logit_grad_2d = MakeMatrix(logits_grad.data(), batch, dim);
-  for (int i = 0; i < batch; ++i) {
-    int ix = target[i];
-    mutable_label_2d(i, ix) = 1.0f;
-  }
-
-  nn::SoftmaxCrossEntropy<float>::ForwardAndBackward(
-      logit_2d, label_2d, scratch_1d, loss_1d, logit_grad_2d);
-
-  const float factor = 1.f / loss.size();
-  logit_grad_2d.device(nn::g_device) = logit_grad_2d * factor;
-  std::vector<float> expected_logits_grad = {
-      0.092077, -0.175206, 0.083129, 0.130367,  0.033689, -0.164056,
-      0.202850, -0.238222, 0.035372, -0.187907, 0.081141, 0.106766};
-
-  for (size_t i = 0; i < expected_logits_grad.size(); ++i) {
-    EXPECT_NEAR(expected_logits_grad[i], logits_grad[i], 1e-5);
-  }
-}
-
-TEST(CrossEntropy, ForwardAndBackward) {
-  /*
-
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-torch.manual_seed(42)
-torch.set_printoptions(precision=6)
-batch, dim = 4, 3
-x = torch.randn(batch, dim)
-x = nn.Parameter(x)
-target = torch.LongTensor([1, 2, 1, 0])
-l = nn.CrossEntropyLoss()
-loss = l(x, target)
-loss.backward()
-
-  */
-
-  nn::ManualSeed(42);
-  int batch = 4, dim = 3;
-  // forward
-  std::vector<float> logits(batch * dim), probs(batch * dim),
-      logits_grad(batch * dim, 0), probs_grad(batch * dim, 0);
-  nn::NormalFill(absl::MakeSpan(logits));
-  std::vector<int> target = {1, 2, 1, 0};
-
-  auto logits_m = MakeConstMatrix(logits.data(), batch, dim);
-  auto probs_m = MakeMatrix(probs.data(), batch, dim);
-  auto probs_const = MakeConstMatrix(probs.data(), batch, dim);
-  float loss1 = 0.0, loss2 = 0.0;
-
-  // Reduction: MEAN
-  nn::Softmax<float> softmax;
-  nn::CrossEntropy<float> criterion1;
-  softmax.Forward(logits_m, probs_m);
-  criterion1.Forward(probs_const, absl::MakeSpan(target), &loss1);
-
-  auto logits_grad_m = MakeMatrix(logits_grad.data(), batch, dim);
-  auto probs_grad_m = MakeMatrix(probs_grad.data(), batch, dim);
-  auto probs_grad_const = MakeConstMatrix(probs_grad.data(), batch, dim);
-  criterion1.Backward(probs_const, absl::MakeSpan(target), probs_grad_m);
-  softmax.Backward(probs_const, probs_grad_const, logits_grad_m);
-
-  std::vector<float> expected_logits_grad1 = {
-      0.092077, -0.175206, 0.083129, 0.130367,  0.033689, -0.164056,
-      0.202850, -0.238222, 0.035372, -0.187907, 0.081141, 0.106766};
-
-  for (size_t i = 0; i < expected_logits_grad1.size(); ++i) {
-    EXPECT_NEAR(expected_logits_grad1[i], logits_grad[i], 1e-5);
-  }
-
-  // Reduction: SUM
-  nn::CrossEntropy<float> criterion2(nn::CrossEntropy<float>::SUM);
-  softmax.Forward(logits_m, probs_m);
-  criterion2.Forward(probs_const, absl::MakeSpan(target), &loss2);
-  EXPECT_NEAR(loss1 * batch, loss2, 1e-5);
-
-  logits_grad_m.setZero();
-  probs_grad_m.setZero();
-  criterion2.Backward(probs_const, absl::MakeSpan(target), probs_grad_m);
-  softmax.Backward(probs_const, probs_grad_const, logits_grad_m);
-  std::vector<float> expected_logits_grad2 = {
-      0.368307, -0.700823, 0.332516, 0.521469,  0.134755, -0.656224,
-      0.811398, -0.952886, 0.141488, -0.751628, 0.324564, 0.427064};
-
-  for (size_t i = 0; i < expected_logits_grad2.size(); ++i) {
-    EXPECT_NEAR(expected_logits_grad2[i], logits_grad[i], 1e-5);
   }
 }

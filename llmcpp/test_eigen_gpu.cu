@@ -1,4 +1,4 @@
-#define EIGEN_USE_GPU
+//#define EIGEN_USE_GPU
 
 #include "gpt.hpp"
 // #include "optim.hpp"

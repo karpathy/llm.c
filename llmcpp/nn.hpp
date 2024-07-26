@@ -19,21 +19,61 @@
 
 namespace nn {
 
+#ifdef EIGEN_USE_GPU
+Eigen::GpuStreamDevice g_stream;
+Eigen::GpuDevice g_device(&g_stream);
+#else
+Eigen::ThreadPool g_thread_pool(16 /* number of threads in pool */);
+Eigen::ThreadPoolDevice g_device(&g_thread_pool,
+                                 12 /* number of threads to use */);
+#endif
+
 mt19937_state g_mt19937_state;
 
 void ManualSeed(unsigned int seed) { manual_seed(&g_mt19937_state, seed); }
 
+void ConstantFill(absl::Span<float> weight, float C) {
+#ifdef EIGEN_USE_GPU
+  std::vector<float> w(weight.size(), C);
+  g_device.memcpyHostToDevice(weight.data(), w.data(),
+                              sizeof(float) * w.size());
+#else
+  absl::c_fill(weight, C);
+#endif
+}
+
 void UniformFill(absl::Span<float> weight, float from = 0.0, float to = 1.0) {
+#ifdef EIGEN_USE_GPU
+  std::vector<float> w(weight.size());
+  uniform_(w.data(), w.size(), from, to, &g_mt19937_state);
+  g_device.memcpyHostToDevice(weight.data(), w.data(),
+                              sizeof(float) * w.size());
+#else
   uniform_(weight.data(), weight.size(), from, to, &g_mt19937_state);
+#endif
 }
 
 void NormalFill(absl::Span<float> weight, float mean = 0.0, float std = 1.0) {
+#ifdef EIGEN_USE_GPU
+  std::vector<float> w(weight.size());
+  normal_(w.data(), w.size(), mean, std, &g_mt19937_state);
+  g_device.memcpyHostToDevice(weight.data(), w.data(),
+                              sizeof(float) * w.size());
+#else
   normal_(weight.data(), weight.size(), mean, std, &g_mt19937_state);
+#endif
 }
 
 void KaimingUniformFill(absl::Span<float> weight, int in_features) {
   const float bound = std::sqrt(1.0f / in_features);
+#ifdef EIGEN_USE_GPU
+  std::vector<float> w(weight.size());
+  uniform_(w.data(), w.size(), -bound, bound, &g_mt19937_state);
+  g_device.memcpyHostToDevice(weight.data(), w.data(),
+                              sizeof(float) * w.size());
+#else
   uniform_(weight.data(), weight.size(), -bound, bound, &g_mt19937_state);
+#endif
 }
 
 std::pair<int, int> SplitRange(int total, int idx, int n) {
@@ -45,10 +85,6 @@ std::pair<int, int> SplitRange(int total, int idx, int n) {
     return {q * idx + r, q * (idx + 1) + r};
   }
 }
-
-Eigen::ThreadPool g_thread_pool(16 /* number of threads in pool */);
-Eigen::ThreadPoolDevice g_cpu_device(&g_thread_pool,
-                                     12 /* number of threads to use */);
 
 enum DataType : int { DT_FLOAT = 1, DT_HALF = 2, DT_INT32 = 3 };
 
@@ -104,8 +140,8 @@ struct Parameter {
   }
 
   ~Parameter() {
-    g_cpu_device.deallocate(data_);
-    g_cpu_device.deallocate(grad_);
+    g_device.deallocate(data_);
+    g_device.deallocate(grad_);
   }
 
   int64_t size() const { return num_element_; }
@@ -273,9 +309,9 @@ struct Parameter {
  private:
   static void* Allocate(DataType dtype, int64_t num_element) {
     if (dtype == DT_FLOAT) {
-      return g_cpu_device.allocate(sizeof(float) * num_element);
+      return g_device.allocate(sizeof(float) * num_element);
     } else if (dtype == DT_HALF) {
-      return g_cpu_device.allocate(sizeof(Eigen::half) * num_element);
+      return g_device.allocate(sizeof(Eigen::half) * num_element);
     } else {
       throw std::invalid_argument("invalid data type: " +
                                   std::to_string(dtype));
@@ -284,9 +320,9 @@ struct Parameter {
 
   static void Zero(void* data, DataType dtype, int64_t num_element) {
     if (dtype == DT_FLOAT) {
-      g_cpu_device.memset(data, 0, sizeof(float) * num_element);
+      g_device.memset(data, 0, sizeof(float) * num_element);
     } else if (dtype == DT_HALF) {
-      g_cpu_device.memset(data, 0, sizeof(Eigen::half) * num_element);
+      g_device.memset(data, 0, sizeof(Eigen::half) * num_element);
     } else {
       throw std::invalid_argument("invalid data type: " +
                                   std::to_string(dtype));
@@ -315,7 +351,7 @@ struct MatMul {
     //    y.noalias() = x1 * x2;
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
         Eigen::IndexPair<int>(1, 0)};
-    y.device(g_cpu_device) = x1.contract(x2, product_dims);
+    y.device(g_device) = x1.contract(x2, product_dims);
   }
 
   static void Backward(typename TTypes<T>::ConstMatrix x1,
@@ -340,7 +376,7 @@ struct MatMul {
     //        = [M, N]
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
         Eigen::IndexPair<int>(1, 1)};
-    x1_grad.device(g_cpu_device) += y_grad.contract(x2, product_dims);
+    x1_grad.device(g_device) += y_grad.contract(x2, product_dims);
 
     // x2_grad = dL/dy * dy/dx2
     //        = x1^T(N, M) * y_grad(M, K)
@@ -348,7 +384,7 @@ struct MatMul {
 
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims2 = {
         Eigen::IndexPair<int>(0, 0)};
-    x2_grad.device(g_cpu_device) += x1.contract(y_grad, product_dims2);
+    x2_grad.device(g_device) += x1.contract(y_grad, product_dims2);
   }
 };
 
@@ -361,7 +397,7 @@ struct Residual {
     CHECK(N == Fx.size() && N == Hx.size());
 
     // H(x) = x + F(x) -> F(x) = H(x) - x
-    Hx.device(g_cpu_device) = x + Fx;
+    Hx.device(g_device) = x + Fx;
   }
 
   static void Backward(typename TTypes<T>::ConstFlat Hx_grad,
@@ -370,8 +406,8 @@ struct Residual {
     int N = Hx_grad.size();
     CHECK(N == x_grad.size() && N == Fx_grad.size());
 
-    x_grad.device(g_cpu_device) += Hx_grad;
-    Fx_grad.device(g_cpu_device) += Hx_grad;
+    x_grad.device(g_device) += Hx_grad;
+    Fx_grad.device(g_device) += Hx_grad;
   }
 };
 
@@ -406,10 +442,10 @@ struct Linear {
       auto bias = MakeFlat(bias_->data<T>(), out_features_);
       Eigen::array<int, 2> broadcast_dims = {static_cast<int>(y.dimension(0)),
                                              1};
-      y.device(g_cpu_device) =
+      y.device(g_device) =
           x.contract(weight, product_dims) + bias.broadcast(broadcast_dims);
     } else {
-      y.device(g_cpu_device) = x.contract(weight, product_dims);
+      y.device(g_device) = x.contract(weight, product_dims);
     }
   }
 
@@ -433,14 +469,14 @@ struct Linear {
     //        = [B, in_features]
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
         Eigen::IndexPair<int>(1, 0)};
-    x_grad.device(g_cpu_device) += y_grad.contract(weight, product_dims);
+    x_grad.device(g_device) += y_grad.contract(weight, product_dims);
 
     // w_grad = dL/dy * dy/dw
     //        = y_grad^T(out_features, B) * x(B, in_features)
     //        = [out_features, in_features]
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims2 = {
         Eigen::IndexPair<int>(0, 0)};
-    weight_grad.device(g_cpu_device) += y_grad.contract(x, product_dims2);
+    weight_grad.device(g_device) += y_grad.contract(x, product_dims2);
 
     if (has_bias_) {
       // b_grad = dL/dy * dy/db
@@ -449,7 +485,7 @@ struct Linear {
       bias_->LazyAllocateGradient();
       auto bias_grad = MakeFlat(bias_->grad<T>(), out_features_);
       Eigen::array<Eigen::Index, 1> along_batch = {0};
-      bias_grad.device(g_cpu_device) = y_grad.sum(along_batch);
+      bias_grad.device(g_device) = y_grad.sum(along_batch);
     }
   }
 
@@ -490,7 +526,7 @@ struct Embedding {
       CHECK_LT(idx[i], num_embeddings_);
       void* dst = embedding.data() + i * embedding_dim_;
       void* src = weight_->data<float>() + idx[i] * embedding_dim_;
-      g_cpu_device.memcpy(dst, src, sizeof(float) * embedding_dim_);
+      g_device.memcpy(dst, src, sizeof(float) * embedding_dim_);
     }
   }
 
@@ -500,14 +536,13 @@ struct Embedding {
 
     // Lazily allocate the memory for gradients
     weight_->LazyAllocateGradient();
-
     for (size_t i = 0; i < idx.size(); ++i) {
       CHECK_LT(idx[i], num_embeddings_);
       const float* g = grad_embedding.data() + i * embedding_dim_;
       float* grad = weight_->grad<float>() + idx[i] * embedding_dim_;
-      auto g_1d = MakeConstFlat(g, embedding_dim_);
-      auto grad_1d = MakeFlat(grad, embedding_dim_);
-      grad_1d.device(g_cpu_device) += g_1d;
+      auto g_1d = TTypes<float>::UnalignedConstFlat(g, embedding_dim_);
+      auto grad_1d = TTypes<float>::UnalignedFlat(grad, embedding_dim_);
+      grad_1d.device(g_device) += g_1d;
     }
   }
 
@@ -529,10 +564,10 @@ struct LayerNorm {
     auto dtype = DataTypeToEnum<T>::value;
     weight_ = std::make_unique<Parameter>(dtype, normalized_shape);
     auto w = weight_->span<T>();
-    absl::c_fill(w, 1.0f);
+    ConstantFill(w, 1.0f);
     bias_ = std::make_unique<Parameter>(dtype, normalized_shape);
     auto b = bias_->span<T>();
-    absl::c_fill(b, 0.0f);
+    ConstantFill(b, 0.0f);
 
     // activation gradient tensor
     norm_ = std::make_unique<Parameter>(dtype);             // [B, D]
@@ -554,7 +589,7 @@ struct LayerNorm {
     CHECK_EQ(rstd.size(), B);
 
     Eigen::array<Eigen::Index, 1> along_class = {1};
-    mean.device(g_cpu_device) = x.mean(along_class);
+    mean.device(g_device) = x.mean(along_class);
 
     // x_zero_centered(B, D) = x.colwise() - m.transpose()
     // x_zero_centered_square(B, D) = x_zero_centered.array().square()
@@ -565,7 +600,7 @@ struct LayerNorm {
     int batch_size = x.dimension(0), num_class = x.dimension(1);
     Eigen::array<Eigen::Index, 2> batch_by_one = {batch_size, 1};
     Eigen::array<Eigen::Index, 2> one_by_class = {1, num_class};
-    rstd.device(g_cpu_device) =
+    rstd.device(g_device) =
         ((x - mean.reshape(batch_by_one).broadcast(one_by_class))
              .square()
              .mean(along_class) +
@@ -579,7 +614,7 @@ struct LayerNorm {
 
     auto weight_1d = MakeFlat(weight_->data<T>(), normalized_shape_);
     auto bias_1d = MakeFlat(bias_->data<T>(), normalized_shape_);
-    y.device(g_cpu_device) =
+    y.device(g_device) =
         (x - mean.reshape(batch_by_one).broadcast(one_by_class)) *
             rstd.reshape(batch_by_one).broadcast(one_by_class) *
             weight_1d.reshape(one_by_class).broadcast(batch_by_one) +
@@ -630,17 +665,17 @@ struct LayerNorm {
     auto dnorm_2d = dnorm_->matrix<T>(B, D);
     auto dnorm_mean_1d = dnorm_mean_->flat<T>();
     auto dnorm_norm_mean_1d = dnorm_norm_mean_->flat<T>();
-    norm_2d.device(g_cpu_device) =
+    norm_2d.device(g_device) =
         (x - mean.reshape(batch_by_one).broadcast(one_by_class)) *
         rstd.reshape(batch_by_one).broadcast(one_by_class);  // [B, D]
-    dnorm_2d.device(g_cpu_device) =
+    dnorm_2d.device(g_device) =
         y_grad *
         weight_1d.reshape(one_by_class).broadcast(batch_by_one);  // [B, D]
     Eigen::array<Eigen::Index, 1> along_class = {1};
-    dnorm_mean_1d.device(g_cpu_device) = dnorm_2d.mean(along_class);  // [B,]
-    dnorm_norm_mean_1d.device(g_cpu_device) =
+    dnorm_mean_1d.device(g_device) = dnorm_2d.mean(along_class);  // [B,]
+    dnorm_norm_mean_1d.device(g_device) =
         (dnorm_2d * norm_2d).mean(along_class);  // [B,]
-    x_grad.device(g_cpu_device) +=
+    x_grad.device(g_device) +=
         ((dnorm_2d -
           dnorm_mean_1d.reshape(batch_by_one).broadcast(one_by_class)) -
          norm_2d *
@@ -652,13 +687,13 @@ struct LayerNorm {
     //        = \sum_i^B [y_grad(B, D) \elewise_dot x_norm(B, D)]
 
     Eigen::array<Eigen::Index, 1> along_batch = {0};
-    weight_grad_1d.device(g_cpu_device) += (y_grad * norm_2d).sum(along_batch);
+    weight_grad_1d.device(g_device) += (y_grad * norm_2d).sum(along_batch);
 
     // b_grad = dL/dy * dy/db
     //        = \sum_i^(B)(y_grad(B, D))
     //        = [D,]
 
-    bias_grad_1d.device(g_cpu_device) += y_grad.sum(along_batch);
+    bias_grad_1d.device(g_device) += y_grad.sum(along_batch);
   }
 
   size_t NumParameters() const { return normalized_shape_ * 2; }
@@ -690,7 +725,7 @@ struct NewGELU {
 
     // y = 0.5 * x * (1.0 + tanh[sqrt(2/pi) * (x + 0.044715 * x^3)])
     float coeff = 0.044715f;
-    y.device(g_cpu_device) =
+    y.device(g_device) =
         0.5 * x * (1.0 + ((sqrt_2_over_pi * (x + coeff * x * x * x)).tanh()));
   }
 
@@ -716,7 +751,7 @@ struct NewGELU {
     auto dydx = 0.5f * (1.0f + tanh_out) +
                 0.5f * x * (1.0f - tanh_out * tanh_out) *
                     (sqrt_2_over_pi * (1.0f + 3.0f * coeff * x * x));
-    x_grad.device(g_cpu_device) += y_grad * dydx;
+    x_grad.device(g_device) += y_grad * dydx;
   }
 };
 
@@ -735,16 +770,16 @@ struct Softmax {
     Eigen::array<Eigen::Index, 2> batch_by_one = {batch_size, 1};
     Eigen::array<Eigen::Index, 2> one_by_class = {1, num_class};
 
-    y.device(g_cpu_device) = (x - x.maximum(along_class)
-                                      .eval()
-                                      .reshape(batch_by_one)
-                                      .broadcast(one_by_class))
-                                 .exp();
-    y.device(g_cpu_device) = y * y.sum(along_class)
-                                     .inverse()
-                                     .eval()
-                                     .reshape(batch_by_one)
-                                     .broadcast(one_by_class);
+    y.device(g_device) = (x - x.maximum(along_class)
+                                  .eval()
+                                  .reshape(batch_by_one)
+                                  .broadcast(one_by_class))
+                             .exp();
+    y.device(g_device) = y * y.sum(along_class)
+                                 .inverse()
+                                 .eval()
+                                 .reshape(batch_by_one)
+                                 .broadcast(one_by_class);
   }
 
   void Backward(typename TTypes<T>::ConstMatrix y,
@@ -765,7 +800,7 @@ struct Softmax {
     auto dyy = y_grad * y;
     auto sum = dyy.sum(along_class).reshape(batch_by_one);
     auto sub = y_grad - sum.broadcast(one_by_class);
-    x_grad.device(g_cpu_device) += sub * y;
+    x_grad.device(g_device) += sub * y;
 
     /*
     // dy_j / dx_i = S_i(1 - S_j) for i==j
@@ -852,16 +887,62 @@ struct SoftmaxCrossEntropy {
     }
   }
 
+  static void ForwardAndBackward(typename TTypes<T>::ConstMatrix logits,
+                                 typename TTypes<T>::ConstMatrix labels,
+                                 typename TTypes<T>::Flat scratch,
+                                 typename TTypes<T>::Flat loss,
+                                 typename TTypes<T>::Matrix logit_grad) {
+    // logits: [B, C], targets: [B,], probs:[B, C], loss: scalar
+    int B = logits.dimension(0), C = logits.dimension(1);
+    CHECK(B == labels.dimension(0) && C == labels.dimension(1));
+    CHECK(B == logit_grad.dimension(0) && C == logit_grad.dimension(1));
+    CHECK_EQ(B, scratch.size());
+    CHECK_EQ(B, loss.size());
+
+    const int batch_size = B, num_class = C;
+    Eigen::array<Eigen::Index, 1> along_class = {1};
+    Eigen::array<Eigen::Index, 2> batch_by_one = {batch_size, 1};
+    Eigen::array<Eigen::Index, 2> one_by_class = {1, num_class};
+
+    // max_logits along classes.
+    scratch.device(g_device) = logits.maximum(along_class);
+
+    // logits - max_logits.
+    logit_grad.device(g_device) =
+        logits - scratch.reshape(batch_by_one).broadcast(one_by_class);
+
+    // sum(exp(logits - max_logits)) along classes.
+    scratch.device(g_device) = logit_grad.exp().sum(along_class);
+
+    // NOTE: Eigen on GPU dispatches to an optimized implementation
+    // for an expression of the form lhs = rhs.sum().
+    // lhs = -rhs.sum() doesn't match the above pattern, so folding in the
+    // negation before calling sum().
+    //  sum(-labels *
+    //     ((logits - max_logits) - log(sum(exp(logits - max_logits)))))
+    //  along classes
+    loss.device(g_device) =
+        (labels * (scratch.log().reshape(batch_by_one).broadcast(one_by_class) -
+                   logit_grad))
+            .sum(along_class);
+
+    // backprop: prob - labels, where
+    //   prob = exp(logits - max_logits) / sum(exp(logits - max_logits))
+    logit_grad.device(g_device) =
+        (logit_grad.exp() /
+         scratch.reshape(batch_by_one).broadcast(one_by_class)) -
+        labels;
+  }
+
   Reduction reduction_;
   std::unique_ptr<Softmax<T>> softmax_;
 };
 
 template <typename T>
-struct VanillaCrossEntropy {
+struct CrossEntropy {
   enum Reduction { MEAN, SUM };
 
-  VanillaCrossEntropy(Reduction reduction = Reduction::MEAN)
-      : reduction_(reduction) {}
+  CrossEntropy(Reduction reduction = Reduction::MEAN) : reduction_(reduction) {}
 
   void Forward(typename TTypes<T>::ConstMatrix probs,
                absl::Span<const int> targets, float* loss) {

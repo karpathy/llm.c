@@ -193,17 +193,17 @@ struct CausalSelfAttention {
     auto q_4d = q_->tensor_4d<Type>(B, NH, T, HS);
     auto k_4d = k_->tensor_4d<Type>(B, NH, HS, T);
     auto v_4d = v_->tensor_4d<Type>(B, NH, T, HS);
-    q_4d.device(nn::g_cpu_device) = qkv3d
+    q_4d.device(nn::g_device) = qkv3d
                                         .slice(offsets_q, extents)  // [B, T, C]
                                         .reshape(shape)       // [B, T, NH, HS]
                                         .shuffle(shuffle_qv)  // [B, NH, T, HS]
         ;
-    k_4d.device(nn::g_cpu_device) = qkv3d
+    k_4d.device(nn::g_device) = qkv3d
                                         .slice(offsets_k, extents)  // [B, T, C]
                                         .reshape(shape)      //  [B, T, NH, HS]
                                         .shuffle(shuffle_k)  //  [B, NH, HS, T]
         ;
-    v_4d.device(nn::g_cpu_device) = qkv3d
+    v_4d.device(nn::g_device) = qkv3d
                                         .slice(offsets_v, extents)  // [B, T, C]
                                         .reshape(shape)       //  [B, T, NH, HS]
                                         .shuffle(shuffle_qv)  //  [B, NH, T, HS]
@@ -253,7 +253,7 @@ struct CausalSelfAttention {
     Eigen::array<Eigen::Index, 4> shuffle_att = {0, 2, 1, 3};
     auto att_4d = att_->tensor_4d<Type>(B, NH, T, HS);
     auto att2_4d = att2_->tensor_4d<Type>(B, T, NH, HS);
-    att2_4d.device(nn::g_cpu_device) =
+    att2_4d.device(nn::g_device) =
         att_4d.shuffle(shuffle_att);  // [B, T, NH, HS]
     auto att2_2d = MakeConstMatrix(att2_->data<Type>(), B * T, C);
     auto y2d = MakeMatrix(y.data(), B * T, C);
@@ -299,7 +299,7 @@ struct CausalSelfAttention {
     Eigen::array<Eigen::Index, 4> shuffle_att = {0, 2, 1, 3};
     auto att_grad = att_->tensor_4d_grad<Type>(B, NH, T, HS);
     auto att2_grad = att2_->tensor_4d_grad<Type>(B, T, NH, HS);
-    att_grad.device(nn::g_cpu_device) =
+    att_grad.device(nn::g_device) =
         att2_grad.shuffle(shuffle_att);  // [B, NH, T, HS]
 
     // attention backward
@@ -363,15 +363,15 @@ struct CausalSelfAttention {
     auto q_grad = q_->tensor_4d_grad<Type>(B, NH, T, HS);
     auto k_grad = k_->tensor_4d_grad<Type>(B, NH, HS, T);
     auto v_grad = v_->tensor_4d_grad<Type>(B, NH, T, HS);
-    qkv_grad.slice(offsets_q, extents).device(nn::g_cpu_device) =
+    qkv_grad.slice(offsets_q, extents).device(nn::g_device) =
         q_grad.shuffle(shuffle_qv).reshape(shape);
 
     // k_grad_: [B, NH, HS, T] -> [B, T, NH, HS] -> [B, T, C]
-    qkv_grad.slice(offsets_k, extents).device(nn::g_cpu_device) =
+    qkv_grad.slice(offsets_k, extents).device(nn::g_device) =
         k_grad.shuffle(shuffle_k).reshape(shape);
 
     // v_grad_: [B, NH, T, HS] -> [B, T, NH, HS] -> [B, T, C]
-    qkv_grad.slice(offsets_v, extents).device(nn::g_cpu_device) =
+    qkv_grad.slice(offsets_v, extents).device(nn::g_device) =
         v_grad.shuffle(shuffle_qv).reshape(shape);
 
     // backward: qkv
@@ -653,7 +653,7 @@ struct GPT {
     //    nn::MatMul::Forward(lnf_y, lm_head, logits_2d);
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
         Eigen::IndexPair<int>(1, 1)};
-    logits_2d.device(nn::g_cpu_device) = lnf_y.contract(lm_head, product_dims);
+    logits_2d.device(nn::g_device) = lnf_y.contract(lm_head, product_dims);
   }
 
   void Forward(typename TTypes<int>::ConstMatrix idx,
@@ -680,7 +680,7 @@ struct GPT {
     // [BT, C] x [C, vocab_size] -> [BT, vocab_size]
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
         Eigen::IndexPair<int>(1, 1)};
-    logits_2d.device(nn::g_cpu_device) = lnf_y.contract(lm_head, product_dims);
+    logits_2d.device(nn::g_device) = lnf_y.contract(lm_head, product_dims);
 
     auto logits_2d_const = MakeConstMatrix(logits.data(), BT, vocab_size_);
     softmax_cross_entropy_->Forward(logits_2d_const, targets, probs_2d, loss);
@@ -729,9 +729,9 @@ struct GPT {
         Eigen::IndexPair<int>(1, 0)};
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims2 = {
         Eigen::IndexPair<int>(0, 0)};
-    lnf_y_grad.device(nn::g_cpu_device) += logits_grad_2d.contract(
+    lnf_y_grad.device(nn::g_device) += logits_grad_2d.contract(
         lm_head, product_dims);  // [BT, vocab_size] x [vocab_size, C]
-    lm_head_grad.device(nn::g_cpu_device) += logits_grad_2d.contract(
+    lm_head_grad.device(nn::g_device) += logits_grad_2d.contract(
         lnf_y, product_dims2);  // [vocab_size, BT] x [BT, C]
 
     // backward LNF
@@ -764,8 +764,8 @@ struct GPT {
     auto tok_emb_grad = tok_emb_->matrix_grad<Type>(B, TC);
     auto pos_emb_grad = pos_emb_->flat_grad<Type>();
     Eigen::array<Eigen::Index, 1> along_batch = {0};
-    tok_emb_grad.device(nn::g_cpu_device) = encoded_grad;
-    pos_emb_grad.device(nn::g_cpu_device) = tok_emb_grad.sum(along_batch);
+    tok_emb_grad.device(nn::g_device) = encoded_grad;
+    pos_emb_grad.device(nn::g_device) = tok_emb_grad.sum(along_batch);
 
     // backward wte, wpe
     std::vector<int> pos(T);
@@ -826,7 +826,7 @@ struct GPT {
     auto encoded = encoded_->matrix<Type>(B, TC);
     Eigen::array<Eigen::Index, 2> batch_by_one = {B, 1};
     Eigen::array<Eigen::Index, 2> one_by_class = {1, TC};
-    encoded.device(nn::g_cpu_device) =
+    encoded.device(nn::g_device) =
         tok_emb + pos_emb.reshape(one_by_class).broadcast(batch_by_one);
 
     for (int l = 0; l < n_layer_; ++l) {
