@@ -467,6 +467,39 @@ loss.backward()
   }
 }
 
+TEST(SoftmaxCrossEntropy, ForwardAndBackward2) {
+  nn::ManualSeed(42);
+  int batch = 4, dim = 3;
+  // forward
+  std::vector<float> logits(batch * dim), labels(batch * dim, 0),
+      logits_grad(batch * dim, 0), scratch(batch, 0), loss(batch, 0);
+  nn::NormalFill(absl::MakeSpan(logits));
+  std::vector<int> target = {1, 2, 1, 0};
+  auto logit_2d = MakeConstMatrix(logits.data(), batch, dim);
+  auto label_2d = MakeConstMatrix(labels.data(), batch, dim);
+  auto mutable_label_2d = MakeMatrix(labels.data(), batch, dim);
+  auto scratch_1d = MakeFlat(scratch.data(), batch);
+  auto loss_1d = MakeFlat(loss.data(), batch);
+  auto logit_grad_2d = MakeMatrix(logits_grad.data(), batch, dim);
+  for (int i = 0; i < batch; ++i) {
+    int ix = target[i];
+    mutable_label_2d(i, ix) = 1.0f;
+  }
+
+  nn::SoftmaxCrossEntropy<float>::ForwardAndBackward(
+      logit_2d, label_2d, scratch_1d, loss_1d, logit_grad_2d);
+
+  const float factor = 1.f / loss.size();
+  logit_grad_2d.device(nn::g_device) = logit_grad_2d * factor;
+  std::vector<float> expected_logits_grad = {
+      0.092077, -0.175206, 0.083129, 0.130367,  0.033689, -0.164056,
+      0.202850, -0.238222, 0.035372, -0.187907, 0.081141, 0.106766};
+
+  for (size_t i = 0; i < expected_logits_grad.size(); ++i) {
+    EXPECT_NEAR(expected_logits_grad[i], logits_grad[i], 1e-5);
+  }
+}
+
 TEST(CrossEntropy, ForwardAndBackward) {
   /*
 

@@ -536,13 +536,12 @@ struct Embedding {
 
     // Lazily allocate the memory for gradients
     weight_->LazyAllocateGradient();
-
     for (size_t i = 0; i < idx.size(); ++i) {
       CHECK_LT(idx[i], num_embeddings_);
       const float* g = grad_embedding.data() + i * embedding_dim_;
       float* grad = weight_->grad<float>() + idx[i] * embedding_dim_;
-      auto g_1d = MakeConstFlat(g, embedding_dim_);
-      auto grad_1d = MakeFlat(grad, embedding_dim_);
+      auto g_1d = TTypes<float>::UnalignedConstFlat(g, embedding_dim_);
+      auto grad_1d = TTypes<float>::UnalignedFlat(grad, embedding_dim_);
       grad_1d.device(g_device) += g_1d;
     }
   }
@@ -886,6 +885,53 @@ struct SoftmaxCrossEntropy {
         logits_grad(b, c) += (probs(b, c) - indicator) * factor;
       }
     }
+  }
+
+  static void ForwardAndBackward(typename TTypes<T>::ConstMatrix logits,
+                                 typename TTypes<T>::ConstMatrix labels,
+                                 typename TTypes<T>::Flat scratch,
+                                 typename TTypes<T>::Flat loss,
+                                 typename TTypes<T>::Matrix logit_grad) {
+    // logits: [B, C], targets: [B,], probs:[B, C], loss: scalar
+    int B = logits.dimension(0), C = logits.dimension(1);
+    CHECK(B == labels.dimension(0) && C == labels.dimension(1));
+    CHECK(B == logit_grad.dimension(0) && C == logit_grad.dimension(1));
+    CHECK_EQ(B, scratch.size());
+    CHECK_EQ(B, loss.size());
+
+    const int batch_size = B, num_class = C;
+    Eigen::array<Eigen::Index, 1> along_class = {1};
+    Eigen::array<Eigen::Index, 2> batch_by_one = {batch_size, 1};
+    Eigen::array<Eigen::Index, 2> one_by_class = {1, num_class};
+
+    // max_logits along classes.
+    scratch.device(g_device) = logits.maximum(along_class);
+
+    // logits - max_logits.
+    logit_grad.device(g_device) =
+        logits - scratch.reshape(batch_by_one).broadcast(one_by_class);
+
+    // sum(exp(logits - max_logits)) along classes.
+    scratch.device(g_device) = logit_grad.exp().sum(along_class);
+
+    // NOTE: Eigen on GPU dispatches to an optimized implementation
+    // for an expression of the form lhs = rhs.sum().
+    // lhs = -rhs.sum() doesn't match the above pattern, so folding in the
+    // negation before calling sum().
+    //  sum(-labels *
+    //     ((logits - max_logits) - log(sum(exp(logits - max_logits)))))
+    //  along classes
+    loss.device(g_device) =
+        (labels * (scratch.log().reshape(batch_by_one).broadcast(one_by_class) -
+                   logit_grad))
+            .sum(along_class);
+
+    // backprop: prob - labels, where
+    //   prob = exp(logits - max_logits) / sum(exp(logits - max_logits))
+    logit_grad.device(g_device) =
+        (logit_grad.exp() /
+         scratch.reshape(batch_by_one).broadcast(one_by_class)) -
+        labels;
   }
 
   Reduction reduction_;
