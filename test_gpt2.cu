@@ -142,7 +142,7 @@ int main(int argc, char *argv[]) {
     printf("batch_size: %d\n", B);
     printf("seq_len: %d\n", T);
 
-    set_zero_configs(&multi_gpu_config, 0, model.num_parameters);
+    set_zero_configs(&multi_gpu_config, 0, model.num_parameters, model.high_perf_mode);
 
     // read reference information from the file saved from Python/PyTorch side
     // 1) input x and y

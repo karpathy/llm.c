@@ -56,7 +56,7 @@ int main(int argc, char *argv[]) {
 
     // override number of layers to 1 because all layers repeat the same kernels, only profile once
     model.config.num_layers = 1;
-    set_zero_configs(&multi_gpu_config, 0, model.num_parameters);
+    set_zero_configs(&multi_gpu_config, 0, model.num_parameters, model.high_perf_mode);
 
     gpt2_allocate_state(&model, B, T);
     // do a training step
