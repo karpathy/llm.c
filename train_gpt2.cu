@@ -965,16 +965,13 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             };
             if(multi_gpu_config.zero_stage == 2) {
 #if MULTI_GPU
-                // wait for last layer's transfer to be completed, so we don't get any race conditions
+                // wait for previous layer's transfer to be completed, so we don't get any race conditions
                 // where main stream is writing to a buffer that nccl stream is reading
                 // this will result in a structure as follows:
-                // Main stream:     Calculate grads of layer 1 in buffer 1
-                // NCCL stream:     Wait for main stream
-                // Main stream:     Calculate grads of layer 2 in buffer 2
-                // NCCL stream:     Transmit data from buffer 1
-                // SYNC NNCL stream
-                // NCCL stream:     Wait for buffer 2 to be ready
-                // Main stream:     calculate grads of layer 3 in buffer 1
+                // main stream: calculate grads of layer n-1 and write to buffer 1 || NCCL stream: waiting for buffer 1 data
+                // main stream: calculate grads of layer n-2 and write to buffer 2 || NCCL stream: transmitting buffer 1 data
+                // main stream: potentially waiting (sync) while nccl stream finishes transmitting buffer 1 data
+                // main stream: calculate grads of layer n-3 and write to buffer 1 || NCCL stream: transmitting buffer 2 data
                 // ...
                 cudaCheck(cudaStreamSynchronize(multi_gpu_config.nccl_stream));
 #endif
