@@ -998,7 +998,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
                 };
 
                 unsigned int seed = random_u32(&model->rng_state);
-                zero2_accumulate_grad(dst_ptr, pointers, nelem, l, seed, main_stream);
+                zero2_accumulate_grad(dst_ptr, pointers, nelem, l, seed, &multi_gpu_config);
             }
         }
     }
@@ -1028,7 +1028,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
                     g.lnfw, g.lnfb,
             };
             unsigned int seed = random_u32(&model->rng_state);
-            zero2_accumulate_grad(dst_ptr, pointers, nelem, 0, seed, main_stream);
+            zero2_accumulate_grad(dst_ptr, pointers, nelem, 0, seed, &multi_gpu_config);
 #endif
         }
     }
