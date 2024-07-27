@@ -976,7 +976,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
                 cudaCheck(cudaStreamSynchronize(multi_gpu_config.nccl_stream));
 #endif
             }
-            multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+            nccl_wait_on_compute(&multi_gpu_config, main_stream);
+            multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config);
 
             if(multi_gpu_config.zero_stage == 2) {
                 // and scatter-add it to the local shard buffers
@@ -1014,7 +1015,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // reduce the gradients for non-transformer block parameters
         floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
         const size_t nelem[] = {Vp * C, T * C, C, C};
-        multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+        nccl_wait_on_compute(&multi_gpu_config, main_stream);
+        multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config);
         if(multi_gpu_config.zero_stage == 2) {
 #if MULTI_GPU
             // wait for all data to be transferred

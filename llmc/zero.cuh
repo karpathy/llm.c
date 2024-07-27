@@ -506,6 +506,17 @@ ShardInfo multi_gpu_get_shard_offset(size_t elements, const MultiGpuConfig* conf
     }
 }
 
+void nccl_wait_on_compute(MultiGpuConfig* config, cudaStream_t compute_stream) {
+    // mark an event on the compute stream, and immediately wait on this in the nccl stream
+    // this means that the nccl stream won't start executing before all compute kernels that
+    // have been submitted before this point have finished.
+    // by using an event instead of cudaSyncStream, we avoid having to synchronize the host, and
+    // can enqueue new work to the GPU right away.
+
+    cudaCheck(cudaEventRecord(config->compute_nccl_sync, compute_stream));
+    cudaCheck(cudaStreamWaitEvent(config->nccl_stream, config->compute_nccl_sync));
+}
+
 // Block NCCL stream until computations on compute_stream are done, then aggregate multiple pointers in an NCCL group.
 // This can work either as an all-reduce (i.e., no ZeRo), or a reduce-scatter (ZeRO 1).
 // The awkward `(&pointers)[N]` syntax ensures we are capturing the parameters as sized arrays, so that it becomes impossible
@@ -513,20 +524,13 @@ ShardInfo multi_gpu_get_shard_offset(size_t elements, const MultiGpuConfig* conf
 template<int N>
 void multi_gpu_async_reduce_gradient(
         floatX* const (&pointers)[N], const size_t (&pointers_sizes)[N],
-        MultiGpuConfig* config, cudaStream_t compute_stream) {
+        MultiGpuConfig* config) {
     if (config->num_processes == 1) {
         return; // no multi-GPU, just exit.
     }
 
 #ifdef MULTI_GPU
     NVTX_RANGE_FN();
-    // mark an event on the compute stream, and immediately wait on this in the nccl stream
-    // this means that the nccl stream won't start executing before all compute kernels that
-    // have been submitted before this point have finished.
-    // by using an event instead of cudaSyncStream, we avoid having to synchronize the host, and
-    // can enqueue new work to the GPU right away.
-    cudaCheck(cudaEventRecord(config->compute_nccl_sync, compute_stream));
-    cudaCheck(cudaStreamWaitEvent(config->nccl_stream, config->compute_nccl_sync));
     ncclCheck(ncclGroupStart()); // NCCL group: aggregate all pointers in a single NCCL GPU kernel.
     for (int i = 0; i < N; ++i) {
         if(config->zero_stage == 0) {
