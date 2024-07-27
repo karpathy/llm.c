@@ -964,7 +964,6 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
                 C * 4 * C, C
             };
             if(multi_gpu_config.zero_stage == 2) {
-#if MULTI_GPU
                 // wait for previous layer's transfer to be completed, so we don't get any race conditions
                 // where main stream is writing to a buffer that nccl stream is reading
                 // this will result in a structure as follows:
@@ -973,8 +972,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
                 // main stream: potentially waiting (sync) while nccl stream finishes transmitting buffer 1 data
                 // main stream: calculate grads of layer n-3 and write to buffer 1 || NCCL stream: transmitting buffer 2 data
                 // ...
-                cudaCheck(cudaStreamSynchronize(multi_gpu_config.nccl_stream));
-#endif
+                compute_wait_on_nccl(&multi_gpu_config, main_stream);
             }
             nccl_wait_on_compute(&multi_gpu_config, main_stream);
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config);
@@ -1018,17 +1016,14 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         nccl_wait_on_compute(&multi_gpu_config, main_stream);
         multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config);
         if(multi_gpu_config.zero_stage == 2) {
-#if MULTI_GPU
-            // wait for all data to be transferred
-            cudaCheck(cudaStreamSynchronize(multi_gpu_config.nccl_stream));
             ParameterTensors g = model->grad_shards;
             floatX* const dst_ptr[] = {
                     g.wte, g.wpe,
                     g.lnfw, g.lnfb,
             };
             unsigned int seed = random_u32(&model->rng_state);
+            // runs on nccl_stream, so automatically sequential w.r.t. the previous all-reduce
             zero2_accumulate_grad(dst_ptr, pointers, nelem, 0, seed, &multi_gpu_config);
-#endif
         }
     }
 

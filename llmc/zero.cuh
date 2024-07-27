@@ -518,7 +518,15 @@ void nccl_wait_on_compute(MultiGpuConfig* config, cudaStream_t compute_stream) {
 #endif
 }
 
-// Block NCCL stream until computations on compute_stream are done, then aggregate multiple pointers in an NCCL group.
+void compute_wait_on_nccl(MultiGpuConfig* config, cudaStream_t compute_stream) {
+    // mark an event on the nccl stream, and immediately wait on this in the compute stream
+#ifdef MULTI_GPU
+    cudaCheck(cudaEventRecord(config->compute_nccl_sync, config->nccl_stream));
+    cudaCheck(cudaStreamWaitEvent(compute_stream, config->compute_nccl_sync));
+#endif
+}
+
+// Aggregate multiple pointers in an NCCL group.
 // This can work either as an all-reduce (i.e., no ZeRo), or a reduce-scatter (ZeRO 1).
 // The awkward `(&pointers)[N]` syntax ensures we are capturing the parameters as sized arrays, so that it becomes impossible
 // to call this function if pointers and pointers_sizes do not match.
