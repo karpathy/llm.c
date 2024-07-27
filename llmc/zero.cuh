@@ -512,9 +512,10 @@ void nccl_wait_on_compute(MultiGpuConfig* config, cudaStream_t compute_stream) {
     // have been submitted before this point have finished.
     // by using an event instead of cudaSyncStream, we avoid having to synchronize the host, and
     // can enqueue new work to the GPU right away.
-
+#ifdef MULTI_GPU
     cudaCheck(cudaEventRecord(config->compute_nccl_sync, compute_stream));
     cudaCheck(cudaStreamWaitEvent(config->nccl_stream, config->compute_nccl_sync));
+#endif
 }
 
 // Block NCCL stream until computations on compute_stream are done, then aggregate multiple pointers in an NCCL group.
