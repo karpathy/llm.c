@@ -585,7 +585,7 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
             // weights tensors are handled here
             if ((l == 0 && (i == 0 || i == 1)) // only at l = 0, init the wte and wpe tensors
               || i == 4 || i == 6 || i == 10 || i == 12) {
-                int n = model->param_elements[i];
+                size_t n = model->param_elements[i];
                 size_t layer_offset = 0;
                 if (i == 0) {
                     // for wte tensor (padded vocab) override to init V instead of Vp rows
