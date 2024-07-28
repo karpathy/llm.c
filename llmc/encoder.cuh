@@ -151,20 +151,20 @@ __global__ void wpe_backward_kernel(floatX* dwpe,
     store128(dwpe_tc, packed_dwpe);
 }
 
-__global__ void init_rope_freqs_kernel(floatX* rope_freqs, float rope_base_freq) {
+__global__ void init_rope_freqs_kernel(float* rope_freqs, float rope_base_freq) {
     int m = blockIdx.x;
     int HS = blockDim.x;
     int out_idx = m * HS + threadIdx.x;
     int i = threadIdx.x / 2 + 1;
 
     float theta_i = __powf(rope_base_freq, -2.0f * (float)(i - 1) / (float)HS);
-    rope_freqs[out_idx] = (floatX)((float)m * theta_i);
+    rope_freqs[out_idx] = (float)m * theta_i;
 }
 
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-void init_rope_freqs(floatX* rope_freqs, int max_seq_len, int HS, float rope_base_freq, cudaStream_t stream) {
+void init_rope_freqs(float* rope_freqs, int max_seq_len, int HS, float rope_base_freq, cudaStream_t stream) {
     NVTX_RANGE_FN();
     init_rope_freqs_kernel<<<max_seq_len, HS, 0, stream>>>(rope_freqs, rope_base_freq);
     cudaCheck(cudaGetLastError());

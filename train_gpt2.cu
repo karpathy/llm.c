@@ -320,7 +320,7 @@ typedef struct {
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
     int use_rope; // use rope position encoding
     float rope_base_freq; // base frequency for rope position encoding
-    floatX* rope_freqs; // rope position encoding frequencies
+    float* rope_freqs; // rope position encoding frequencies
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -373,10 +373,9 @@ void gpt2_allocate_weights(GPT2 *model) {
     // allocate memory for rope frequencies
     if (model->use_rope) {
         int HS = model->config.channels / model->config.num_heads;
-        cudaCheck(cudaMalloc((floatX**)&model->rope_freqs, model->config.max_seq_len * HS * sizeof(floatX)));
+        cudaCheck(cudaMalloc((float**)&model->rope_freqs, model->config.max_seq_len * HS * sizeof(float)));
         init_rope_freqs(model->rope_freqs, model->config.max_seq_len, HS, model->rope_base_freq, main_stream);
     }
-    // TODO: test rope freq table with Python
 }
 
 void gpt2_allocate_state(GPT2 *model, int B, int T) {
@@ -1427,7 +1426,7 @@ int main(int argc, char *argv[]) {
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
     // architectural settings
-    int use_rope = 0; // use RoPE positional embeddings
+    int use_rope = 1; // use RoPE positional embeddings
     float rope_base_freq = 10000.0f; // base frequency for RoPE
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
