@@ -161,11 +161,23 @@ struct GPUUtilInfo {
     unsigned int power;
     unsigned int power_limit;
     unsigned int fan;
-    unsigned long long throttle;
 
     float gpu_utilization;
     float mem_utilization;
+    const char* throttle_reason;
 };
+
+const char* get_throttle_reason(unsigned long long bits) {
+    if(bits & (nvmlClocksThrottleReasonSwPowerCap | nvmlClocksThrottleReasonHwPowerBrakeSlowdown)) {
+        return "power cap";
+    } else if (bits & (nvmlClocksThrottleReasonSwThermalSlowdown | nvmlClocksThrottleReasonHwThermalSlowdown)) {
+        return "thermal cap";
+    } else if (bits & (nvmlClocksThrottleReasonAll)) {
+        return "other cap";
+    } else {
+        return "no cap";
+    }
+}
 
 GPUUtilInfo get_gpu_utilization_info() {
     GPUUtilInfo info;
@@ -174,7 +186,9 @@ GPUUtilInfo get_gpu_utilization_info() {
     nvmlCheck(nvmlDeviceGetMaxClockInfo(device, NVML_CLOCK_SM, &info.max_clock));
     nvmlCheck(nvmlDeviceGetPowerManagementLimit(device, &info.power_limit));
     nvmlCheck(nvmlDeviceGetPowerUsage(device, &info.power));
-    nvmlCheck(nvmlDeviceGetCurrentClocksThrottleReasons(device, &info.throttle));
+    unsigned long long throttle;
+    nvmlCheck(nvmlDeviceGetCurrentClocksThrottleReasons(device, &throttle));
+    info.throttle_reason = get_throttle_reason(throttle);
     nvmlCheck(nvmlDeviceGetFanSpeed(device, &info.fan));
     // other potentially interesting functions
     // nvmlDeviceGetPcieThroughput

@@ -1831,8 +1831,9 @@ int main(int argc, char *argv[]) {
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
         if((step + 1) % 10 == 0) {
             GPUUtilInfo gpu_info = get_gpu_utilization_info();
-            printf0("                  compute %2.1f%% | memory: %2.1f%% | fan: %2d%% | clock: %4d MHz / %4d MHz | power %4d W / %4d W\n",
-                    gpu_info.gpu_utilization, gpu_info.mem_utilization, gpu_info.fan, gpu_info.clock, gpu_info.max_clock, gpu_info.power / 1000, gpu_info.power_limit / 1000);
+            printf0("                  compute %2.1f%% | memory: %2.1f%% | fan: %2d%% | %4d MHz / %4d MHz | %4d W / %4d W | %s\n",
+                    gpu_info.gpu_utilization, gpu_info.mem_utilization, gpu_info.fan, gpu_info.clock, gpu_info.max_clock, gpu_info.power / 1000, gpu_info.power_limit / 1000,
+                    gpu_info.throttle_reason);
         }
         logger_log_train(&logger, step, model.mean_loss, step_learning_rate, grad_norm);
 
