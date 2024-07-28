@@ -38,7 +38,7 @@ __global__ void encoder_forward_kernel3(floatX* out,
     x128 wte128 = load128cs(wte_ix);
     x128 wpe128;
     if (!use_rope) {
-        load128cs(wpe_tc);
+        wpe128 = load128cs(wpe_tc);
     }
     for (int k = 0; k < x128::size; k++) {
         if (!use_rope) {
@@ -161,8 +161,8 @@ __global__ void wpe_backward_kernel(floatX* dwpe,
 __global__ void init_rope_freqs_kernel(float* rope_freqs, float rope_base_freq) {
     int m = blockIdx.x;
     int d_half = blockDim.x;
-    int out_idx = m * d_half + threadIdx.x;
     int i = threadIdx.x + 1;
+    int out_idx = m * d_half + i - 1;
 
     float theta_i = __powf(rope_base_freq, -2.0f * (float)(i - 1) / (2.f * (float)d_half));
     rope_freqs[out_idx] = (float)m * theta_i;

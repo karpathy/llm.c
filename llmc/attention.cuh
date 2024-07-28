@@ -190,7 +190,7 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
 }
 
 __global__ void rope_rotate_kernel(floatX* q, floatX* k, float* rope_freqs, int B, int NH, int T, int HS, int is_backward) {
-    // thanks to nice properties of RoPE this is both the fwd & bwd pass kernel!
+    // thanks to the nice mathematical properties of RoPE this is both our fwd & bwd pass kernel!
     // the only difference is that we have to toggle the sign of the sin term in the rotation
     // q, k are of shape (B, NH, T, HS)
     // rope_freqs is of shape (T, HS/2)
@@ -206,31 +206,31 @@ __global__ void rope_rotate_kernel(floatX* q, floatX* k, float* rope_freqs, int 
     int i = rest % n;
 
     float* rope_freqs_t = rope_freqs + t * HS + i * (x128::size / 2);
-    f128 freqs128 = load128(rope_freqs_t);  // caching the frequencies
+    f128 freqs_reg = load128(rope_freqs_t);  // caching the frequencies
 
     int idx = b * NH * T * HS + nh * T * HS + t * HS + i * x128::size;
-    x128 q128 = load128cs(&q[idx]);
-    x128 k128 = load128cs(&k[idx]);
-    x128 qout128, kout128;
+    x128 q_reg = load128cs(&q[idx]);
+    x128 k_reg = load128cs(&k[idx]);
+    x128 qout_reg, kout_reg;
     for (int k = 0; k < x128::size / 2; k++) {  // div by 2 because we're processing tuples of 2
         // rotate q
-        floatX x1 = q128[2*k];
-        floatX x2 = q128[2*k + 1];
-        floatX q_out1 = (floatX)((float)x1 * cosf(freqs128[k]) + (is_backward ? 1 : -1) * (float)x2 * sinf(freqs128[k]));
-        floatX q_out2 = (floatX)((float)x2 * cosf(freqs128[k]) + (is_backward ? -1 : 1) * (float)x1 * sinf(freqs128[k]));
-        qout128[2*k] = q_out1;
-        qout128[2*k + 1] = q_out2;
+        floatX x1 = q_reg[2*k];
+        floatX x2 = q_reg[2*k + 1];
+        floatX q_out1 = (floatX)((float)x1 * cosf(freqs_reg[k]) + (is_backward ? 1 : -1) * (float)x2 * sinf(freqs_reg[k]));
+        floatX q_out2 = (floatX)((float)x2 * cosf(freqs_reg[k]) + (is_backward ? -1 : 1) * (float)x1 * sinf(freqs_reg[k]));
+        qout_reg[2*k] = q_out1;
+        qout_reg[2*k + 1] = q_out2;
         // rotate k
-        x1 = k128[2*k];
-        x2 = k128[2*k + 1];
-        floatX k_out1 = (floatX)((float)x1 * cosf(freqs128[k]) + (is_backward ? 1 : -1) * (float)x2 * sinf(freqs128[k]));
-        floatX k_out2 = (floatX)((float)x2 * cosf(freqs128[k]) + (is_backward ? -1 : 1) * (float)x1 * sinf(freqs128[k]));
-        kout128[2*k] = k_out1;
-        kout128[2*k + 1] = k_out2;
+        x1 = k_reg[2*k];
+        x2 = k_reg[2*k + 1];
+        floatX k_out1 = (floatX)((float)x1 * cosf(freqs_reg[k]) + (is_backward ? 1 : -1) * (float)x2 * sinf(freqs_reg[k]));
+        floatX k_out2 = (floatX)((float)x2 * cosf(freqs_reg[k]) + (is_backward ? -1 : 1) * (float)x1 * sinf(freqs_reg[k]));
+        kout_reg[2*k] = k_out1;
+        kout_reg[2*k + 1] = k_out2;
     }
 
-    store128cs(&q[idx], qout128);
-    store128cs(&k[idx], kout128);
+    store128cs(&q[idx], qout_reg);
+    store128cs(&k[idx], kout_reg);
 }
 
 // ----------------------------------------------------------------------------
