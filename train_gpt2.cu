@@ -718,7 +718,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, model->use_rope, model->rope_freqs, B, T, C, NH, main_stream);
         #endif
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
@@ -1561,6 +1561,9 @@ int main(int argc, char *argv[]) {
     GPT2 model;
     gpt2_init_common(&model);
     // architectural modifications
+    #ifdef ENABLE_CUDNN
+    use_rope = 0;  // RoPE is not supported with cudnn atm
+    #endif
     model.use_rope = use_rope;
     model.rope_base_freq = rope_base_freq;
     if (resuming == 1) {

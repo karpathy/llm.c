@@ -189,11 +189,47 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
     }
 }
 
+__global__ void rope_rotate_kernel(floatX* q, floatX* k, const float* rope_freqs, int B, int NH, int T, int HS) {
+    // q, k are of shape (B, NH, T, HS)
+    // rope_freqs is of shape (T, HS)
+    int HS_half = HS / 2;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * NH * T * HS_half) { return; }
+
+    int b = idx / (NH * T * HS_half);
+    int rest = idx % (NH * T * HS_half);
+    int nh = rest / (T * HS_half);
+    rest = rest % (T * HS_half);
+    int t = rest / HS_half;
+    int hs = rest % HS_half;
+
+    // TODO(gordicaleksa): optimize load x128...
+    // TODO(gordicaleksa): since we're not using half of rope freqs reduce the freq table
+    float freq = rope_freqs[t * HS + 2*hs];
+    int idx1 = b * NH * T * HS + nh * T * HS + t * HS + 2*hs;
+    int idx2 = b * NH * T * HS + nh * T * HS + t * HS + 2*hs + 1;
+
+    floatX x1 = q[idx1];
+    floatX x2 = q[idx2];
+    floatX q_out1 = (floatX)((float)x1 * cosf(freq) - (float)x2 * sinf(freq));
+    floatX q_out2 = (floatX)((float)x2 * cosf(freq) + (float)x1 * sinf(freq));
+
+    x1 = k[idx1];
+    x2 = k[idx2];
+    floatX k_out1 = (floatX)((float)x1 * cosf(freq) - (float)x2 * sinf(freq));
+    floatX k_out2 = (floatX)((float)x2 * cosf(freq) + (float)x1 * sinf(freq));
+
+    q[idx1] = q_out1;
+    q[idx2] = q_out2;
+    k[idx1] = k_out1;
+    k[idx2] = k_out2;
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
 void attention_forward(floatX* out, floatX* qkvr, floatX* att,
-                       floatX* inp,
+                       floatX* inp, int use_rope, float* rope_freqs,
                        int B, int T, int C, int NH, cudaStream_t stream) {
     NVTX_RANGE_FN();
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
@@ -213,6 +249,13 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, B, T, NH, HS);
+
+    if (use_rope) {
+        // TODO(gordicaleksa): fuse this with permute kernel (?) - avoid extra kernel launch overhead
+        total_threads = B * NH * T * (HS / 2);
+        num_blocks = CEIL_DIV(total_threads, block_size);
+        rope_rotate_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, rope_freqs, B, NH, T, HS);
+    }
 
     floatX* preatt = inp; // reuse inp as scratch buffer
     matmul_cublaslt(preatt, k, q, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
