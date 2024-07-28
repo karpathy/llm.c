@@ -319,6 +319,8 @@ typedef struct {
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
     int use_rope; // use rope position encoding
+    float rope_base_freq; // base frequency for rope position encoding
+    floatX* rope_freqs; // rope position encoding frequencies
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -350,6 +352,8 @@ void gpt2_init_common(GPT2 *model) {
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
     // architecture specific settings
     model->use_rope = 0; // use rope position encoding
+    model->rope_base_freq = 10000.0f; // base frequency for rope position encoding
+    model->rope_freqs = NULL; // rope position encoding frequencies
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -364,6 +368,15 @@ void gpt2_allocate_weights(GPT2 *model) {
     // create memory for model parameters on the device
     assert(model->params_memory == nullptr);
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
+
+    // TODO: do not allocate WPE! if use_rope is on
+    // allocate memory for rope frequencies
+    if (model->use_rope) {
+        int HS = model->config.channels / model->config.num_heads;
+        cudaCheck(cudaMalloc((floatX**)&model->rope_freqs, model->config.max_seq_len * HS * sizeof(floatX)));
+        init_rope_freqs(model->rope_freqs, model->config.max_seq_len, HS, model->rope_base_freq, main_stream);
+    }
+    // TODO: test rope freq table with Python
 }
 
 void gpt2_allocate_state(GPT2 *model, int B, int T) {
@@ -1415,6 +1428,7 @@ int main(int argc, char *argv[]) {
     int hellaswag_eval = 0;
     // architectural settings
     int use_rope = 0; // use RoPE positional embeddings
+    float rope_base_freq = 10000.0f; // base frequency for RoPE
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1540,6 +1554,7 @@ int main(int argc, char *argv[]) {
     gpt2_init_common(&model);
     // architectural modifications
     model.use_rope = use_rope;
+    model.rope_base_freq = rope_base_freq;
     if (resuming == 1) {
         // if `-y 1` was set, then we are resuming from the latest checkpoint
         gpt2_build_from_checkpoint(&model, filename_buffer);
