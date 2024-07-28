@@ -214,40 +214,73 @@ __device__ __host__ constexpr unsigned int Get2dNoiseUint(int indexX, int indexY
     constexpr unsigned int PRIME_NUMBER = 198491317u; // Large prime number with non-boring bits
     unsigned int x = static_cast<unsigned int>(indexX);
     unsigned int y = static_cast<unsigned int>(indexY);
-
     return SquirrelNoise5(x + (PRIME_NUMBER * y), seed);
 }
 
 // stochastic rounding built on top of Squirel Noise above (with seed updated per step via xorshift)
-__device__ __forceinline__ void stochastic_rounding(float in, __nv_bfloat16 *out, unsigned int seed) {
-    // todo - is this stochastic rounding *too good*? can we cut any corners?
-    // makes sure each thread gets a different random number
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
-    unsigned int threshold = random & 0xFFFF;
-    unsigned int float_bits = __float_as_uint(in);
-    unsigned int rounded_bits = float_bits & 0x0000FFFF;
-    float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
-    *out = __float2bfloat16_rn(__uint_as_float(float_bits));
-}
-// WIP INEFFICIENT FP8 - so many wasted bits, would like to use one uint across multiple roundings
-__device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e5m2 *out, unsigned int seed) {
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
-    unsigned int threshold = random & 0x001FFFFF;
-    unsigned int float_bits = __float_as_uint(in);
-    unsigned int rounded_bits = float_bits & 0x001FFFFF;
-    float_bits = (rounded_bits > threshold) ? (float_bits | 0x001FFFFF) : (float_bits  & ~0x001FFFFF);
-    *out = __nv_fp8_e5m2(__uint_as_float(float_bits));
-}
-__device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e4m3 *out, unsigned int seed) {
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
-    unsigned int threshold = random & 0x000FFFFF;
-    unsigned int float_bits = __float_as_uint(in);
-    unsigned int rounded_bits = float_bits & 0x000FFFFF;
-    float_bits = (rounded_bits > threshold) ? (float_bits | 0x000FFFFF) : (float_bits  & ~0x000FFFFF);
-    *out = __nv_fp8_e4m3(__uint_as_float(float_bits));
-}
-__device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigned int random) {
-    *out = (float)in; // todo - implement this...
+// new algorithm that calculates distance from rounded up/down values to correctly handle denorms
+// (didn't matter with BF16 because denorms are so tiny they're irrelevant, unlike in FP8/FP16)
+template<bool noise=true, typename highp=float, typename Ti=__nv_fp8_e4m3>
+__device__ __forceinline__ void stochastic_rounding(float in, Ti *out, unsigned int seed, float prob_offset=0.0f) {
+    unsigned int random = noise ? Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed) : seed;
+
+    // prob_offset allows rounding towards gradient more of the time (one paper recommends that)
+    // e.g. +0.3f ==> 65% chance up, 35% chance down
+    highp threshold_percentage = ((highp)random / (highp)0xFFFFFFFF) - prob_offset;
+
+    Ti rounded_down, rounded_up;
+    if constexpr (std::is_same<Ti, half>::value) {
+        rounded_down = __float2half_rd(in);
+        rounded_up = __float2half_ru(in);
+    } else if constexpr (std::is_same<Ti, __nv_bfloat16>::value) {
+        rounded_down = __float2bfloat16_rd(in);
+        rounded_up = __float2bfloat16_ru(in);
+    } else if constexpr (std::is_same<Ti, __nv_fp8_e4m3>::value) {
+        // CUDA doesn't have round down/up instructions for FP8 (in SW or HW) so we do it ourselves
+        // ARM-Intel-NVIDIA style FP8 E4M3 (different for AMD-Graphcore-Qualcomm format!)
+        Ti rounded = __nv_fp8_e4m3(in);
+        unsigned char rounded_bits = rounded.__x;
+        unsigned char absolute_bits = rounded_bits & 127;
+        unsigned char rounded_up_bits = absolute_bits + 1;
+        unsigned char rounded_down_bits = absolute_bits - 1;
+
+        // compiler likes the following code atm, but small changes may increase instructions by a lot
+        // as it may suddenly decide to use branches rather than predication...
+        if (absolute_bits >= 126) { // maximum normal value (+NaN)
+            rounded_up_bits = absolute_bits;
+            if (absolute_bits == 127) { // NaN (not always preserving sign)
+                rounded_down_bits = 127;
+            }
+        } else if (absolute_bits == 0) { // zero
+            rounded_down_bits = 0;
+        } else {
+            unsigned char mantissa_bits = absolute_bits & 7;
+            if (mantissa_bits == 7) { // maximum mantissa (already known non-NaN/non-max)
+                rounded_up_bits = (absolute_bits - mantissa_bits) + 8; // clear mantissa, add 1 to exponent
+            } else if (mantissa_bits == 0) { // minimum mantissa (already known non-zero)
+                rounded_down_bits = (absolute_bits + 7) - 8; // max mantissa, subtract 1 from exponent
+            }
+        }
+        if (in < 0) { // negative input: swap rounded up/down and add negative sign
+            unsigned char swap_tmp = rounded_down_bits | 128;
+            rounded_down_bits = rounded_up_bits | 128;
+            rounded_up_bits = swap_tmp;
+        }
+
+        // rounding to nearest even already gave us 1 of the 2 rounded values surrounding the input
+        // we only need the other one (but no point skipping anything above given SIMT divergence)
+        rounded_down.__x = ((float)rounded <= in) ? rounded.__x : rounded_down_bits;
+        rounded_up.__x = ((float)rounded >= in) ? rounded.__x : rounded_up_bits;
+    } else if constexpr (std::is_same<Ti, __nv_fp8_e5m2>::value) {
+        assert(false); // todo
+    } else {
+        assert(false);
+    }
+
+    highp diff = (highp)rounded_up - (highp)rounded_down;
+    highp lerp = ((highp)in - (highp)rounded_down) / diff; // division by 0 is OK as it means (up == down) anyway
+    lerp += prob_offset; // e.g. negative prob_offset => more likely to round down (can used to round towards gradient)
+    *out = (lerp > threshold_percentage) ? rounded_up : rounded_down;
 }
 __device__ __forceinline__ void stochastic_rounding(float in, float *out, unsigned int random) {
     *out = in; // dummy function for when floatX is float (FP32 mode)

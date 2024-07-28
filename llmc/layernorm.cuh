@@ -156,11 +156,11 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, Tn* normed, flo
                                                const floatX* inp1, const T2* inp2,
                                                const floatX* weight, const floatX* bias,
                                                int N, int C, float* inp2_descale_ptr, float* normed_scale_ptr,
-                                               float* normed_out_absmax) {
+                                               void* normed_out_absmax) {
     assert(blockDim.x == WARP_SIZE);
     float inp2_descale = inp2_descale_ptr ? *inp2_descale_ptr : 1.0f;
     float normed_scale = normed_scale_ptr ? *normed_scale_ptr : 1.0f;
-    uint absmax_uint = 0;
+    unsigned int absmax_uint = 0;
 
     // load weights and biases into shared memory
     // do this before we allow any threads to exit!
@@ -473,7 +473,7 @@ void layernorm_forward(Tn* out, float* mean, float* rstd,
     if (std::is_same<Tn, __nv_fp8_e4m3>::value) {
         float *calculated_from_absmax = absmax_tracker.get_absmax_data("layernorm", out, B*T*C, mean, SCALE_FORWARD_B, false);
         if (!calculated_from_absmax) {
-            recompute_due_to_absmax = true; // will need to do the matmul twice :(
+            recompute_due_to_absmax = true; // will need to run the kernel twice :(
             calculated_from_absmax = absmax_tracker.get_absmax_data("layernorm_1st", out, B*T*C, mean, SCALE_FORWARD_B, false, true);
         }
         scale_normed = calculated_from_absmax + SCALE_OFFSET;

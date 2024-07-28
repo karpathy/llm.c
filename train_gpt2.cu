@@ -3,12 +3,18 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 
 // todo - make into proper makefile config options
-#define FORCE_FP8_MATMUL true
-#define FORCE_FP8_WEIGHTS true // not compatible with existing checkpoints
-#define FORCE_FP8_ACTIVATIONS true // compatible with existing checkpoints
-#define FORCE_FP8_GRADIENTS true // activation gradients directly output in FP8
-bool use_weights_transpose_cache = true; // cached across gradient accumulation steps (same weight)
-bool use_act_transpose_cache = true; // usually l_atty with BF16 attention, disabled during inference
+#define FORCE_FP8_MATMUL false
+#define FORCE_FP8_ALLOW_LAYER_FORWARD false
+#define FORCE_FP8_ALLOW_LAYER_BACKWARDS false
+#define FORCE_FP8_ALLOW_EMBEDDING_FORWARD false
+#define FORCE_FP8_ALLOW_EMBEDDING_BACKWARDS false
+#define FORCE_FP8_ALLOW_ACTIVATION_GRADIENTS false // only relevant if ALLOW_BACKWARDS is true but FP8_WEIGHTS/ACTIVATIONS/GRADIENTS are false
+#define FORCE_FP8_ALLOW_PARAMETER_GRADIENTS false
+#define FORCE_FP8_WEIGHTS false // not compatible with existing checkpoints
+#define FORCE_FP8_ACTIVATIONS false // compatible with existing checkpoints
+#define FORCE_FP8_GRADIENTS false // activation gradients directly output in FP8
+bool use_weights_transpose_cache = false; // cached across gradient accumulation steps (same weight)
+bool use_act_transpose_cache = false; // usually l_atty with BF16 attention, disabled during inference
 
 // todo - make command line parameters for tuning
 // 1.0/448.0f would be the most aggressive setting for e4m3
@@ -17,7 +23,7 @@ bool use_act_transpose_cache = true; // usually l_atty with BF16 attention, disa
 // but not sure that's actually true, will need to check their code
 #define SCALE_A 1.0f/448.0f
 #define SCALE_FORWARD_B 1.0f/448.0f
-#define SCALE_BACKWARDS_B 1.0f/114688.0f
+#define SCALE_BACKWARDS_B 1.0f/57344.0f
 #define SCALE_FP8_WEIGHTS 1.0f/448.0f
 
 // to make it easy to compare BF16 vs FP8 for layernorm output
@@ -339,7 +345,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[15] = TENSOR_SPEC(data->lnf_rstd, B * T);
     tensors[16] = TENSOR_SPEC(data->losses, B * T);
     tensors[17] = TENSOR_SPEC(data->qkvr, L * B * T * 3*C);
-    tensors[18] = TENSOR_SPEC(data->output, B * T * max(3*C, max(NH*T, Vp)));
+    tensors[18] = TENSOR_SPEC(data->output, B * T * max(4*C, max(NH*T, Vp)));
 
     tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * 4 * C);
     tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
@@ -843,7 +849,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     floatX* dresidual = (floatX*)model->acts.scratch_btc; // the main buffer holding the gradient in the backward pass
     cudaCheck(cudaMemset(dresidual, 0, B * T * C * sizeof(floatX)));
 
-    // re-use the output buffer of the forward pass as a scratchpad during backward pass
+    // re-use the output buffer of the forward pass as a scratchpad during backward pass (3*C*B*T)
     float*  scratchF = (float*)acts.output;
     floatX* scratchX = (floatX*)acts.output;
 
@@ -907,6 +913,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // re-using this memory in every Transformer block as we calculate backward pass
 
         floatX* dl_bt4c = (floatX*)model->acts.scratch_bt4c;
+        floatG* dl_bt4c_fp8 = (floatG*)model->acts.scratch_bt4c;
 
         // start the backward pass for this layer
         // hack - todo - unsupported with FP8 weights (will be fixed ASAP)
@@ -916,12 +923,12 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
             gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream);
         }*/
-        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion, l_fcw);
+        matmul_backward(dl_bt4c_fp8, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion, l_fcw);
         //if(model->recompute >= 2) {
         //    // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
         //    layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
         //}
-        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream, (floatNorm*)NULL, 0, l_ln2_mean);
+        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c_fp8, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream, (floatNorm*)NULL, 0, l_ln2_mean, l_fcprojw);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
@@ -1917,23 +1924,41 @@ int main(int argc, char *argv[]) {
             // backward pass. all model params accumulate gradients with += inside this inner loop
             gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
         }
-        float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss)); // loss z-score
+        float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss, (double)skip_update_lossz)); // loss z-score
         // fetch the next learning rate
         float step_learning_rate = get_learning_rate(&lr_scheduler, step);
         // calculate the gradient norm and how much we wish to scale the gradient
         float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
-        float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
+        float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm, (double)skip_update_gradz)); // grad z-score
+
+        float beta1 = 0.9f;
+        float beta2 = 0.95f;
+        float grad_scale = 1.0f;
         // update the model parameters
         if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) {
-            printf0("skipping update due to loss z-score of %f\n", zloss);
+            printf0("mostly skipping update due to loss z-score of %f\n", zloss);
+            step_learning_rate *= 0.1f;
+            weight_decay *= 0.2f;
+            beta1 = 0.95f; // same as beta2
         } else if (isfinite(zgrad) && skip_update_gradz != 0.0f && zgrad > skip_update_gradz) {
-            printf0("skipping update due to grad z-score of %f\n", zgrad);
+            printf0("mostly skipping update due to grad z-score of %f\n", zgrad);
+            step_learning_rate *= 0.1f;
+            weight_decay *= 0.2f;
+            beta1 = 0.95f; // same as beta2
+        } else if (isfinite(zgrad) && zgrad > 2.0f) {
+            float lr_ratio = min(1.0f, 3.5f / zgrad); // 2.0 to 3.5 only reduces beta2
+            printf0("reducing beta2 to 0.9 and lr/wd by %.3f due to grad z-score of %f\n", lr_ratio);
+            step_learning_rate *= lr_ratio;
+            weight_decay *= lr_ratio;
+            beta2 = 0.9f; // same as beta1
         } else {
-            // clip the gradient norm to a maximum value
-            float grad_clip = 1.0f;
-            float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
-            gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
+            // clip the gradient, relevant for early steps only where norm is >1.0, improves learning, due to smaller m/v
+            // which is a bit silly, but don't want a regression just because of removing this for now...
+            // unlike before, we won't clip if grad z-score is high, so it won't result in instability later in the run
+            grad_scale = (grad_norm > 1.0f) ? 1.0f / grad_norm : 1.0f;
         }
+
+        gpt2_update(&model, step_learning_rate, beta1, beta2, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
 
         size_t act_bytes = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {

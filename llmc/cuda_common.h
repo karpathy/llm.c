@@ -106,7 +106,7 @@ typedef floatX floatN;
 #if FORCE_FP8_MATMUL == true && FORCE_FP8_GRADIENTS == true
 typedef __nv_fp8_e5m2 floatG;
 #else
-typedef floatX floatN;
+typedef floatX floatG;
 #endif
 
 

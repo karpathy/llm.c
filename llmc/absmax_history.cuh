@@ -100,10 +100,10 @@ public:
             info.layer = global_current_layer;
             strncpy(info.name, name, TENSOR_INFO_NAME_LENGTH);
         }
-        //if (!never_warn && !is_new && info.update_count == 0 && info.previous_update_count == 0) {
-        //    printf("Warning: get_absmax_data() for '%s' (layer %d, called name: '%s') ==> update_count=0 and previous_update_count=0 for existing tensor at %p (size %lu)\n",
-        //        info.name, global_current_layer, name, tensor_address, num_elements);
-        //}
+        if (!never_warn && !is_new && info.update_count == 0 && info.previous_update_count == 0) {
+            //printf("Warning: get_absmax_data() for '%s' (layer %d, called name: '%s') ==> update_count=0 and previous_update_count=0 for existing tensor at %p (size %lu)\n",
+            //    info.name, global_current_layer, name, tensor_address, num_elements);
+        }
 
         #if ALWAYS_UPDATE_ABSMAX == true // slow, for sanity checking only
         if (calculate_if_needed) {
@@ -142,12 +142,12 @@ public:
         bool is_new;
         TensorInfo& info = get_tensor_info(tensor_address, num_elements, associated_tensor, scale_factor, is_new);
 
-        //size_t old_update_count = info.update_count;
+        size_t old_update_count = info.update_count;
         info.update_count = reset_update_count ? 1 : (info.update_count + 1);
-        //if (info.update_count > 1) {
-        //    printf(" next_absmax_ptr() called %lu times for tensor '%s' (layer %d) at %p (num_elements %lu) [old count: %lu, previous count: %lu] (current layer: %d) ==> h_current_indices[info.index]: %d\n",
-        //        info.update_count, info.name, info.layer, tensor_address, num_elements, old_update_count, info.previous_update_count, global_current_layer, h_current_indices[info.index]);
-        //}
+        if (info.update_count > 1) {
+            printf("next_absmax_ptr() called %lu times for tensor '%s' (layer %d) at %p (num_elements %lu) [old count: %lu, previous count: %lu] (current layer: %d) ==> h_current_indices[info.index]: %d\n",
+                info.update_count, info.name, info.layer, tensor_address, num_elements, old_update_count, info.previous_update_count, global_current_layer, h_current_indices[info.index]);
+        }
 
         // we only ever update weights or everything else (activations/gradients)
         // simply keep track of what is a weight using 8th bit of current index
@@ -220,8 +220,13 @@ private:
     std::vector<uint8_t> h_current_indices;
     size_t max_tensor_count;
 
-    void reset_all_update_counts() {
+    void reset_all_update_counts(bool always_reset_all=true, bool weight_update_only=false) {
         for (auto& pair : tensor_info_map) {
+            if (!always_reset_all) {
+                if ((h_current_indices[pair.second.index] >= 128) != weight_update_only) {
+                    continue; // only update either weights or everything else (act/grad/etc.)
+                }
+            }
             pair.second.previous_update_count = pair.second.update_count;
             pair.second.update_count = 0;
         }
@@ -328,6 +333,7 @@ private:
 };
 
 __global__ void update_all_absmax_kernel(float* data, uint8_t* currentIndices, size_t tensorCount, float fudgeFactor, bool weight_update_only) {
+#if FORCE_FP8_MATMUL == true
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= tensorCount) { return; }
 
@@ -355,9 +361,11 @@ __global__ void update_all_absmax_kernel(float* data, uint8_t* currentIndices, s
     data[offset + ABSMAX_HISTORY_SIZE + SCALE_OFFSET]   = 1.0f / (maxVal * fudgeFactor * scale_factor);
     data[offset + ABSMAX_HISTORY_SIZE + DESCALE_OFFSET] = maxVal * fudgeFactor * scale_factor;
     data[offset + currentIndex] = 0.0f;
+#endif
 }
 
 __global__ void update_single_absmax_kernel(float* data, uint8_t* currentIndex, float fudgeFactor) {
+#if FORCE_FP8_MATMUL == true
     float maxVal = 0.0f;
     for (uint8_t i = 0; i < ABSMAX_HISTORY_SIZE; ++i) {
         maxVal = max(maxVal, data[i]);
@@ -377,9 +385,11 @@ __global__ void update_single_absmax_kernel(float* data, uint8_t* currentIndex, 
     data[ABSMAX_HISTORY_SIZE + ABSMAX_OFFSET]  = maxVal;
     data[ABSMAX_HISTORY_SIZE + SCALE_OFFSET]   = 1.0f / (maxVal * fudgeFactor * scale_factor);
     data[ABSMAX_HISTORY_SIZE + DESCALE_OFFSET] = maxVal * fudgeFactor * scale_factor;
+#endif
 }
 
 void TensorAbsMaxTracker::update_all_absmax(cudaStream_t stream, float fudgeFactor, bool reset_update_counts, bool weight_update_only) {
+#if FORCE_FP8_MATMUL == true
     if (current_tensor_count == 0) {
         return;
     }
@@ -391,9 +401,9 @@ void TensorAbsMaxTracker::update_all_absmax(cudaStream_t stream, float fudgeFact
     update_all_absmax_kernel<<<grid_size, block_size, 0, stream>>>
                             (d_storage, d_current_indices, current_tensor_count, fudgeFactor, weight_update_only);
     cudaCheck(cudaGetLastError());
-
+#endif
     if (reset_update_counts) {
-        reset_all_update_counts();  // Reset call counts after updating
+        reset_all_update_counts(false, weight_update_only);  // Reset call counts after updating
     }
 }
 
@@ -407,11 +417,13 @@ void TensorAbsMaxTracker::update_single_absmax(const T* tensor_address, size_t n
         throw std::runtime_error("Tensor not registered");
     }
 
+#if FORCE_FP8_MATMUL == true
     size_t index = it->second.index;
     size_t offset = get_storage_offset(index);
 
     update_single_absmax_kernel<<<1, 1, 0, stream>>>(d_storage + offset, d_current_indices + index, fudgeFactor);
     cudaCheck(cudaGetLastError());
+#endif
 
     // reset call count after updating (to 1 so we know it has been calculated)
     it->second.previous_update_count = it->second.update_count;
