@@ -144,6 +144,7 @@ float get_flops_promised(const char* device, int precision_mode) {
     return -1.0f; // ¯\_(ツ)_/¯
 }
 
+// lazily initialize nvml and generate a handle to the GPU
 nvmlDevice_t nvml_get_device() {
     static bool needs_init = true;
     static nvmlDevice_t device;
@@ -161,12 +162,16 @@ struct GPUUtilInfo {
     unsigned int power;
     unsigned int power_limit;
     unsigned int fan;
+    unsigned int temperature;
+    unsigned int temp_slowdown;
 
     float gpu_utilization;
     float mem_utilization;
     const char* throttle_reason;
 };
 
+// convert throttle reason bitfield into a text reason.
+// this is a lossy conversion; we just want to give some idea of what is happening
 const char* get_throttle_reason(unsigned long long bits) {
     if(bits & (nvmlClocksThrottleReasonSwPowerCap | nvmlClocksThrottleReasonHwPowerBrakeSlowdown)) {
         return "power cap";
@@ -179,22 +184,25 @@ const char* get_throttle_reason(unsigned long long bits) {
     }
 }
 
+// gather data for a GPUUtilInfo object
 GPUUtilInfo get_gpu_utilization_info() {
     GPUUtilInfo info;
     nvmlDevice_t device = nvml_get_device();
+    // query different infos directly
     nvmlCheck(nvmlDeviceGetClockInfo(device, NVML_CLOCK_SM, &info.clock));
     nvmlCheck(nvmlDeviceGetMaxClockInfo(device, NVML_CLOCK_SM, &info.max_clock));
     nvmlCheck(nvmlDeviceGetPowerManagementLimit(device, &info.power_limit));
     nvmlCheck(nvmlDeviceGetPowerUsage(device, &info.power));
+    nvmlCheck(nvmlDeviceGetTemperature(device, NVML_TEMPERATURE_GPU, &info.temperature));
+    nvmlCheck(nvmlDeviceGetTemperatureThreshold(device, NVML_TEMPERATURE_THRESHOLD_SLOWDOWN, &info.temp_slowdown));
     unsigned long long throttle;
     nvmlCheck(nvmlDeviceGetCurrentClocksThrottleReasons(device, &throttle));
     info.throttle_reason = get_throttle_reason(throttle);
     nvmlCheck(nvmlDeviceGetFanSpeed(device, &info.fan));
-    // other potentially interesting functions
-    // nvmlDeviceGetPcieThroughput
-    // nvmlDeviceGetPcieSpeed
-    // nvmlDeviceGetNumGpuCores
-    // nvmlDeviceGetMemoryBusWidth
+
+    // for "utilization", we look at recorded samples. In principle, we could query the driver for how many samples
+    // to request, but then we'd need to dynamically allocate sufficient space. Let's just hard-code a limit of 128,
+    // and have no memory management required
     constexpr const int BUFFER_LIMIT = 128;
     nvmlSample_t buffer[BUFFER_LIMIT];
     nvmlValueType_t v_type;
@@ -205,6 +213,8 @@ GPUUtilInfo get_gpu_utilization_info() {
         gpu_utilization += (float)buffer[i].sampleValue.uiVal;
     }
     gpu_utilization /= (float)sample_count;
+
+    // sample count may have been modified by the query above; reset back to buffer size
     sample_count = BUFFER_LIMIT;
     nvmlCheck(nvmlDeviceGetSamples(device, NVML_MEMORY_UTILIZATION_SAMPLES, 0, &v_type, &sample_count, buffer));
     float mem_utilization = 0.f;
