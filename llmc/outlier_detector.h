@@ -13,7 +13,7 @@ reconsider this choice in the future, as the compute cost here is minimal.
 #include <math.h>
 
 // use compile-time constant for window size to avoid dynamic memory allocations
-#define OUTLIER_DETECTOR_WINDOW_SIZE 64
+#define OUTLIER_DETECTOR_WINDOW_SIZE 100
 
 typedef struct {
     double buffer[OUTLIER_DETECTOR_WINDOW_SIZE];
@@ -71,13 +71,13 @@ double update_detector(OutlierDetector *detector, double new_value, double skip_
             // let's go back in time and pretend this never happened
             // i.e. don't let bad outliers affect the threshold for detecting future outliers
             // otherwise the detector will get less picky and accept things it really shouldn't!
-            // but we do update on the 3rd consecutive outlier, to avoid getting stuck completely
+            // but we do update on consecutive outliers, to avoid getting stuck completely
             detector->skipped_in_a_row++;
-            if (detector->skipped_in_a_row < 3) {
+            if (detector->skipped_in_a_row <= 1) {
+                detector->index = (detector->index - 1) % OUTLIER_DETECTOR_WINDOW_SIZE;
                 detector->sum += old_value - new_value;
                 detector->sum_sq += (old_value * old_value) - (new_value * new_value);
                 detector->buffer[detector->index] = old_value;
-                detector->index = (detector->index - 1) % OUTLIER_DETECTOR_WINDOW_SIZE;
             }
         } else {
             detector->skipped_in_a_row = 0;
