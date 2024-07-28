@@ -374,7 +374,7 @@ void gpt2_allocate_weights(GPT2 *model) {
         int HS = model->config.channels / model->config.num_heads;
         assert(HS % 2 == 0); // HS must be even for RoPE
         cudaCheck(cudaMalloc((float**)&model->rope_freqs, model->config.max_seq_len * (HS / 2) * sizeof(float)));
-        // TODO(gordicaleksa): will floatX mess up the rope frequencies?
+        // TODO(gordicaleksa): would floatX mess up the rope frequencies due to a lower precision?
         init_rope_freqs(model->rope_freqs, model->config.max_seq_len, HS / 2, model->rope_base_freq, main_stream);
     }
 }
@@ -907,7 +907,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
-        attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
+        attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, model->use_rope, model->rope_freqs, B, T, C, NH, main_stream);
         #endif
         if(model->recompute >= 2) {
             layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);

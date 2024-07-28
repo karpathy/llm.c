@@ -189,7 +189,9 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
     }
 }
 
-__global__ void rope_rotate_kernel(floatX* q, floatX* k, float* rope_freqs, int B, int NH, int T, int HS) {
+__global__ void rope_rotate_kernel(floatX* q, floatX* k, float* rope_freqs, int B, int NH, int T, int HS, int is_backward) {
+    // thanks to nice properties of RoPE this is both the fwd & bwd pass kernel!
+    // the only difference is that we have to toggle the sign of the sin term in the rotation
     // q, k are of shape (B, NH, T, HS)
     // rope_freqs is of shape (T, HS/2)
     int n = HS / x128::size;
@@ -214,15 +216,15 @@ __global__ void rope_rotate_kernel(floatX* q, floatX* k, float* rope_freqs, int 
         // rotate q
         floatX x1 = q128[2*k];
         floatX x2 = q128[2*k + 1];
-        floatX q_out1 = (floatX)((float)x1 * cosf(freqs128[k]) - (float)x2 * sinf(freqs128[k]));
-        floatX q_out2 = (floatX)((float)x2 * cosf(freqs128[k]) + (float)x1 * sinf(freqs128[k]));
+        floatX q_out1 = (floatX)((float)x1 * cosf(freqs128[k]) + (is_backward ? 1 : -1) * (float)x2 * sinf(freqs128[k]));
+        floatX q_out2 = (floatX)((float)x2 * cosf(freqs128[k]) + (is_backward ? -1 : 1) * (float)x1 * sinf(freqs128[k]));
         qout128[2*k] = q_out1;
         qout128[2*k + 1] = q_out2;
         // rotate k
         x1 = k128[2*k];
         x2 = k128[2*k + 1];
-        floatX k_out1 = (floatX)((float)x1 * cosf(freqs128[k]) - (float)x2 * sinf(freqs128[k]));
-        floatX k_out2 = (floatX)((float)x2 * cosf(freqs128[k]) + (float)x1 * sinf(freqs128[k]));
+        floatX k_out1 = (floatX)((float)x1 * cosf(freqs128[k]) + (is_backward ? 1 : -1) * (float)x2 * sinf(freqs128[k]));
+        floatX k_out2 = (floatX)((float)x2 * cosf(freqs128[k]) + (is_backward ? -1 : 1) * (float)x1 * sinf(freqs128[k]));
         kout128[2*k] = k_out1;
         kout128[2*k + 1] = k_out2;
     }
@@ -257,11 +259,10 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, B, T, NH, HS);
 
     if (use_rope) {
-        // TODO(gordicaleksa): fuse this with permute kernel (?) - avoid extra kernel launch overhead
         assert(HS % x128::size == 0);
         total_threads = B * NH * T * (HS / x128::size);
         num_blocks = CEIL_DIV(total_threads, block_size);
-        rope_rotate_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, rope_freqs, B, NH, T, HS);
+        rope_rotate_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, rope_freqs, B, NH, T, HS, 0);
     }
 
     floatX* preatt = inp; // reuse inp as scratch buffer
@@ -289,6 +290,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
                         const floatX* dout,
                         const floatX* qkvr, const floatX* att,
+                        int use_rope, float* rope_freqs,
                         int B, int T, int C, int NH, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
@@ -319,6 +321,14 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     matmul_cublaslt(dq, k, dpreatt, nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
     // backward into k
     matmul_cublaslt(dk, q, dpreatt, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
+
+    if (use_rope) {
+        assert(HS % x128::size == 0);
+        int total_threads = B * NH * T * (HS / x128::size);
+        num_blocks = CEIL_DIV(total_threads, block_size);
+        rope_rotate_kernel<<<num_blocks, block_size, 0, stream>>>(dq, dk, rope_freqs, B, NH, T, HS, 1);
+    }
+
     // backward into inp
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
     permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dinp, dq, dk, dv, B, T, NH, HS);
