@@ -997,7 +997,7 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
         // so we only calculate the grad norm at the grads_memory belonging to the local shards
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
             if (model->use_rope && i == 1) {
-                // skip the wpe tensor if we are using RoPE -> minor optimization
+                // skip the wpe tensor if we are using RoPE -> minor optimization, results would be correct without this as well
                 continue;
             }
             ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
@@ -1436,7 +1436,7 @@ int main(int argc, char *argv[]) {
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
     // architectural settings
-    int use_rope = 1; // use RoPE positional embeddings
+    int use_rope = 0; // use RoPE positional embeddings
     float rope_base_freq = 10000.0f; // base frequency for RoPE
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
