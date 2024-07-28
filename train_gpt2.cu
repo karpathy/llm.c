@@ -1530,8 +1530,8 @@ int main(int argc, char *argv[]) {
     int warmup_iterations = 0;
     float final_learning_rate_frac = 1.0f; // final fraction of learning rate, at end of training
     float weight_decay = 0.0f;
-    float skip_update_lossz = 0.0f; // skip update if loss goes above this in zscore
-    float skip_update_gradz = 0.0f; // skip update if grad_norm goes above this in zscore
+    float skip_update_lossz = 8.0f; // skip update if loss goes above this in zscore
+    float skip_update_gradz = 8.0f; // skip update if grad_norm goes above this in zscore
     int val_loss_every = 20; // every how many steps do we eval validation loss?
     int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
@@ -1947,7 +1947,7 @@ int main(int argc, char *argv[]) {
             beta1 = 0.95f; // same as beta2
         } else if (isfinite(zgrad) && zgrad > 2.0f) {
             float lr_ratio = min(1.0f, 3.5f / zgrad); // 2.0 to 3.5 only reduces beta2
-            printf0("reducing beta2 to 0.9 and lr/wd by %.3f due to grad z-score of %f\n", lr_ratio);
+            printf0("reducing beta2 to 0.9 and lr/wd by %.3f due to grad z-score of %f\n", lr_ratio, zgrad);
             step_learning_rate *= lr_ratio;
             weight_decay *= lr_ratio;
             beta2 = 0.9f; // same as beta1
