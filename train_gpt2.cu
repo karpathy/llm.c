@@ -369,11 +369,11 @@ void gpt2_allocate_weights(GPT2 *model) {
     assert(model->params_memory == nullptr);
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 
-    // TODO: do not allocate WPE! if use_rope is on
     // allocate memory for rope frequencies
     if (model->use_rope) {
         int HS = model->config.channels / model->config.num_heads;
         cudaCheck(cudaMalloc((float**)&model->rope_freqs, model->config.max_seq_len * HS * sizeof(float)));
+        // TODO(gordicaleksa): will floatX mess up the rope frequencies?
         init_rope_freqs(model->rope_freqs, model->config.max_seq_len, HS, model->rope_base_freq, main_stream);
     }
 }
@@ -668,7 +668,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, model->use_rope, B, T, C, main_stream); // encoding goes into residual[0]
 
     // first layernorm isn't fused
     layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
@@ -938,7 +938,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         }
     }
     encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
-                     dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
+                     dresidual, model->inputs, inputs, model->use_rope, B, T, C, random_u32(&model->rng_state), main_stream);
 
     // Aggregate all gradients that are not part of the transformer blocks
     if(last_step) {
@@ -995,6 +995,10 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
         // grads_memory only contains the averaged gradients at the local shards,
         // so we only calculate the grad norm at the grads_memory belonging to the local shards
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            if (model->use_rope && i == 1) {
+                // skip the wpe tensor if we are using RoPE -> minor optimization
+                continue;
+            }
             ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
             ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
             ptrdiff_t offset = tensor.offset + shard.offset;
@@ -1046,6 +1050,11 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     // AdamW update
     // handle adamw for all the transformer blocks
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        if (model->use_rope && i == 1) {
+            // skip the wpe tensor if we are using RoPE
+            continue;
+        }
+
         // generate a unique seed for each tensor
         unsigned int seed = random_u32(&model->rng_state);
 
