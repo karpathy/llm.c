@@ -160,11 +160,11 @@ __global__ void wpe_backward_kernel(floatX* dwpe,
 
 __global__ void init_rope_freqs_kernel(float* rope_freqs, float rope_base_freq) {
     int m = blockIdx.x;
-    int HS = blockDim.x;
-    int out_idx = m * HS + threadIdx.x;
-    int i = threadIdx.x / 2 + 1;
+    int d_half = blockDim.x;
+    int out_idx = m * d_half + threadIdx.x;
+    int i = threadIdx.x + 1;
 
-    float theta_i = __powf(rope_base_freq, -2.0f * (float)(i - 1) / (float)HS);
+    float theta_i = __powf(rope_base_freq, -2.0f * (float)(i - 1) / (2.f * (float)d_half));
     rope_freqs[out_idx] = (float)m * theta_i;
 }
 

@@ -372,9 +372,10 @@ void gpt2_allocate_weights(GPT2 *model) {
     // allocate memory for rope frequencies
     if (model->use_rope) {
         int HS = model->config.channels / model->config.num_heads;
-        cudaCheck(cudaMalloc((float**)&model->rope_freqs, model->config.max_seq_len * HS * sizeof(float)));
+        assert(HS % 2 == 0); // HS must be even for RoPE
+        cudaCheck(cudaMalloc((float**)&model->rope_freqs, model->config.max_seq_len * (HS / 2) * sizeof(float)));
         // TODO(gordicaleksa): will floatX mess up the rope frequencies?
-        init_rope_freqs(model->rope_freqs, model->config.max_seq_len, HS, model->rope_base_freq, main_stream);
+        init_rope_freqs(model->rope_freqs, model->config.max_seq_len, HS / 2, model->rope_base_freq, main_stream);
     }
 }
 

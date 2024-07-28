@@ -204,8 +204,7 @@ __global__ void rope_rotate_kernel(floatX* q, floatX* k, const float* rope_freqs
     int hs = rest % HS_half;
 
     // TODO(gordicaleksa): optimize load x128...
-    // TODO(gordicaleksa): since we're not using half of rope freqs reduce the freq table
-    float freq = rope_freqs[t * HS + 2*hs];
+    float freq = rope_freqs[t * HS + hs];
     int idx1 = b * NH * T * HS + nh * T * HS + t * HS + 2*hs;
     int idx2 = b * NH * T * HS + nh * T * HS + t * HS + 2*hs + 1;
 
