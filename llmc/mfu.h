@@ -181,16 +181,17 @@ GPUUtilInfo get_gpu_utilization_info() {
     // nvmlDeviceGetPcieSpeed
     // nvmlDeviceGetNumGpuCores
     // nvmlDeviceGetMemoryBusWidth
-    nvmlSample_t buffer[64];
+    constexpr const int BUFFER_LIMIT = 128;
+    nvmlSample_t buffer[BUFFER_LIMIT];
     nvmlValueType_t v_type;
-    unsigned int sample_count = 64;
+    unsigned int sample_count = BUFFER_LIMIT;
     nvmlCheck(nvmlDeviceGetSamples(device, NVML_GPU_UTILIZATION_SAMPLES, 0, &v_type, &sample_count, buffer));
     float gpu_utilization = 0.f;
     for(unsigned i = 0; i < sample_count; ++i) {
         gpu_utilization += (float)buffer[i].sampleValue.uiVal;
     }
     gpu_utilization /= (float)sample_count;
-    sample_count = 64;
+    sample_count = BUFFER_LIMIT;
     nvmlCheck(nvmlDeviceGetSamples(device, NVML_MEMORY_UTILIZATION_SAMPLES, 0, &v_type, &sample_count, buffer));
     float mem_utilization = 0.f;
     for(unsigned i = 0; i < sample_count; ++i) {
