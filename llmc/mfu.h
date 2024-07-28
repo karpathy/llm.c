@@ -4,11 +4,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <nvml.h>
 
 // tied to enum PrecisionMode, in a future refactor make them the same
 #define MFUH_PRECISION_FP32 0
 #define MFUH_PRECISION_FP16 1
 #define MFUH_PRECISION_BF16 2
+
+inline void nvml_check(nvmlReturn_t status, const char *file, int line) {
+    if (status != NVML_SUCCESS) {
+        printf("[NVML ERROR] at file %s:%d:\n%s\n", file, line, nvmlErrorString(status));
+        exit(EXIT_FAILURE);
+    }
+};
+#define nvmlCheck(err) (nvml_check(err, __FILE__, __LINE__))
+
 
 typedef struct {
     float TF_32;       // tensor-core performance 32 bit
@@ -132,6 +142,65 @@ float get_flops_promised(const char* device, int precision_mode) {
     }
 
     return -1.0f; // ¯\_(ツ)_/¯
+}
+
+nvmlDevice_t nvml_get_device() {
+    static bool needs_init = true;
+    static nvmlDevice_t device;
+    if(needs_init) {
+        needs_init = false;
+        nvmlCheck(nvmlInit());
+        nvmlCheck(nvmlDeviceGetHandleByIndex_v2(0, &device));
+    }
+    return device;
+}
+
+struct GPUUtilInfo {
+    unsigned int clock;
+    unsigned int max_clock;
+    unsigned int power;
+    unsigned int power_limit;
+    unsigned int fan;
+    unsigned long long throttle;
+
+    float gpu_utilization;
+    float mem_utilization;
+};
+
+GPUUtilInfo get_gpu_utilization_info() {
+    GPUUtilInfo info;
+    nvmlDevice_t device = nvml_get_device();
+    nvmlCheck(nvmlDeviceGetClockInfo(device, NVML_CLOCK_SM, &info.clock));
+    nvmlCheck(nvmlDeviceGetMaxClockInfo(device, NVML_CLOCK_SM, &info.max_clock));
+    nvmlCheck(nvmlDeviceGetPowerManagementLimit(device, &info.power_limit));
+    nvmlCheck(nvmlDeviceGetPowerUsage(device, &info.power));
+    nvmlCheck(nvmlDeviceGetCurrentClocksThrottleReasons(device, &info.throttle));
+    nvmlCheck(nvmlDeviceGetFanSpeed(device, &info.fan));
+    // other potentially interesting functions
+    // nvmlDeviceGetPcieThroughput
+    // nvmlDeviceGetPcieSpeed
+    // nvmlDeviceGetNumGpuCores
+    // nvmlDeviceGetMemoryBusWidth
+    nvmlSample_t buffer[64];
+    nvmlValueType_t v_type;
+    unsigned int sample_count = 64;
+    nvmlCheck(nvmlDeviceGetSamples(device, NVML_GPU_UTILIZATION_SAMPLES, 0, &v_type, &sample_count, buffer));
+    float gpu_utilization = 0.f;
+    for(unsigned i = 0; i < sample_count; ++i) {
+        gpu_utilization += (float)buffer[i].sampleValue.uiVal;
+    }
+    gpu_utilization /= (float)sample_count;
+    sample_count = 64;
+    nvmlCheck(nvmlDeviceGetSamples(device, NVML_MEMORY_UTILIZATION_SAMPLES, 0, &v_type, &sample_count, buffer));
+    float mem_utilization = 0.f;
+    for(unsigned i = 0; i < sample_count; ++i) {
+        mem_utilization += (float)buffer[i].sampleValue.uiVal;
+    }
+    mem_utilization /= (float)sample_count;
+
+    info.gpu_utilization = gpu_utilization;
+    info.mem_utilization = mem_utilization;
+    return info;
 }
 
 #endif // MFU_H
