@@ -189,39 +189,46 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
     }
 }
 
-__global__ void rope_rotate_kernel(floatX* q, floatX* k, const float* rope_freqs, int B, int NH, int T, int HS) {
+__global__ void rope_rotate_kernel(floatX* q, floatX* k, float* rope_freqs, int B, int NH, int T, int HS) {
     // q, k are of shape (B, NH, T, HS)
-    // rope_freqs is of shape (T, HS)
-    int HS_half = HS / 2;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * NH * T * HS_half) { return; }
+    // rope_freqs is of shape (T, HS/2)
+    int n = HS / x128::size;
+    int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread_idx >= B * NH * T * n) { return; }
 
-    int b = idx / (NH * T * HS_half);
-    int rest = idx % (NH * T * HS_half);
-    int nh = rest / (T * HS_half);
-    rest = rest % (T * HS_half);
-    int t = rest / HS_half;
-    int hs = rest % HS_half;
+    int b = thread_idx / (NH * T * n);
+    int rest = thread_idx % (NH * T * n);
+    int nh = rest / (T * n);
+    rest = rest % (T * n);
+    int t = rest / n;
+    int i = rest % n;
 
-    // TODO(gordicaleksa): optimize load x128...
-    float freq = rope_freqs[t * HS + hs];
-    int idx1 = b * NH * T * HS + nh * T * HS + t * HS + 2*hs;
-    int idx2 = b * NH * T * HS + nh * T * HS + t * HS + 2*hs + 1;
+    float* rope_freqs_t = rope_freqs + t * HS + i * (x128::size / 2);
+    f128 freqs128 = load128(rope_freqs_t);  // caching the frequencies
 
-    floatX x1 = q[idx1];
-    floatX x2 = q[idx2];
-    floatX q_out1 = (floatX)((float)x1 * cosf(freq) - (float)x2 * sinf(freq));
-    floatX q_out2 = (floatX)((float)x2 * cosf(freq) + (float)x1 * sinf(freq));
+    int idx = b * NH * T * HS + nh * T * HS + t * HS + i * x128::size;
+    x128 q128 = load128cs(&q[idx]);
+    x128 k128 = load128cs(&k[idx]);
+    x128 qout128, kout128;
+    for (int k = 0; k < x128::size / 2; k++) {  // div by 2 because we're processing tuples of 2
+        // rotate q
+        floatX x1 = q128[2*k];
+        floatX x2 = q128[2*k + 1];
+        floatX q_out1 = (floatX)((float)x1 * cosf(freqs128[k]) - (float)x2 * sinf(freqs128[k]));
+        floatX q_out2 = (floatX)((float)x2 * cosf(freqs128[k]) + (float)x1 * sinf(freqs128[k]));
+        qout128[2*k] = q_out1;
+        qout128[2*k + 1] = q_out2;
+        // rotate k
+        x1 = k128[2*k];
+        x2 = k128[2*k + 1];
+        floatX k_out1 = (floatX)((float)x1 * cosf(freqs128[k]) - (float)x2 * sinf(freqs128[k]));
+        floatX k_out2 = (floatX)((float)x2 * cosf(freqs128[k]) + (float)x1 * sinf(freqs128[k]));
+        kout128[2*k] = k_out1;
+        kout128[2*k + 1] = k_out2;
+    }
 
-    x1 = k[idx1];
-    x2 = k[idx2];
-    floatX k_out1 = (floatX)((float)x1 * cosf(freq) - (float)x2 * sinf(freq));
-    floatX k_out2 = (floatX)((float)x2 * cosf(freq) + (float)x1 * sinf(freq));
-
-    q[idx1] = q_out1;
-    q[idx2] = q_out2;
-    k[idx1] = k_out1;
-    k[idx2] = k_out2;
+    store128cs(&q[idx], qout128);
+    store128cs(&k[idx], kout128);
 }
 
 // ----------------------------------------------------------------------------
@@ -251,7 +258,8 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 
     if (use_rope) {
         // TODO(gordicaleksa): fuse this with permute kernel (?) - avoid extra kernel launch overhead
-        total_threads = B * NH * T * (HS / 2);
+        assert(HS % x128::size == 0);
+        total_threads = B * NH * T * (HS / x128::size);
         num_blocks = CEIL_DIV(total_threads, block_size);
         rope_rotate_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, rope_freqs, B, NH, T, HS);
     }
