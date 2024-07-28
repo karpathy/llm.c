@@ -439,7 +439,11 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     fcloseCheck(model_file);
 }
 
-void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool resuming=false) {
+void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool weight_init=true) {
+    // If weight_init is true, we will load the weights from this checkpoint .bin file
+    // We sometimes want this to be false, if we are going to initialize these weights from
+    // the master weights that are instead stored in the state .bin file.
+    // In that case, this function mostly loads the model hyperparameters from the header.
 
     if (PRECISION_MODE == PRECISION_FP16) {
         // TODO for later perhaps, would require us dynamically converting the
@@ -463,8 +467,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool r
         exit(EXIT_FAILURE);
     }
 
-    // check if the precision mode matches the model (don't care if restoring from master weights!)
-    if (!resuming || !model->use_master_weights) {
+    // check if the precision mode of the checkpoing matches the model precision
+    if (weight_init) {
         if (PRECISION_MODE == PRECISION_BF16 && version != 5) {
             fprintf(stderr, "Precision is configured as BF16 but model at %s is not.\n", checkpoint_path);
             fprintf(stderr, "---> HINT: are you sure you're loading a _bf16.bin file?\n");
@@ -486,11 +490,10 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool r
     model->config.channels = model_header[6];
     model->config.padded_vocab_size = model_header[7];
 
-    gpt2_allocate_weights(model);
-
-    // read in all the parameters from file and copy them to device (if we need them)
-    // if we are restoring with master weights, ignore these weights and init from master instead
-    if (!resuming || !model->use_master_weights) {
+    // read in the parameters if weight_init is true
+    // we are assuming the space has already been allocated!
+    if (weight_init) {
+        assert(model->params_memory != NULL);
         file_to_device(model->params_memory, model_file, model->num_parameters_bytes, IO_BUF_SIZE, main_stream);
     }
     fcloseCheck(model_file);
@@ -1538,13 +1541,12 @@ int main(int argc, char *argv[]) {
 
     // figure out if we are going to be resuming the optimization
     int resuming = 0;
+    // find the DONE file with the highest step count
     int resume_max_step = find_max_step(output_log_dir);
-    if (resume == 1) {
-        // find the DONE file with the highest step count
+    if (resume == 1) { // is -y 1 resume flag set?
         assert(output_log_dir != NULL);
-        if (resume_max_step == -1) {
-        } else {
-            resuming = 1;
+        if (resume_max_step != -1) {
+            resuming = 1; // -y 1 is set, and we found a checkpoint we can resume from
             snprintf(filename_buffer, sizeof(filename_buffer), "%s/model_%08d.bin", output_log_dir, resume_max_step);
         }
     }
@@ -1552,9 +1554,12 @@ int main(int argc, char *argv[]) {
     // build the GPT-2 model
     GPT2 model;
     gpt2_init_common(&model);
+    gpt2_allocate_weights(&model);
     if (resuming == 1) {
         // if `-y 1` was set, then we are resuming from the latest checkpoint
-        gpt2_build_from_checkpoint(&model, filename_buffer, true);
+        // if we are using master weights, we'll init them later inside load_state()
+        bool weight_init = !use_master_weights;
+        gpt2_build_from_checkpoint(&model, filename_buffer, weight_init);
     } else if (ends_with_bin(load_filename)) {
         // otherwise, if this is a .bin file, we assume it's a model, let's init from it
         gpt2_build_from_checkpoint(&model, load_filename);
