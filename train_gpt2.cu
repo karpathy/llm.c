@@ -490,6 +490,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     model->config.channels = model_header[6];
     model->config.padded_vocab_size = model_header[7];
 
+    // allocate memory for the model parameters
+    gpt2_allocate_weights(model);
+
     // read in the parameters if weight_init is true
     // we are assuming the space has already been allocated!
     if (weight_init) {
@@ -1554,7 +1557,6 @@ int main(int argc, char *argv[]) {
     // build the GPT-2 model
     GPT2 model;
     gpt2_init_common(&model);
-    gpt2_allocate_weights(&model);
     if (resuming == 1) {
         // if `-y 1` was set, then we are resuming from the latest checkpoint
         // if we are using master weights, we'll init them later inside load_state()
