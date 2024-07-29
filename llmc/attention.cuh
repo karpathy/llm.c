@@ -205,7 +205,7 @@ __global__ void rope_rotate_kernel(floatX* q, floatX* k, float* rope_freqs, int 
     int t = rest / n;
     int i = rest % n;
 
-    float* rope_freqs_t = rope_freqs + t * HS + i * (x128::size / 2);
+    float* rope_freqs_t = rope_freqs + t * (HS / 2) + i * (x128::size / 2);
     f128 freqs_reg = load128(rope_freqs_t);  // caching the frequencies
 
     int idx = b * NH * T * HS + nh * T * HS + t * HS + i * x128::size;
