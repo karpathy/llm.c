@@ -1048,14 +1048,19 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         cudaCheck(cudaMemset(model->m_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
         cudaCheck(cudaMemset(model->v_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
     }
+
+    int gated_ffn = model->param_elements[12] > 0;
+
     // AdamW update
     // handle adamw for all the transformer blocks
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        if (!gated_ffn && (i == 12 || i == 13)) { continue; }  // skip the gated ffn weights
+
         // generate a unique seed for each tensor
         unsigned int seed = random_u32(&model->rng_state);
 
         int num_layers = model->config.num_layers;
-        if((i < 2 || i > 13)) {
+        if((i < 2 || i > 15)) {
             num_layers = 1;
         }
 
@@ -1068,7 +1073,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         // in particular this also decays the embedding weights, but this is ok:
         // - the token embeddings are weight shared and participate in the final projection to logits
         // - the position embeddings actively participate at every forward/backward pass
-        float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
+        float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12 || i == 14) ? weight_decay : 0.0f;
         floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
         floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
 
