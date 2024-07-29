@@ -235,16 +235,24 @@ void matmul_forward_cublaslt(floatX* out,
     // By default only fuse GELU/{act_func} for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
     if (act_func_fusion < 1 && pre_act) {
         matmul_cublaslt(pre_act, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
-        if (strcmp(act_func, "gelu") == 0) {
-            gelu_forward(out, pre_act, B*T*OC, stream);
-        } else {
-            // TODO(gordicaleksa): think how to efficiently implement SwiGLU
-            printf("Unsupported activation function: %s\n", act_func);
-            exit(EXIT_FAILURE);
-        }
+        gelu_forward(out, pre_act, B*T*OC, stream);
     } else {
         assert(strcmp(act_func, "gelu") == 0);  // currently only GELU is supported for fusion
         matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_act, false);
+    }
+}
+
+void matmul_forward_fc1(floatX* out,
+                     floatX* inp, floatX* weight1, floatX* bias1, floatX* weight2, floatX* bias2,
+                     int B, int T, int C, int OC, cudaStream_t stream,
+                     const char* act_func, floatX* pre_act=NULL, int act_func_fusion=1) {
+    if (weight2 == NULL) {
+        assert(bias2 == NULL);
+        matmul_forward_cublaslt(out, inp, weight1, bias1, B, T, C, OC, stream, act_func, pre_act, act_func_fusion);
+    } else {
+        // TODO(gordicaleksa): implement SwiGLU for FC1
+        assert(strcmp(act_func, "gelu") != 0);
+        assert(0); // not implemented
     }
 }
 

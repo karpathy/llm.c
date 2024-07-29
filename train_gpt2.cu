@@ -94,7 +94,7 @@ typedef struct {
 } GPT2Config;
 
 // the parameters of the model
-constexpr const int NUM_PARAMETER_TENSORS = 16;
+constexpr const int NUM_PARAMETER_TENSORS = 18;
 typedef struct {
     floatX* wte; // (V, C)
     floatX* wpe; // (maxT, C)
@@ -108,6 +108,8 @@ typedef struct {
     floatX* ln2b; // (L, C)
     floatX* fcw; // (L, 4*C, C)
     floatX* fcb; // (L, 4*C)
+    floatX* gatew; // (L, 4*C, C)
+    floatX* gateb; // (L, 4*C)
     floatX* fcprojw; // (L, C, 4*C)
     floatX* fcprojb; // (L, C)
     floatX* lnfw; // (C)
@@ -115,7 +117,7 @@ typedef struct {
 } ParameterTensors;
 static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
-void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
+void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config, int gated_ffn) {
     size_t Vp = config.padded_vocab_size;
     size_t C = config.channels;
     size_t maxT = config.max_seq_len;
@@ -132,10 +134,12 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     param_sizes[9] = L * C; // ln2b
     param_sizes[10] = L * (4 * C) * C; // fcw
     param_sizes[11] = L * (4 * C); // fcb
-    param_sizes[12] = L * C * (4 * C); // fcprojw
-    param_sizes[13] = L * C; // fcprojb
-    param_sizes[14] = C; // lnfw
-    param_sizes[15] = C; // lnfb
+    param_sizes[12] = gated_ffn ? L * C * (4 * C) : 0; // gatew
+    param_sizes[13] = gated_ffn ? L * C : 0; // gateb
+    param_sizes[14] = L * C * (4 * C); // fcprojw
+    param_sizes[15] = L * C; // fcprojb
+    param_sizes[16] = C; // lnfw
+    param_sizes[17] = C; // lnfb
 
     // populate the parameter sizes in bytes (all the same for now, keeping for future use)
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -150,6 +154,7 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters_bytes += param_elements[i] * param_sizeof[i];
     }
+    int gated_ffn = param_elements[12] > 0;
     // malloc all parameters all at once on the device
     void* params_memory;
     cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
@@ -157,10 +162,12 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     floatX** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
+        gated_ffn ? &params->gatew : NULL, gated_ffn ? &params->gateb : NULL,
         &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
     };
     char* params_memory_iterator = (char*)params_memory;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        if (ptrs[i] == NULL) continue;
         *(ptrs[i]) = (floatX*)params_memory_iterator;
         params_memory_iterator += param_elements[i] * param_sizeof[i];
     }
@@ -353,7 +360,7 @@ void gpt2_init_common(GPT2 *model) {
 
 void gpt2_allocate_weights(GPT2 *model) {
     // fill in all the parameter tensor dimensions and types
-    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
+    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config, strcmp(model->act_func, "gelu") != 0);
     model->num_parameters = 0;
     model->num_parameters_bytes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -432,6 +439,7 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model_header[5] = model->config.num_heads;
     model_header[6] = model->config.channels;
     model_header[7] = model->config.padded_vocab_size;
+    model_header[8] = strcmp(model->act_func, "gelu") == 0 ? 0 : 1;
     fwriteCheck(model_header, sizeof(int), 256, model_file);
     // write the parameters
     device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
@@ -482,6 +490,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->config.num_heads = model_header[5];
     model->config.channels = model_header[6];
     model->config.padded_vocab_size = model_header[7];
+    model->act_func = model_header[8] == 0 ? "gelu" : "swiglu";
 
     gpt2_allocate_weights(model);
 
@@ -561,6 +570,7 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     model->config.padded_vocab_size = 50304; // padded to 128 for CUDA kernel efficiency
 
     gpt2_allocate_weights(model);
+    int gated_ffn = model->param_elements[12] > 0;
 
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
@@ -578,22 +588,24 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     for (int l = 0; l < L; l++) {
         offset = 0;
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            if (!gated_ffn && (i == 12 || i == 13)) continue; // skip the gated ffn parameters
+
             // the layernorm parameters are all initialized to 1
-            if (l == 0 && (i == 2 || i == 8 || i == 14)) { // only at l = 0 to init these just once
+            if (l == 0 && (i == 2 || i == 8 || i == 16)) { // only at l = 0 to init these just once
                 for (size_t j = 0; j < model->param_elements[i]; j++) {
                     params_memory_cpu[offset + j] = 1.0f;
                 }
             }
             // weights tensors are handled here
             if ((l == 0 && (i == 0 || i == 1)) // only at l = 0, init the wte and wpe tensors
-              || i == 4 || i == 6 || i == 10 || i == 12) {
+              || i == 4 || i == 6 || i == 10 || i == 12 || i == 14) {
                 size_t n = model->param_elements[i];
                 size_t layer_offset = 0;
                 if (i == 0) {
                     // for wte tensor (padded vocab) override to init V instead of Vp rows
                     n = model->config.vocab_size * model->config.channels;
                 }
-                if (i == 4 || i == 6 || i == 10 || i == 12) {
+                if (i == 4 || i == 6 || i == 10 || i == 12 || i == 14) {
                     // weight tensors, we are only initializing layer l
                     assert(n % L == 0);
                     n = n / L;
@@ -601,7 +613,7 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
                 }
                 // in GPT-2, the projections back into the residual stream are additionally
                 // scaled by 1/sqrt(2*L) for training stability
-                float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
+                float scale = (i == 6 || i == 14) ? 0.02f * residual_scale : 0.02f;
                 // okay let's draw the random numbers and write them
                 float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
                 normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
@@ -652,6 +664,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // we can do this while the copies are already underway
     tokenCheck(inputs, B*T, V);
 
+    int gated_ffn = model->param_elements[12] > 0;
+
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
@@ -674,6 +688,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_ln2b = params.ln2b + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcb = params.fcb + l * 4*C;
+        floatX* l_gatedw = gated_ffn ? params.gatew + l * 4*C * C : NULL;
+        floatX* l_gatedb = gated_ffn ? params.gateb + l * 4*C : NULL;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         floatX* l_fcprojb = params.fcprojb + l * C;
 
@@ -710,7 +726,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream, model->act_func);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch_act, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, model->act_func, l_fch, model->act_func_fusion);
+        matmul_forward_fc1(l_fch_act, l_ln2, l_fcw, l_fcb, gated_ffn ? l_gatedw : NULL, gated_ffn ? l_gatedb : NULL,
+            B, T, C, 4*C, main_stream, model->act_func, l_fch, model->act_func_fusion);
         matmul_forward_cublaslt(scratch, l_fch_act, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream, model->act_func);
         // OK, fusion across blocks.
         if(l+1 != L) {
