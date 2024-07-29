@@ -165,26 +165,27 @@ void matmul_cublaslt(Td* d, const Ta* a, const Tb* b, const floatX* bias,
     if (batch_count == 0 && allow_fp8) {
         a_precision = CUDA_R_8F_E4M3;
         if constexpr (!std::is_same<Ta, __nv_fp8_e4m3>::value) {
+            void* associated = associated_with_a ? associated_with_a : (void*)b;
             __nv_fp8_e4m3* a_fp8 = NULL;
-            float *calculated_from_absmax = absmax_tracker.get_absmax_data("matmul_a", a, k*m, associated_with_a ? associated_with_a : b, SCALE_A, true, true);
+            float *calculated_from_absmax = absmax_tracker.get_absmax_data("matmul_a", a, k*m, associated, SCALE_A, true, true);
             absmax_a = (float*)calculated_from_absmax+DESCALE_OFFSET;
 
-            if (!transA && backward && use_act_transpose_cache) {
-                a_fp8 = g_transposed_cache.getTransposed<Ta, __nv_fp8_e4m3>(a, m, k, /* compute */ false, /* find_only*/ true);
+            if (!transA && backward && use_act_transpose_cache && !is_embedding) {
+                a_fp8 = g_transposed_cache.getTransposed<Ta, __nv_fp8_e4m3>(a, associated, m, k, /* compute */ false, /* find_only*/ true);
             }
             if (a_fp8 == NULL) {
                 release_scratch_a = true;
                 a_fp8 = CudaScratchAllocator::getMemory<__nv_fp8_e4m3>(m*k);
-                float *next_absmax = absmax_tracker.next_absmax_ptr(a, k*m, associated_with_a ? associated_with_a : b, 0.0f, true);
+                float *next_absmax = absmax_tracker.next_absmax_ptr(a, k*m, associated, 0.0f, true);
                 copy_or_transpose<true> (!transA, a_fp8, a, m, k, NULL, calculated_from_absmax+DESCALE_OFFSET, (unsigned int*)next_absmax, stream);
             }
             a_converted = (Ta*)a_fp8;
         } else {
             if (!transA) {
-                if (use_weights_transpose_cache && associated_with_a == NULL) {
-                    a_converted = g_transposed_cache.getTransposed(a, m, k, stream);
+                if (use_weights_transpose_cache && !is_embedding && associated_with_a == NULL) {
+                    a_converted = g_transposed_cache.getTransposed(a, NULL, m, k, stream);
                 } else {
-                    a_converted = g_transposed_cache.getTransposed(a, m, k, false, true);
+                    a_converted = g_transposed_cache.getTransposed(a, NULL, m, k, false, true);
                     if (a_converted == NULL) {
                         a_converted = CudaScratchAllocator::getMemory<__nv_fp8_e4m3>(m*k);
                         copy_or_transpose<false> (true, a_converted, a, m, k, NULL, NULL, NULL, stream);
@@ -215,8 +216,8 @@ void matmul_cublaslt(Td* d, const Ta* a, const Tb* b, const floatX* bias,
                 float *calculated_from_absmax = absmax_tracker.get_absmax_data("matmul_b_e4", b, k*n, a, SCALE_FORWARD_B, true, true);
                 float *next_absmax = absmax_tracker.next_absmax_ptr(b, k*n, a, 0.0f, true);
                 absmax_b = (float*)calculated_from_absmax+DESCALE_OFFSET;
-                if (use_act_transpose_cache) {
-                    __nv_fp8_e4m3* transposed = g_transposed_cache.getTransposed<Tb, __nv_fp8_e4m3>(b, n, k, /* compute */ false);
+                if (use_act_transpose_cache && !is_embedding) {
+                    __nv_fp8_e4m3* transposed = g_transposed_cache.getTransposed<Tb, __nv_fp8_e4m3>(b, associated_with_a, n, k, /* compute */ false);
                     copy_and_transpose<true> (transposed, b_fp8, b, n, k, NULL, calculated_from_absmax+DESCALE_OFFSET, (unsigned int*)next_absmax, stream);
                 } else {
                     copy_or_transpose<true> (transB, b_fp8, b, n, k, NULL, calculated_from_absmax+DESCALE_OFFSET, (unsigned int*)next_absmax, stream);
@@ -439,8 +440,8 @@ void matmul_forward_cublaslt(Td* out,
 
             float *out_scale = out_from_absmax + SCALE_OFFSET;
 
-            if (use_act_transpose_cache) {
-                __nv_fp8_e4m3* transposed = g_transposed_cache.getTransposed<__nv_fp8_e4m3, __nv_fp8_e4m3>(out, OC, B*T, /* compute */ false);
+            if (use_act_transpose_cache && false) { // todo = disabled for now - need to make sure it will hit in backwards!
+                __nv_fp8_e4m3* transposed = g_transposed_cache.getTransposed<__nv_fp8_e4m3, __nv_fp8_e4m3>(out, weight, OC, B*T, /* compute */ false);
                 copy_and_transpose<true, gelu_forward_elementwise, false> (transposed, out, pre_gelu, OC, B*T, pre_gelu_descale, out_scale, (unsigned int*)out_next_absmax, stream);
             } else {
                 copy_advanced<false, gelu_forward_elementwise, false>(out, pre_gelu, B*T*OC, pre_gelu_descale, out_scale, out_next_absmax, stream);

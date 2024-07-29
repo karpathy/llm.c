@@ -12,6 +12,9 @@
 #include "cuda_common.h"
 #include "cuda_utils.cuh"
 
+#include "zero.cuh"
+extern MultiGpuConfig multi_gpu_config;
+
 // after gpt2_update() ==> 1) ncclAllReduce on d_storage, 2) make sure indices match for all tensors, 3) update_all_absmax()
 // --> so need to disable updating absmax for inference that only runs on rank 0 (is returning NULL for next_absmax enough?)
 // annoying this is a stalling sync...
@@ -81,12 +84,13 @@ public:
 
     TensorAbsMaxTracker()
         : current_tensor_count(0), max_tensor_count(0), d_storage(nullptr), d_current_indices(nullptr) {
-        grow_storage_if_needed(INITIAL_TENSOR_COUNT);
+        // not sure why init needs to be done in main() with multi-GPU/MPI it seems?!
     }
 
     ~TensorAbsMaxTracker() {
-        if (d_storage) cudaCheck(cudaFree(d_storage));
-        if (d_current_indices) cudaCheck(cudaFree(d_current_indices));
+        // not sure why this needs to be commented with multi-GPU/MPI it seems?!
+        //if (d_storage) cudaCheck(cudaFree(d_storage));
+        //if (d_current_indices) cudaCheck(cudaFree(d_current_indices));
     }
 
     template<typename T>
@@ -208,30 +212,6 @@ public:
         }
     }
 
-    // todo - d_storage is public for now so that we can ncclReduce it outside of this class
-    float* d_storage; // both absmax history storage and derived data (scaled/descale/etc.)
-    // todo - current_tensor_count is public so we can use MPI to check it matches with other ranks
-    size_t current_tensor_count;
-private:
-    // GPU
-    uint8_t* d_current_indices; // 8th bit of d/h_current_indices indicate whether this is a weight
-    // CPU
-    std::unordered_map<TensorKey, TensorInfo, TensorKeyHash> tensor_info_map;
-    std::vector<uint8_t> h_current_indices;
-    size_t max_tensor_count;
-
-    void reset_all_update_counts(bool always_reset_all=true, bool weight_update_only=false) {
-        for (auto& pair : tensor_info_map) {
-            if (!always_reset_all) {
-                if ((h_current_indices[pair.second.index] >= 128) != weight_update_only) {
-                    continue; // only update either weights or everything else (act/grad/etc.)
-                }
-            }
-            pair.second.previous_update_count = pair.second.update_count;
-            pair.second.update_count = 0;
-        }
-    }
-
     void grow_storage_if_needed(size_t newTensorCount) {
         // todo - not safe...
         // what if a kernel has 2xFP8 and this grows when querying for 2nd one, after storing the 1st?!
@@ -266,6 +246,30 @@ private:
         h_current_indices.resize(new_max_tensor_count);
         max_tensor_count = new_max_tensor_count;
         cudaCheck(cudaGetLastError());
+    }
+
+    // todo - d_storage is public for now so that we can ncclReduce it outside of this class
+    float* d_storage; // both absmax history storage and derived data (scaled/descale/etc.)
+    // todo - current_tensor_count is public so we can use MPI to check it matches with other ranks
+    size_t current_tensor_count;
+private:
+    // GPU
+    uint8_t* d_current_indices; // 8th bit of d/h_current_indices indicate whether this is a weight
+    // CPU
+    std::unordered_map<TensorKey, TensorInfo, TensorKeyHash> tensor_info_map;
+    std::vector<uint8_t> h_current_indices;
+    size_t max_tensor_count;
+
+    void reset_all_update_counts(bool always_reset_all=true, bool weight_update_only=false) {
+        for (auto& pair : tensor_info_map) {
+            if (!always_reset_all) {
+                if ((h_current_indices[pair.second.index] >= 128) != weight_update_only) {
+                    continue; // only update either weights or everything else (act/grad/etc.)
+                }
+            }
+            pair.second.previous_update_count = pair.second.update_count;
+            pair.second.update_count = 0;
+        }
     }
 
     size_t get_storage_offset(size_t index) const {
@@ -421,6 +425,12 @@ void TensorAbsMaxTracker::update_single_absmax(const T* tensor_address, size_t n
     size_t index = it->second.index;
     size_t offset = get_storage_offset(index);
 
+    cudaCheck(cudaGetLastError());
+
+    //("(%d) update_single_absmax() called for tensor '%s' (layer %d) at %p (num_elements %lu) ==> h_current_indices[info.index]: %d\n",
+    //    multi_gpu_config.process_rank, it->second.name, it->second.layer, tensor_address, num_elements, h_current_indices[index]);
+    //printf("(%d) d_storage: %p, d_current_indices: %p, index: %lu, offset: %lu\n", multi_gpu_config.process_rank, d_storage, d_current_indices, index, offset);
+
     update_single_absmax_kernel<<<1, 1, 0, stream>>>(d_storage + offset, d_current_indices + index, fudgeFactor);
     cudaCheck(cudaGetLastError());
 #endif
@@ -440,6 +450,4 @@ float* TensorAbsMaxTracker::calculate_manual_absmax(const T* tensor_address, siz
     update_single_absmax(tensor_address, num_elements, associated_tensor, 1.0f, stream);
     return get_absmax_data("", tensor_address, num_elements, associated_tensor);
 }
-
-TensorAbsMaxTracker absmax_tracker;
 #endif

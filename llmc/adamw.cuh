@@ -143,7 +143,7 @@ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memo
         for (int i = 0; i < num_slices; i++) {
             global_current_layer = num_slices > 1 ? i+1 : 0;
             Tp* layer_params_memory = params_memory + i * num_parameters;
-            float *calculated_from_absmax = absmax_tracker.get_absmax_data("adamw", layer_params_memory, num_parameters, NULL, SCALE_FP8_WEIGHTS, false, true);
+            float *calculated_from_absmax = absmax_tracker.get_absmax_data("adamw", layer_params_memory, num_parameters, NULL, SCALE_FP8_WEIGHTS, true /* todo - why is this needed not but was OK without it on non-multi-GPU? */, true);
             absmax_params.scale_factor[i] = calculated_from_absmax + SCALE_OFFSET;
             absmax_params.absmax_output[i] = absmax_tracker.next_absmax_ptr(layer_params_memory, num_parameters, NULL, 0.0f, false, true);
         }

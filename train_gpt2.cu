@@ -3,18 +3,18 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 
 // todo - make into proper makefile config options
-#define FORCE_FP8_MATMUL false
-#define FORCE_FP8_ALLOW_LAYER_FORWARD false
-#define FORCE_FP8_ALLOW_LAYER_BACKWARDS false
+#define FORCE_FP8_MATMUL true
+#define FORCE_FP8_ALLOW_LAYER_FORWARD true
+#define FORCE_FP8_ALLOW_LAYER_BACKWARDS true
 #define FORCE_FP8_ALLOW_EMBEDDING_FORWARD false
 #define FORCE_FP8_ALLOW_EMBEDDING_BACKWARDS false
-#define FORCE_FP8_ALLOW_ACTIVATION_GRADIENTS false // only relevant if ALLOW_BACKWARDS is true but FP8_WEIGHTS/ACTIVATIONS/GRADIENTS are false
-#define FORCE_FP8_ALLOW_PARAMETER_GRADIENTS false
-#define FORCE_FP8_WEIGHTS false // not compatible with existing checkpoints
-#define FORCE_FP8_ACTIVATIONS false // compatible with existing checkpoints
+#define FORCE_FP8_ALLOW_ACTIVATION_GRADIENTS true // only relevant if ALLOW_BACKWARDS is true but FP8_WEIGHTS/ACTIVATIONS/GRADIENTS are false
+#define FORCE_FP8_ALLOW_PARAMETER_GRADIENTS true
+#define FORCE_FP8_WEIGHTS true // not compatible with existing checkpoints
+#define FORCE_FP8_ACTIVATIONS true // compatible with existing checkpoints
 #define FORCE_FP8_GRADIENTS false // activation gradients directly output in FP8
-bool use_weights_transpose_cache = false; // cached across gradient accumulation steps (same weight)
-bool use_act_transpose_cache = false; // usually l_atty with BF16 attention, disabled during inference
+bool use_weights_transpose_cache = true; // cached across gradient accumulation steps (same weight)
+bool use_act_transpose_cache = true; // usually l_atty with BF16 attention, disabled during inference
 
 // todo - make command line parameters for tuning
 // 1.0/448.0f would be the most aggressive setting for e4m3
@@ -74,6 +74,7 @@ int global_current_layer = -1;
 #include "llmc/cublas_common.h"
 // ... todo ...
 #include "llmc/absmax_history.cuh"
+TensorAbsMaxTracker absmax_tracker; // todo - ...
 // ... todo ...
 #include "llmc/copy_and_fp8.cuh"
 // ----------- Layer implementations in CUDA -----------
@@ -1149,6 +1150,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         // todo - we end up checking param_sizeof *3 times* below because we need to cast to the right format
         // is there a nice way to avoid doing that? (without checking for init_master_weights 3 times instead etc...)
         if(init_master_weights) {
+            cudaCheck(cudaGetLastError());
+
             size_t grid_size = CEIL_DIV(shard.size, 512);
             if (model->param_sizeof[i] == sizeof(floatX)) {
                 copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, param_ptr, shard.size,
@@ -1161,6 +1164,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                 copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, (float*)param_ptr, shard.size,
                                                                      shard.size, tensor.size);
             }
+
             cudaCheck(cudaGetLastError());
         }
 
@@ -1190,6 +1194,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 #if MULTI_GPU
             ncclCheck(ncclGroupStart());
             for(int l = 0; l < num_layers; ++l) {
+                cudaCheck(cudaGetLastError());
+
                 // gather updated shards of model->params_memory from each process
                 if (model->param_sizeof[i] == sizeof(floatX)) {
                     ncclCheck(ncclAllGather(param_ptr + l * tensor.size,
@@ -1207,6 +1213,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                             shard.size, ncclFloat, // FP32
                                             multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
                 }
+                cudaCheck(cudaGetLastError());
             }
             ncclCheck(ncclGroupEnd());
 #endif
@@ -1764,6 +1771,9 @@ int main(int argc, char *argv[]) {
     LearningRateScheduler lr_scheduler;
     lr_scheduler_init(&lr_scheduler, lr_scheduler_type, learning_rate,
                       warmup_iterations, train_num_batches, final_learning_rate_frac);
+
+    // initialize the absmax tracker for FP8
+    absmax_tracker.grow_storage_if_needed(8192);
 
     // some memory for generating samples from the model
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));

@@ -680,6 +680,16 @@ size_t CudaScratchAllocator::total_allocated = 0;
 // ----------------------------------------------------------------------------
 // Transposed Cache (for FP8 weights)
 
+#include <functional>
+
+// Custom hash function for std::pair<uint64_t, uint64_t>
+// todo - why did we need this? complained about default constructor issue?
+struct PairHash {
+    std::size_t operator()(const std::pair<uint64_t, uint64_t>& p) const {
+        return std::hash<uint64_t>{}(p.first) ^ (std::hash<uint64_t>{}(p.second) << 1);
+    }
+};
+
 class TransposedCache {
 private:
     struct CacheEntry {
@@ -687,12 +697,16 @@ private:
         size_t size;
     };
 
-    std::unordered_map<uint64_t, CacheEntry> cache;
+    std::unordered_map<std::pair<uint64_t, uint64_t>, CacheEntry, PairHash> cache;
 
 public:
+    TransposedCache() = default;
+
     template<typename T, typename Tout=T>
-    Tout* getTransposed(const T* original, size_t m, size_t k, bool compute=true, bool find_only=false, cudaStream_t stream=0) {
-        uint64_t key = reinterpret_cast<uint64_t>(original);
+    Tout* getTransposed(const T* original, const void* associatedTensor, size_t m, size_t k, bool compute=true, bool find_only=false, cudaStream_t stream=0) {
+        uint64_t key1 = reinterpret_cast<uint64_t>(original);
+        uint64_t key2 = reinterpret_cast<uint64_t>(associatedTensor);
+        auto key = std::make_pair(key1, key2);
         size_t size = m * k * sizeof(T);
 
         auto it = cache.find(key);
@@ -700,12 +714,12 @@ public:
             return reinterpret_cast<Tout*>(it->second.ptr);
         }
         if (find_only) {
-            return NULL;
+            return nullptr;
         }
 
         Tout* transposed = CudaScratchAllocator::getMemory<Tout>(m * k, true);
         if (compute) {
-            copy_or_transpose<false>(true, transposed, original, m, k, NULL, NULL, NULL, stream);
+            copy_or_transpose<false>(true, transposed, original, m, k, nullptr, nullptr, nullptr, stream);
         }
 
         cache[key] = {transposed, size};
