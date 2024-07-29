@@ -702,6 +702,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
+        floatX* l_fc2 = gated_ffn ? acts.fch + (l == L-1 ? L-2 : l+1) * B * T * 4*C : NULL;  // reuse the same buffer for pre activation in case of SwiGLU
         // reuse the same activation buffer at each layer, as we'll re-compute the gelu/{act_func} during backward
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
         floatX* l_fch_act = (model->recompute < 1) ? acts.fch_act + l * B * T * 4*C : acts.fch_act;
@@ -727,7 +728,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream, model->act_func);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
         matmul_forward_fc1(l_fch_act, l_ln2, l_fcw, l_fcb, gated_ffn ? l_gatedw : NULL, gated_ffn ? l_gatedb : NULL,
-            B, T, C, 4*C, main_stream, model->act_func, l_fch, model->act_func_fusion);
+            B, T, C, 4*C, main_stream, model->act_func, l_fch, l_fc2, model->act_func_fusion);
         matmul_forward_cublaslt(scratch, l_fch_act, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream, model->act_func);
         // OK, fusion across blocks.
         if(l+1 != L) {

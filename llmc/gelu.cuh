@@ -25,6 +25,20 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp) {
     store128(out + idx, packed_out);
 }
 
+__global__ void swiglu_forward_kernel(floatX* out, const floatX* inp1, const floatX* inp2) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+
+    x128 packed_out;
+    x128 packed_inp1 = load128cs(inp1 + idx);
+    x128 packed_inp2 = load128cs(inp2 + idx);
+    for(int k = 0; k < packed_inp1.size; ++k) {
+        float x1 = (float)packed_inp1[k];
+        float x2 = (float)packed_inp2[k];
+        packed_out[k] = (floatX)((x1 * x2) / (1.0f + expf(-x1)));
+    }
+    store128(out + idx, packed_out);
+}
+
 __global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const floatX* inp) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
 
@@ -62,5 +76,14 @@ void gelu_backward_inplace(floatX* d_in_out, const floatX* inp, const int N, cud
     assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
     gelu_backward_inplace_kernel<<<grid_size, block_size, 0, stream>>>(d_in_out, inp);
+    cudaCheck(cudaGetLastError());
+}
+
+void swiglu_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N, cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    const int block_size = 512;
+    assert(N % (block_size * x128::size) == 0);
+    const int grid_size = CEIL_DIV(N, block_size * x128::size);
+    swiglu_forward_kernel<<<grid_size, block_size, 0, stream>>>(out, inp1, inp2);
     cudaCheck(cudaGetLastError());
 }

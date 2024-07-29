@@ -245,14 +245,15 @@ void matmul_forward_cublaslt(floatX* out,
 void matmul_forward_fc1(floatX* out,
                      floatX* inp, floatX* weight1, floatX* bias1, floatX* weight2, floatX* bias2,
                      int B, int T, int C, int OC, cudaStream_t stream,
-                     const char* act_func, floatX* pre_act=NULL, int act_func_fusion=1) {
+                     const char* act_func, floatX* pre_act1=NULL, floatX* pre_act2=NULL, int act_func_fusion=1) {
     if (weight2 == NULL) {
         assert(bias2 == NULL);
-        matmul_forward_cublaslt(out, inp, weight1, bias1, B, T, C, OC, stream, act_func, pre_act, act_func_fusion);
+        matmul_forward_cublaslt(out, inp, weight1, bias1, B, T, C, OC, stream, act_func, pre_act1, act_func_fusion);
     } else {
-        // TODO(gordicaleksa): implement SwiGLU for FC1
-        assert(strcmp(act_func, "gelu") != 0);
-        assert(0); // not implemented
+        assert(strcmp(act_func, "swiglu") == 0);
+        matmul_cublaslt(pre_act1, weight1, inp, bias1, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
+        matmul_cublaslt(pre_act2, weight2, inp, bias2, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
+        swiglu_forward(out, pre_act1, pre_act2, B*T*OC, stream);
     }
 }
 
