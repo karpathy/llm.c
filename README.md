@@ -258,4 +258,4 @@ Ways of organizing development:
 
 ## license
 
-MIT
+[MIT](https://en.wikipedia.org/wiki/MIT_License)
