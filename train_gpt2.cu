@@ -314,6 +314,7 @@ typedef struct {
     int use_master_weights;     // keep master weights copy in float for optim update? 0|1
     bool init_state;   // set to true if master weights need to be initialized
     int act_func_fusion; // fuse gelu/{act_func} via cuBLASLt (0=none, 1=forward, 2=forward+backward)
+    const char* act_func; // the activation function to use, e.g. "gelu"
     int recompute; // recompute gelu/{act_func} | layernorm forward during model backward? 0|1|2
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
@@ -347,6 +348,7 @@ void gpt2_init_common(GPT2 *model) {
     model->init_state = true;
     model->recompute = 1; // good default: recompute gelu/{act_func} but not layernorm
     model->act_func_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+    model->act_func = "gelu"; // default: gelu
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -693,7 +695,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // now do the forward pass
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream, model->act_func);
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
@@ -702,14 +704,14 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         }
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream, model->act_func);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
         #endif
 
-        matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+        matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream, model->act_func);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch_act, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->act_func_fusion);
-        matmul_forward_cublaslt(scratch, l_fch_act, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+        matmul_forward_cublaslt(l_fch_act, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, model->act_func, l_fch, model->act_func_fusion);
+        matmul_forward_cublaslt(scratch, l_fch_act, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream, model->act_func);
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
@@ -726,7 +728,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream, model->act_func);
     cudaCheck(cudaDeviceSynchronize());
 }
 
@@ -1408,6 +1410,8 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu/{act_func}
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    // architecture settings
+    const char* act_func = "gelu";  // use gelu activation function by default
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1439,7 +1443,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g' && argv[i][2] == 'e') { act_func_fusion = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'a' && argv[i][2] == '\0') { overfit_single_batch = atoi(argv[i+1]); }
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
@@ -1456,7 +1460,13 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'a' && argv[i][2] == 'f') { act_func = argv[i+1]; }
         else { error_usage(); }
+    }
+
+    if (strcmp(act_func, "gelu") != 0 && strcmp(act_func, "swiglu") != 0) {
+        fprintf(stderr, "Error: act_func must be either 'gelu' or 'swiglu'\n");
+        error_usage();
     }
 
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
@@ -1503,6 +1513,7 @@ int main(int argc, char *argv[]) {
     printf0("| genT                  | %-50d |\n", genT);
     printf0("| overfit_single_batch  | %-50d |\n", overfit_single_batch);
     printf0("| use_master_weights    | %-50s |\n", use_master_weights ? "enabled" : "disabled");
+    printf0("| activation function   | %-50s |\n", act_func);
     printf0("| act_func_fusion       | %-50d |\n", act_func_fusion);
     printf0("| recompute             | %-50d |\n", recompute);
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -1544,6 +1555,7 @@ int main(int argc, char *argv[]) {
 
     model.use_master_weights = use_master_weights;
     model.act_func_fusion = act_func_fusion;
+    model.act_func = act_func;
     model.recompute = recompute;
     printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : load_filename);
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);

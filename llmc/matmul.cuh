@@ -231,13 +231,20 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
 void matmul_forward_cublaslt(floatX* out,
                      floatX* inp, floatX* weight, floatX* bias,
                      int B, int T, int C, int OC, cudaStream_t stream,
-                     floatX* pre_gelu=NULL, int gelu_fusion=1) {
-    // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
-    if (gelu_fusion < 1 && pre_gelu) {
-        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
-        gelu_forward(out, pre_gelu, B*T*OC, stream);
+                     const char* act_func, floatX* pre_act=NULL, int act_func_fusion=1) {
+    // By default only fuse GELU/{act_func} for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
+    if (act_func_fusion < 1 && pre_act) {
+        matmul_cublaslt(pre_act, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
+        if (strcmp(act_func, "gelu") == 0) {
+            gelu_forward(out, pre_act, B*T*OC, stream);
+        } else {
+            // TODO(gordicaleksa): think how to efficiently implement SwiGLU
+            printf("Unsupported activation function: %s\n", act_func);
+            exit(EXIT_FAILURE);
+        }
     } else {
-        matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
+        assert(strcmp(act_func, "gelu") == 0);  // currently only GELU is supported for fusion
+        matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_act, false);
     }
 }
 
