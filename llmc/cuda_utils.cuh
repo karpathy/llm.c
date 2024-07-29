@@ -136,7 +136,7 @@ __global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n, ptrdiff_t
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // need to try grid stride looping for more perf later
     if (idx < n) {
-        dst[idx + stride_dst * blockIdx.y] = cast_value<Td, Ts>(src[idx + stride_src * blockIdx.y]);
+        dst[idx + stride_dst * blockIdx.y] = cast_value<Td>(src[idx + stride_src * blockIdx.y]);
     }
 }
 
@@ -258,6 +258,23 @@ __device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigne
 }
 __device__ __forceinline__ void stochastic_rounding(float in, float *out, unsigned int random) {
     *out = in; // dummy function for when floatX is float (FP32 mode)
+}
+
+// Add two (potentially low-precision) vectors of size `n` together using stochastic rounding
+template<class T>
+__global__ void vector_add(T* dst, const T* src, size_t n, unsigned seed) {
+    using t128 = Packed128<T>;
+    assert(n % t128::size == 0);
+    ptrdiff_t idx = ((ptrdiff_t)blockIdx.x * blockDim.x + threadIdx.x) * t128::size;
+    if (idx < n) {
+        t128 src_v = load128cs(src + idx);
+        t128 dst_v = load128cs(dst + idx);
+        for(int k = 0; k < t128::size; ++k) {
+            float sum = (float)dst_v[k] + (float)src_v[k];
+            stochastic_rounding(sum, &dst_v[k], seed + idx);
+        }
+        store128cs(dst + idx, dst_v);
+    }
 }
 
 #endif
