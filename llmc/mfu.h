@@ -4,13 +4,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if __has_include(<nvml.h>)
+#define USE_NVML 1
 #include <nvml.h>
+#else
+#define USE_NVML 0
+#endif
 
 // tied to enum PrecisionMode, in a future refactor make them the same
 #define MFUH_PRECISION_FP32 0
 #define MFUH_PRECISION_FP16 1
 #define MFUH_PRECISION_BF16 2
 
+#if USE_NVML
 inline void nvml_check(nvmlReturn_t status, const char *file, int line) {
     if (status != NVML_SUCCESS) {
         printf("[NVML ERROR] at file %s:%d:\n%s\n", file, line, nvmlErrorString(status));
@@ -18,6 +24,7 @@ inline void nvml_check(nvmlReturn_t status, const char *file, int line) {
     }
 };
 #define nvmlCheck(err) (nvml_check(err, __FILE__, __LINE__))
+#endif
 
 
 typedef struct {
@@ -144,18 +151,6 @@ float get_flops_promised(const char* device, int precision_mode) {
     return -1.0f; // ¯\_(ツ)_/¯
 }
 
-// lazily initialize nvml and generate a handle to the GPU
-nvmlDevice_t nvml_get_device() {
-    static bool needs_init = true;
-    static nvmlDevice_t device;
-    if(needs_init) {
-        needs_init = false;
-        nvmlCheck(nvmlInit());
-        nvmlCheck(nvmlDeviceGetHandleByIndex_v2(0, &device));
-    }
-    return device;
-}
-
 struct GPUUtilInfo {
     unsigned int clock;
     unsigned int max_clock;
@@ -169,6 +164,19 @@ struct GPUUtilInfo {
     float mem_utilization;
     const char* throttle_reason;
 };
+
+// lazily initialize nvml and generate a handle to the GPU
+#if USE_NVML
+nvmlDevice_t nvml_get_device() {
+    static bool needs_init = true;
+    static nvmlDevice_t device;
+    if(needs_init) {
+        needs_init = false;
+        nvmlCheck(nvmlInit());
+        nvmlCheck(nvmlDeviceGetHandleByIndex_v2(0, &device));
+    }
+    return device;
+}
 
 // convert throttle reason bitfield into a text reason.
 // this is a lossy conversion; we just want to give some idea of what is happening
@@ -227,5 +235,10 @@ GPUUtilInfo get_gpu_utilization_info() {
     info.mem_utilization = mem_utilization;
     return info;
 }
-
+#else
+GPUUtilInfo get_gpu_utilization_info() {
+    fprintf(stderr, "Error: Compiled without nvml support. Cannot perform additional GPU state tracking.");
+    exit(EXIT_FAILURE);
+}
+#endif
 #endif // MFU_H
