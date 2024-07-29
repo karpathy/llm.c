@@ -992,6 +992,7 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
     // repurposing this buffer (which isn't needed now) to write grad norm into it
     float* grad_norm_squared = (float*)model->acts.output;
     float grad_norm_squared_cpu = 0.0f;
+    int gated_ffn = model->param_elements[12] > 0;
 
     int num_slices[2] = {1, model->config.num_layers};
     int max_num_block_sums = get_max_num_block_sums(num_slices, 2);
@@ -1000,11 +1001,12 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
         // grads_memory only contains the averaged gradients at the local shards,
         // so we only calculate the grad norm at the grads_memory belonging to the local shards
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            if (!gated_ffn && (i == 12 || i == 13)) { continue; }  // skip the gated ffn weights
             ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
             ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
             ptrdiff_t offset = tensor.offset + shard.offset;
             bool is_first_pass = (i == 0);
-            if((i < 2 || i > 13)) {
+            if((i < 2 || i > 15)) {
                 global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, 0, 1,
                                     max_num_block_sums, is_first_pass, main_stream);
             } else {
