@@ -257,11 +257,11 @@ void matmul_forward_fc1(floatX* out,
     }
 }
 
-void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
+void matmul_backward(floatX* dinp1, floatX* dinp2, floatX* dweight, floatX* dbias,
                      floatX* dout, floatX* inp, floatX* weight,
                      float* dbias_buffer,
                      int B, int T, int C, int OC, cudaStream_t stream,
-                     floatX* pre_gelu=NULL, int gelu_fusion=1) {
+                     const char* act_func, floatX* pre_act1=NULL, floatX* pre_act2=NULL, int gelu_fusion=1) {
     NVTX_RANGE_FN();
 
     // backward to bias, if given, does a +=
@@ -291,13 +291,18 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
         dbias = NULL; // prevent dbias calculation from also being fused in matmul_cublaslt below (if we enabled fusion)
     }
 
+    int is_gelu = strcmp(act_func, "gelu") == 0;
+
     // backward to input, uses = in the backward pass (set the gradient)
-    matmul_cublaslt(dinp, weight, dout, NULL, C, B*T, OC, stream, false, false, 0, 0, 0, 0, false,
-                    gelu_fusion >= 2 ? pre_gelu : NULL, true);
+    matmul_cublaslt(dinp1, weight, dout, NULL, C, B*T, OC, stream, false, false, 0, 0, 0, 0, false,
+                    is_gelu && gelu_fusion >= 2 ? pre_act1 : NULL, true);
 
     // backward GELU (if it wasn't fused into the matmul above)
-    if (gelu_fusion < 2 && pre_gelu) {
-        gelu_backward_inplace(dinp, pre_gelu, B*T*C, stream);
+    if (is_gelu && gelu_fusion < 2 && pre_act1) {
+        gelu_backward_inplace(dinp1, pre_act1, B*T*C, stream);
+    } else if (!is_gelu && pre_act1) {
+        assert(strcmp(act_func, "swiglu") == 0);
+        swiglu_backward_inplace(dinp1, dinp2, pre_act1, pre_act2, B*T*C, stream);
     }
 
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one

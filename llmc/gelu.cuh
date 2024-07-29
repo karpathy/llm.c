@@ -25,20 +25,6 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp) {
     store128(out + idx, packed_out);
 }
 
-__global__ void swiglu_forward_kernel(floatX* out, const floatX* inp1, const floatX* inp2) {
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-
-    x128 packed_out;
-    x128 packed_inp1 = load128cs(inp1 + idx);
-    x128 packed_inp2 = load128cs(inp2 + idx);
-    for(int k = 0; k < packed_inp1.size; ++k) {
-        float x1 = (float)packed_inp1[k];
-        float x2 = (float)packed_inp2[k];
-        packed_out[k] = (floatX)((x1 * x2) / (1.0f + expf(-x1)));
-    }
-    store128(out + idx, packed_out);
-}
-
 __global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const floatX* inp) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
 
@@ -56,6 +42,41 @@ __global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const floatX* inp
         packed_dinp[k] = (floatX)(local_grad * (float)packed_dout[k]);
     }
     store128(d_in_out + idx, packed_dinp);
+}
+
+__global__ void swiglu_forward_kernel(floatX* out, const floatX* inp1, const floatX* inp2) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+
+    x128 packed_out;
+    x128 packed_inp1 = load128cs(inp1 + idx);
+    x128 packed_inp2 = load128cs(inp2 + idx);
+    for(int k = 0; k < packed_inp1.size; ++k) {
+        float x1 = (float)packed_inp1[k];
+        float x2 = (float)packed_inp2[k];
+        packed_out[k] = (floatX)((x1 * x2) / (1.0f + expf(-x1)));
+    }
+    store128(out + idx, packed_out);
+}
+
+__global__ void swiglu_backward_kernel(floatX* dinp_out1, floatX* dinp2, const floatX* inp1, const floatX* inp2) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+
+    x128 packed_dinp1;
+    x128 packed_dinp2;
+    x128 packed_inp1 = load128cs(inp1 + idx);
+    x128 packed_inp2 = load128cs(inp2 + idx);
+    x128 packed_dinp_out1 = load128(dinp_out1 + idx);
+    for (int k = 0; k < packed_inp1.size; ++k) {
+        float x1 = (float)packed_inp1[k];
+        float x2 = (float)packed_inp2[k];
+        float sig_x1 = 1.0f / (1.0f + expf(-x1));
+        float local_grad1 = x2 * sig_x1 * (1.0f + x1 * (1.0f - sig_x1));
+        float local_grad2 = x1 * sig_x1;
+        packed_dinp1[k] = (floatX)(local_grad1 * (float)packed_dinp_out1[k]);
+        packed_dinp2[k] = (floatX)(local_grad2 * (float)packed_dinp_out1[k]);
+    }
+    store128(dinp_out1 + idx, packed_dinp1);
+    store128(dinp2 + idx, packed_dinp2);
 }
 
 // ----------------------------------------------------------------------------
@@ -85,5 +106,14 @@ void swiglu_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N, 
     assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
     swiglu_forward_kernel<<<grid_size, block_size, 0, stream>>>(out, inp1, inp2);
+    cudaCheck(cudaGetLastError());
+}
+
+void swiglu_backward_inplace(floatX* dinp_out1, floatX* dinp2, const floatX* inp1, const floatX* inp2, const int N, cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    const int block_size = 128;
+    assert(N % (block_size * x128::size) == 0);
+    const int grid_size = CEIL_DIV(N, block_size * x128::size);
+    swiglu_backward_kernel<<<grid_size, block_size, 0, stream>>>(dinp_out1, dinp2, inp1, inp2);
     cudaCheck(cudaGetLastError());
 }
