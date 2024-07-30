@@ -249,7 +249,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[9] = TENSOR_SPEC(data->ln2_rstd, L * B * T);
     tensors[10] = TENSOR_SPEC(data->fch, L * B * T * 4*C);
     tensors[11] = TENSOR_SPEC(data->fch2, gated_ffn ? L * B * T * 4*C : 0);
-    // if recompute >= 1 then we will recompute gelu/{act_func}_forward during backward and use this as scratch buffer
+    // if recompute >= 1 then we will recompute {act_func}_forward during backward and use this as scratch buffer
     tensors[12] = TENSOR_SPEC(data->fch_act, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
     tensors[13] = TENSOR_SPEC(data->residual3, L * B * T * C);
     tensors[14] = TENSOR_SPEC(data->lnf, B * T * C);
@@ -324,9 +324,9 @@ typedef struct {
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
     int use_master_weights;     // keep master weights copy in float for optim update? 0|1
     bool init_state;   // set to true if master weights need to be initialized
-    int act_func_fusion; // fuse gelu/{act_func} via cuBLASLt (0=none, 1=forward, 2=forward+backward)
+    int act_func_fusion; // fuse gelu/act_func via cuBLASLt (0=none, 1=forward, 2=forward+backward)
     const char* act_func; // the activation function to use, e.g. "gelu"
-    int recompute; // recompute gelu/{act_func} | layernorm forward during model backward? 0|1|2
+    int recompute; // recompute act_func | layernorm forward during model backward? 0|1|2
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
@@ -357,9 +357,9 @@ void gpt2_init_common(GPT2 *model) {
     model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
     model->use_master_weights = 1; // safe default: do keep master weights in fp32
     model->init_state = true;
-    model->recompute = 1; // good default: recompute gelu/{act_func} but not layernorm
+    model->recompute = 1; // good default: recompute act_func but not layernorm
     model->act_func_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
-    model->act_func = "gelu"; // default: gelu
+    model->act_func = "gelu";
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -709,7 +709,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
         floatX* l_fch2 = gated_ffn ? acts.fch2 + l * B * T * 4*C : NULL;
-        // reuse the same activation buffer at each layer, as we'll re-compute the gelu/{act_func} during backward
+        // reuse the same activation buffer at each layer, as we'll re-compute the act_func during backward
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
         floatX* l_fch_act = (model->recompute < 1) ? acts.fch_act + l * B * T * 4*C : acts.fch_act;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
@@ -1452,7 +1452,7 @@ int main(int argc, char *argv[]) {
     int override_enable_tf32 = 1;
     int use_master_weights = 1;
     int act_func_fusion = -1; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
-    int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu/{act_func}
+    int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute act_func
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
     // architecture settings
@@ -1525,7 +1525,7 @@ int main(int argc, char *argv[]) {
     int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
     // calculate sensible default for total batch size as assuming no gradient accumulation
     if (total_batch_size == -1) { total_batch_size = tokens_per_fwdbwd; }
-    // in the future, we might want to set gelu/{act_func} fusion to 2 for SM90+ and 0 for other GPUs
+    // in the future, we might want to set gelu/act_func fusion to 2 for SM90+ and 0 for other GPUs
     if (act_func_fusion == -1) { act_func_fusion = 0; } // (deviceProp.major >= 9) ? 2 : 0; } // in gpt2_init_common for test_gpt2cu...
     // calculate the number of gradient accumulation steps from the desired total batch size
     assert(total_batch_size % tokens_per_fwdbwd == 0);
