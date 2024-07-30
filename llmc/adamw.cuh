@@ -61,6 +61,16 @@ __global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg
                  );
 }
 
+template <typename Tp>
+__global__ void init_from_master_kernel(Tp* params_memory, float* master_params_memory, size_t num_parameters,
+                                          ptrdiff_t w_stride, ptrdiff_t s_stride, unsigned int seed) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_parameters) { return; }
+    params_memory += blockIdx.y * w_stride; // adjust for layer offset
+    master_params_memory += blockIdx.y * s_stride;
+    stochastic_rounding(master_params_memory[idx], &params_memory[idx], seed);
+}
+
 template <typename Tp, typename Tg>
 void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                   ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride,  int num_slices, float learning_rate, float beta1, float beta2, int t, float eps, float weight_decay,
@@ -74,5 +84,15 @@ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memo
                                                          m_memory, v_memory, num_parameters, w_stride, g_stride, s_stride,
                                                          learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay,
                                                          grad_scale, seed);
+    cudaCheck(cudaGetLastError());
+}
+
+template <typename Tp>
+void init_from_master(Tp* params_memory, float* master_params_memory, size_t num_parameters,
+                        ptrdiff_t w_stride, ptrdiff_t s_stride, int num_slices, unsigned int seed, cudaStream_t stream) {
+    int block_size = 512; // must match block size of adamw_update so that RNG also matches
+    int num_blocks = CEIL_DIV(num_parameters, block_size);
+    init_from_master_kernel<<<dim3(num_blocks, num_slices), block_size, 0, stream>>>
+                             (params_memory, master_params_memory, num_parameters, w_stride, s_stride, seed);
     cudaCheck(cudaGetLastError());
 }
