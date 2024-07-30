@@ -62,6 +62,7 @@ $(info ---------------------------------------------)
 
 ifneq ($(OS), Windows_NT)
   NVCC := $(shell which nvcc 2>/dev/null)
+  NVCC_LDFLAGS += -lnvidia-ml
 
   # Function to test if the compiler accepts a given flag.
   define check_and_add_flag

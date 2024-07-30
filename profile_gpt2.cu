@@ -58,10 +58,10 @@ int main(int argc, char *argv[]) {
     model.config.num_layers = 1;
     set_zero_configs(&multi_gpu_config, 0, model.num_parameters);
 
+    gpt2_allocate_state(&model, B, T);
     // do a training step
     gpt2_forward(&model, x, B, T);
-    gpt2_zero_grad(&model);
-    gpt2_backward_and_reduce(&model, x, y, 1, true);
+    gpt2_backward_and_reduce(&model, x, y, 1, 0);
     float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
     float grad_scale = (grad_norm > 1.0f) ? 1.0f / grad_norm : 1.0f;
     gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, grad_scale, 1, &multi_gpu_config);

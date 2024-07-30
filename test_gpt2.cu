@@ -118,10 +118,12 @@ int main(int argc, char *argv[]) {
 
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { exit(EXIT_FAILURE);  } // must have arg after flag
+        if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { exit(EXIT_FAILURE); } // must be -x[y] (one dash, one or two letters)
         if (argv[i][0] != '-') { exit(EXIT_FAILURE); } // must start with dash
         if (argv[i][1] == 'w') { model.use_master_weights = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r' && argv[i][2] == '\0') { model.recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r' && argv[i][2] == 'g') { model.rng_state = atoi(argv[i+1]) + multi_gpu_config.process_rank; }
+        else if (argv[i][1] == 'g' && argv[i][2] == 'e') { model.gelu_fusion = atoi(argv[i+1]); }
     }
 
     // load additional information that we will use for debugging and error checking
@@ -166,6 +168,8 @@ int main(int argc, char *argv[]) {
 
     // overall OK signal for the test
     int allok = 1;
+
+    gpt2_allocate_state(&model, B, T);
 
     // First, do target-free forward pass to validate logits
     gpt2_forward(&model, x, B, T);
@@ -218,8 +222,7 @@ int main(int argc, char *argv[]) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
         gpt2_forward(&model, x, B, T);
-        gpt2_zero_grad(&model);
-        gpt2_backward_and_reduce(&model, x, y, 1, true);
+        gpt2_backward_and_reduce(&model, x, y, 1, 0);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
@@ -304,16 +307,16 @@ int main(int argc, char *argv[]) {
 
     // expected losses are as follows, from Python
     float expected_losses[10] = {
-        5.270009,
-        4.060681,
-        3.320085,
-        2.717550,
-        2.181066,
-        1.653923,
-        1.168050,
-        0.736873,
-        0.401021,
-        0.187493
+        5.270009f,
+        4.060681f,
+        3.320085f,
+        2.717550f,
+        2.181066f,
+        1.653923f,
+        1.168050f,
+        0.736873f,
+        0.401021f,
+        0.187493f
     };
 
     // compare
@@ -336,8 +339,7 @@ int main(int argc, char *argv[]) {
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
         gpt2_forward(&model, loader.inputs, B, T);
-        gpt2_zero_grad(&model);
-        gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, true);
+        gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, 0);
         gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
         losses[step] = model.mean_loss;
         tokens[step] = loader.inputs[0];
@@ -347,12 +349,12 @@ int main(int argc, char *argv[]) {
     gpt2_free(&model);
     gpt2_build_from_checkpoint(&model, "test_gpt2cu_model.ckpt");
     int ld_step;
+    gpt2_allocate_state(&model, B, T);
     load_state(&ld_step, &model, &loader, "test_gpt2cu_state.ckpt");
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
         gpt2_forward(&model, loader.inputs, B, T);
-        gpt2_zero_grad(&model);
-        gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, true);
+        gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, 0);
         gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
 
         if(loader.inputs[0] != tokens[step]) {

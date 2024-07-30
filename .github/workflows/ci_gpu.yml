@@ -39,7 +39,13 @@ jobs:
       - name: Train model (FP32) with gpt2_124M.bin
         run: |
           PRECISION=FP32 make train_gpt2cu
-          ./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -e gpt2_124M.bin
+          ./train_gpt2cu -b 1 -t 64 -d 256 -l 0.0001 -v 200 -s 200 -a 1 -x 10 -r 0 -f 0 -e "gpt2_124M.bin"
+
+      - name: Test for percent loss differential for FP32 
+        run: |
+          PRECISION=FP32 make train_gpt2cu
+          ./train_gpt2cu -b 1 -t 64 -d 256 -l 0.0001 -v 200 -s 200 -a 1 -x 10 -r 0 -f 0 -e "gpt2_124M.bin" > train_gpt2cu_fp32_precision.txt
+          python dev/loss_checker_ci.py -f train_gpt2cu_fp32_precision.txt -s 20 -e 28 -a 5.0
 
       - name: Build FP32 precision
         run: PRECISION=FP32 make test_gpt2cu profile_gpt2cu

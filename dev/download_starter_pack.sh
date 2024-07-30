@@ -4,14 +4,16 @@
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
 # Base URL
-BASE_URL="https://huggingface.co/datasets/chrisdryden/llmcDatasets/resolve/main/"
+BASE_URL="https://huggingface.co/datasets/karpathy/llmc-starter-pack/resolve/main/"
 
 # Directory paths based on script location
 SAVE_DIR_PARENT="$SCRIPT_DIR/.."
 SAVE_DIR_TINY="$SCRIPT_DIR/data/tinyshakespeare"
+SAVE_DIR_HELLA="$SCRIPT_DIR/data/hellaswag"
 
 # Create the directories if they don't exist
 mkdir -p "$SAVE_DIR_TINY"
+mkdir -p "$SAVE_DIR_HELLA"
 
 # Files to download
 FILES=(
@@ -21,6 +23,7 @@ FILES=(
     "gpt2_tokenizer.bin"
     "tiny_shakespeare_train.bin"
     "tiny_shakespeare_val.bin"
+    "hellaswag_val.bin"
 )
 
 # Function to download files to the appropriate directory
@@ -32,6 +35,8 @@ download_file() {
     # Determine the save directory based on the file name
     if [[ "$FILE_NAME" == tiny_shakespeare* ]]; then
         FILE_PATH="${SAVE_DIR_TINY}/${FILE_NAME}"
+    elif [[ "$FILE_NAME" == hellaswag* ]]; then
+        FILE_PATH="${SAVE_DIR_HELLA}/${FILE_NAME}"
     else
         FILE_PATH="${SAVE_DIR_PARENT}/${FILE_NAME}"
     fi

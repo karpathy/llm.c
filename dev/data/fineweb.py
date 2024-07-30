@@ -14,13 +14,16 @@ example doc to highlight the structure of the dataset:
   "language_score": 0.9185474514961243,
   "token_count": 594
 }
+
+Example of downloading the 100B dataset of FineWebEDU, from root directory:
+python dev/data/fineweb.py -t edu -v 100B
+100B runs for small few hours, depending on your internet and computer.
 """
 import os
 import argparse
 import multiprocessing as mp
 import numpy as np
 import tiktoken
-# from huggingface_hub import snapshot_download
 from datasets import load_dataset
 from tqdm import tqdm
 import argparse
@@ -28,26 +31,34 @@ import argparse
 from data_common import write_datafile
 # ------------------------------------------
 
-parser = argparse.ArgumentParser(description="FineWeb dataset preprocessing")
-parser.add_argument("-v", "--version", type=str, default="10B", help="Which version of fineweb to use 10B|100B")
-parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each shard in tokens")
+parser = argparse.ArgumentParser(description="FineWeb and Edu-FineWeb dataset preprocessing")
+parser.add_argument("-t", "--type", type=str, default="classic", help="Fineweb type, edu|classic")
+parser.add_argument("-v", "--version", type=str, default="10B", help="Fineweb data sample size, 10B|100B")
+parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each data shard in the output .bin files, in tokens")
 args = parser.parse_args()
 
 # FineWeb has a few possible subsamples available
-assert args.version in ["10B", "100B"], "version must be one of 10B, 100B"
-if args.version == "10B":
-    local_dir = "fineweb10B"
-    remote_name = "sample-10BT"
-elif args.version == "100B":
-    local_dir = "fineweb100B"
-    remote_name = "sample-100BT"
+assert args.version in {"10B", "100B"}, "version must be one of: 10B, 100B"
+assert args.type in {"edu", "classic"}, "type must be one of: edu, classic"
+directories = {
+    ("classic", "10B"): ("fineweb10B", "sample-10BT"),
+    ("classic", "100B"): ("fineweb100B", "sample-100BT"),
+    ("edu", "10B"): ("edu_fineweb10B", "sample-10BT"),
+    ("edu", "100B"): ("edu_fineweb100B", "sample-100BT")
+}
+local_dir, remote_name = directories[(args.type, args.version)]
 
 # create the cache the local directory if it doesn't exist yet
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
 # download the dataset
-fw = load_dataset("HuggingFaceFW/fineweb", name=remote_name, split="train")
+if args.type == "classic":
+    fw = load_dataset("HuggingFaceFW/fineweb", name=remote_name, split="train")
+    name = "fineweb"
+elif args.type =="edu":
+    fw = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train")
+    name = "edu_fineweb"
 
 # init the tokenizer
 enc = tiktoken.get_encoding("gpt2")
@@ -83,7 +94,7 @@ with mp.Pool(nprocs) as pool:
         else:
             # write the current shard and start a new one
             split = "val" if shard_index == 0 else "train"
-            filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{split}_{shard_index:06d}.bin")
+            filename = os.path.join(DATA_CACHE_DIR, f"{name}_{split}_{shard_index:06d}.bin")
             # split the document into whatever fits in this shard; the remainder goes to next one
             remainder = args.shard_size - token_count
             progress_bar.update(remainder)
@@ -98,5 +109,5 @@ with mp.Pool(nprocs) as pool:
     # write any remaining tokens as the last shard
     if token_count != 0:
         split = "val" if shard_index == 0 else "train"
-        filename = os.path.join(DATA_CACHE_DIR, f"fineweb_{split}_{shard_index:06d}.bin")
+        filename = os.path.join(DATA_CACHE_DIR, f"{name}_{split}_{shard_index:06d}.bin")
         write_datafile(filename, all_tokens_np[:token_count])

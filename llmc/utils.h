@@ -15,6 +15,7 @@
 // implementation of dirent for Windows is in dev/unistd.h
 #ifndef _WIN32
 #include <dirent.h>
+#include <arpa/inet.h>
 #endif
 
 // ----------------------------------------------------------------------------
@@ -73,6 +74,32 @@ extern inline void fclose_check(FILE *fp, const char *file, int line) {
 }
 
 #define fcloseCheck(fp) fclose_check(fp, __FILE__, __LINE__)
+
+extern inline void sclose_check(int sockfd, const char *file, int line) {
+    if (close(sockfd) != 0) {
+        fprintf(stderr, "Error: Failed to close socket at %s:%d\n", file, line);
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        exit(EXIT_FAILURE);
+    }
+}
+
+#define scloseCheck(sockfd) sclose_check(sockfd, __FILE__, __LINE__)
+
+#ifdef _WIN32
+extern inline void closesocket_check(int sockfd, const char *file, int line) {
+    if (closesocket(sockfd) != 0) {
+        fprintf(stderr, "Error: Failed to close socket at %s:%d\n", file, line);
+        fprintf(stderr, "Error details:\n");
+        fprintf(stderr, "  File: %s\n", file);
+        fprintf(stderr, "  Line: %d\n", line);
+        exit(EXIT_FAILURE);
+    }
+}
+
+#define closesocketCheck(sockfd) closesocket_check(sockfd, __FILE__, __LINE__)
+#endif
 
 extern inline void fseek_check(FILE *fp, long off, int whence, const char *file, int line) {
     if (fseek(fp, off, whence) != 0) {
@@ -180,6 +207,17 @@ extern inline int find_max_step(const char* output_log_dir) {
     }
     closedir(dir);
     return max_step;
+}
+
+extern inline int ends_with_bin(const char* str) {
+    // checks if str ends with ".bin". could be generalized in the future.
+    if (str == NULL) { return 0; }
+    size_t len = strlen(str);
+    const char* suffix = ".bin";
+    size_t suffix_len = strlen(suffix);
+    if (len < suffix_len) { return 0; }
+    int suffix_matches = strncmp(str + len - suffix_len, suffix, suffix_len) == 0;
+    return suffix_matches;
 }
 
 #endif

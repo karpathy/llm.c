@@ -6,7 +6,7 @@ int check_tensor(float *a, float *b, int n, const char* label) {
     int print_upto = 5;
     int ok = 1;
     float maxdiff = 0.0f;
-    float tol = 2e-2;
+    float tol = 2e-2f;
     printf("%s\n", label);
     for (int i = 0; i < n; i++) {
         // look at the diffence at position i of these two tensors
@@ -52,7 +52,7 @@ int main(int argc, char *argv[]) {
     FILE *state_file = fopen("gpt2_124M_debug_state.bin", "rb");
     if (state_file == NULL) { printf("Error opening state file\n"); return 1; }
     int state_header[256];
-    fread(state_header, sizeof(int), 256, state_file);
+    freadCheck(state_header, sizeof(int), 256, state_file);
     if (state_header[0] != 20240327) { printf("Bad magic state file\n"); return 1; }
     if (state_header[1] != 2) {
         printf("Bad version in state file\n");
@@ -75,28 +75,28 @@ int main(int argc, char *argv[]) {
     float* expected_loss = (float*) malloc(1 * sizeof(float));
 
     // read reference information from Python
-    fread(x, sizeof(int), B*T, state_file);
-    fread(y, sizeof(int), B*T, state_file);
-    fread(expected_logits, sizeof(float), B*T*V, state_file);
-    fread(expected_loss, sizeof(float), 1, state_file);
-    fread(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
-    fclose(state_file);
+    freadCheck(x, sizeof(int), B*T, state_file);
+    freadCheck(y, sizeof(int), B*T, state_file);
+    freadCheck(expected_logits, sizeof(float), B*T*V, state_file);
+    freadCheck(expected_loss, sizeof(float), 1, state_file);
+    freadCheck(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
+    fcloseCheck(state_file);
 
     // overall OK signal for the test
     int allok = 1;
 
     // let's do 10 training iterations, following the pytorch code
     float expected_losses[10] = {
-        5.270007133483887,
-        4.059706687927246,
-        3.3751230239868164,
-        2.8007826805114746,
-        2.315382242202759,
-        1.8490285873413086,
-        1.3946564197540283,
-        0.9991465210914612,
-        0.6240804195404053,
-        0.37651097774505615
+        5.270007133483887f,
+        4.059706687927246f,
+        3.3751230239868164f,
+        2.8007826805114746f,
+        2.315382242202759f,
+        1.8490285873413086f,
+        1.3946564197540283f,
+        0.9991465210914612f,
+        0.6240804195404053f,
+        0.37651097774505615f
     };
     for (int step = 0; step < 10; step++) {
 
