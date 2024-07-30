@@ -59,6 +59,8 @@ typedef struct {
     float*  ln2b; // (L, C)
     float*  fcw; // (L, 4*C, C)
     float*  fcb; // (L, 4*C)
+    float*  gatew; // (L, 4*C, C)
+    float*  gateb; // (L, 4*C)
     float*  fcprojw; // (L, C, 4*C)
     float*  fcprojb; // (L, C)
     float*  lnfw; // (C)
@@ -78,6 +80,7 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
     float** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
+        &params->gatew, &params->gateb,
         &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
     };
     float* params_memory_iterator = params_memory;
