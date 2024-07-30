@@ -494,7 +494,6 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     gpt2_allocate_weights(model);
 
     // read in the parameters if weight_init is true
-    // we are assuming the space has already been allocated!
     if (weight_init) {
         assert(model->params_memory != NULL);
         file_to_device(model->params_memory, model_file, model->num_parameters_bytes, IO_BUF_SIZE, main_stream);
