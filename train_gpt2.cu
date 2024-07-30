@@ -949,6 +949,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
                 dl_attprojw, dl_attprojb,
                 dl_ln2w, dl_ln2b,
                 dl_fcw, dl_fcb,
+                gated_ffn ? dl_gatew : NULL, gated_ffn ? dl_gateb : NULL,
                 dl_fcprojw, dl_fcprojb
             };
             const size_t nelem[] = {
@@ -956,6 +957,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
                 3 * C * C, 3 * C,
                 C * C, C,
                 C, C,
+                4 * C * C, 4 * C,
                 4 * C * C, 4 * C,
                 C * 4 * C, C
             };
@@ -998,7 +1000,7 @@ ShardInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_te
     }
     size_t size = model->param_elements[param_tensor_id] ;
     // if we are in the transformer block, we need to additionally offset by the layer id
-    if(2 <= param_tensor_id && param_tensor_id <= 13) {
+    if(2 <= param_tensor_id && param_tensor_id <= 15) {
         size /= model->config.num_layers;
         offset += (ptrdiff_t)(layer_id * size);
     }
