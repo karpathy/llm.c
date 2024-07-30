@@ -234,10 +234,13 @@ void matmul_forward_cublaslt(floatX* out,
                      const char* act_func, floatX* pre_act=NULL, int act_func_fusion=1) {
     // By default only fuse GELU/{act_func} for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
     if (act_func_fusion < 1 && pre_act) {
+        assert(strcmp(act_func, "gelu") == 0);
         matmul_cublaslt(pre_act, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
         gelu_forward(out, pre_act, B*T*OC, stream);
     } else {
-        assert(strcmp(act_func, "gelu") == 0);  // currently only GELU is supported for fusion
+        if (pre_act != NULL) {
+            assert(strcmp(act_func, "gelu") == 0);  // currently only GELU is supported for fusion
+        }
         matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_act, false);
     }
 }

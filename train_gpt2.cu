@@ -496,6 +496,18 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->config.num_heads = model_header[5];
     model->config.channels = model_header[6];
     model->config.padded_vocab_size = model_header[7];
+
+    if (strcmp(model->act_func, "gelu") == 0) {
+        if (model_header[8] != 0) {
+            fprintf(stderr, "Model file has SwiGLU activation function, but we are loading a GELU model\n");
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        if (model_header[8] == 0) {
+            fprintf(stderr, "Model file has GELU activation function, but we are loading a SwiGLU model\n");
+            exit(EXIT_FAILURE);
+        }
+    }
     model->act_func = model_header[8] == 0 ? "gelu" : "swiglu";
 
     gpt2_allocate_weights(model);
@@ -1588,6 +1600,7 @@ int main(int argc, char *argv[]) {
     // build the GPT-2 model
     GPT2 model;
     gpt2_init_common(&model);
+    model.act_func = act_func;
     if (resuming == 1) {
         // if `-y 1` was set, then we are resuming from the latest checkpoint
         gpt2_build_from_checkpoint(&model, filename_buffer);
@@ -1602,7 +1615,6 @@ int main(int argc, char *argv[]) {
 
     model.use_master_weights = use_master_weights;
     model.act_func_fusion = act_func_fusion;
-    model.act_func = act_func;
     model.recompute = recompute;
     printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : load_filename);
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
