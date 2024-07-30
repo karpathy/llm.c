@@ -48,17 +48,19 @@ __global__ void swiglu_forward_kernel(floatX* out, const floatX* inp1, const flo
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
 
     x128 packed_out;
-    x128 packed_inp1 = load128cs(inp1 + idx);
+    x128 packed_inp1 = load128cs(inp1 + idx); // load and do not keep in cache
     x128 packed_inp2 = load128cs(inp2 + idx);
     for(int k = 0; k < packed_inp1.size; ++k) {
         float x1 = (float)packed_inp1[k];
         float x2 = (float)packed_inp2[k];
+        // swish(x1) = x1 * sigmoid(x1) = x1 / (1.0 + exp(-x1))
+        // swiglu(x1, x2) = swish(x1) * x2
         packed_out[k] = (floatX)((x1 * x2) / (1.0f + expf(-x1)));
     }
     store128(out + idx, packed_out);
 }
 
-__global__ void swiglu_backward_kernel(floatX* dinp_out1, floatX* dinp2, const floatX* inp1, const floatX* inp2) {
+__global__ void swiglu_backward_inplace_kernel(floatX* dinp_out1, floatX* dinp2, const floatX* inp1, const floatX* inp2) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
 
     x128 packed_dinp1;
@@ -70,6 +72,10 @@ __global__ void swiglu_backward_kernel(floatX* dinp_out1, floatX* dinp2, const f
         float x1 = (float)packed_inp1[k];
         float x2 = (float)packed_inp2[k];
         float sig_x1 = 1.0f / (1.0f + expf(-x1));
+        // swiglu(x1, x2) = swish(x1) * x2
+        // -> dout/dx1 = x2 * sigmoid(x1) + x2 * x1 * sigmoid(x1) * (1 - sigmoid(x1))
+        // ---> dout/dx1 = x2 * sigmoid(x1) * (1 + x1 * (1 - sigmoid(x1)))
+        // -> dout/dx2 = swish(x1) = x1 * sigmoid(x1)
         float local_grad1 = x2 * sig_x1 * (1.0f + x1 * (1.0f - sig_x1));
         float local_grad2 = x1 * sig_x1;
         packed_dinp1[k] = (floatX)(local_grad1 * (float)packed_dinp_out1[k]);
@@ -114,6 +120,6 @@ void swiglu_backward_inplace(floatX* dinp_out1, floatX* dinp2, const floatX* inp
     const int block_size = 128;
     assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    swiglu_backward_kernel<<<grid_size, block_size, 0, stream>>>(dinp_out1, dinp2, inp1, inp2);
+    swiglu_backward_inplace_kernel<<<grid_size, block_size, 0, stream>>>(dinp_out1, dinp2, inp1, inp2);
     cudaCheck(cudaGetLastError());
 }
