@@ -231,21 +231,40 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
 void matmul_forward_cublaslt(floatX* out,
                      floatX* inp, floatX* weight, floatX* bias,
                      int B, int T, int C, int OC, cudaStream_t stream,
-                     floatX* pre_gelu=NULL, int gelu_fusion=1) {
-    // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
-    if (gelu_fusion < 1 && pre_gelu) {
-        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
-        gelu_forward(out, pre_gelu, B*T*OC, stream);
+                     const char* act_func, floatX* pre_act=NULL, int act_func_fusion=1) {
+    // By default only fuse GELU/{act_func} for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
+    if (act_func_fusion < 1 && pre_act) {
+        assert(strcmp(act_func, "gelu") == 0);
+        matmul_cublaslt(pre_act, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
+        gelu_forward(out, pre_act, B*T*OC, stream);
     } else {
-        matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
+        if (pre_act != NULL) {
+            assert(strcmp(act_func, "gelu") == 0);  // currently only GELU is supported for fusion
+        }
+        matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_act, false);
     }
 }
 
-void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
+void matmul_forward_fc1(floatX* out,
+                     floatX* inp, floatX* weight1, floatX* bias1, floatX* weight2, floatX* bias2,
+                     int B, int T, int C, int OC, cudaStream_t stream,
+                     const char* act_func, floatX* pre_act1=NULL, floatX* pre_act2=NULL, int act_func_fusion=1) {
+    if (weight2 == NULL) {
+        assert(bias2 == NULL);
+        matmul_forward_cublaslt(out, inp, weight1, bias1, B, T, C, OC, stream, act_func, pre_act1, act_func_fusion);
+    } else {
+        assert(strcmp(act_func, "swiglu") == 0);
+        matmul_cublaslt(pre_act1, weight1, inp, bias1, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
+        matmul_cublaslt(pre_act2, weight2, inp, bias2, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
+        swiglu_forward(out, pre_act1, pre_act2, B*T*OC, stream);
+    }
+}
+
+void matmul_backward(floatX* dinp1, floatX* dinp2, floatX* dweight, floatX* dbias,
                      floatX* dout, floatX* inp, floatX* weight,
                      float* dbias_buffer,
-                     int B, int T, int C, int OC, cudaStream_t stream,
-                     floatX* pre_gelu=NULL, int gelu_fusion=1) {
+                     int B, int T, int C, int OC, cudaStream_t stream, int accumulate_input,
+                     const char* act_func, floatX* pre_act1=NULL, floatX* pre_act2=NULL, int gelu_fusion=1) {
     NVTX_RANGE_FN();
 
     // backward to bias, if given, does a +=
@@ -275,13 +294,18 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
         dbias = NULL; // prevent dbias calculation from also being fused in matmul_cublaslt below (if we enabled fusion)
     }
 
+    int is_gelu = strcmp(act_func, "gelu") == 0;
+
     // backward to input, uses = in the backward pass (set the gradient)
-    matmul_cublaslt(dinp, weight, dout, NULL, C, B*T, OC, stream, false, false, 0, 0, 0, 0, false,
-                    gelu_fusion >= 2 ? pre_gelu : NULL, true);
+    matmul_cublaslt(dinp1, weight, dout, NULL, C, B*T, OC, stream, false, false, 0, 0, 0, 0,
+        accumulate_input /* accumulate */, is_gelu && gelu_fusion >= 2 ? pre_act1 : NULL, true);
 
     // backward GELU (if it wasn't fused into the matmul above)
-    if (gelu_fusion < 2 && pre_gelu) {
-        gelu_backward_inplace(dinp, pre_gelu, B*T*C, stream);
+    if (is_gelu && gelu_fusion < 2 && pre_act1) {
+        gelu_backward_inplace(dinp1, pre_act1, B*T*C, stream);
+    } else if (!is_gelu && pre_act1) {
+        assert(strcmp(act_func, "swiglu") == 0);
+        swiglu_backward_inplace(dinp1, dinp2, pre_act1, pre_act2, B*T*C, stream);
     }
 
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
