@@ -643,6 +643,7 @@ int main(int argc, char **argv) {
     free(inp);
     cudaCheck(cudaFree(d_out));
     cudaCheck(cudaFree(d_inp));
+    cudaCheck(cudaFree(d_qkvr));
     cublasDestroy(cublas_handle);
 
     return 0;

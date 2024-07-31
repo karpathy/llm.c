@@ -1137,6 +1137,7 @@ int main(int argc, char **argv) {
     free(dinp);
     free(dpreatt);
     free(datt);
+    free(h_dinp);
     cudaCheck(cudaFree(d_inp));
     cudaCheck(cudaFree(d_qkvr));
     cudaCheck(cudaFree(d_preatt));

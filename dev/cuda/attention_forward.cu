@@ -1377,6 +1377,7 @@ int main(int argc, char **argv) {
     cudaCheck(cudaFree(d_preatt));
     cudaCheck(cudaFree(d_att));
     cudaCheck(cudaFree(d_inp));
+    cudaCheck(cudaFree(d_stats));
     cublasDestroy(cublas_handle);
 
     #ifdef ENABLE_CUDNN

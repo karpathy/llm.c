@@ -13,6 +13,8 @@
 #include <string.h>
 #include <direct.h> // for _mkdir and _stat
 #include <io.h> // needed for _access below and _findfirst, _findnext, _findclose
+#pragma comment(lib, "Ws2_32.lib")  // Link Ws2_32.lib for socket functions
+#include <winsock2.h>
 
 #define CLOCK_MONOTONIC 0
 static inline int clock_gettime(int ignore_variable, struct timespec* tv)

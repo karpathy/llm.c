@@ -170,6 +170,8 @@ int main(int argc, char *argv[]) {
     // overall OK signal for the test
     int allok = 1;
 
+    gpt2_allocate_state(&model, B, T);
+
     // First, do target-free forward pass to validate logits
     gpt2_forward(&model, x, B, T, 0, NULL);
     // at this point, target should be equal to expected_logits, let's compare
@@ -314,16 +316,16 @@ int main(int argc, char *argv[]) {
     // expected losses are as follows, from Python
     float expected_losses[10];
     float non_mup_expected_losses[10] = {
-        5.270009,
-        4.060681,
-        3.320085,
-        2.717550,
-        2.181066,
-        1.653923,
-        1.168050,
-        0.736873,
-        0.401021,
-        0.187493
+        5.270009f,
+        4.060681f,
+        3.320085f,
+        2.717550f,
+        2.181066f,
+        1.653923f,
+        1.168050f,
+        0.736873f,
+        0.401021f,
+        0.187493f
     };
 
     float mup_expected_losses[10] = {
@@ -379,6 +381,7 @@ int main(int argc, char *argv[]) {
     gpt2_free(&model);
     gpt2_build_from_checkpoint(&model, "test_gpt2cu_model.ckpt");
     int ld_step;
+    gpt2_allocate_state(&model, B, T);
     load_state(&ld_step, &model, &loader, "test_gpt2cu_state.ckpt");
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
