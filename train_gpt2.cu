@@ -536,23 +536,30 @@ void gpt2_set_hyperparameters(GPT2Config* config, const char* depth_str, int mup
     config->max_seq_len = 1024;
 }
 
-void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
+void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str, int mup_width, int mup_coord_check) {
     // we use channels instead of depth for GPT-3 because GPT-3 model depths are not one-to-one
     // note that our models are not necessarily identical to GPT-3 because
     // we use dense attention, not the alternating dense/banded attention of GPT-3
     int channels = atoi(channels_str);
     assert(channels > 0); // atoi returns 0 if not a number
     int depth, head_size;
-    if      (channels == 384)   { depth = 6;  head_size = 64; }  // (unofficial) gpt3-tiny (31M)
-    else if (channels == 768)   { depth = 12; head_size = 64; }  // gpt3-small (125M)
-    else if (channels == 1024)  { depth = 24; head_size = 64; }  // gpt3-medium (350M)
-    else if (channels == 1536)  { depth = 24; head_size = 96; }  // gpt3-large (760M)
-    else if (channels == 2048)  { depth = 24; head_size = 128; } // gpt3-xl (1.3B) [heads fixed]
-    else if (channels == 2560)  { depth = 32; head_size = 80; }  // gpt3-2.7B
-    else if (channels == 4096)  { depth = 32; head_size = 128; } // gpt3-6.7B
-    else if (channels == 5140)  { depth = 40; head_size = 128; } // gpt3-13B
-    else if (channels == 12288) { depth = 96; head_size = 128; } // gpt3 (175B)
-    else { fprintf(stderr, "Unsupported GPT-3 channels: %d\n", channels); exit(EXIT_FAILURE); }
+     if (mup_coord_check) {
+        // for the mup_coord_check, we use a small model
+        depth = 2;
+        head_size = mup_width / 2;  // 2 heads
+        channels = mup_width;
+    } else {
+        if      (channels == 384)   { depth = 6;  head_size = 64; }  // (unofficial) gpt3-tiny (31M)
+        else if (channels == 768)   { depth = 12; head_size = 64; }  // gpt3-small (125M)
+        else if (channels == 1024)  { depth = 24; head_size = 64; }  // gpt3-medium (350M)
+        else if (channels == 1536)  { depth = 24; head_size = 96; }  // gpt3-large (760M)
+        else if (channels == 2048)  { depth = 24; head_size = 128; } // gpt3-xl (1.3B) [heads fixed]
+        else if (channels == 2560)  { depth = 32; head_size = 80; }  // gpt3-2.7B
+        else if (channels == 4096)  { depth = 32; head_size = 128; } // gpt3-6.7B
+        else if (channels == 5140)  { depth = 40; head_size = 128; } // gpt3-13B
+        else if (channels == 12288) { depth = 96; head_size = 128; } // gpt3 (175B)
+        else { fprintf(stderr, "Unsupported GPT-3 channels: %d\n", channels); exit(EXIT_FAILURE); }
+    }
     assert(channels % head_size == 0);
     config->num_layers = depth;
     config->channels = channels;
@@ -574,7 +581,7 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor, int mup_widt
     } else if (len > 6 && strncmp(descriptor, "gpt2:d", 6) == 0) {
         gpt2_set_hyperparameters(&model->config, descriptor + 6, mup_width, mup_coord_check); // pass along the depth str without the 'gpt2:d'
     } else if (len > 6 && strncmp(descriptor, "gpt3:c", 6) == 0) {
-        gpt3_set_hyperparameters(&model->config, descriptor + 6); // pass along the channels str without the 'gpt3:c'
+        gpt3_set_hyperparameters(&model->config, descriptor + 6, mup_width, mup_coord_check); // pass along the channels str without the 'gpt3:c'
     } else {
         fprintf(stderr, "Unsupported model descriptor: %s\n", descriptor); exit(EXIT_FAILURE);
     }
