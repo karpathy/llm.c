@@ -66,6 +66,33 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
     }
 }
 
+// Optimised with option to use optimised HW TANH instruction by default
+__global__ void gelu_forward_kernel3(floatX* out, const floatX* inp, int N) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    if (idx >= N) { return; }
+
+    x128 packed_out;
+    x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
+    for(int k = 0; k < packed_inp.size; ++k) {
+        float xi = (float)packed_inp[k];
+        float cube = 0.044715f * xi * xi * xi;
+
+        float tanh_in_out = GELU_SCALING_FACTOR * (xi + cube);
+        #if !defined(PRECISE_GELU_TANH) && __CUDA_ARCH__ >= 750
+        asm ("tanh.approx.f32 %0,%1;" : "=f"(tanh_in_out) : "f"(tanh_in_out));
+        #else
+        tanh_in_out = tanhf(tanh_in_out);
+        #endif
+
+        // the following uses FMUL+FMA instead of FMUL+FADD+FMUL for "0.5f * x * (1.0f + tanh_out)"
+        float half_xi = 0.5f * xi;
+        packed_out[k] = (floatX)(half_xi * tanh_in_out + half_xi);
+    }
+    // store instead of storecs (without cache streaming) in case it is useful for the
+    // data to be in the cache for the next operation after this GeLU
+    store128(out + idx, packed_out);
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -81,6 +108,12 @@ void gelu_forward2(floatX* out, const floatX* inp, int N, const int block_size) 
     cudaCheck(cudaGetLastError());
 }
 
+void gelu_forward3(floatX* out, const floatX* inp, int N, const int block_size) {
+    const int grid_size = ceil_div(N, block_size * x128::size);
+    gelu_forward_kernel3<<<grid_size, block_size>>>(out, inp, N);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void gelu_forward(int kernel_num,
                   floatX* out,
@@ -93,6 +126,9 @@ void gelu_forward(int kernel_num,
             break;
         case 2:
             gelu_forward2(out, inp, B * T * C, block_size);
+            break;
+        case 3:
+            gelu_forward3(out, inp, B * T * C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
