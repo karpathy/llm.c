@@ -1146,7 +1146,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
             adamw_update(param_ptr, master_ptr, grad_ptr,
                         m_ptr, v_ptr,
                         shard.size, tensor.size, tensor.size, shard.size, num_layers,
-                        learning_rate,
+                        lr,
                         beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
         }
 
