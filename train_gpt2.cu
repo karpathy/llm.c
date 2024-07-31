@@ -134,8 +134,8 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     param_sizes[9] = L * C; // ln2b
     param_sizes[10] = L * (4 * C) * C; // fcw
     param_sizes[11] = L * (4 * C); // fcb
-    param_sizes[12] = gated_ffn ? L * C * (4 * C) : 0; // gatew
-    param_sizes[13] = gated_ffn ? L * C : 0; // gateb
+    param_sizes[12] = gated_ffn ? L * (4 * C) * C : 0; // gatew
+    param_sizes[13] = gated_ffn ? L * (4 * C) : 0; // gateb
     param_sizes[14] = L * C * (4 * C); // fcprojw
     param_sizes[15] = L * C; // fcprojb
     param_sizes[16] = C; // lnfw
@@ -706,8 +706,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_ln2b = params.ln2b + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcb = params.fcb + l * 4*C;
-        floatX* l_gatedw = gated_ffn ? params.gatew + l * 4*C * C : NULL;
-        floatX* l_gatedb = gated_ffn ? params.gateb + l * 4*C : NULL;
+        floatX* l_gatew = gated_ffn ? params.gatew + l * 4*C * C : NULL;
+        floatX* l_gateb = gated_ffn ? params.gateb + l * 4*C : NULL;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         floatX* l_fcprojb = params.fcprojb + l * C;
 
@@ -745,7 +745,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream, model->act_func);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_fc1(l_fch_act, l_ln2, l_fcw, l_fcb, gated_ffn ? l_gatedw : NULL, gated_ffn ? l_gatedb : NULL,
+        matmul_forward_fc1(l_fch_act, l_ln2, l_fcw, l_fcb, gated_ffn ? l_gatew : NULL, gated_ffn ? l_gateb : NULL,
             B, T, C, 4*C, main_stream, model->act_func, l_fch, l_fch2, model->act_func_fusion);
         matmul_forward_cublaslt(scratch, l_fch_act, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream, model->act_func);
         // OK, fusion across blocks.
@@ -875,6 +875,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* l_ln2w = params.ln2w + l * C;
         floatX* l_ln2b = params.ln2b + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
+        floatX* l_gatew = gated_ffn ? params.gatew + l * 4*C * C : NULL;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
         floatX* dl_ln1w = grads.ln1w + l * C;
@@ -928,7 +929,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         }
         if (dl_bt4c2 != NULL) {
             // backprop into gate
-            matmul_backward(dl_btc, NULL, dl_gatew, dl_gateb, dl_bt4c2, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream, 0, model->act_func);
+            matmul_backward(dl_btc, NULL, dl_gatew, dl_gateb, dl_bt4c2, l_ln2, l_gatew, scratchF, B, T, C, 4 * C, main_stream, 0, model->act_func);
         }
         matmul_backward(dl_btc, NULL, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream, dl_bt4c2 != NULL, model->act_func);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
