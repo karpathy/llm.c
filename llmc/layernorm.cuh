@@ -255,10 +255,11 @@ __global__ void residual_forward_kernel(floatX* out, const floatX* inp1, const T
     store128(out + idx, packed_out);
 }
 
+template <typename Tdout>
 __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with only 1024 threads?
     layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
-                                const floatX* dout, const floatX* inp, const floatX* weight,
-                                const float* mean, const float* rstd,
+                                const Tdout* dout, const floatX* inp, const floatX* weight,
+                                const float* mean, const float* rstd, const float* descale_ptr,
                                 int B, int T, int C) {
     int BLOCK_SIZE = blockDim.x;
     int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
@@ -270,6 +271,11 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
     int warpsInGrid = gridDim.x * warpsInBlock;
     int C_per_iteration = WARP_SIZE * x128::size;
     int iterations_C = CEIL_DIV(C, C_per_iteration); // + 2;
+
+    float dout_descale_factor = 1.0f;
+    if (std::is_same<Tdout, __nv_fp8_e5m2>::value && descale_ptr != NULL) {
+        dout_descale_factor = *descale_ptr;
+    }
 
     // the first half of shared memory is bias, second is weight
     size_t rounded_C = CEIL_DIV(C, (32 * x128::size)) * (32 * x128::size);
@@ -289,7 +295,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
     __syncthreads();
 
     for (int bt = baseIdx; bt < B * T; bt += warpsInGrid) {
-        const floatX* dout_bt = dout + bt * C;
+        const Tdout* dout_bt = dout + bt * C;
         const floatX* inp_bt = inp +bt * C;
         floatX* dinp_bt = dinp + bt * C;
 
@@ -297,11 +303,11 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
         float dnorm_mean = 0.0f;
         float dnorm_norm_mean = 0.0f;
         for (int i = warpThreadIdx * x128::size; i < C; i += WARP_SIZE * x128::size) {
-            x128 dout128_i   = load128(dout_bt + i);
+            Packed128<Tdout> dout128_i   = load128(dout_bt + i);
             x128 inp128_i    = load128(inp_bt  + i);
             x128 weight128_i = load128(weight  + i);
             for (int k = 0; k < x128::size; k++) {
-                float dnorm_i = (float)weight128_i[k] * (float)dout128_i[k];
+                float dnorm_i = (float)weight128_i[k] * ((float)dout128_i[k] * dout_descale_factor);
                 dnorm_mean += dnorm_i;
                 dnorm_norm_mean += dnorm_i * (float)inp128_i[k];
             }
@@ -315,7 +321,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
         for (int c = 0; c < iterations_C; c++) {
             int global_index = (warpThreadIdx * x128::size) + (c * C_per_iteration);
 
-            x128 dout128   = x128::zeros();
+            Packed128<Tdout> dout128   = Packed128<Tdout>::zeros();
             x128 inp128    = x128::zeros();
             x128 dinp128   = x128::zeros();
             x128 weight128 = x128::zeros();
@@ -332,7 +338,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
                 f128 dweight_f;
                 for(int i = 0; i < f128::size; ++i) {
                     int x = o * f128::size + i;
-                    float dout_i = (float)dout128[x];
+                    float dout_i = ((float)dout128[x] * dout_descale_factor);
                     float norm_bti = ((float)inp128[x] - mean_bt) * rstd_bt;
                     dbias_f[i] = dout_i;
                     dweight_f[i] = norm_bti * dout_i;
@@ -570,8 +576,9 @@ void fused_residual_forward5(floatX* residual, Tn* normed, float* mean, float* r
     cudaCheck(cudaGetLastError());
 }
 
+template <typename Tdout>
 void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
-                        const floatX* dout, const floatX* inp, const floatX* weight, const float* mean, const float* rstd,
+                        const Tdout* dout, const floatX* inp, const floatX* weight, const float* mean, const float* rstd,
                         int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 512;
@@ -580,7 +587,11 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     size_t rounded_C = CEIL_DIV(C, (32 * x128::size)) * (32 * x128::size);
     size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - 32) * f128::size) * sizeof(float);
 
+    float* dout_descale_ptr = absmax_tracker.get_descale_ptr(dout, B*T*C, mean);
+    if (std::is_same<Tdout, __nv_fp8_e5m2>::value) {
+        assert(dout_descale_ptr);
+    }
     cudaCheck(cudaMemsetAsync(scratch, 0, 1 * sizeof(float), stream)); // only need to reset the flag to 0
-    layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+    layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, dout_descale_ptr, B, T, C);
     cudaCheck(cudaGetLastError());
 }

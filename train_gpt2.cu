@@ -12,7 +12,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #define FORCE_FP8_ALLOW_PARAMETER_GRADIENTS true
 #define FORCE_FP8_WEIGHTS true // not compatible with existing checkpoints
 #define FORCE_FP8_ACTIVATIONS true // compatible with existing checkpoints
-#define FORCE_FP8_GRADIENTS false // activation gradients directly output in FP8
+#define FORCE_FP8_GRADIENTS true // activation gradients directly output in FP8
 bool use_weights_transpose_cache = true; // cached across gradient accumulation steps (same weight)
 bool use_act_transpose_cache = true; // usually l_atty with BF16 attention, disabled during inference
 
@@ -866,7 +866,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
     // from this point on, we no longer need the values stored in the last residual, so we can reuse that memory as generic
     // scratch for backward computations
-    floatX* dl_btc = residual;
+    floatX* dl_btc = (floatX*)residual;
+    floatG* dl_btc_fp8 = (floatG*)residual;
 
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
@@ -924,14 +925,14 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
             gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream);
         }*/
-        matmul_backward(dl_bt4c_fp8, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion, l_fcw);
+        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion, l_fcw);
         //if(model->recompute >= 2) {
         //    // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
         //    layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
         //}
-        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c_fp8, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream, (floatNorm*)NULL, 0, l_ln2_mean, l_fcprojw);
+        matmul_backward(dl_btc_fp8, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream, (floatNorm*)NULL, 0, l_ln2_mean, l_fcprojw);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
-        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
+        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc_fp8, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
 
         #ifdef ENABLE_CUDNN
@@ -948,9 +949,9 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         //    layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
         //}
         // QKV parameter gradients
-        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream, (floatNorm*)NULL, 0, l_ln1_mean);
+        matmul_backward(dl_btc_fp8, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream, (floatNorm*)NULL, 0, l_ln1_mean);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
+        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc_fp8, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
 
         // Accumulate gradients from this layer in a background stream.
         if(last_step) {
