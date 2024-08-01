@@ -132,6 +132,8 @@ sudo apt-get update
 sudo apt-get -y install libcudnn9-dev-cuda-12
 ```
 
+If the cuDNN package is not installed under a default location, you can explicitly specify the location of cuDNN by setting the `CUDNN_PATH` to the `make` command line. 
+
 On top of this you need the [cuDNN frontend](https://github.com/NVIDIA/cudnn-frontend/tree/main), but this is just header files. Simply clone the repo to your disk. The Makefile currently looks for it in either your home directory or the current directory. If you have put it elsewhere, add `CUDNN_FRONTEND_PATH=/path/to/your/cudnn-frontend/include` to the `make` command-line.
 
 ## multi-GPU training
