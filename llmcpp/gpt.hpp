@@ -143,11 +143,14 @@ struct CausalSelfAttention {
     softmax_ = std::make_unique<nn::Softmax<Type>>();
 
     // mask
-    bias_ = Eigen::MatrixXi::Ones(block_size, block_size)
-                .triangularView<Eigen::Lower>();
+    auto dtype = nn::DataTypeToEnum<Type>::value;
+    for (int i = 0; i <= block_size; ++i) {
+      bias_.emplace_back(std::make_unique<nn::Parameter>(dtype, i * i));
+      auto bias_2d = bias_.back()->matrix<Type>(i, i);
+      nn::UpperTriangularWithNegativeInf(bias_2d);
+    }
 
     // activation tensors
-    auto dtype = nn::DataTypeToEnum<Type>::value;
     qkv_ = std::make_unique<nn::Activation>(dtype);     // [B, T, 3C]
     q_ = std::make_unique<nn::Activation>(dtype);       // [B, NH, T, HS]
     k_ = std::make_unique<nn::Activation>(dtype);       // [B, NH, HS, T]
@@ -194,19 +197,19 @@ struct CausalSelfAttention {
     auto k_4d = k_->tensor_4d<Type>(B, NH, HS, T);
     auto v_4d = v_->tensor_4d<Type>(B, NH, T, HS);
     q_4d.device(nn::g_device) = qkv3d
-                                        .slice(offsets_q, extents)  // [B, T, C]
-                                        .reshape(shape)       // [B, T, NH, HS]
-                                        .shuffle(shuffle_qv)  // [B, NH, T, HS]
+                                    .slice(offsets_q, extents)  // [B, T, C]
+                                    .reshape(shape)       // [B, T, NH, HS]
+                                    .shuffle(shuffle_qv)  // [B, NH, T, HS]
         ;
     k_4d.device(nn::g_device) = qkv3d
-                                        .slice(offsets_k, extents)  // [B, T, C]
-                                        .reshape(shape)      //  [B, T, NH, HS]
-                                        .shuffle(shuffle_k)  //  [B, NH, HS, T]
+                                    .slice(offsets_k, extents)  // [B, T, C]
+                                    .reshape(shape)      //  [B, T, NH, HS]
+                                    .shuffle(shuffle_k)  //  [B, NH, HS, T]
         ;
     v_4d.device(nn::g_device) = qkv3d
-                                        .slice(offsets_v, extents)  // [B, T, C]
-                                        .reshape(shape)       //  [B, T, NH, HS]
-                                        .shuffle(shuffle_qv)  //  [B, NH, T, HS]
+                                    .slice(offsets_v, extents)  // [B, T, C]
+                                    .reshape(shape)       //  [B, T, NH, HS]
+                                    .shuffle(shuffle_qv)  //  [B, NH, T, HS]
         ;
 
     const float factor = 1.0f / std::sqrt(static_cast<float>(HS));
@@ -224,16 +227,9 @@ struct CausalSelfAttention {
         auto att2d =
             MakeMatrix(att_->data<Type>() + (b * NH + h) * T * HS, T, HS);
 
-        //        preatt2d.noalias() = (q2d * k2d) * factor;
-        nn::MatMul<Type>::Forward(q2d, k2d, preatt2d);
-        preatt2d = preatt2d * factor;
-        for (int i = 0; i < T; ++i) {
-          for (int j = 0; j < T; ++j) {
-            if (!bias_(i, j)) {
-              preatt2d(i, j) = -std::numeric_limits<float>::infinity();
-            }
-          }
-        }
+        nn::MatMul<Type>::Forward(q2d, k2d, preatt2d, factor);
+        auto bias_2d = bias_[T]->matrix<Type>(T, T);
+        preatt2d.device(nn::g_device) = preatt2d + bias_2d;
 
         // softmax
         auto preatt2d_tensor =
@@ -243,7 +239,6 @@ struct CausalSelfAttention {
         softmax_->Forward(preatt2d_tensor, preatt_softmax2d_tensor);
 
         // att * v
-        //        att2d = preatt_softmax2d * v2d;
         typename TTypes<Type>::ConstMatrix v2d_const =
             MakeConstMatrix(v_->data<Type>() + (b * NH + h) * T * HS, T, HS);
         nn::MatMul<Type>::Forward(preatt_softmax2d, v2d_const, att2d);
@@ -344,9 +339,7 @@ struct CausalSelfAttention {
         // backward: mask
         // backward: q * k
         nn::MatMul<Type>::Backward(q2d, k2d, preatt_grad2d_const, q_grad2d,
-                                   k_grad2d);
-        q_grad2d = q_grad2d * factor;
-        k_grad2d = k_grad2d * factor;
+                                   k_grad2d, factor);
       }
     }
 
@@ -408,7 +401,9 @@ struct CausalSelfAttention {
 
   // not really a 'bias', more of a mask, but following the OpenAI/HF naming
   // though
-  Eigen::MatrixXi bias_;
+  //  Eigen::MatrixXi bias_;
+  std::vector<std::unique_ptr<nn::Activation>>
+      bias_;  // [0x0], [1x1], ... [block_size, block_size]
 };
 
 template <typename Type>

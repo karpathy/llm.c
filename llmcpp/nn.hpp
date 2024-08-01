@@ -76,6 +76,20 @@ void KaimingUniformFill(absl::Span<float> weight, int in_features) {
 #endif
 }
 
+void UpperTriangularWithNegativeInf(typename TTypes<float>::Matrix matrix) {
+  using MatrixXf =
+      Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+  MatrixXf m = MatrixXf::Zero(matrix.dimension(0), matrix.dimension(1));
+  m.triangularView<Eigen::StrictlyUpper>().setConstant(
+      -std::numeric_limits<float>::infinity());
+#ifdef EIGEN_USE_GPU
+  g_device.memcpyHostToDevice(matrix.data(), m.data(),
+                              sizeof(float) * matrix.size());
+#else
+  g_device.memcpy(matrix.data(), m.data(), sizeof(float) * matrix.size());
+#endif
+}
+
 std::pair<int, int> SplitRange(int total, int idx, int n) {
   int q = total / n;
   int r = total % n;
@@ -341,7 +355,7 @@ template <typename T>
 struct MatMul {
   static void Forward(typename TTypes<T>::ConstMatrix x1,
                       typename TTypes<T>::ConstMatrix x2,
-                      typename TTypes<T>::Matrix y) {
+                      typename TTypes<T>::Matrix y, T scale = 1.0f) {
     // x: [M, N], x2: [N, K], y: [M, K]
     CHECK_EQ(x1.dimension(0), y.dimension(0));
     CHECK_EQ(x1.dimension(1), x2.dimension(0));
@@ -351,14 +365,14 @@ struct MatMul {
     //    y.noalias() = x1 * x2;
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
         Eigen::IndexPair<int>(1, 0)};
-    y.device(g_device) = x1.contract(x2, product_dims);
+    y.device(g_device) = x1.contract(x2, product_dims) * scale;
   }
 
   static void Backward(typename TTypes<T>::ConstMatrix x1,
                        typename TTypes<T>::ConstMatrix x2,
                        typename TTypes<T>::ConstMatrix y_grad,
                        typename TTypes<T>::Matrix x1_grad,
-                       typename TTypes<T>::Matrix x2_grad) {
+                       typename TTypes<T>::Matrix x2_grad, T scale = 1.0) {
     // input:
     // x1: [M, N], x2:[N, K]
     // y_grad: [M, K]
@@ -376,7 +390,7 @@ struct MatMul {
     //        = [M, N]
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
         Eigen::IndexPair<int>(1, 1)};
-    x1_grad.device(g_device) += y_grad.contract(x2, product_dims);
+    x1_grad.device(g_device) += y_grad.contract(x2, product_dims) * scale;
 
     // x2_grad = dL/dy * dy/dx2
     //        = x1^T(N, M) * y_grad(M, K)
@@ -384,7 +398,7 @@ struct MatMul {
 
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims2 = {
         Eigen::IndexPair<int>(0, 0)};
-    x2_grad.device(g_device) += x1.contract(y_grad, product_dims2);
+    x2_grad.device(g_device) += x1.contract(y_grad, product_dims2) * scale;
   }
 };
 
