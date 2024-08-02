@@ -1,3 +1,7 @@
+# Taken from:
+# 1) https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/model.py
+# 2) https://github.com/meta-llama/llama3/blob/11817d47e1ba7a4959b025eb1ca308572e0e3963/llama/generation.py
+
 import torch
 from torch import nn
 

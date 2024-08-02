@@ -24,7 +24,6 @@ import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-
 from typing import (
     List,
     Optional,
@@ -987,6 +986,8 @@ if __name__ == "__main__":
             print(prompt, end="")
             print(f"{result['generation']}")
             print("\n==================================\n")
+
+        exit(0)  # only inference supported for now
 
     # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
