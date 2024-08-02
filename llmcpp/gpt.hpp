@@ -5,43 +5,6 @@
 
 namespace gpt {
 
-#define LAZY_ALLOCATE_VECTOR(v, X) \
-  do {                             \
-    if (v.size() == 0) {           \
-      v.resize(X);                 \
-      v.setZero();                 \
-    }                              \
-    CHECK(v.size() == X);          \
-  } while (false)
-
-#define LAZY_ALLOCATE_MATRIX(m, X, Y)      \
-  do {                                     \
-    if (m.size() == 0) {                   \
-      m.resize(X, Y);                      \
-      m.setZero();                         \
-    }                                      \
-    CHECK(m.rows() == X && m.cols() == Y); \
-  } while (false)
-
-#define LAZY_ALLOCATE_TENSOR3D(t, X, Y, Z)                                    \
-  do {                                                                        \
-    if (t.size() == 0) {                                                      \
-      t.resize(X, Y, Z);                                                      \
-      t.setZero();                                                            \
-    }                                                                         \
-    CHECK(t.dimension(0) == X && t.dimension(1) == Y && t.dimension(2) == Z); \
-  } while (false)
-
-#define LAZY_ALLOCATE_TENSOR4D(t, A, B, C, D)                                  \
-  do {                                                                         \
-    if (t.size() == 0) {                                                       \
-      t.resize(A, B, C, D);                                                    \
-      t.setZero();                                                             \
-    }                                                                          \
-    CHECK(t.dimension(0) == A && t.dimension(1) == B && t.dimension(2) == C && \
-          t.dimension(3) == D);                                                \
-  } while (false)
-
 template <typename T>
 struct MLP {
   explicit MLP(int n_embed) : n_embed_(n_embed) {
@@ -628,6 +591,57 @@ struct GPT {
         std::make_unique<nn::Activation>(dtype);  // [B*T, vocab_size]
   }
 
+  void __Forward(typename TTypes<int>::ConstMatrix idx) {
+    const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_,
+              L = n_layer_;
+    const int BT = B * T, TC = T * C;
+    const int BTC = BT * C;
+
+    CHECK_LE(T, block_size_) << "Cannot forward sequence of length " << T
+                             << ", block size is only " << block_size_;
+    std::vector<int> pos(T);
+    std::iota(pos.begin(), pos.end(), 0);
+
+    // Lazily allocate memory
+    tok_emb_->LazyAllocate(B * T * C);
+    pos_emb_->LazyAllocate(T * C);
+    encoded_->LazyAllocate(B * T * C);
+    block_y_->LazyAllocate(L * B * T * C);
+    lnf_y_->LazyAllocate(BT * C);
+    lnf_mean_->LazyAllocate(BT);
+    lnf_rstd_->LazyAllocate(BT);
+
+    wte_->Forward(idx,
+                  absl::MakeSpan(tok_emb_->data<Type>(), tok_emb_->size()));
+    wpe_->Forward(pos,
+                  absl::MakeSpan(pos_emb_->data<Type>(), pos_emb_->size()));
+
+    auto tok_emb = tok_emb_->matrix<Type>(B, TC);
+    auto pos_emb = pos_emb_->flat<Type>();
+    auto encoded = encoded_->matrix<Type>(B, TC);
+    Eigen::array<Eigen::Index, 2> batch_by_one = {B, 1};
+    Eigen::array<Eigen::Index, 2> one_by_class = {1, TC};
+    encoded.device(nn::g_device) =
+        tok_emb + pos_emb.reshape(one_by_class).broadcast(batch_by_one);
+
+    for (int l = 0; l < n_layer_; ++l) {
+      const auto& block = h_[l];
+      Type* x = l == 0 ? encoded_->data<Type>()
+                       : block_y_->data<Type>() + (l - 1) * BTC;
+      Type* y = block_y_->data<Type>() + l * BTC;
+      auto block_x_3d = MakeConst3DTensor(x, B, T, C);
+      auto block_y_3d = Make3DTensor(y, B, T, C);
+      block->Forward(block_x_3d, block_y_3d);
+    }
+
+    auto block_out_2d =
+        MakeConstMatrix(block_y_->data<Type>() + (L - 1) * BTC, BT, C);
+    auto lnf_y = MakeMatrix(lnf_y_->data<Type>(), BT, C);
+    auto lnf_mean = MakeFlat(lnf_mean_->data<Type>(), BT);
+    auto lnf_rstd = MakeFlat(lnf_rstd_->data<Type>(), BT);
+    lnf_->Forward(block_out_2d, lnf_y, lnf_mean, lnf_rstd);
+  }
+
   void Forward(typename TTypes<int>::ConstMatrix idx,
                typename TTypes<Type, 3>::Tensor logits) {
     const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_;
@@ -635,7 +649,7 @@ struct GPT {
     CHECK(logits.dimension(0) == B && logits.dimension(1) == T &&
           logits.dimension(2) == vocab_size_)
         << "B: " << B << ", T: " << T << ", vocab_size: " << vocab_size_;
-    DoForward(idx);
+    __Forward(idx);
 
     // OPTIMIZE:
     // inference-time mini-optimization: only forward the lm_head on the very
@@ -662,7 +676,7 @@ struct GPT {
     CHECK(logits.dimension(0) == B && logits.dimension(1) == T &&
           logits.dimension(2) == vocab_size_)
         << "B: " << B << ", T: " << T << ", vocab_size: " << vocab_size_;
-    DoForward(idx);
+    __Forward(idx);
 
     //    LAZY_ALLOCATE_MATRIX(probs_, BT, vocab_size_);
     probs_->LazyAllocate(BT * vocab_size_);
@@ -787,59 +801,6 @@ struct GPT {
       b->Parameters(parameters);
     }
     lnf_->Parameters(parameters);
-  }
-
- private:
-  void DoForward(typename TTypes<int>::ConstMatrix idx) {
-    const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_,
-              L = n_layer_;
-    const int BT = B * T, TC = T * C;
-    const int BTC = BT * C;
-    const int LBTC = L * BTC;
-
-    CHECK_LE(T, block_size_) << "Cannot forward sequence of length " << T
-                             << ", block size is only " << block_size_;
-    std::vector<int> pos(T);
-    std::iota(pos.begin(), pos.end(), 0);
-
-    // Lazily allocate memory
-    tok_emb_->LazyAllocate(B * T * C);
-    pos_emb_->LazyAllocate(T * C);
-    encoded_->LazyAllocate(B * T * C);
-    block_y_->LazyAllocate(L * B * T * C);
-    lnf_y_->LazyAllocate(BT * C);
-    lnf_mean_->LazyAllocate(BT);
-    lnf_rstd_->LazyAllocate(BT);
-
-    wte_->Forward(idx,
-                  absl::MakeSpan(tok_emb_->data<Type>(), tok_emb_->size()));
-    wpe_->Forward(pos,
-                  absl::MakeSpan(pos_emb_->data<Type>(), pos_emb_->size()));
-
-    auto tok_emb = tok_emb_->matrix<Type>(B, TC);
-    auto pos_emb = pos_emb_->flat<Type>();
-    auto encoded = encoded_->matrix<Type>(B, TC);
-    Eigen::array<Eigen::Index, 2> batch_by_one = {B, 1};
-    Eigen::array<Eigen::Index, 2> one_by_class = {1, TC};
-    encoded.device(nn::g_device) =
-        tok_emb + pos_emb.reshape(one_by_class).broadcast(batch_by_one);
-
-    for (int l = 0; l < n_layer_; ++l) {
-      const auto& block = h_[l];
-      Type* x = l == 0 ? encoded_->data<Type>()
-                       : block_y_->data<Type>() + (l - 1) * BTC;
-      Type* y = block_y_->data<Type>() + l * BTC;
-      auto block_x_3d = MakeConst3DTensor(x, B, T, C);
-      auto block_y_3d = Make3DTensor(y, B, T, C);
-      block->Forward(block_x_3d, block_y_3d);
-    }
-
-    auto block_out_2d =
-        MakeConstMatrix(block_y_->data<Type>() + (L - 1) * BTC, BT, C);
-    auto lnf_y = MakeMatrix(lnf_y_->data<Type>(), BT, C);
-    auto lnf_mean = MakeFlat(lnf_mean_->data<Type>(), BT);
-    auto lnf_rstd = MakeFlat(lnf_rstd_->data<Type>(), BT);
-    lnf_->Forward(block_out_2d, lnf_y, lnf_mean, lnf_rstd);
   }
 
  public:

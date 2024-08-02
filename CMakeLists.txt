@@ -66,14 +66,27 @@ if (CUDA_FOUND)
     )
     #    target_compile_options(test_eigen_gpu PRIVATE -Xcompiler=-Ofast,-march=native)
 
-    # nn_test_cu
-    add_executable(nn_test_cu llmcpp/nn_test.cu)
-    target_compile_definitions(nn_test_cu PRIVATE EIGEN_USE_GPU)
-    set_target_properties(nn_test_cu PROPERTIES
+    # nn_test_gpu
+    add_executable(nn_test_gpu llmcpp/nn_test.cu)
+    target_compile_definitions(nn_test_gpu PRIVATE EIGEN_USE_GPU)
+    set_target_properties(nn_test_gpu PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
             CUDA_ARCHITECTURES "61;70;75"
     )
-    target_link_libraries(nn_test_cu
+    target_link_libraries(nn_test_gpu
+            absl::strings absl::log absl::check
+            GTest::gtest_main
+            ${CUDA_LIBRARIES}
+    )
+
+    # gpt_test_gpu
+    add_executable(gpt_test_gpu llmcpp/gpt_test.cu)
+    target_compile_definitions(gpt_test_gpu PRIVATE EIGEN_USE_GPU)
+    set_target_properties(gpt_test_gpu PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_ARCHITECTURES "61;70;75"
+    )
+    target_link_libraries(gpt_test_gpu
             absl::strings absl::log absl::check
             GTest::gtest_main
             ${CUDA_LIBRARIES}

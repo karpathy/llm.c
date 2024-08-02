@@ -83,6 +83,7 @@ int main(int argc, char** argv) {
   std::vector<nn::Parameter*> parameters;
   model.Parameters(&parameters);
   optim::AdamW optimizer(parameters, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f);
+  std::vector<double> timings;
   for (int step = 0; step <= 10; step++) {
     // once in a while estimate the validation loss
     if (step % 10 == 0) {
@@ -159,6 +160,15 @@ int main(int argc, char** argv) {
         (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     printf("step %d: train loss %f (took %f ms)\n", step, loss,
            time_elapsed_s * 1000);
+    if (step) {
+      timings.push_back(time_elapsed_s);
+    }
+  }
+
+  double sum = std::accumulate(timings.begin(), timings.end(), 0.0);
+  if (!timings.empty()) {
+    printf("final %zu iters avg: %.3f ms\n", timings.size(),
+           1000 * sum / timings.size());
   }
 
   // free

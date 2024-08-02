@@ -130,6 +130,7 @@ int main(int argc, char** argv) {
   optim::AdamW optimizer(parameters, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f);
   float loss = 0;
 
+  std::vector<double> timings;
   for (int step = 0; step < 10; step++) {
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -140,6 +141,9 @@ int main(int argc, char** argv) {
     clock_gettime(CLOCK_MONOTONIC, &end);
     double time_elapsed_s =
         (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    if (step) {
+      timings.push_back(time_elapsed_s);
+    }
 
     if (step == 0) {
       // error checking at step 0 for reference activations/gradients
@@ -257,6 +261,11 @@ int main(int argc, char** argv) {
 
   // final judgement
   printf("overall okay: %d\n", allok);
+  double sum = std::accumulate(timings.begin(), timings.end(), 0.0);
+  if (!timings.empty()) {
+    printf("final %zu iters avg: %.3f ms\n", timings.size(),
+           1000 * sum / timings.size());
+  }
 
   // free everything
   free(x);
