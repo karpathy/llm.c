@@ -23,6 +23,21 @@ import struct
 import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
+
+from typing import (
+    AbstractSet,
+    cast,
+    Collection,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -33,9 +48,216 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from torch.distributed.optim import ZeroRedundancyOptimizer
 import torch.distributed as dist
+from tiktoken.load import load_tiktoken_bpe
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
+
+# The tiktoken tokenizer can handle <=400k chars without
+# pyo3_runtime.PanicException.
+TIKTOKEN_MAX_ENCODE_CHARS = 400_000
+
+# https://github.com/openai/tiktoken/issues/195
+# Here we iterate over subsequences and split if we exceed the limit
+# of max consecutive non-whitespace or whitespace characters.
+MAX_NO_WHITESPACES_CHARS = 25_000
+
+
+class Tokenizer:
+    """
+    Tokenizing and encoding/decoding text using the Tiktoken tokenizer.
+    """
+
+    special_tokens: Dict[str, int]
+
+    num_reserved_special_tokens = 256
+
+    pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"  # noqa: E501
+
+    def __init__(self, model_path: str):
+        """
+        Initializes the Tokenizer with a Tiktoken model.
+
+        Args:
+            model_path (str): The path to the Tiktoken model file.
+        """
+        assert os.path.isfile(model_path), model_path
+
+        mergeable_ranks = load_tiktoken_bpe(model_path)
+        num_base_tokens = len(mergeable_ranks)
+        special_tokens = [
+            "<|begin_of_text|>",
+            "<|end_of_text|>",
+            "<|reserved_special_token_0|>",
+            "<|reserved_special_token_1|>",
+            "<|finetune_right_pad_id|>",
+            "<|step_id|>",
+            "<|start_header_id|>",
+            "<|end_header_id|>",
+            "<|eom_id|>",  # end of message
+            "<|eot_id|>",  # end of turn
+            "<|python_tag|>",
+        ]
+        reserved_tokens = [
+            f"<|reserved_special_token_{2 + i}|>"
+            for i in range(self.num_reserved_special_tokens - len(special_tokens))
+        ]
+        special_tokens = special_tokens + reserved_tokens
+
+        self.special_tokens = {
+            token: num_base_tokens + i for i, token in enumerate(special_tokens)
+        }
+        self.model = tiktoken.Encoding(
+            name=Path(model_path).name,
+            pat_str=self.pat_str,
+            mergeable_ranks=mergeable_ranks,
+            special_tokens=self.special_tokens,
+        )
+
+        self.n_words: int = num_base_tokens + len(special_tokens)
+        # BOS / EOS token IDs
+        self.bos_id: int = self.special_tokens["<|begin_of_text|>"]
+        self.eos_id: int = self.special_tokens["<|end_of_text|>"]
+        self.eot_id: int = self.special_tokens["<|eot_id|>"]
+        self.eom_id: int = self.special_tokens["<|eom_id|>"]
+        self.python_tag_id = self.special_tokens["<|python_tag|>"]
+        self.pad_id: int = self.special_tokens["<|finetune_right_pad_id|>"]
+        self.stop_tokens = [
+            self.special_tokens["<|eom_id|>"],
+            self.special_tokens["<|eot_id|>"],
+        ]
+
+    def encode(
+        self,
+        s: str,
+        *,
+        bos: bool,
+        eos: bool,
+        allowed_special: Optional[Union[Literal["all"], AbstractSet[str]]] = None,
+        disallowed_special: Union[Literal["all"], Collection[str]] = (),
+    ) -> List[int]:
+        """
+        Encodes a string into a list of token IDs.
+
+        Args:
+            s (str): The input string to be encoded.
+            bos (bool): Whether to prepend the beginning-of-sequence token.
+            eos (bool): Whether to append the end-of-sequence token.
+            allowed_tokens ("all"|set[str]): allowed special tokens in string
+            disallowed_tokens ("all"|set[str]): special tokens that raise an error when in string
+
+        Returns:
+            list[int]: A list of token IDs.
+
+        By default, setting disallowed_special=() encodes a string by ignoring
+        special tokens. Specifically:
+        - Setting `disallowed_special` to () will cause all text corresponding
+          to special tokens to be encoded as natural text (insteading of raising
+          an error).
+        - Setting `allowed_special` to "all" will treat all text corresponding
+          to special tokens to be encoded as special tokens.
+        """
+        if allowed_special is None:
+            allowed_special = set()
+        assert type(s) is str
+
+        substrs = (
+            substr
+            for i in range(0, len(s), TIKTOKEN_MAX_ENCODE_CHARS)
+            for substr in self._split_whitespaces_or_nonwhitespaces(
+                s[i : i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
+            )
+        )
+        t: List[int] = []
+        for substr in substrs:
+            t.extend(
+                self.model.encode(
+                    substr,
+                    allowed_special=allowed_special,
+                    disallowed_special=disallowed_special,
+                )
+            )
+        if bos:
+            t.insert(0, self.bos_id)
+        if eos:
+            t.append(self.eos_id)
+        return t
+
+    def decode(self, t: Sequence[int]) -> str:
+        """
+        Decodes a list of token IDs into a string.
+
+        Args:
+            t (List[int]): The list of token IDs to be decoded.
+
+        Returns:
+            str: The decoded string.
+        """
+        # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
+        return self.model.decode(cast(List[int], t))
+
+    @staticmethod
+    def _split_whitespaces_or_nonwhitespaces(
+        s: str, max_consecutive_slice_len: int
+    ) -> Iterator[str]:
+        """
+        Splits the string `s` so that each substring contains no more than `max_consecutive_slice_len`
+        consecutive whitespaces or consecutive non-whitespaces.
+        """
+        current_slice_len = 0
+        current_slice_is_space = s[0].isspace() if len(s) > 0 else False
+        slice_start = 0
+
+        for i in range(len(s)):
+            is_now_space = s[i].isspace()
+
+            if current_slice_is_space ^ is_now_space:
+                current_slice_len = 1
+                current_slice_is_space = is_now_space
+            else:
+                current_slice_len += 1
+                if current_slice_len > max_consecutive_slice_len:
+                    yield s[slice_start:i]
+                    slice_start = i
+                    current_slice_len = 1
+        yield s[slice_start:]
+
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
+def sample_top_p(probs, p):
+    """
+    Perform top-p (nucleus) sampling on a probability distribution.
+
+    Args:
+        probs (torch.Tensor): Probability distribution tensor.
+        p (float): Probability threshold for top-p sampling.
+
+    Returns:
+        torch.Tensor: Sampled token indices.
+
+    Note:
+        Top-p sampling selects the smallest set of tokens whose cumulative probability mass
+        exceeds the threshold p. The distribution is renormalized based on the selected tokens.
+    """
+    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    mask = probs_sum - probs_sort > p
+    probs_sort[mask] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    next_token = torch.multinomial(probs_sort, num_samples=1)
+    next_token = torch.gather(probs_idx, -1, next_token)
+    return next_token
 
 class NewGELU(nn.Module):
     """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
@@ -45,72 +267,197 @@ class NewGELU(nn.Module):
 # using a global to toggle flash-attention
 FLASH = 0
 
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
+
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    bs, slen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    )
+
+def apply_scaling(freqs: torch.Tensor):
+    # Values obtained from grid search
+    scale_factor = 8
+    low_freq_factor = 1
+    high_freq_factor = 4
+    old_context_len = 8192  # original llama3 length
+
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+    new_freqs = []
+    for freq in freqs:
+        wavelen = 2 * math.pi / freq
+        if wavelen < high_freq_wavelen:
+            new_freqs.append(freq)
+        elif wavelen > low_freq_wavelen:
+            new_freqs.append(freq / scale_factor)
+        else:
+            assert low_freq_wavelen != high_freq_wavelen
+            smooth = (old_context_len / wavelen - low_freq_factor) / (
+                high_freq_factor - low_freq_factor
+            )
+            new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
+    return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
+
+def precompute_freqs_cis(
+    dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False
+):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    if use_scaled:
+        freqs = apply_scaling(freqs)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
-        # regularization
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
+        is_llama = config.is_llama
+        self.is_llama = is_llama
+        if not is_llama:
+            # key, query, value projections for all heads, but in a batch
+            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+            # output projection
+            self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+            self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+            # regularization
+            self.n_head = config.n_head
+            self.n_embd = config.n_embd
+        else:
+            self.n_kv_heads = config.n_kv_head
+            self.n_local_heads = config.n_head
+            self.n_local_kv_heads = self.n_kv_heads
+            self.n_rep = self.n_local_heads // self.n_local_kv_heads
+            self.head_dim = config.n_embd // config.n_head
+
+            self.wq = nn.Linear(config.n_embd, config.n_head * self.head_dim, bias=False)
+            self.wk = nn.Linear(config.n_embd, self.n_kv_heads * self.head_dim, bias=False)
+            self.wv = nn.Linear(config.n_embd, self.n_kv_heads * self.head_dim, bias=False)
+            self.wo = nn.Linear(config.n_head * self.head_dim, config.n_embd, bias=False)
+
         # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                     .view(1, 1, config.block_size, config.block_size))
+                                    .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        if FLASH:
-            # flashattention
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    def forward(self, x, freqs_cis=None):
+        if not self.is_llama:
+            B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+            # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+            qkv = self.c_attn(x)
+            q, k, v = qkv.split(self.n_embd, dim=2)
+            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            if FLASH:
+                # flashattention
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            else:
+                # manual implementation of attention
+                # this materializes the large (T,T) matrix for all the queries and keys
+                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+                att = F.softmax(att, dim=-1)
+                y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            # output projection
+            y = self.c_proj(y)
+            return y
         else:
-            # manual implementation of attention
-            # this materializes the large (T,T) matrix for all the queries and keys
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-        # output projection
-        y = self.c_proj(y)
-        return y
+            bsz, seqlen, _ = x.shape
+
+            # QKV
+            xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+            xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+            xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+            xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+            # rotate QK (rope)
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+            # repeat k/v heads if n_kv_heads < n_heads (GQA)
+            keys = repeat_kv(xk, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+            values = repeat_kv(xv, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+
+            # attention
+            xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+            keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+            values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+            scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+            scores = scores.masked_fill(self.bias[:,:,:seqlen,:seqlen] == 0, float('-inf'))
+
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+            output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+            return self.wo(output)
 
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu    = NewGELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        is_llama = config.is_llama
+        self.is_llama = is_llama
+        if not is_llama:
+            self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
+            self.gelu    = NewGELU()
+            self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
+            self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        else:
+            hidden_dim = 4 * config.n_embd
+            hidden_dim = int(2 * hidden_dim / 3)
+            # custom dim factor multiplier
+            if config.ffn_dim_multiplier is not None:
+                hidden_dim = int(config.ffn_dim_multiplier * hidden_dim)
+            hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
+            self.w1 = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.w2 = nn.Linear(hidden_dim, config.n_embd, bias=False)
+            self.w3 = nn.Linear(config.n_embd, hidden_dim, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        return x
+        if not self.is_llama:
+            x = self.c_fc(x)
+            x = self.gelu(x)
+            x = self.c_proj(x)
+            return x
+        else:
+            return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        is_llama = config.is_llama
+        self.ln_1 = RMSNorm(config.n_embd, config.norm_eps) if is_llama else nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.ln_2 = RMSNorm(config.n_embd, config.norm_eps) if is_llama else nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, freqs_cis=None):
+        x = x + self.attn(self.ln_1(x), freqs_cis)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -119,32 +466,60 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
+    is_llama = False
     block_size: int = 1024
     vocab_size: int = 50257
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
 
+@dataclass
+class Llama31Config:
+    is_llama = True
+    block_size: int = 1024
+    vocab_size: int = 128256
+    n_layer: int = 32
+    n_head: int = 32
+    n_kv_head: int = 8
+    n_embd: int = 4096
+    ffn_dim_multiplier: float = 1.3
+    multiple_of: int = 1024
+    norm_eps: float = 1e-5
+    rope_theta: float = 500000.0
+    use_scaled_rope: bool = True
+
 class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.config = config
+        is_llama = config.is_llama
+        self.is_llama = is_llama
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            **({'wpe': nn.Embedding(config.block_size, config.n_embd)} if not is_llama else {}),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd),
+            ln_f = RMSNorm(config.n_embd, config.norm_eps) if is_llama else nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        if not is_llama:
+            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights, use a torch rng object to be very careful
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(42)
-        self.apply(self._init_weights)
+        if not is_llama:
+            self.apply(self._init_weights)
+
+        if is_llama:
+            self.freqs_cis = precompute_freqs_cis(
+                config.n_embd // config.n_head,
+                config.block_size * 2,
+                config.rope_theta,
+                config.use_scaled_rope,
+            )
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -167,20 +542,25 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = tok_emb + pos_emb
+        freqs_cis = None
+        if not self.is_llama:
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+            x = tok_emb + pos_emb
+        else:
+            x = tok_emb
+            freqs_cis = self.freqs_cis[:t]
 
-        for block in self.transformer.h:
-            x = block(x)
+        for i, block in enumerate(self.transformer.h):
+            x = block(x, freqs_cis)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            logits = self.lm_head(x).float()
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :]).float() # note: using list [-1] to preserve the time dim
             loss = None
 
         # there are performance reasons why not returning logits is prudent, if not needed
@@ -188,6 +568,64 @@ class GPT(nn.Module):
             logits = None
 
         return logits, loss
+
+    @staticmethod
+    def modify_llama_keys(checkpoint, config: Llama31Config):
+        # 1) rename key tok_embeddings.weight to transformer.wte.weight
+        checkpoint['transformer.wte.weight'] = checkpoint.pop('tok_embeddings.weight')
+
+        # layers.0.attention_norm.weight -> transformer.h.0.ln_1.weight
+        # layers.0.ffn_norm.weight -> transformer.h.0.ln_2.weight
+        # loop over all layers
+        for i in range(config.n_layer):
+            for name in ['attention_norm', 'ffn_norm']:
+                for suffix in ['weight']:
+                    old_key = f'layers.{i}.{name}.{suffix}'
+                    new_key = f'transformer.h.{i}.ln_{1 if name == "attention_norm" else 2}.{suffix}'
+                    checkpoint[new_key] = checkpoint.pop(old_key)
+
+        # layers.0.attention.wq.weight -> transformer.h.0.attn.wq.weight
+        # layers.0.attention.wk.weight -> transformer.h.0.attn.wk.weight
+        # layers.0.attention.wv.weight -> transformer.h.0.attn.wv.weight
+        # layers.0.attention.wo.weight -> transformer.h.0.attn.wo.weight
+        # loop over all layers
+        for i in range(config.n_layer):
+            for name in ['attention.wq', 'attention.wk', 'attention.wv', 'attention.wo']:
+                for suffix in ['weight']:
+                    old_key = f'layers.{i}.{name}.{suffix}'
+                    new_key = f'transformer.h.{i}.attn.{name.split(".")[-1]}.{suffix}'
+                    checkpoint[new_key] = checkpoint.pop(old_key)
+
+        # layers.0.feed_forward.w1.weight -> transformer.h.0.mlp.w1.weight
+        # layers.0.feed_forward.w2.weight -> transformer.h.0.mlp.w2.weight
+        # layers.0.feed_forward.w3.weight -> transformer.h.0.mlp.w3.weight
+        # loop over all layers
+        for i in range(config.n_layer):
+            for name in ['feed_forward.w1', 'feed_forward.w2', 'feed_forward.w3']:
+                for suffix in ['weight']:
+                    old_key = f'layers.{i}.{name}.{suffix}'
+                    new_key = f'transformer.h.{i}.mlp.{name.split(".")[-1]}.{suffix}'
+                    checkpoint[new_key] = checkpoint.pop(old_key)
+
+        # norm.weight -> transformer.ln_f.weight
+        # output.weight -> lm_head.weight
+        checkpoint['transformer.ln_f.weight'] = checkpoint.pop('norm.weight')
+        checkpoint['lm_head.weight'] = checkpoint.pop('output.weight')
+
+        return checkpoint
+
+    @classmethod
+    def from_pretrained_llama3_1(cls):
+        ckpt_dir = "/home/aleksa/Documents/eureka/nano-llama31/llama-models/models/llama3_1/Meta-Llama-3.1-8B"
+        ckpt_path = sorted(Path(ckpt_dir).glob("*.pth"))[0]
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        checkpoint = GPT.modify_llama_keys(checkpoint, Llama31Config())
+        model_args = Llama31Config()
+
+        torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
+        model = GPT(model_args)
+        model.load_state_dict(checkpoint, strict=False)
+        return model
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -295,6 +733,116 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+    @torch.inference_mode()
+    def generate2(
+        self,
+        prompt_tokens: List[List[int]],
+        max_gen_len: int,
+        temperature: float = 0.6,
+        top_p: float = 0.9,
+        logprobs: bool = False,
+        echo: bool = False,
+    ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
+        """
+        Generate text sequences based on provided prompts using the language generation model.
+
+        Args:
+            prompt_tokens (List[List[int]]): List of tokenized prompts, where each prompt is represented as a list of integers.
+            max_gen_len (int): Maximum length of the generated text sequence.
+            temperature (float, optional): Temperature value for controlling randomness in sampling. Defaults to 0.6.
+            top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
+            logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
+            echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
+
+        Returns:
+            Tuple[List[List[int]], Optional[List[List[float]]]]: A tuple containing generated token sequences and, if logprobs is True, corresponding token log probabilities.
+
+        Note:
+            This method uses the provided prompts as a basis for generating text. It employs nucleus sampling to produce text with controlled randomness.
+            If logprobs is True, token log probabilities are computed for each generated token.
+
+        """
+        params = self.config
+        bsz = len(prompt_tokens)
+        # assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
+
+        min_prompt_len = min(len(t) for t in prompt_tokens)
+        max_prompt_len = max(len(t) for t in prompt_tokens)
+        assert max_prompt_len <= params.block_size
+        total_len = min(params.block_size, max_gen_len + max_prompt_len)
+
+        pad_id = self.tokenizer.pad_id
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        for k, t in enumerate(prompt_tokens):
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+        if logprobs:
+            token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
+
+        prev_pos = 0
+        eos_reached = torch.tensor([False] * bsz, device="cuda")
+        input_text_mask = tokens != pad_id
+
+        if min_prompt_len == total_len:
+            logits, _ = self.forward(tokens)
+            token_logprobs = -F.cross_entropy(
+                input=logits.transpose(1, 2),
+                target=tokens,
+                reduction="none",
+                ignore_index=pad_id,
+            )
+
+        stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens))
+
+        for cur_pos in range(min_prompt_len, total_len):
+            logits, _ = self.forward(tokens[:, :cur_pos])
+            if temperature > 0:
+                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                next_token = sample_top_p(probs, top_p)
+            else:
+                next_token = torch.argmax(logits[:, -1], dim=-1)
+
+            next_token = next_token.reshape(-1)
+            # only replace token if prompt has already been generated
+            next_token = torch.where(
+                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
+            )
+            tokens[:, cur_pos] = next_token
+            if logprobs:
+                token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
+                    input=logits.transpose(1, 2),
+                    target=tokens[:, prev_pos + 1 : cur_pos + 1],
+                    reduction="none",
+                    ignore_index=pad_id,
+                )
+            eos_reached |= (~input_text_mask[:, cur_pos]) & (
+                torch.isin(next_token, stop_tokens)
+            )
+            prev_pos = cur_pos
+            if all(eos_reached):
+                break
+
+        if logprobs:
+            token_logprobs = token_logprobs.tolist()
+        out_tokens, out_logprobs = [], []
+        for i, toks in enumerate(tokens.tolist()):
+            # cut to max gen len
+            start = 0 if echo else len(prompt_tokens[i])
+            toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
+            probs = None
+            if logprobs:
+                probs = token_logprobs[i][start : len(prompt_tokens[i]) + max_gen_len]
+            # cut to after eos tok if any
+            for stop_token in self.tokenizer.stop_tokens:
+                try:
+                    eos_idx = toks.index(stop_token)
+                    toks = toks[:eos_idx]
+                    probs = probs[:eos_idx] if logprobs else None
+                except ValueError:
+                    pass
+            out_tokens.append(toks)
+            out_logprobs.append(probs)
+        return (out_tokens, out_logprobs if logprobs else None)
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -541,6 +1089,7 @@ if __name__ == "__main__":
     # default settings will overfit a tiny batch of data
     # and save model weights and debug state to disk on the first iteration
     parser = argparse.ArgumentParser()
+    parser.add_argument("--use_llama3", type=int, default=1, help="use llama3 model")
     # file system input / output
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
@@ -627,7 +1176,7 @@ if __name__ == "__main__":
 
     # set up a context manager following the desired dtype and device
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
-    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
+    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if (device_type == "cuda" and not args.use_llama3) else nullcontext()
 
     # rng / reproducibility
     torch.manual_seed(42)
@@ -659,8 +1208,12 @@ if __name__ == "__main__":
         }[args.model]
         model = GPT(model_config)
     else:
-        # load the GPT-2 model weights
-        model = GPT.from_pretrained(args.model)
+        if args.use_llama3:
+            model = GPT.from_pretrained_llama3_1()
+        else:
+            # load the GPT-2 model weights
+            model = GPT.from_pretrained(args.model)
+
     model.train()
     model.to(device)
     if args.compile:
@@ -682,7 +1235,7 @@ if __name__ == "__main__":
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
 
     # do one forward pass to generate ground truth for our C tests
-    if master_process and args.write_tensors and (not args.inference_only):
+    if not args.use_llama3 and master_process and args.write_tensors and (not args.inference_only):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         logits, loss = model(x, y)
@@ -745,41 +1298,63 @@ if __name__ == "__main__":
         last_step = (step == args.num_iterations)
 
         # once in a while evaluate the validation dataset
-        if (args.val_loss_every > 0 \
-            and (step % args.val_loss_every == 0 or last_step)) \
-            and (val_loader is not None):
-            model.eval()
-            val_loader.reset()
-            with torch.no_grad():
-                val_loss = 0.0
-                for _ in range(args.val_max_steps):
-                    x, y = val_loader.next_batch()
-                    x, y = x.to(device), y.to(device)
-                    _, loss = model(x, y, return_logits=False)
-                    val_loss += loss.item()
-                val_loss /= args.val_max_steps
-            # log to console and to file
-            print0(f"val loss {val_loss}")
-            if master_process and logfile is not None:
-                with open(logfile, "a") as f:
-                    f.write("s:%d tel:%f\n" % (step, val_loss))
+        # if (args.val_loss_every > 0 \
+        #     and (step % args.val_loss_every == 0 or last_step)) \
+        #     and (val_loader is not None):
+        #     model.eval()
+        #     val_loader.reset()
+        #     with torch.no_grad():
+        #         val_loss = 0.0
+        #         for _ in range(args.val_max_steps):
+        #             x, y = val_loader.next_batch()
+        #             x, y = x.to(device), y.to(device)
+        #             _, loss = model(x, y, return_logits=False)
+        #             val_loss += loss.item()
+        #         val_loss /= args.val_max_steps
+        #     # log to console and to file
+        #     print0(f"val loss {val_loss}")
+        #     if master_process and logfile is not None:
+        #         with open(logfile, "a") as f:
+        #             f.write("s:%d tel:%f\n" % (step, val_loss))
 
         # once in a while perform model inference on the master process
-        if (args.sample_every > 0 \
-            and (step % args.sample_every == 0 or last_step)) \
-            and master_process:
+        if True:
+            # (args.sample_every > 0 \
+            # and (step % args.sample_every == 0 or last_step)) \
+            # and master_process:
             model.eval()
             # before we end, let's also do one round of inference
             # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
-            start_ids = [enc.eot_token]
-            xg = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-            max_new_tokens = 32
-            temperature = 1.0
-            top_k = 40
-            yg = raw_model.generate(xg, max_new_tokens, temperature=temperature, top_k=top_k)
-            print0('---------------')
-            print0(enc.decode(yg[0].tolist()))
-            print0('---------------')
+            # start_ids = [enc.eot_token]
+            # xg = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+            # max_new_tokens = 32
+            # temperature = 1.0
+            # top_k = 40
+            tokenizer_path = "/home/aleksa/Documents/eureka/nano-llama31/llama-models/models/llama3_1/Meta-Llama-3.1-8B/tokenizer.model"
+            tokenizer = Tokenizer(model_path=tokenizer_path)
+            raw_model.tokenizer = tokenizer
+            prompts: List[str] = [
+        # For these prompts, the expected answer is the natural continuation of the prompt
+        "Clearly, the meaning of life is",
+        "Simply put, the theory of relativity states that",
+        """The repo llm.c on GitHub is""",
+        # Few shot prompt (providing a few examples before asking model to complete more);
+        """Translate English to French:
+
+        sea otter => loutre de mer
+        peppermint => menthe poivrée
+        plush girafe => girafe peluche
+        cheese =>""",
+            ]
+
+            prompt_tokens = [tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+
+            generation_tokens, _ = raw_model.generate2(prompt_tokens, max_gen_len=64, temperature=0.6, top_p=0.9, logprobs=False, echo=False)
+            results = [{"generation": tokenizer.decode(t)} for t in generation_tokens]
+            for prompt, result in zip(prompts, results):
+                print(prompt, end="") # AK: change end="\n" to end=""
+                print(f"{result['generation']}")
+                print("\n==================================\n")
 
         # bit confusing: we want to make sure to eval and sample on 0th iteration
         # but also after the very last iteration. so we loop for step <= num_iterations
