@@ -63,93 +63,62 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         self.is_llama = config.is_llama
         if not self.is_llama:
-            # key, query, value projections for all heads, but in a batch
-            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-            # output projection
-            self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+            assert config.n_head == config.n_kv_head, "GQA is only available for LLaMA"
+
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_rep = self.n_head // self.n_kv_head
+        self.hd = config.n_embd // config.n_head
+
+        self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.hd, bias=not self.is_llama)  # key, query, value projections
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=not self.is_llama)  # output projection
+
+        if not self.is_llama:
             self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
-            # regularization
-            self.n_head = config.n_head
-            self.n_embd = config.n_embd
-        else:
-            self.n_head = config.n_head
-            self.n_kv_head = config.n_kv_head
-            self.n_rep = self.n_head // self.n_kv_head
-            self.head_dim = config.n_embd // config.n_head
 
-            self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.head_dim)
-            self.c_proj = nn.Linear(config.n_head * self.head_dim, config.n_embd, bias=False)
-
-            self.cache_k = torch.zeros((4, config.block_size, config.n_kv_head, self.head_dim))
-            self.cache_v = torch.zeros((4, config.block_size, config.n_kv_head, self.head_dim))
+        self.cache_k = torch.zeros((config.batch_size, config.block_size, config.n_kv_head, self.hd))
+        self.cache_v = torch.zeros((config.batch_size, config.block_size, config.n_kv_head, self.hd))
 
         # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x, freqs_cis=None, start_pos=None):
-        if not self.is_llama:
-            B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-            # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-            qkv = self.c_attn(x)
-            q, k, v = qkv.split(self.n_embd, dim=2)
-            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            if FLASH:
-                # flashattention
-                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            else:
-                # manual implementation of attention
-                # this materializes the large (T,T) matrix for all the queries and keys
-                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-                att = F.softmax(att, dim=-1)
-                y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-            y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-            # output projection
-            y = self.c_proj(y)
-            return y
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
+        q, k, v = map(lambda t: t.view(B, T, -1, self.hd), (q, k, v))  # (B, T, NH, HD)
+
+        if self.is_llama:
+            q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)
+
+        if start_pos >= 0:  # kv-caching (which we can disable by setting start_pos = -1)
+            self.cache_k[:B, start_pos : start_pos + T] = k
+            self.cache_v[:B, start_pos : start_pos + T] = v
+            k = self.cache_k[:B, : start_pos + T]
+            v = self.cache_v[:B, : start_pos + T]
+
+        if self.is_llama:
+            k = repeat_kv(k, self.n_rep)  # GQA
+            v = repeat_kv(v, self.n_rep)
+
+        q = q.transpose(1, 2)  # (B, NH, T, HD)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        if FLASH:
+            # flashattention
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
-            # TODO(gordicaleksa): this can be easily merged with the if branch above
-            bsz, seqlen, _ = x.shape
-
-            # QKV
-            xq, xk, xv = torch.split(self.c_attn(x), [self.n_head * self.head_dim, self.n_kv_head * self.head_dim, self.n_kv_head * self.head_dim], dim=-1)
-            xq = xq.view(bsz, seqlen, self.n_head, self.head_dim)
-            xk = xk.view(bsz, seqlen, self.n_kv_head, self.head_dim)
-            xv = xv.view(bsz, seqlen, self.n_kv_head, self.head_dim)
-            # rotate QK (rope)
-            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-
-            # kv-caching (which we can disable by setting start_pos = -1)
-            if start_pos >= 0:
-                self.cache_k = self.cache_k.to(xq)
-                self.cache_v = self.cache_v.to(xq)
-                self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-                self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-                keys = self.cache_k[:bsz, : start_pos + seqlen]
-                values = self.cache_v[:bsz, : start_pos + seqlen]
-            else:
-                keys = xk
-                values = xv
-
-            # repeat k/v heads if n_kv_heads < n_heads (GQA)
-            keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-            values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-
-            # attention
-            xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-            keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-            values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-            scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-            scores = scores.masked_fill(self.bias[:,:,:seqlen,:seqlen] == 0, float('-inf'))
-
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
-            output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-            return self.c_proj(output)
+            # manual implementation of attention
+            # this materializes the large (T,T) matrix for all the queries and keys
+            scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.hd))
+            scores = scores.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(scores.float(), dim=-1).type_as(q)
+            y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.c_proj(y)
+        return y
 
 class MLP(nn.Module):
 
@@ -211,6 +180,7 @@ class GPTConfig:
     vocab_size: int = 50257
     n_layer: int = 12
     n_head: int = 12
+    n_kv_head: int = 12
     n_embd: int = 768
 
 @dataclass
@@ -228,6 +198,7 @@ class LlamaConfig:
     norm_eps: float = 1e-5
     rope_theta: float = 500000.0
     use_scaled_rope: bool = True
+    batch_size = 4
 
 class GPT(nn.Module):
 
