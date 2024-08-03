@@ -45,7 +45,7 @@ from llmc_py.rope import precompute_freqs_cis, apply_rotary_emb
 from llmc_py.utils import repeat_kv, sample_top_p, RMSNorm
 
 # -----------------------------------------------------------------------------
-# PyTorch nn.Module definitions for the GPT-2 model
+# PyTorch nn.Module definitions for the LLaMA 3.x model
 
 # using a global to toggle flash-attention
 FLASH = 0
@@ -564,7 +564,8 @@ def write_model(model, filename, dtype):
     header[11] = model.config.rope_theta
     header[12] = model.config.use_scaled_rope
     header[13] = model.config.max_gen_batch_size
-    header[14] = model.version
+    header[14] = int(model.config.version.split('.')[0]) # major version
+    header[15] = int(model.config.version.split('.')[1]) # minor version
     # 2) the parameters follow the header
     params = {name: param.cpu() for name, param in model.named_parameters()}
     # now write to file
@@ -620,7 +621,7 @@ if __name__ == "__main__":
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
-    parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
+    parser.add_argument("--model", type=str, default="llama3.1", help="llama3.1")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -656,7 +657,7 @@ if __name__ == "__main__":
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
     assert args.dtype in {"float32", "float16", "bfloat16"}
-    assert args.model in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl", "d12", "d24", "d36", "d48"}
+    assert args.model in {"llama3.1"}
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -741,38 +742,22 @@ if __name__ == "__main__":
         val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 
     # -------------------------------------------------------------------------
-    # LLaMA 3 inference
-    model.eval()
-    prompts: List[str] = json.loads(open(os.path.join(os.path.dirname(__file__), 'llmc_py', 'prompts.json')).read())['prompts']
-    prompt_tokens = [model.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
-
-    generation_tokens, _ = model.generate(prompt_tokens, max_gen_len=64, temperature=0.6, top_p=0.9, logprobs=False, echo=False)
-    results = [{"generation": model.tokenizer.decode(t)} for t in generation_tokens]
-    for prompt, result in zip(prompts, results):
-        print(prompt, end="")
-        print(f"{result['generation']}")
-        print("\n==================================\n")
-
-    exit(0)  # only inference supported for now
-
-    # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
 
     # do one forward pass to generate ground truth for our C tests
     if master_process and args.write_tensors and (not args.inference_only):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        logits, loss = model(x, y)
-        loss.backward()
+        logits, loss = model(x, y, start_pos=0)
+        # loss.backward()
         # save model params, in both float32 and bfloat16
-        model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
-        model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
-        model_size_str = model_to_size[args.model] # e.g. "124M", or "d12"
-        write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
-        write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
+        model_to_size = {"llama3.1": "8B"}
+        model_size_str = model_to_size[args.model] # e.g. "8B"
+        write_model(model, f"llama3.1_{model_size_str}.bin", dtype="float32")
+        write_model(model, f"llama3.1_{model_size_str}_bf16.bin", dtype="bfloat16")
         # save x, y, logits, loss, and parameter gradients, for debugging C
         # always store these in fp32 to have an accurate reference (?)
-        write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
+        write_state(model, x, y, logits, loss, f"llama3_{model_size_str}_debug_state.bin")
         # reset the train_loader for the optimization below
         train_loader.reset()
 
@@ -846,16 +831,15 @@ if __name__ == "__main__":
             and (step % args.sample_every == 0 or last_step)) \
             and master_process:
             model.eval()
-            # before we end, let's also do one round of inference
-            # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
-            start_ids = [[enc.eot_token]]
-            enc.pad_id = enc.eot_token  # dummy value, it's a no-op
-            enc.stop_tokens = [-1]  # dummy value, we don't stop early
-            raw_model.tokenizer = enc
-            yg = raw_model.generate(start_ids, max_gen_len=32, temperature=1.0, top_p=0.9)
-            print0('---------------')
-            print0(enc.decode(yg[0][0]))
-            print0('---------------')
+            prompts: List[str] = json.loads(open(os.path.join(os.path.dirname(__file__), 'llmc_py', 'prompts.json')).read())['prompts']
+            prompt_tokens = [model.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+
+            generation_tokens, _ = model.generate(prompt_tokens, max_gen_len=64, temperature=0.6, top_p=0.9, logprobs=False, echo=False)
+            results = [{"generation": model.tokenizer.decode(t)} for t in generation_tokens]
+            for prompt, result in zip(prompts, results):
+                print(prompt, end="")
+                print(f"{result['generation']}")
+                print("\n==================================\n")
 
         # bit confusing: we want to make sure to eval and sample on 0th iteration
         # but also after the very last iteration. so we loop for step <= num_iterations
