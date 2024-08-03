@@ -82,11 +82,14 @@ class CausalSelfAttention(nn.Module):
             self.wv = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim, bias=False)
             self.wo = nn.Linear(config.n_head * self.head_dim, config.n_embd, bias=False)
 
+            self.cache_k = torch.zeros((4, config.block_size, config.n_kv_head, self.head_dim))
+            self.cache_v = torch.zeros((4, config.block_size, config.n_kv_head, self.head_dim))
+
         # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, freqs_cis=None):
+    def forward(self, x, freqs_cis=None, start_pos=None):
         if not self.is_llama:
             B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
             # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -121,9 +124,21 @@ class CausalSelfAttention(nn.Module):
             # rotate QK (rope)
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
+            # kv-caching (which we can disable by setting start_pos = -1)
+            if start_pos >= 0:
+                self.cache_k = self.cache_k.to(xq)
+                self.cache_v = self.cache_v.to(xq)
+                self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+                self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+                keys = self.cache_k[:bsz, : start_pos + seqlen]
+                values = self.cache_v[:bsz, : start_pos + seqlen]
+            else:
+                keys = xk
+                values = xv
+
             # repeat k/v heads if n_kv_heads < n_heads (GQA)
-            keys = repeat_kv(xk, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-            values = repeat_kv(xv, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+            keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+            values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
             # attention
             xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
@@ -177,8 +192,8 @@ class Block(nn.Module):
         self.ln_2 = RMSNorm(config.n_embd, config.norm_eps) if config.is_llama else nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x, freqs_cis=None):
-        x = x + self.attn(self.ln_1(x), freqs_cis)
+    def forward(self, x, freqs_cis=None, start_pos=None):
+        x = x + self.attn(self.ln_1(x), freqs_cis, start_pos)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -255,7 +270,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
 
-    def forward(self, idx, targets=None, return_logits=True):
+    def forward(self, idx, targets=None, return_logits=True, start_pos=-1):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -269,10 +284,10 @@ class GPT(nn.Module):
             x = tok_emb + pos_emb
         else:
             x = tok_emb
-            freqs_cis = self.freqs_cis[:t]
+            freqs_cis = self.freqs_cis[start_pos:start_pos+t]
 
         for i, block in enumerate(self.transformer.h):
-            x = block(x, freqs_cis)
+            x = block(x, freqs_cis, start_pos)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -509,7 +524,7 @@ class GPT(nn.Module):
         input_text_mask = tokens != pad_id
 
         if min_prompt_len == total_len:
-            logits, _ = self.forward(tokens)
+            logits, _ = self.forward(tokens, start_pos=prev_pos)
             token_logprobs = -F.cross_entropy(
                 input=logits.transpose(1, 2),
                 target=tokens,
@@ -520,7 +535,7 @@ class GPT(nn.Module):
         stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens))
 
         for cur_pos in range(min_prompt_len, total_len):
-            logits, _ = self.forward(tokens[:, :cur_pos])
+            logits, _ = self.forward(tokens[:, prev_pos:cur_pos], start_pos=prev_pos)
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
