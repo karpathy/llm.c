@@ -146,22 +146,10 @@ class Block(nn.Module):
         return x
 
 # -----------------------------------------------------------------------------
-# The main GPT-2 model
-
-@dataclass
-class GPTConfig:
-    is_llama = False
-    block_size: int = 1024
-    vocab_size: int = 50257
-    n_layer: int = 12
-    n_head: int = 12
-    n_kv_head: int = 12
-    n_embd: int = 768
-    max_gen_batch_size = 4
+# The main LLaMA 3.1 model
 
 @dataclass
 class LlamaConfig:
-    is_llama = True
     version: str = "3.1"
     block_size: int = 1024
     vocab_size: int = 128256
@@ -174,39 +162,32 @@ class LlamaConfig:
     norm_eps: float = 1e-5
     rope_theta: float = 500000.0
     use_scaled_rope: bool = True
-    max_gen_batch_size = 4
+    max_gen_batch_size: int = 4
 
-class GPT(nn.Module):
+class LLaMA(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.is_llama = config.is_llama
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            **({} if self.is_llama else {'wpe': nn.Embedding(config.block_size, config.n_embd)}),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = RMSNorm(config.n_embd, config.norm_eps) if self.is_llama else nn.LayerNorm(config.n_embd),
+            ln_f = RMSNorm(config.n_embd, config.norm_eps),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        if not self.is_llama:
-            self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
-            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights, use a torch rng object to be very careful
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(42)
-        if not self.is_llama:
-            self.apply(self._init_weights)
+        # self.apply(self._init_weights)
 
-        if self.is_llama:
-            self.freqs_cis = precompute_freqs_cis(
-                config.n_embd // config.n_head,
-                config.block_size * 2,
-                config.rope_theta,
-                config.use_scaled_rope,
-            )
+        self.freqs_cis = precompute_freqs_cis(
+            config.n_embd // config.n_head,
+            config.block_size * 2,
+            config.rope_theta,
+            config.use_scaled_rope,
+        )
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -227,15 +208,9 @@ class GPT(nn.Module):
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        freqs_cis = None
-        if not self.is_llama:
-            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-            x = tok_emb + pos_emb
-        else:
-            x = tok_emb  # we use RoPE in llama3
-            freqs_cis = self.freqs_cis[start_pos:start_pos+t]
+        # forward the LLaMA model itself
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        freqs_cis = self.freqs_cis[start_pos:start_pos+t]
 
         for i, block in enumerate(self.transformer.h):
             x = block(x, freqs_cis, start_pos)
@@ -243,15 +218,11 @@ class GPT(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            if self.is_llama:
-                logits = logits.float()
+            logits = self.lm_head(x).float()
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            if self.is_llama:
-                logits = logits.float()
+            logits = self.lm_head(x[:, [-1], :]).float() # note: using list [-1] to preserve the time dim
             loss = None
 
         # there are performance reasons why not returning logits is prudent, if not needed
@@ -296,67 +267,19 @@ class GPT(nn.Module):
 
     @classmethod
     def from_pretrained_llama3(cls, ckpt_dir, tokenizer_path):
+        """Loads pretrained LLaMA model weights from a checkpoint directory"""
         model_args = LlamaConfig()
 
         ckpt_path = sorted(Path(ckpt_dir).glob("*.pth"))[0]
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        checkpoint = GPT.adapt_llama_state_dict_keys(checkpoint, model_args)
+        checkpoint = LLaMA.adapt_llama_state_dict_keys(checkpoint, model_args)
 
         torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
-        model = GPT(model_args)
+        model = LLaMA(model_args)
         model.load_state_dict(checkpoint, strict=False)
 
         tokenizer = Tokenizer(model_path=tokenizer_path)
         model.tokenizer = tokenizer
-        return model
-
-    @classmethod
-    def from_pretrained(cls, model_type):
-        """Loads pretrained GPT-2 model weights from huggingface"""
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-        }[model_type]
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
-
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
         return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage):
@@ -440,7 +363,7 @@ class GPT(nn.Module):
         input_text_mask = tokens != pad_id
 
         if min_prompt_len == total_len:
-            logits, _ = self.forward(tokens, start_pos=prev_pos if self.config.is_llama else -1)
+            logits, _ = self.forward(tokens, start_pos=prev_pos)
             token_logprobs = -F.cross_entropy(
                 input=logits.transpose(1, 2),
                 target=tokens,
@@ -451,7 +374,7 @@ class GPT(nn.Module):
         stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens)).to(device)
 
         for cur_pos in range(min_prompt_len, total_len):
-            logits, _ = self.forward(tokens[:, prev_pos:cur_pos], start_pos=prev_pos if self.config.is_llama else -1)
+            logits, _ = self.forward(tokens[:, prev_pos:cur_pos], start_pos=prev_pos)
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
@@ -474,7 +397,7 @@ class GPT(nn.Module):
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
                 torch.isin(next_token, stop_tokens)
             )
-            prev_pos = cur_pos if self.config.is_llama else 0
+            prev_pos = cur_pos
             if all(eos_reached):
                 break
 
@@ -864,15 +787,15 @@ if __name__ == "__main__":
             "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
             "d48": GPTConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600),
         }[args.model]
-        model = GPT(model_config)
+        model = LLaMA(model_config)
     else:
         if args.llama3:
             assert args.llama3_ckpt_dir is not None and os.path.exists(args.llama3_ckpt_dir), f"llama3 ckpt dir {args.llama3_ckpt_dir} does not exist"
             assert args.llama3_tokenizer_path is not None and os.path.exists(args.llama3_tokenizer_path), f"llama3 tokenizer path {args.llama3_tokenizer_path} does not exist"
-            model = GPT.from_pretrained_llama3(args.llama3_ckpt_dir, args.llama3_tokenizer_path)
+            model = LLaMA.from_pretrained_llama3(args.llama3_ckpt_dir, args.llama3_tokenizer_path)
         else:
             # load the GPT-2 model weights
-            model = GPT.from_pretrained(args.model)
+            model = LLaMA.from_pretrained(args.model)
 
     model.train()
     model.to(device)
