@@ -1,19 +1,18 @@
 """
-Reference code for GPT-2 training and inference.
+Reference code for LLaMA-3.1 training and inference.
 Will save the model weights into files, to be read from C as initialization.
 
 References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+# 1) https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/tokenizer.py
+# 2) https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/model.py
+# 3) https://github.com/meta-llama/llama3/blob/11817d47e1ba7a4959b025eb1ca308572e0e3963/llama/generation.py
 
 Example launches to only benchmark the speed of bfloat16 compiled GPU training:
 1 GPU:
-python train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
+python train_llama3.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
 you can also turn on flash-attention by appending --flash=1
 4 GPU:
-torchrun --standalone --nproc_per_node=4 train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
+torchrun --standalone --nproc_per_node=4 train_llama3.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
 """
 
 import os
@@ -48,11 +47,6 @@ from llmc_py.utils import repeat_kv, sample_top_p, RMSNorm
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
-class NewGELU(nn.Module):
-    """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
-    def forward(self, input):
-        return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
-
 # using a global to toggle flash-attention
 FLASH = 0
 
@@ -61,21 +55,17 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        self.is_llama = config.is_llama
-        if not self.is_llama:
-            assert config.n_head == config.n_kv_head, "GQA is only available for LLaMA"
 
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_rep = self.n_head // self.n_kv_head
         self.hd = config.n_embd // config.n_head
 
-        self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.hd, bias=not self.is_llama)  # key, query, value projections
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=not self.is_llama)  # output projection
+        self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.hd, bias=False)  # key, query, value projections
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)  # output projection
+        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
-        if not self.is_llama:
-            self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
-
+        # static KV cache
         self.cache_k = torch.zeros((config.max_gen_batch_size, config.block_size, config.n_kv_head, self.hd))
         self.cache_v = torch.zeros((config.max_gen_batch_size, config.block_size, config.n_kv_head, self.hd))
 
@@ -85,12 +75,12 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, freqs_cis=None, start_pos=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
         q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
         q, k, v = map(lambda t: t.view(B, T, -1, self.hd), (q, k, v))  # (B, T, NH, HD)
 
-        if self.is_llama:
-            q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)
+        q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)
 
         if start_pos >= 0:  # kv-caching (which we can disable by setting start_pos = -1)
             self.cache_k[:B, start_pos : start_pos + T] = k
@@ -98,9 +88,8 @@ class CausalSelfAttention(nn.Module):
             k = self.cache_k[:B, : start_pos + T]
             v = self.cache_v[:B, : start_pos + T]
 
-        if self.is_llama:
-            k = repeat_kv(k, self.n_rep)  # GQA
-            v = repeat_kv(v, self.n_rep)
+        k = repeat_kv(k, self.n_rep)  # GQA
+        v = repeat_kv(v, self.n_rep)
 
         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # (B, NH, T, HD)
 
@@ -768,7 +757,7 @@ if __name__ == "__main__":
     # default settings will overfit a tiny batch of data
     # and save model weights and debug state to disk on the first iteration
     parser = argparse.ArgumentParser()
-    parser.add_argument("--llama3", type=int, default=0, help="use llama3 model")
+    parser.add_argument("--llama3", type=int, default=1, help="use llama3 model")
     parser.add_argument("--llama3_ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint")
     parser.add_argument("--llama3_tokenizer_path", type=str, default=None, help="path to llama3 tokenizer")
     # file system input / output
