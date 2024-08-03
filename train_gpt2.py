@@ -23,6 +23,7 @@ import struct
 import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import (
     List,
@@ -984,20 +985,7 @@ if __name__ == "__main__":
     # LLaMA 3 inference
     if args.llama3:
         model.eval()
-        prompts: List[str] = [
-        # For these prompts, the expected answer is the natural continuation of the prompt
-        "Clearly, the meaning of life is",
-        "Simply put, the theory of relativity states that",
-        """The repo llm.c on GitHub is""",
-        # Few shot prompt (providing a few examples before asking model to complete more);
-        """Translate English to French:
-
-        sea otter => loutre de mer
-        peppermint => menthe poivrée
-        plush girafe => girafe peluche
-        cheese =>""",
-            ]
-
+        prompts: List[str] = json.loads(open(os.path.join(os.path.dirname(__file__), 'llmc_py', 'prompts.json')).read())['prompts']
         prompt_tokens = [model.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
 
         generation_tokens, _ = model.generate_llama(prompt_tokens, max_gen_len=64, temperature=0.6, top_p=0.9, logprobs=False, echo=False)
