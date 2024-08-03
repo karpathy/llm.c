@@ -156,21 +156,21 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.is_llama = config.is_llama
+        hidden_dim = 4 * config.n_embd
         if not self.is_llama:
-            self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
+            self.c_fc    = nn.Linear(config.n_embd, hidden_dim)
             self.gelu    = NewGELU()
-            self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
+            self.c_proj  = nn.Linear(hidden_dim, config.n_embd)
             self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
         else:
-            hidden_dim = 4 * config.n_embd
             hidden_dim = int(2 * hidden_dim / 3)
             # custom dim factor multiplier
             if config.ffn_dim_multiplier is not None:
                 hidden_dim = int(config.ffn_dim_multiplier * hidden_dim)
             hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
-            self.w1 = nn.Linear(config.n_embd, hidden_dim, bias=False)
-            self.w2 = nn.Linear(hidden_dim, config.n_embd, bias=False)
-            self.w3 = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_fc2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
 
     def forward(self, x):
         if not self.is_llama:
@@ -179,7 +179,13 @@ class MLP(nn.Module):
             x = self.c_proj(x)
             return x
         else:
-            return self.w2(F.silu(self.w1(x)) * self.w3(x))
+            x1 = self.c_fc(x)
+            x2 = self.c_fc2(x)
+            x2 = F.silu(x2)
+            x = x1 * x2
+            x = self.c_proj(x)
+            return x  # SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))
+
 
 class Block(nn.Module):
 
@@ -237,8 +243,8 @@ class GPT(nn.Module):
             ln_f = RMSNorm(config.n_embd, config.norm_eps) if self.is_llama else nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
         if not self.is_llama:
+            self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
             self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights, use a torch rng object to be very careful
@@ -281,7 +287,7 @@ class GPT(nn.Module):
             pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
             x = tok_emb + pos_emb
         else:
-            x = tok_emb
+            x = tok_emb  # we use RoPE in llama3
             freqs_cis = self.freqs_cis[start_pos:start_pos+t]
 
         for i, block in enumerate(self.transformer.h):
@@ -329,10 +335,11 @@ class GPT(nn.Module):
             new_key = f'transformer.h.{i}.attn.c_proj.weight'
             checkpoint[new_key] = checkpoint.pop(old_key)
 
+        ffn_map = {'w1': 'c_fc2', 'w2': 'c_proj', 'w3': 'c_fc'}
         for i in range(config.n_layer):
             for name in ['feed_forward.w1', 'feed_forward.w2', 'feed_forward.w3']:
                 old_key = f'layers.{i}.{name}.weight'
-                new_key = f'transformer.h.{i}.mlp.{name.split(".")[-1]}.weight'
+                new_key = f'transformer.h.{i}.mlp.{ffn_map[name.split(".")[-1]]}.weight'
                 checkpoint[new_key] = checkpoint.pop(old_key)
 
         checkpoint['transformer.ln_f.weight'] = checkpoint.pop('norm.weight')
