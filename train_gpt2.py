@@ -497,7 +497,7 @@ class GPT(nn.Module):
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
                 torch.isin(next_token, stop_tokens)
             )
-            prev_pos = cur_pos
+            prev_pos = cur_pos if self.config.is_llama else 0
             if all(eos_reached):
                 break
 
@@ -768,7 +768,7 @@ if __name__ == "__main__":
     # default settings will overfit a tiny batch of data
     # and save model weights and debug state to disk on the first iteration
     parser = argparse.ArgumentParser()
-    parser.add_argument("--llama3", type=int, default=1, help="use llama3 model")
+    parser.add_argument("--llama3", type=int, default=0, help="use llama3 model")
     parser.add_argument("--llama3_ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint")
     parser.add_argument("--llama3_tokenizer_path", type=str, default=None, help="path to llama3 tokenizer")
     # file system input / output
