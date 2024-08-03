@@ -76,8 +76,8 @@ class CausalSelfAttention(nn.Module):
         if not self.is_llama:
             self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
-        self.cache_k = torch.zeros((config.batch_size, config.block_size, config.n_kv_head, self.hd))
-        self.cache_v = torch.zeros((config.batch_size, config.block_size, config.n_kv_head, self.hd))
+        self.cache_k = torch.zeros((config.max_gen_batch_size, config.block_size, config.n_kv_head, self.hd))
+        self.cache_v = torch.zeros((config.max_gen_batch_size, config.block_size, config.n_kv_head, self.hd))
 
         # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
@@ -180,6 +180,7 @@ class GPTConfig:
     n_head: int = 12
     n_kv_head: int = 12
     n_embd: int = 768
+    max_gen_batch_size = 4
 
 @dataclass
 class LlamaConfig:
@@ -196,7 +197,7 @@ class LlamaConfig:
     norm_eps: float = 1e-5
     rope_theta: float = 500000.0
     use_scaled_rope: bool = True
-    batch_size = 4
+    max_gen_batch_size = 4
 
 class GPT(nn.Module):
 
@@ -412,35 +413,8 @@ class GPT(nn.Module):
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
         return optimizer
 
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
-
     @torch.inference_mode()
-    def generate_llama(
+    def generate(
         self,
         prompt_tokens: List[List[int]],
         max_gen_len: int,
@@ -468,28 +442,28 @@ class GPT(nn.Module):
             If logprobs is True, token log probabilities are computed for each generated token.
 
         """
-        params = self.config
         bsz = len(prompt_tokens)
-        # assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
+        assert bsz <= self.config.max_gen_batch_size, (bsz, self.config.max_gen_batch_size)
+        device = next(self.parameters()).device
 
         min_prompt_len = min(len(t) for t in prompt_tokens)
         max_prompt_len = max(len(t) for t in prompt_tokens)
-        assert max_prompt_len <= params.block_size
-        total_len = min(params.block_size, max_gen_len + max_prompt_len)
+        assert max_prompt_len <= self.config.block_size
+        total_len = min(self.config.block_size, max_gen_len + max_prompt_len)
 
         pad_id = self.tokenizer.pad_id
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
         for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
         prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
+        eos_reached = torch.tensor([False] * bsz, device=device)
         input_text_mask = tokens != pad_id
 
         if min_prompt_len == total_len:
-            logits, _ = self.forward(tokens, start_pos=prev_pos)
+            logits, _ = self.forward(tokens, start_pos=prev_pos if self.config.is_llama else -1)
             token_logprobs = -F.cross_entropy(
                 input=logits.transpose(1, 2),
                 target=tokens,
@@ -497,10 +471,10 @@ class GPT(nn.Module):
                 ignore_index=pad_id,
             )
 
-        stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens))
+        stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens)).to(device)
 
         for cur_pos in range(min_prompt_len, total_len):
-            logits, _ = self.forward(tokens[:, prev_pos:cur_pos], start_pos=prev_pos)
+            logits, _ = self.forward(tokens[:, prev_pos:cur_pos], start_pos=prev_pos if self.config.is_llama else -1)
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
@@ -947,7 +921,7 @@ if __name__ == "__main__":
         prompts: List[str] = json.loads(open(os.path.join(os.path.dirname(__file__), 'llmc_py', 'prompts.json')).read())['prompts']
         prompt_tokens = [model.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
 
-        generation_tokens, _ = model.generate_llama(prompt_tokens, max_gen_len=64, temperature=0.6, top_p=0.9, logprobs=False, echo=False)
+        generation_tokens, _ = model.generate(prompt_tokens, max_gen_len=64, temperature=0.6, top_p=0.9, logprobs=False, echo=False)
         results = [{"generation": model.tokenizer.decode(t)} for t in generation_tokens]
         for prompt, result in zip(prompts, results):
             print(prompt, end="")
@@ -1049,14 +1023,13 @@ if __name__ == "__main__":
             model.eval()
             # before we end, let's also do one round of inference
             # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
-            start_ids = [enc.eot_token]
-            xg = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-            max_new_tokens = 32
-            temperature = 1.0
-            top_k = 40
-            yg = raw_model.generate(xg, max_new_tokens, temperature=temperature, top_k=top_k)
+            start_ids = [[enc.eot_token]]
+            enc.pad_id = enc.eot_token  # dummy value, it's a no-op
+            enc.stop_tokens = [-1]  # dummy value, we don't stop early
+            raw_model.tokenizer = enc
+            yg = raw_model.generate(start_ids, max_gen_len=32, temperature=1.0, top_p=0.9)
             print0('---------------')
-            print0(enc.decode(yg[0].tolist()))
+            print0(enc.decode(yg[0][0]))
             print0('---------------')
 
         # bit confusing: we want to make sure to eval and sample on 0th iteration
