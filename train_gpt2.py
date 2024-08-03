@@ -111,45 +111,33 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.is_llama = config.is_llama
         hidden_dim = 4 * config.n_embd
-        if not self.is_llama:
-            self.c_fc    = nn.Linear(config.n_embd, hidden_dim)
-            self.gelu    = NewGELU()
-            self.c_proj  = nn.Linear(hidden_dim, config.n_embd)
-            self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
-        else:
-            hidden_dim = int(2 * hidden_dim / 3)
-            # custom dim factor multiplier
-            if config.ffn_dim_multiplier is not None:
-                hidden_dim = int(config.ffn_dim_multiplier * hidden_dim)
-            hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
-            self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
-            self.c_fc2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
-            self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        hidden_dim = int(2 * hidden_dim / 3)
+        # custom dim factor multiplier
+        if config.ffn_dim_multiplier is not None:
+            hidden_dim = int(config.ffn_dim_multiplier * hidden_dim)
+        hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
+        self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
     def forward(self, x):
-        if not self.is_llama:
-            x = self.c_fc(x)
-            x = self.gelu(x)
-            x = self.c_proj(x)
-            return x
-        else:
-            x1 = self.c_fc(x)
-            x2 = self.c_fc2(x)
-            x2 = F.silu(x2)
-            x = x1 * x2
-            x = self.c_proj(x)
-            return x  # SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))
-
+        # SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))
+        x1 = self.c_fc(x)
+        x2 = self.c_fc2(x)
+        x2 = F.silu(x2)
+        x = x1 * x2
+        x = self.c_proj(x)
+        return x
 
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = RMSNorm(config.n_embd, config.norm_eps) if config.is_llama else nn.LayerNorm(config.n_embd)
+        self.ln_1 = RMSNorm(config.n_embd, config.norm_eps)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = RMSNorm(config.n_embd, config.norm_eps) if config.is_llama else nn.LayerNorm(config.n_embd)
+        self.ln_2 = RMSNorm(config.n_embd, config.norm_eps)
         self.mlp = MLP(config)
 
     def forward(self, x, freqs_cis=None, start_pos=None):
