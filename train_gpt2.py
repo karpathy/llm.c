@@ -609,15 +609,13 @@ def print0(*args, **kwargs):
 if __name__ == "__main__":
     import time
     import argparse
-    import tiktoken
     print0(f"Running pytorch {torch.version.__version__}")
 
     # default settings will overfit a tiny batch of data
     # and save model weights and debug state to disk on the first iteration
     parser = argparse.ArgumentParser()
-    parser.add_argument("--llama3", type=int, default=1, help="use llama3 model")
-    parser.add_argument("--llama3_ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint")
-    parser.add_argument("--llama3_tokenizer_path", type=str, default=None, help="path to llama3 tokenizer")
+    parser.add_argument("--ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint")
+    parser.add_argument("--tokenizer_path", type=str, default=None, help="path to llama3 tokenizer")
     # file system input / output
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
@@ -704,7 +702,7 @@ if __name__ == "__main__":
 
     # set up a context manager following the desired dtype and device
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
-    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if (device_type == "cuda" and not args.llama3) else nullcontext()
+    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if (device_type == "cuda") else nullcontext()
 
     # rng / reproducibility
     torch.manual_seed(42)
@@ -720,30 +718,10 @@ if __name__ == "__main__":
     assert args.flash in {0, 1}
     FLASH = args.flash
 
-    # init (and write) the tokenizer
-    enc = tiktoken.get_encoding("gpt2")
-    if master_process and args.write_tensors: # tokenizer is technically not tensors but ok
-        # write_tokenizer(enc, "gpt2_tokenizer.bin")
-        pass
-
-    # init the model, either from scratch or from OpenAI pretrained checkpoint
-    if args.model[0] == "d":
-        # from scratch (random weights)
-        model_config = {
-            "d12": GPTConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768),
-            "d24": GPTConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024),
-            "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
-            "d48": GPTConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600),
-        }[args.model]
-        model = LLaMA(model_config)
-    else:
-        if args.llama3:
-            assert args.llama3_ckpt_dir is not None and os.path.exists(args.llama3_ckpt_dir), f"llama3 ckpt dir {args.llama3_ckpt_dir} does not exist"
-            assert args.llama3_tokenizer_path is not None and os.path.exists(args.llama3_tokenizer_path), f"llama3 tokenizer path {args.llama3_tokenizer_path} does not exist"
-            model = LLaMA.from_pretrained_llama3(args.llama3_ckpt_dir, args.llama3_tokenizer_path)
-        else:
-            # load the GPT-2 model weights
-            model = LLaMA.from_pretrained(args.model)
+    # init the model
+    assert args.ckpt_dir is not None and os.path.exists(args.ckpt_dir), f"llama3 ckpt dir {args.ckpt_dir} does not exist"
+    assert args.tokenizer_path is not None and os.path.exists(args.tokenizer_path), f"llama3 tokenizer path {args.tokenizer_path} does not exist"
+    model = LLaMA.from_pretrained_llama3(args.ckpt_dir, args.tokenizer_path)
 
     model.train()
     model.to(device)
@@ -764,19 +742,18 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------------
     # LLaMA 3 inference
-    if args.llama3:
-        model.eval()
-        prompts: List[str] = json.loads(open(os.path.join(os.path.dirname(__file__), 'llmc_py', 'prompts.json')).read())['prompts']
-        prompt_tokens = [model.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+    model.eval()
+    prompts: List[str] = json.loads(open(os.path.join(os.path.dirname(__file__), 'llmc_py', 'prompts.json')).read())['prompts']
+    prompt_tokens = [model.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
 
-        generation_tokens, _ = model.generate(prompt_tokens, max_gen_len=64, temperature=0.6, top_p=0.9, logprobs=False, echo=False)
-        results = [{"generation": model.tokenizer.decode(t)} for t in generation_tokens]
-        for prompt, result in zip(prompts, results):
-            print(prompt, end="")
-            print(f"{result['generation']}")
-            print("\n==================================\n")
+    generation_tokens, _ = model.generate(prompt_tokens, max_gen_len=64, temperature=0.6, top_p=0.9, logprobs=False, echo=False)
+    results = [{"generation": model.tokenizer.decode(t)} for t in generation_tokens]
+    for prompt, result in zip(prompts, results):
+        print(prompt, end="")
+        print(f"{result['generation']}")
+        print("\n==================================\n")
 
-        exit(0)  # only inference supported for now
+    exit(0)  # only inference supported for now
 
     # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
