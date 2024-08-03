@@ -309,49 +309,32 @@ class GPT(nn.Module):
 
     @staticmethod
     def adapt_llama_state_dict_keys(checkpoint, config: LlamaConfig):
-        # rename key tok_embeddings.weight to transformer.wte.weight
         checkpoint['transformer.wte.weight'] = checkpoint.pop('tok_embeddings.weight')
 
-        # layers.x.attention_norm.weight -> transformer.h.x.ln_1.weight
-        # layers.x.ffn_norm.weight -> transformer.h.x.ln_2.weight
         for i in range(config.n_layer):
             for name in ['attention_norm', 'ffn_norm']:
-                for suffix in ['weight']:
-                    old_key = f'layers.{i}.{name}.{suffix}'
-                    new_key = f'transformer.h.{i}.ln_{1 if name == "attention_norm" else 2}.{suffix}'
-                    checkpoint[new_key] = checkpoint.pop(old_key)
+                old_key = f'layers.{i}.{name}.weight'  # e.g. layers.x.attention_norm.weight -> transformer.h.x.ln_1.weight
+                new_key = f'transformer.h.{i}.ln_{1 if name == "attention_norm" else 2}.weight'
+                checkpoint[new_key] = checkpoint.pop(old_key)
 
-        # we merge the following 3:
-        # layers.x.attention.wq.weight
-        # layers.x.attention.wk.weight
-        # layers.x.attention.wv.weight
-        # into transformer.h.x.attn.c_attn.weight
-        # layers.x.attention.wo.weight -> transformer.h.x.attn.c_proj.weight
         for i in range(config.n_layer):
             for name in ['attention.wq', 'attention.wk', 'attention.wv']:
-                for suffix in ['weight']:
-                    old_key = f'layers.{i}.{name}.{suffix}'
-                    new_key = f'transformer.h.{i}.attn.c_attn.weight'
-                    if name == 'attention.wq':
-                        checkpoint[new_key] = checkpoint.pop(old_key)
-                    else:
-                        checkpoint[new_key] = torch.cat((checkpoint[new_key], checkpoint.pop(old_key)), dim=0)
+                old_key = f'layers.{i}.{name}.weight'
+                new_key = f'transformer.h.{i}.attn.c_attn.weight'
+                if name == 'attention.wq':
+                    checkpoint[new_key] = checkpoint.pop(old_key)
+                else:  # merge 3 weights into transformer.h.x.attn.c_attn.weight
+                    checkpoint[new_key] = torch.cat((checkpoint[new_key], checkpoint.pop(old_key)), dim=0)
             old_key = f'layers.{i}.attention.wo.weight'
             new_key = f'transformer.h.{i}.attn.c_proj.weight'
             checkpoint[new_key] = checkpoint.pop(old_key)
 
-        # layers.x.feed_forward.w1.weight -> transformer.h.x.mlp.w1.weight
-        # layers.x.feed_forward.w2.weight -> transformer.h.x.mlp.w2.weight
-        # layers.x.feed_forward.w3.weight -> transformer.h.x.mlp.w3.weight
         for i in range(config.n_layer):
             for name in ['feed_forward.w1', 'feed_forward.w2', 'feed_forward.w3']:
-                for suffix in ['weight']:
-                    old_key = f'layers.{i}.{name}.{suffix}'
-                    new_key = f'transformer.h.{i}.mlp.{name.split(".")[-1]}.{suffix}'
-                    checkpoint[new_key] = checkpoint.pop(old_key)
+                old_key = f'layers.{i}.{name}.weight'
+                new_key = f'transformer.h.{i}.mlp.{name.split(".")[-1]}.weight'
+                checkpoint[new_key] = checkpoint.pop(old_key)
 
-        # norm.weight -> transformer.ln_f.weight
-        # output.weight -> lm_head.weight
         checkpoint['transformer.ln_f.weight'] = checkpoint.pop('norm.weight')
         checkpoint['lm_head.weight'] = checkpoint.pop('output.weight')
 
