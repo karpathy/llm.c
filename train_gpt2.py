@@ -102,9 +102,7 @@ class CausalSelfAttention(nn.Module):
             k = repeat_kv(k, self.n_rep)  # GQA
             v = repeat_kv(v, self.n_rep)
 
-        q = q.transpose(1, 2)  # (B, NH, T, HD)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # (B, NH, T, HD)
 
         if FLASH:
             # flashattention
