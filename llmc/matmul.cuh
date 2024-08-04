@@ -16,65 +16,61 @@ Matrix Multiplication, with help from cuBLASLt
 template<typename OutFloat, bool UseAuxBuffer>
 __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
                                              std::bool_constant<UseAuxBuffer>) {
-    constexpr const int bdx = 4;
-    constexpr const int bdy = WARP_SIZE / bdx;
-    assert(blockDim.x == bdx);
-    assert(blockDim.y == bdy);
+    static_assert(WARP_SIZE % 4 == 0, "WARP_SIZE must be a multiple of 4");
+    constexpr int bdx = 4;
+    constexpr int bdy = WARP_SIZE / bdx;
+    assert(blockDim.x == bdx && blockDim.y == bdy);
+    
+    int warp_d = threadIdx.x;
+    int warp_c = threadIdx.y;
+    int block_d = threadIdx.z;
+    int global_oc = blockIdx.x * bdy * x128::size + warp_c * x128::size; // 64 OCs at BF16
 
-    int warp_d = (int)threadIdx.x;
-    int warp_c = (int)threadIdx.y;
-    int block_d = (int)threadIdx.z;
+    __shared__ float sub_results[x128::size][WARP_SIZE][bdy];
+    
+    if (global_oc < OC) {
+        int bt_per_block = bdx * blockDim.z;
+        float accumulators[x128::size] = {0.0f};
+        int idx = blockIdx.y * bt_per_block + warp_d + bdx * block_d;
 
-    const int OC_per_warp = bdy * x128::size;  // 64 at BF16
-
-    int local_oc = warp_c * x128::size;
-    int global_oc = blockIdx.x * OC_per_warp + local_oc;
-
-    int local_bt = warp_d + bdx * block_d;
-    int bt_per_block = bdx * blockDim.z;
-
-    float accumulators[x128::size];
-    for (int k = 0; k < x128::size; k++) {
-        accumulators[k] = 0.0f;
-    }
-
-    if(global_oc < OC) {
-        // sum up over all bt within registers
-        for (int idx = blockIdx.y * bt_per_block + local_bt; idx < B * T; idx += gridDim.y * bt_per_block) {
-            x128 packed_dout = load128(dout + global_oc + idx*OC);
+        for (; idx < B * T; idx += gridDim.y * bt_per_block) {
+            x128 packed_dout = load128(dout + global_oc + idx * OC);
             for (int k = 0; k < x128::size; k++) {
-                accumulators[k] += (float)packed_dout[k];
+                accumulators[k] += static_cast<float>(packed_dout[k]);
+            }
+        }
+
+        for (int k = 0; k < x128::size; k++) {
+            float v = accumulators[k];
+            for (int offset = 4 / 2; offset > 0; offset /= 2) {
+                v += __shfl_down_sync(0xffffffff, v, offset);
+            }
+            if (warp_d == 0) {
+                sub_results[k][block_d][warp_c] = v;
             }
         }
     }
-
-    __shared__ float sub_results[x128::size][WARP_SIZE][bdy];
-
-    // reduce within-warp results
-    for (int k = 0; k < x128::size; k++) {
-        float v = accumulators[k];
-        v += __shfl_down_sync(0xffffffff, v, 1, 4);
-        v += __shfl_down_sync(0xffffffff, v, 2, 4);
-        if(warp_d == 0) {
-            sub_results[k][block_d][warp_c] = v;
-        }
-    }
-    __syncthreads();
-
-    // block-wide reductions
-    for (int k = block_d; k < x128::size; k += blockDim.z) {
-        float a = 0.f;
-        for (int r = warp_d; r < blockDim.z; r += bdx) {
-            float v = sub_results[k][r][warp_c];
-            v += __shfl_down_sync(0xffffffff, v, 1, 4);
-            v += __shfl_down_sync(0xffffffff, v, 2, 4);
-            a += v;
-        }
-        if(warp_d == 0 && global_oc < OC) {
-            if constexpr (!UseAuxBuffer) {
-                dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
-            } else {
-                dbias[global_oc + k + blockIdx.y * OC] = a;
+    __syncthreads(); 
+    
+    if (global_oc < OC) {
+        for (int k = block_d; k < x128::size; k += blockDim.z) {
+            float a = 0.0f;
+            for (int r = warp_d; r < blockDim.z; r += bdx) {
+                float v = sub_results[k][r][warp_c];
+                for (int offset = 4 / 2; offset > 0; offset /= 2) {
+                    v += __shfl_down_sync(0xffffffff, v, offset);
+                }
+                a += v;
+            }
+            if (warp_d == 0) {
+                float current_value = static_cast<float>(dbias[global_oc + k]);
+                if (a != current_value || UseAuxBuffer) { // only write if different
+                    if constexpr (!UseAuxBuffer) {
+                        dbias[global_oc + k] = static_cast<OutFloat>(a + current_value);
+                    } else {
+                        dbias[global_oc + k + blockIdx.y * OC] = a;
+                    }
+                }
             }
         }
     }
