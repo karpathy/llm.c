@@ -2,6 +2,11 @@
 Reference code for LLaMA-3.1 training and inference.
 Will save the model weights into files, to be read from C as initialization.
 
+This code differs from GPT-2 very slightly, there are three main differences:
+1) RoPE: LLaMA uses a different positional encoding scheme called Relative Positional Encoding (RoPE).
+2) GQA: Grouped Query Attention (GQA) is used to reduce the number of attention heads.
+3) SwiGLU: Swish-Gated Linear Unit (SwiGLU) is used as the activation function in the MLP.
+
 References:
 # 1) https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/tokenizer.py
 # 2) https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/model.py
@@ -9,10 +14,10 @@ References:
 
 Example launches to only benchmark the speed of bfloat16 compiled GPU training:
 1 GPU:
-python train_llama3.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
+python train_llama3.py --write_tensors=0 --num_iterations=50 --sequence_length=8192 --compile=1 --tensorcores=1 --dtype=bfloat16
 you can also turn on flash-attention by appending --flash=1
 4 GPU:
-torchrun --standalone --nproc_per_node=4 train_llama3.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
+torchrun --standalone --nproc_per_node=4 train_llama3.py --write_tensors=0 --num_iterations=50 --sequence_length=8192 --compile=1 --tensorcores=1 --dtype=bfloat16
 """
 
 import os
@@ -59,14 +64,16 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_rep = self.n_head // self.n_kv_head
         self.hd = config.n_embd // config.n_head
+        self.use_kv = config.use_kv
 
         self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.hd, bias=False)  # key, query, value projections
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)  # output projection
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
-        # static KV cache
-        self.cache_k = torch.zeros((config.max_gen_batch_size, config.block_size, config.n_kv_head, self.hd))
-        self.cache_v = torch.zeros((config.max_gen_batch_size, config.block_size, config.n_kv_head, self.hd))
+        # static KV cache - we could alternatively allocate it outside of the model and just pass it in when needed
+        if self.use_kv:
+            self.cache_k = torch.zeros((config.max_gen_batch_size, config.block_size, config.n_kv_head, self.hd))
+            self.cache_v = torch.zeros((config.max_gen_batch_size, config.block_size, config.n_kv_head, self.hd))
 
         # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
@@ -79,15 +86,15 @@ class CausalSelfAttention(nn.Module):
         q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
         q, k, v = map(lambda t: t.view(B, T, -1, self.hd), (q, k, v))  # (B, T, NH, HD)
 
-        q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)
+        q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)  <-- 1. difference compared to GPT-2
 
-        if not self.training and start_pos >= 0:  # use kv-caching during inference
+        if self.use_kv and not self.training and start_pos >= 0:  # use kv-caching during inference
             self.cache_k[:B, start_pos : start_pos + T] = k
             self.cache_v[:B, start_pos : start_pos + T] = v
             k = self.cache_k[:B, : start_pos + T]
             v = self.cache_v[:B, : start_pos + T]
 
-        k = repeat_kv(k, self.n_rep)  # GQA
+        k = repeat_kv(k, self.n_rep)  # GQA <-- 2. difference compared to GPT-2
         v = repeat_kv(v, self.n_rep)
 
         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # (B, NH, T, HD)
@@ -122,7 +129,7 @@ class MLP(nn.Module):
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
     def forward(self, x):
-        # SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))
+        # SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))  <-- 3. difference compared to GPT-2
         x1 = self.c_fc(x)
         x2 = self.c_fc2(x)
         x2 = F.silu(x2)
@@ -150,7 +157,7 @@ class Block(nn.Module):
 @dataclass
 class LlamaConfig:
     version: str = "3.1"
-    block_size: int = 1024
+    block_size: int = 8192
     vocab_size: int = 128256
     n_layer: int = 32
     n_head: int = 32
@@ -162,6 +169,7 @@ class LlamaConfig:
     rope_theta: float = 500000.0
     use_scaled_rope: bool = True
     max_gen_batch_size: int = 4
+    use_kv: bool = True
 
 class LLaMA(nn.Module):
 
@@ -188,10 +196,8 @@ class LLaMA(nn.Module):
         )
 
     def forward(self, idx, targets=None, return_logits=True, start_pos=0):
-        device = idx.device
-        b, t = idx.size()
+        _, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the LLaMA model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -642,7 +648,7 @@ if __name__ == "__main__":
 
     # args error checking and convenience variables
     B, T = args.batch_size, args.sequence_length
-    assert 1 <= T <= 1024
+    assert 1 <= T <= 8192, "sequence length must be between 1 and 8192"
     assert args.dtype in {"float32", "float16", "bfloat16"}
     assert args.model in {"llama3.1"}
 
