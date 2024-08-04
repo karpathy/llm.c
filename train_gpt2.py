@@ -18,7 +18,6 @@ torchrun --standalone --nproc_per_node=4 train_llama3.py --write_tensors=0 --num
 import os
 import math
 import glob
-import struct
 import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass
