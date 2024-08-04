@@ -81,7 +81,7 @@ class CausalSelfAttention(nn.Module):
 
         q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)
 
-        if start_pos >= 0:  # kv-caching (which we can disable by setting start_pos = -1)
+        if not self.training and start_pos >= 0:  # use kv-caching during inference
             self.cache_k[:B, start_pos : start_pos + T] = k
             self.cache_v[:B, start_pos : start_pos + T] = v
             k = self.cache_k[:B, : start_pos + T]
@@ -187,7 +187,7 @@ class LLaMA(nn.Module):
             config.use_scaled_rope,
         )
 
-    def forward(self, idx, targets=None, return_logits=True, start_pos=-1):
+    def forward(self, idx, targets=None, return_logits=True, start_pos=0):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -744,7 +744,7 @@ if __name__ == "__main__":
     if master_process and args.write_tensors and (not args.inference_only):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        logits, loss = model(x, y, start_pos=0)
+        logits, loss = model(x, y)
         loss.backward()
         # save model params, in bfloat16
         model_to_size = {"llama3.1": "8B"}
