@@ -259,9 +259,11 @@ class LLaMA(nn.Module):
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         checkpoint = LLaMA.adapt_llama_state_dict_keys(checkpoint, model_args)
 
-        torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
+        original_default_type = torch.get_default_dtype()  # save the default type
+        torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)  # much faster loading
         model = LLaMA(model_args)
         model.load_state_dict(checkpoint, strict=False)
+        torch.set_default_tensor_type(torch.tensor([], dtype=original_default_type, device="cpu").type())  # restore default type
 
         tokenizer = Tokenizer(model_path=tokenizer_path)
         model.tokenizer = tokenizer
@@ -529,10 +531,10 @@ def write_tensors(model_tensors, L, file, dtype):
 def write_model(model, filename, dtype):
     # everything we need to instantiate the model
     # 1) header is: version int, LLaMAConfig ints, padding to 1024 bytes
-    assert dtype in {"float32", "bfloat16"} # float16 todo maybe later
+    assert dtype in {"float32", "bfloat16"}
     version = {
-        "float32": 3, # 3: all tensors are fp32, padded vocab
-        "bfloat16": 5, # 5: all tensors are bf16, padded vocab
+        "float32": 3, # 3: all tensors are fp32
+        "bfloat16": 5, # 5: all tensors are bf16
     }[dtype]
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240803 # magic
@@ -632,10 +634,10 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
     parser.add_argument("--flash", type=int, default=0, help="use flash attention")
-    parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
+    parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|float16|bfloat16")
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
     # python -> C bridge
-    parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
+    parser.add_argument("--write_tensors", type=int, default=0, help="write tensors to disk")
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -643,6 +645,15 @@ if __name__ == "__main__":
     assert 1 <= T <= 1024
     assert args.dtype in {"float32", "float16", "bfloat16"}
     assert args.model in {"llama3.1"}
+
+    # create the logging directory if it does not exist
+    logfile = None
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        logfile = os.path.join(args.output_dir, "main.log")
+        # create the log file "main.log" inside it, and wipe it clean
+        with open(logfile, "w") as f:
+            pass
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -678,6 +689,7 @@ if __name__ == "__main__":
                 device = "mps"
     print(f"using device: {device}")
     device_type = 'cuda' if 'cuda' in device else 'cpu'
+    assert device_type in {'cuda'}  # we need to load LLaMA as bf16 on CUDA
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
@@ -710,7 +722,6 @@ if __name__ == "__main__":
     model = LLaMA.from_pretrained_llama3(args.ckpt_dir, args.tokenizer_path)
 
     model.train()
-    model.to(device)
     if args.compile:
         if hasattr(config, "coordinate_descent_tuning"):
             config.coordinate_descent_tuning = True # suggested by @Chillee
@@ -734,15 +745,14 @@ if __name__ == "__main__":
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         logits, loss = model(x, y, start_pos=0)
-        # loss.backward()
-        # save model params, in both float32 and bfloat16
+        loss.backward()
+        # save model params, in bfloat16
         model_to_size = {"llama3.1": "8B"}
         model_size_str = model_to_size[args.model] # e.g. "8B"
-        write_model(model, f"llama3.1_{model_size_str}.bin", dtype="float32")
-        write_model(model, f"llama3.1_{model_size_str}_bf16.bin", dtype="bfloat16")
+        write_model(model, os.path.join(args.output_dir, f"llama3.1_{model_size_str}_bf16.bin"), dtype="bfloat16")
         # save x, y, logits, loss, and parameter gradients, for debugging C
         # always store these in fp32 to have an accurate reference (?)
-        write_state(model, x, y, logits, loss, f"llama3_{model_size_str}_debug_state.bin")
+        write_state(model, x, y, logits, loss, os.path.join(args.output_dir, f"llama3_{model_size_str}_debug_state.bin"))
         # reset the train_loader for the optimization below
         train_loader.reset()
 
@@ -773,15 +783,6 @@ if __name__ == "__main__":
         assert 0 <= decay_ratio <= 1
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
         return min_lr + coeff * (args.learning_rate - min_lr)
-
-    # create the logging directory if it does not exist
-    logfile = None
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        logfile = os.path.join(args.output_dir, "main.log")
-        # create the log file "main.log" inside it, and wipe it clean
-        with open(logfile, "w") as f:
-            pass
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
