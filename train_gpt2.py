@@ -106,7 +106,7 @@ class CausalSelfAttention(nn.Module):
             # manual implementation of attention
             # this materializes the large (T,T) matrix for all the queries and keys
             scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.hd))
-            scores = scores.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            scores = scores.masked_fill(self.bias[:,:,:T,:T] == 0, torch.finfo(scores.dtype).min)
             att = F.softmax(scores.float(), dim=-1).type_as(q)
             y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
