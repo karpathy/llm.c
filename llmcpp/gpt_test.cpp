@@ -219,7 +219,7 @@ logits, loss = gpt2(idx)
   std::vector<int> target = {2, 4, 5, 6, 3, 2, 9, 0};
   auto target_m = TTypes<int>::ConstMatrix(target.data(), B, T);
   float loss = 0.0;
-  gpt.Forward(idx_m, target_m, logits_3d, &loss);
+  gpt.ForwardCPU(idx_m, target_m, logits_3d, &loss);
 
   std::vector<float> expected_logits = {
       0.412538,  1.435400,  -0.845702, -0.836272, -0.912762, 0.366170,
@@ -242,7 +242,7 @@ logits, loss = gpt2(idx)
   EXPECT_NEAR(loss, 2.485592, 1e-5);
 
   // Backward
-  gpt.Backward(idx_m, target_m);
+  gpt.BackwardCPU(idx_m, target_m);
   auto wte_grad = gpt.wte_->weight_->span_grad<float>();
   auto wpe_grad = gpt.wpe_->weight_->span_grad<float>();
 

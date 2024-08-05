@@ -90,6 +90,17 @@ void UpperTriangularWithNegativeInf(typename TTypes<float>::Matrix matrix) {
 #endif
 }
 
+void OntHot(typename TTypes<int>::ConstFlat target,
+            typename TTypes<float>::Matrix label) {
+  int batch_size = target.size(), num_class = label.dimension(1);
+  CHECK_EQ(batch_size, label.dimension(0));
+  for (int i = 0; i < batch_size; ++i) {
+    int ix = target(i);
+    CHECK_LT(ix, num_class);
+    label(i, ix) = 1.0f;
+  }
+}
+
 std::pair<int, int> SplitRange(int total, int idx, int n) {
   int q = total / n;
   int r = total % n;

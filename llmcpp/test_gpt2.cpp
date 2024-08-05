@@ -134,9 +134,9 @@ int main(int argc, char** argv) {
   for (int step = 0; step < 10; step++) {
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    model_cpp.gpt2_->Forward(idx, target, logit_3d, &loss);
+    model_cpp.gpt2_->ForwardCPU(idx, target, logit_3d, &loss);
     optimizer.ZeroGrad();
-    model_cpp.gpt2_->Backward(idx, target);
+    model_cpp.gpt2_->BackwardCPU(idx, target);
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     double time_elapsed_s =

@@ -586,6 +586,8 @@ struct GPT {
     lnf_y_ = std::make_unique<nn::Activation>(dtype);     // [B*T, C]
     lnf_mean_ = std::make_unique<nn::Activation>(dtype);  // [B*T]
     lnf_rstd_ = std::make_unique<nn::Activation>(dtype);  // [B*T]
+    scratch_ = std::make_unique<nn::Activation>(dtype);   // [B*T]
+    loss_ = std::make_unique<nn::Activation>(dtype);      // [B*T]
     probs_ = std::make_unique<nn::Activation>(dtype);     // [B*T, vocab_size]
     logits_grad_ =
         std::make_unique<nn::Activation>(dtype);  // [B*T, vocab_size]
@@ -665,9 +667,39 @@ struct GPT {
     logits_2d.device(nn::g_device) = lnf_y.contract(lm_head, product_dims);
   }
 
-  void Forward(typename TTypes<int>::ConstMatrix idx,
-               typename TTypes<int>::ConstMatrix targets,
-               typename TTypes<Type, 3>::Tensor logits, float* loss) {
+  void SoftmaxForwardCPU(typename TTypes<Type>::ConstMatrix logits,
+                         absl::Span<const int> targets, float* loss) {
+    int BT = logits.dimension(0);
+    CHECK_EQ(BT, targets.size());
+    CHECK_EQ(vocab_size_, logits.dimension(1));
+    probs_->LazyAllocate(BT * vocab_size_);
+    auto probs_2d = MakeMatrix(probs_->data<Type>(), BT, vocab_size_);
+    softmax_cross_entropy_->Forward(logits, targets, probs_2d, loss);
+  }
+
+  void SoftmaxForwardGPU(typename TTypes<Type>::ConstMatrix logits,
+                         typename TTypes<Type>::ConstMatrix labels,
+                         float* loss) {
+    int BT = logits.dimension(0);
+    CHECK_EQ(BT, labels.dimension(0));
+    CHECK_EQ(vocab_size_, logits.dimension(1));
+    CHECK_EQ(vocab_size_, labels.dimension(1));
+    scratch_->LazyAllocate(BT);
+    loss_->LazyAllocate(BT);
+    logits_grad_->LazyAllocate(BT * vocab_size_);
+    logits_grad_->ZeroData();
+    auto logits_grad = MakeMatrix(logits_grad_->data<Type>(), BT, vocab_size_);
+    nn::SoftmaxCrossEntropy<Type>::ForwardAndBackward(
+        logits, labels, scratch_->template flat<Type>(),
+        loss_->template flat<Type>(), logits_grad);
+    logits_grad.device(nn::g_device) = logits_grad * (1.0f / BT);
+    TTypes<float>::Scalar loss_scalar(loss);
+    loss_scalar.device(nn::g_device) = loss_->template flat<Type>().mean();
+  }
+
+  void ForwardCPU(typename TTypes<int>::ConstMatrix idx,
+                  typename TTypes<int>::ConstMatrix targets,
+                  typename TTypes<Type, 3>::Tensor logits, float* loss) {
     // idx: [B, T], targets: [B, T]
     // logits: [B, T, vocab_size]
     const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_;
@@ -677,9 +709,6 @@ struct GPT {
           logits.dimension(2) == vocab_size_)
         << "B: " << B << ", T: " << T << ", vocab_size: " << vocab_size_;
     __Forward(idx);
-
-    //    LAZY_ALLOCATE_MATRIX(probs_, BT, vocab_size_);
-    probs_->LazyAllocate(BT * vocab_size_);
 
     auto lnf_y = MakeMatrix(lnf_y_->data<Type>(), BT, C);
     auto lm_head = MakeMatrix(lm_head_, vocab_size_, n_embed_);
@@ -692,18 +721,59 @@ struct GPT {
     logits_2d.device(nn::g_device) = lnf_y.contract(lm_head, product_dims);
 
     auto logits_2d_const = MakeConstMatrix(logits.data(), BT, vocab_size_);
-    softmax_cross_entropy_->Forward(logits_2d_const, targets, probs_2d, loss);
+    SoftmaxForwardCPU(logits_2d_const, targets, loss);
   }
 
-  void Backward(typename TTypes<int>::ConstMatrix idx,
-                typename TTypes<int>::ConstMatrix targets) {
+  void ForwardGPU(typename TTypes<int>::ConstMatrix idx,
+                  typename TTypes<Type, 3>::ConstTensor labels,
+                  typename TTypes<Type, 3>::Tensor logits, float* loss) {
+    // idx: [B, T], targets: [B, T]
+    // logits: [B, T, vocab_size]
+    const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_;
+    const int BT = B * T;
+    CHECK(labels.dimension(0) == B && labels.dimension(1) == T &&
+          labels.dimension(2) == vocab_size_);
+    CHECK(logits.dimension(0) == B && logits.dimension(1) == T &&
+          logits.dimension(2) == vocab_size_)
+        << "B: " << B << ", T: " << T << ", vocab_size: " << vocab_size_;
+    __Forward(idx);
+
+    auto lnf_y = MakeMatrix(lnf_y_->data<Type>(), BT, C);
+    auto lm_head = MakeMatrix(lm_head_, vocab_size_, n_embed_);
+    auto logits_2d = MakeMatrix(logits.data(), BT, vocab_size_);
+
+    // [BT, C] x [C, vocab_size] -> [BT, vocab_size]
+    Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
+        Eigen::IndexPair<int>(1, 1)};
+    logits_2d.device(nn::g_device) = lnf_y.contract(lm_head, product_dims);
+
+    auto logits_2d_const = MakeConstMatrix(logits.data(), BT, vocab_size_);
+    auto labels_2d_const = MakeConstMatrix(labels.data(), BT, vocab_size_);
+    SoftmaxForwardGPU(logits_2d_const, labels_2d_const, loss);
+  }
+
+  void SoftmaxBackwardCPU(absl::Span<const int> targets) {
+    int BT = targets.size();
+    logits_grad_->LazyAllocate(BT * vocab_size_);
+    logits_grad_->ZeroData();
+    auto probs_2d = MakeConstMatrix(probs_->data<Type>(), BT, vocab_size_);
+    auto logits_grad_2d =
+        MakeMatrix(logits_grad_->data<Type>(), BT, vocab_size_);
+    softmax_cross_entropy_->Backward(probs_2d, targets, logits_grad_2d);
+  }
+
+  void BackwardCPU(typename TTypes<int>::ConstMatrix idx,
+                   typename TTypes<int>::ConstMatrix targets) {
+    SoftmaxBackwardCPU(targets);
+    BackwardGPU(idx);
+  }
+
+  void BackwardGPU(typename TTypes<int>::ConstMatrix idx) {
     // idx: [B, T], targets: [B, T]
     const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_,
               L = n_layer_;
     const int BT = B * T, TC = T * C;
     const int BTC = BT * C;
-    const int LBTC = L * BTC;
-    CHECK(targets.dimension(0) == B && targets.dimension(1) == T);
 
     wte_->weight_->LazyAllocateGradient();
     if (lm_head_grad_ == nullptr) {
@@ -715,21 +785,16 @@ struct GPT {
     encoded_->LazyAllocateGradient();
     block_y_->LazyAllocateGradient();
     lnf_y_->LazyAllocateGradient();
-    logits_grad_->LazyAllocate(BT * vocab_size_);
+
     tok_emb_->ZeroGrad();
     pos_emb_->ZeroGrad();
     encoded_->ZeroGrad();
     block_y_->ZeroGrad();
     lnf_y_->ZeroGrad();
-    logits_grad_->ZeroData();
-
-    // backward cross entropy
-    auto probs_2d = MakeConstMatrix(probs_->data<Type>(), BT, vocab_size_);
-    auto logits_grad_2d =
-        MakeMatrix(logits_grad_->data<Type>(), BT, vocab_size_);
-    softmax_cross_entropy_->Backward(probs_2d, targets, logits_grad_2d);
 
     // backward lm_head
+    auto logits_grad_2d =
+        MakeMatrix(logits_grad_->data<Type>(), BT, vocab_size_);
     auto lnf_y = MakeMatrix(lnf_y_->data<Type>(), BT, C);
     auto lnf_y_grad = MakeMatrix(lnf_y_->grad<Type>(), BT, C);
     auto lm_head = MakeMatrix(lm_head_, vocab_size_, C);
@@ -829,6 +894,8 @@ struct GPT {
   std::unique_ptr<nn::Activation> lnf_y_;                // [B*T, C]
   std::unique_ptr<nn::Activation> lnf_mean_, lnf_rstd_;  // [B*T]
   std::unique_ptr<nn::Activation> probs_;                // [B*T, vocab_size]
+  std::unique_ptr<nn::Activation> scratch_;              // [B*T]
+  std::unique_ptr<nn::Activation> loss_;                 // [B*T]
   std::unique_ptr<nn::Activation> logits_grad_;          // [B*T, vocab_size]
 };
 

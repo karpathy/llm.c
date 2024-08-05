@@ -36,6 +36,8 @@ int sample_mult(float* probabilities, int n, float coin) {
   return n - 1;  // in case of rounding errors
 }
 
+bool USE_FAST_SOFTMAX = true;
+
 int main(int argc, char** argv) {
   gpt2::GPT2<float> model;
   model.BuildFromCheckpoint("gpt2_124M.bin");
@@ -79,6 +81,7 @@ int main(int argc, char** argv) {
   int V = model.config.vocab_size;
   std::unique_ptr<float[]> logit = std::make_unique<float[]>(B * T * V);
   std::unique_ptr<float[]> prob = std::make_unique<float[]>(B * T * V);
+  nn::Parameter label(nn::DT_FLOAT, B * T * V);
   nn::Softmax<float> softmax;
   std::vector<nn::Parameter*> parameters;
   model.Parameters(&parameters);
@@ -93,9 +96,18 @@ int main(int argc, char** argv) {
         dataloader_next_batch(&val_loader);
         float loss = 0.0f;
         auto idx = TTypes<int>::ConstMatrix(val_loader.inputs, B, T);
-        auto target = TTypes<int>::ConstMatrix(val_loader.targets, B, T);
-        auto logit_3d = Make3DTensor(logit.get(), B, T, V);
-        model.gpt2_->Forward(idx, target, logit_3d, &loss);
+        if (USE_FAST_SOFTMAX) {
+          auto target = TTypes<int>::ConstMatrix(val_loader.targets, B, T);
+          auto logit_3d = Make3DTensor(logit.get(), B, T, V);
+          model.gpt2_->ForwardCPU(idx, target, logit_3d, &loss);
+        } else {
+          label.ZeroData();
+          nn::OntHot(MakeConstFlat(val_loader.targets, B * T),
+                     label.matrix<float>(B * T, V));
+          auto label_3d = label.const_tensor_3d<float>(B, T, V);
+          auto logit_3d = Make3DTensor(logit.get(), B, T, V);
+          model.gpt2_->ForwardGPU(idx, label_3d, logit_3d, &loss);
+        }
         val_loss += loss;
       }
       val_loss /= val_num_batches;
@@ -149,11 +161,22 @@ int main(int argc, char** argv) {
     dataloader_next_batch(&train_loader);
     float loss = 0.0f;
     auto idx = TTypes<int>::ConstMatrix(train_loader.inputs, B, T);
-    auto target = TTypes<int>::ConstMatrix(train_loader.targets, B, T);
-    auto logit_3d = Make3DTensor(logit.get(), B, T, V);
-    model.gpt2_->Forward(idx, target, logit_3d, &loss);
-    optimizer.ZeroGrad();
-    model.gpt2_->Backward(idx, target);
+    if (USE_FAST_SOFTMAX) {
+      auto target = TTypes<int>::ConstMatrix(train_loader.targets, B, T);
+      auto logit_3d = Make3DTensor(logit.get(), B, T, V);
+      model.gpt2_->ForwardCPU(idx, target, logit_3d, &loss);
+      optimizer.ZeroGrad();
+      model.gpt2_->BackwardCPU(idx, target);
+    } else {
+      label.ZeroData();
+      nn::OntHot(MakeConstFlat(train_loader.targets, B * T),
+                 label.matrix<float>(B * T, V));
+      auto label_3d = label.const_tensor_3d<float>(B, T, V);
+      auto logit_3d = Make3DTensor(logit.get(), B, T, V);
+      model.gpt2_->ForwardGPU(idx, label_3d, logit_3d, &loss);
+      optimizer.ZeroGrad();
+      model.gpt2_->BackwardGPU(idx);
+    }
     optimizer.Step(step + 1);
     clock_gettime(CLOCK_MONOTONIC, &end);
     double time_elapsed_s =

@@ -54,9 +54,9 @@ for i in range(10):
   };
   for (int step = 0; step < 10; ++step) {
     float loss = 0.0;
-    gpt.Forward(idx_m, target_m, logits_3d, &loss);
+    gpt.ForwardCPU(idx_m, target_m, logits_3d, &loss);
     optimizer.ZeroGrad();
-    gpt.Backward(idx_m, target_m);
+    gpt.BackwardCPU(idx_m, target_m);
     optimizer.Step();
     fprintf(stdout, "Step %d, loss = %.6f\n", step, loss);
     CHECK(std::abs(loss - expected_loss[step]) < 1e-5);

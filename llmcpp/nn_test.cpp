@@ -481,10 +481,7 @@ TEST(SoftmaxCrossEntropy, ForwardAndBackward2) {
   auto scratch_1d = MakeFlat(scratch.data(), batch);
   auto loss_1d = MakeFlat(loss.data(), batch);
   auto logit_grad_2d = MakeMatrix(logits_grad.data(), batch, dim);
-  for (int i = 0; i < batch; ++i) {
-    int ix = target[i];
-    mutable_label_2d(i, ix) = 1.0f;
-  }
+  nn::OntHot(MakeConstFlat(target.data(), target.size()), mutable_label_2d);
 
   nn::SoftmaxCrossEntropy<float>::ForwardAndBackward(
       logit_2d, label_2d, scratch_1d, loss_1d, logit_grad_2d);
