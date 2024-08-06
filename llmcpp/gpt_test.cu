@@ -253,14 +253,13 @@ logits, loss = gpt2(idx)
   std::vector<float> label(target.size() * vocab_size);
   nn::OntHot(MakeConstFlat(target.data(), target.size()),
              MakeMatrix(label.data(), target.size(), vocab_size));
-  nn::Parameter d_loss(DT_FLOAT, 1), d_label(DT_FLOAT, label.size());
+  nn::Parameter d_label(DT_FLOAT, label.size());
   nn::g_device.memcpyHostToDevice(d_label.data<float>(), label.data(),
                                   sizeof(float) * label.size());
   nn::g_device.synchronize();
   float loss = 0.0;
   gpt.ForwardGPU(idx_m, d_label.const_tensor_3d<float>(B, T, vocab_size),
-                 logits_3d, d_loss.data<float>());
-  nn::g_device.memcpyDeviceToHost(&loss, d_loss.data<float>(), sizeof(float));
+                 logits_3d, &loss);
 
   std::vector<float> expected_logits = {
       0.412538,  1.435400,  -0.845702, -0.836272, -0.912762, 0.366170,

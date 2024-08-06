@@ -581,16 +581,17 @@ struct GPT {
 
     // activation
     auto dtype = nn::DataTypeToEnum<Type>::value;
-    tok_emb_ = std::make_unique<nn::Activation>(dtype);   // [B, T, C]
-    pos_emb_ = std::make_unique<nn::Activation>(dtype);   // [T, C]
-    encoded_ = std::make_unique<nn::Activation>(dtype);   // [B, T, C]
-    block_y_ = std::make_unique<nn::Activation>(dtype);   // [L, B, T, C]
-    lnf_y_ = std::make_unique<nn::Activation>(dtype);     // [B*T, C]
-    lnf_mean_ = std::make_unique<nn::Activation>(dtype);  // [B*T]
-    lnf_rstd_ = std::make_unique<nn::Activation>(dtype);  // [B*T]
-    scratch_ = std::make_unique<nn::Activation>(dtype);   // [B*T]
-    loss_ = std::make_unique<nn::Activation>(dtype);      // [B*T]
-    probs_ = std::make_unique<nn::Activation>(dtype);     // [B*T, vocab_size]
+    tok_emb_ = std::make_unique<nn::Activation>(dtype);    // [B, T, C]
+    pos_emb_ = std::make_unique<nn::Activation>(dtype);    // [T, C]
+    encoded_ = std::make_unique<nn::Activation>(dtype);    // [B, T, C]
+    block_y_ = std::make_unique<nn::Activation>(dtype);    // [L, B, T, C]
+    lnf_y_ = std::make_unique<nn::Activation>(dtype);      // [B*T, C]
+    lnf_mean_ = std::make_unique<nn::Activation>(dtype);   // [B*T]
+    lnf_rstd_ = std::make_unique<nn::Activation>(dtype);   // [B*T]
+    scratch_ = std::make_unique<nn::Activation>(dtype);    // [B*T]
+    loss_ = std::make_unique<nn::Activation>(dtype);       // [B*T]
+    loss_mean_ = std::make_unique<nn::Activation>(dtype);  // [1]
+    probs_ = std::make_unique<nn::Activation>(dtype);      // [B*T, vocab_size]
     logits_grad_ =
         std::make_unique<nn::Activation>(dtype);  // [B*T, vocab_size]
   }
@@ -688,6 +689,7 @@ struct GPT {
     CHECK_EQ(vocab_size_, labels.dimension(1));
     scratch_->LazyAllocate(BT);
     loss_->LazyAllocate(BT);
+    loss_mean_->LazyAllocate(1);
     logits_grad_->LazyAllocate(BT * vocab_size_);
     logits_grad_->ZeroData();
     auto logits_grad = MakeMatrix(logits_grad_->data<Type>(), BT, vocab_size_);
@@ -695,8 +697,18 @@ struct GPT {
         logits, labels, scratch_->template flat<Type>(),
         loss_->template flat<Type>(), logits_grad);
     logits_grad.device(nn::g_device) = logits_grad * (1.0f / BT);
-    TTypes<float>::Scalar loss_scalar(loss);
-    loss_scalar.device(nn::g_device) = loss_->template flat<Type>().mean();
+
+#ifdef EIGEN_USE_GPU
+    TTypes<Type>::UnalignedScalar loss_mean(loss_mean_->data<Type>());
+    loss_mean.device(nn::g_device) = loss_->template flat<Type>().mean();
+    nn::g_device.memcpyDeviceToHost(loss, loss_mean.data(), sizeof(Type));
+    nn::g_device.synchronize();
+#else
+    LOG(FATAL) << "Never reach here!!!";
+#endif
+    //    TTypes<float>::Scalar loss_scalar(loss);
+    //    loss_scalar.device(nn::g_device) = loss_->template
+    //    flat<Type>().mean();
   }
 
   void ForwardCPU(typename TTypes<int>::ConstMatrix idx,
@@ -898,6 +910,7 @@ struct GPT {
   std::unique_ptr<nn::Activation> probs_;                // [B*T, vocab_size]
   std::unique_ptr<nn::Activation> scratch_;              // [B*T]
   std::unique_ptr<nn::Activation> loss_;                 // [B*T]
+  std::unique_ptr<nn::Activation> loss_mean_;            // [1]
   std::unique_ptr<nn::Activation> logits_grad_;          // [B*T, vocab_size]
 };
 

@@ -59,16 +59,12 @@ for i in range(10):
       4.583667, 4.563725, 4.544271, 4.525268, 4.506680,
   };
   for (int step = 0; step < 10; ++step) {
-    nn::Parameter loss(nn::DT_FLOAT, 1);
-    gpt.ForwardGPU(idx_m, label_3d, logits_3d, loss.data<float>());
+    float loss = 0.0f;
+    gpt.ForwardGPU(idx_m, label_3d, logits_3d, &loss);
     optimizer.ZeroGrad();
     gpt.BackwardGPU(idx_m);
     optimizer.Step();
-    float loss_cpu = 0.0;
-    nn::g_device.memcpyDeviceToHost(&loss_cpu, loss.data<float>(),
-                                    sizeof(float));
-    nn::g_device.synchronize();
-    fprintf(stdout, "Step %d, loss = %.6f\n", step, loss_cpu);
-    CHECK(std::abs(loss_cpu - expected_loss[step]) < 1e-5);
+    fprintf(stdout, "Step %d, loss = %.6f\n", step, loss);
+    CHECK(std::abs(loss - expected_loss[step]) < 1e-5);
   }
 }

@@ -61,7 +61,14 @@ struct GPT2 {
     printf("num_parameters: %zu\n", gpt2_->NumParameters());
 
     auto restore_fn = [&](nn::Parameter* p, const std::string& name) {
-      freadCheck(p->data<Type>(), sizeof(float), p->size(), model_file);
+#ifdef EIGEN_USE_GPU
+      std::vector<Type> cpu_data(p->size());
+      freadCheck(cpu_data.data(), sizeof(Type), p->size(), model_file);
+      nn::g_device.memcpyHostToDevice(p->data<Type>(), cpu_data.data(),
+                                      sizeof(Type) * p->size());
+#else
+      freadCheck(p->data<Type>(), sizeof(Type), p->size(), model_file);
+#endif
     };
     ApplyFn(restore_fn, L);
     fcloseCheck(model_file);

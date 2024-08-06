@@ -98,7 +98,12 @@ if (CUDA_FOUND)
     add_executable(gpt_optim_gpu llmcpp/gpt_optim.cu)
     target_link_libraries(gpt_optim_gpu
             gpt_gpu
-            GTest::gtest_main
+    )
+
+    # train_gpt2_gpu
+    add_executable(train_gpt2_gpu llmcpp/train_gpt2.cu)
+    target_link_libraries(train_gpt2_gpu
+            gpt_gpu
     )
 endif ()
 
@@ -132,7 +137,7 @@ add_executable(gpt_test llmcpp/gpt_test.cpp)
 target_link_libraries(gpt_test gpt GTest::gtest_main)
 
 add_executable(gpt_optim llmcpp/gpt_optim.cpp)
-target_link_libraries(gpt_optim gpt GTest::gtest_main)
+target_link_libraries(gpt_optim gpt)
 
 add_executable(test_eigen_cpu llmcpp/test_eigen_cpu.cpp)
 target_link_libraries(test_eigen_cpu absl::strings absl::log absl::check GTest::gtest_main)
