@@ -105,7 +105,7 @@ loss.backward()
   auto x2_2d = x2_gpu.const_matrix<float>(N, K);
   auto y_2d = y_gpu.matrix<float>(M, K);
   gpu_device.synchronize();
-  nn::MatMul<float>::Forward(x1_2d, x2_2d, y_2d);
+  nn::MatMul::Forward(x1_2d, x2_2d, y_2d);
 
   std::vector<float> expected_y = {0.556428, -0.253943, 1.119845, -1.617147,
                                    3.693071, -3.965338, 0.837917, 0.722053};
@@ -132,7 +132,7 @@ loss.backward()
   auto y_grad_2d = y_grad_gpu.const_matrix<float>(M, K);
   auto x1_grad_2d = x1_grad_gpu.matrix<float>(M, N);
   auto x2_grad_2d = x2_grad_gpu.matrix<float>(N, K);
-  nn::MatMul<float>::Backward(x1_2d, x2_2d, y_grad_2d, x1_grad_2d, x2_grad_2d);
+  nn::MatMul::Backward(x1_2d, x2_2d, y_grad_2d, x1_grad_2d, x2_grad_2d);
 
   std::vector<float> expected_x1_grad = {
       -0.579509, -0.030988, 2.139325, -0.579509, -0.030988, 2.139325,
@@ -168,7 +168,7 @@ loss.backward()
   nn::ManualSeed(42);
   auto& gpu_device = nn::g_device;
   int B = 4, in_features = 3, out_features = 2;
-  nn::Linear<float> m(in_features, out_features, true);
+  nn::Linear m(in_features, out_features, true);
   std::vector<float> x = {-1.122856, -0.186328, 2.208201,  -0.637997,
                           0.461657,  0.267351,  0.534905,  0.809357,
                           1.110290,  -1.689799, -0.988960, 0.957972};
@@ -312,7 +312,7 @@ loss.backward()
   auto y_m = MakeMatrix(y.data<float>(), row_size, embedding_dim);
   auto mean_m = MakeFlat(mean.data<float>(), row_size);
   auto rstd_m = MakeFlat(rstd.data<float>(), row_size);
-  auto m = nn::LayerNorm<float>(embedding_dim);
+  auto m = nn::LayerNorm(embedding_dim);
   m.Forward(x_m, y_m, mean_m, rstd_m);
   std::vector<float> expected_y = {
       0.871568,  0.592812,  0.220889,  -1.685270, 1.343979,  -0.747299,
@@ -495,7 +495,7 @@ loss.backward()
   gpu_device.memcpyHostToDevice(x_gpu.data<float>(), x.data(),
                                 sizeof(float) * x.size());
   gpu_device.synchronize();
-  nn::NewGELU<float> m;
+  nn::NewGELU m;
   m.Forward(x_gpu.const_flat<float>(), y_gpu.flat<float>());
   gpu_device.memcpyDeviceToHost(y.data(), y_gpu.data<float>(),
                                 sizeof(float) * y.size());

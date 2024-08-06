@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
   GPT2 model;
   gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
-  gpt2::GPT2<float> model_cpp;
+  gpt2::GPT2 model_cpp;
   model_cpp.BuildFromCheckpoint("gpt2_124M.bin");
 
   int C = model.config.channels;

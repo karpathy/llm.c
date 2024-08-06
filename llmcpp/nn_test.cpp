@@ -75,7 +75,7 @@ loss.backward()
   auto x1m = MakeConstMatrix(x1.data(), M, N);
   auto x2m = MakeConstMatrix(x2.data(), N, K);
   auto ym = MakeMatrix(y.data(), M, K);
-  nn::MatMul<float>::Forward(x1m, x2m, ym);
+  nn::MatMul::Forward(x1m, x2m, ym);
 
   std::vector<float> expected_y = {0.556428, -0.253943, 1.119845, -1.617147,
                                    3.693071, -3.965338, 0.837917, 0.722053};
@@ -89,7 +89,7 @@ loss.backward()
   auto y_gradm = MakeConstMatrix(y_grad.data(), M, K);
   auto x1_gradm = MakeMatrix(x1_grad.data(), M, N);
   auto x2_gradm = MakeMatrix(x2_grad.data(), N, K);
-  nn::MatMul<float>::Backward(x1m, x2m, y_gradm, x1_gradm, x2_gradm);
+  nn::MatMul::Backward(x1m, x2m, y_gradm, x1_gradm, x2_gradm);
 
   std::vector<float> expected_x1_grad = {
       -0.579509, -0.030988, 2.139325, -0.579509, -0.030988, 2.139325,
@@ -119,7 +119,7 @@ loss.backward()
 
   nn::ManualSeed(42);
   int B = 4, in_features = 3, out_features = 2;
-  nn::Linear<float> m(in_features, out_features, true);
+  nn::Linear m(in_features, out_features, true);
   std::vector<float> x = {-1.122856, -0.186328, 2.208201,  -0.637997,
                           0.461657,  0.267351,  0.534905,  0.809357,
                           1.110290,  -1.689799, -0.988960, 0.957972};
@@ -223,7 +223,7 @@ loss.backward()
   auto y_m = MakeMatrix(y.data(), row_size, embedding_dim);
   auto mean_m = MakeFlat(mean.data(), row_size);
   auto rstd_m = MakeFlat(rstd.data(), row_size);
-  auto m = nn::LayerNorm<float>(embedding_dim);
+  auto m = nn::LayerNorm(embedding_dim);
   m.Forward(x_m, y_m, mean_m, rstd_m);
   std::vector<float> expected_y = {
       0.871568,  0.592812,  0.220889,  -1.685270, 1.343979,  -0.747299,
@@ -385,7 +385,7 @@ loss.backward()
                                    -0.147006, -0.079394, 2.178409, -0.167029,
                                    0.312915,  0.161853,  0.376359, 0.639989};
   std::vector<float> y(x.size(), 0);
-  nn::NewGELU<float> m;
+  nn::NewGELU m;
   m.Forward(MakeConstFlat(x.data(), x.size()), MakeFlat(y.data(), y.size()));
   for (size_t i = 0; i < expected_y.size(); ++i) {
     EXPECT_NEAR(expected_y[i], y[i], 1e-5);
@@ -435,7 +435,7 @@ loss.backward()
   float loss1 = 0.0, loss2 = 0.0;
 
   // Reduction: MEAN
-  nn::SoftmaxCrossEntropy<float> criterion1;
+  nn::SoftmaxCrossEntropy criterion1;
   criterion1.Forward(logits_m, absl::MakeSpan(target), probs_m, &loss1);
 
   auto probs_const = MakeConstMatrix(probs.data(), batch, dim);
@@ -451,8 +451,7 @@ loss.backward()
   }
 
   // Reduction: SUM
-  nn::SoftmaxCrossEntropy<float> criterion2(
-      nn::SoftmaxCrossEntropy<float>::SUM);
+  nn::SoftmaxCrossEntropy criterion2(nn::SoftmaxCrossEntropy::SUM);
   criterion2.Forward(logits_m, absl::MakeSpan(target), probs_m, &loss2);
   EXPECT_NEAR(loss1 * batch, loss2, 1e-5);
 
@@ -483,8 +482,8 @@ TEST(SoftmaxCrossEntropy, ForwardAndBackward2) {
   auto logit_grad_2d = MakeMatrix(logits_grad.data(), batch, dim);
   nn::OntHot(MakeConstFlat(target.data(), target.size()), mutable_label_2d);
 
-  nn::SoftmaxCrossEntropy<float>::ForwardAndBackward(
-      logit_2d, label_2d, scratch_1d, loss_1d, logit_grad_2d);
+  nn::SoftmaxCrossEntropy::ForwardAndBackward(logit_2d, label_2d, scratch_1d,
+                                              loss_1d, logit_grad_2d);
 
   const float factor = 1.f / loss.size();
   logit_grad_2d.device(nn::g_device) = logit_grad_2d * factor;
@@ -529,8 +528,8 @@ loss.backward()
   float loss1 = 0.0, loss2 = 0.0;
 
   // Reduction: MEAN
-  nn::Softmax<float> softmax;
-  nn::CrossEntropy<float> criterion1;
+  nn::Softmax softmax;
+  nn::CrossEntropy criterion1;
   softmax.Forward(logits_m, probs_m);
   criterion1.Forward(probs_const, absl::MakeSpan(target), &loss1);
 
@@ -549,7 +548,7 @@ loss.backward()
   }
 
   // Reduction: SUM
-  nn::CrossEntropy<float> criterion2(nn::CrossEntropy<float>::SUM);
+  nn::CrossEntropy criterion2(nn::CrossEntropy::SUM);
   softmax.Forward(logits_m, probs_m);
   criterion2.Forward(probs_const, absl::MakeSpan(target), &loss2);
   EXPECT_NEAR(loss1 * batch, loss2, 1e-5);

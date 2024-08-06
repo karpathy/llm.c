@@ -39,7 +39,7 @@ int sample_mult(float* probabilities, int n, float coin) {
 bool USE_FAST_SOFTMAX = true;
 
 int main(int argc, char** argv) {
-  gpt2::GPT2<float> model;
+  gpt2::GPT2 model;
   model.BuildFromCheckpoint("gpt2_124M.bin");
 
   // build the DataLoaders from tokens files. for now use tiny_shakespeare if
@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
   std::unique_ptr<float[]> logit = std::make_unique<float[]>(B * T * V);
   std::unique_ptr<float[]> prob = std::make_unique<float[]>(B * T * V);
   nn::Parameter label(nn::DT_FLOAT, B * T * V);
-  nn::Softmax<float> softmax;
+  nn::Softmax softmax;
   std::vector<nn::Parameter*> parameters;
   model.Parameters(&parameters);
   optim::AdamW optimizer(parameters, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f);

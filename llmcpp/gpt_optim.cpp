@@ -30,8 +30,7 @@ for i in range(10):
   nn::ManualSeed(42);
   int block_size = 8, n_embd = 16, n_head = 4, n_layer = 8, vocab_size = 100;
   int B = 4, T = block_size, C = n_embd, nh = n_head, hs = n_embd / nh;
-  gpt::GPT<float> gpt(block_size, vocab_size, vocab_size, n_layer, n_head,
-                      n_embd);
+  gpt::GPT gpt(block_size, vocab_size, vocab_size, n_layer, n_head, n_embd);
 
   std::vector<int> idx = {35, 28, 51, 9,  81, 41, 30, 22, 99, 91, 96,
                           20, 99, 46, 85, 63, 0,  78, 75, 43, 94, 99,

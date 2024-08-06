@@ -32,7 +32,7 @@ loss.backward()
 
   nn::ManualSeed(42);
   int B = 4, n_embed = 3;
-  gpt::MLP<float> mlp(n_embed);
+  gpt::MLP mlp(n_embed);
 
   // initialize
   std::vector<float> x = {0.548416, -0.441472, 1.581529, -0.198127,
@@ -90,7 +90,7 @@ y = attn(x)
 
   nn::ManualSeed(42);
   int B = 2, T = 4, C = 6, nh = 2, hs = C / nh;
-  gpt::CausalSelfAttention<float> attn(T, nh, C);
+  gpt::CausalSelfAttention attn(T, nh, C);
 
   Parameter d_x(DT_FLOAT, B * T * C), d_y(DT_FLOAT, B * T * C),
       d_x_grad(DT_FLOAT, B * T * C), d_y_grad(DT_FLOAT, B * T * C);
@@ -158,7 +158,7 @@ loss.backward()
 
   nn::ManualSeed(42);
   int B = 2, T = 4, C = 6, nh = 2, hs = C / nh;
-  gpt::Block<float> block(T, nh, C);
+  gpt::Block block(T, nh, C);
 
   Parameter d_x(DT_FLOAT, B * T * C), d_y(DT_FLOAT, B * T * C);
   std::vector<float> y(B * T * C);
@@ -205,5 +205,124 @@ loss.backward()
       1.138839, 0.948495, 0.854385, 0.838419, 1.305177,  0.914685};
   for (size_t i = 0; i < expected_x_grad.size(); ++i) {
     EXPECT_NEAR(expected_x_grad[i], x_grad[i], 1e-5);
+  }
+}
+
+TEST(GPT, ForwardAndBackward) {
+  /*
+torch.set_printoptions(precision=6)
+torch.manual_seed(42)
+config = GPTConfig(block_size=4, n_embd=6, n_head=2, n_layer=12, vocab_size=10)
+gpt2 = GPT(config=config)
+B, T, C = 2, 4, 6
+idx = torch.LongTensor([[1, 2, 4, 5], [4, 3, 2, 9]])
+targets = torch.LongTensor([[2, 4, 5, 6], [3, 2, 9, 0]])
+logits, loss = gpt2(idx)
+  */
+
+  nn::ManualSeed(42);
+  int block_size = 4, n_embd = 6, n_head = 2, n_layer = 12, vocab_size = 10;
+  int B = 2, T = block_size, C = n_embd, nh = n_head, hs = n_embd / nh;
+  gpt::GPT gpt(block_size, vocab_size, vocab_size, n_layer, n_head, n_embd);
+
+  std::vector<int> idx = {1, 2, 4, 5, 4, 3, 2, 9};
+  auto idx_m = TTypes<int>::ConstMatrix(idx.data(), B, T);
+  nn::Parameter d_logits(DT_FLOAT, B * T * vocab_size),
+      d_logits_last_t(DT_FLOAT, B * vocab_size);
+  auto logits_3d = d_logits.tensor_3d<float>(B, T, vocab_size);
+
+  // Without targets
+  gpt.Forward(idx_m, logits_3d);
+  auto logits_last_t_2d = d_logits_last_t.matrix<float>(B, vocab_size);
+  logits_last_t_2d.device(nn::g_device) = logits_3d.chip(T - 1, 1);
+  std::vector<float> logits_last_t(B * vocab_size);
+  nn::g_device.memcpyDeviceToHost(logits_last_t.data(),
+                                  d_logits_last_t.data<float>(),
+                                  sizeof(float) * logits_last_t.size());
+  nn::g_device.synchronize();
+  std::vector<float> expected_logits_last_t = {
+      0.678302,  0.421532, 0.378493, -0.835950, 0.857062, 0.964537, 0.516393,
+      -0.197802, 0.534203, 1.200121, 0.472574,  0.484028, 0.511667, -0.864123,
+      0.911163,  0.713747, 0.539312, -0.185592, 0.479005, 1.159166};
+  for (size_t i = 0; i < expected_logits_last_t.size(); ++i) {
+    EXPECT_NEAR(expected_logits_last_t[i], logits_last_t[i], 1e-5);
+  }
+
+  // With targets
+  std::vector<int> target = {2, 4, 5, 6, 3, 2, 9, 0};
+  std::vector<float> label(target.size() * vocab_size);
+  nn::OntHot(MakeConstFlat(target.data(), target.size()),
+             MakeMatrix(label.data(), target.size(), vocab_size));
+  nn::Parameter d_loss(DT_FLOAT, 1), d_label(DT_FLOAT, label.size());
+  nn::g_device.memcpyHostToDevice(d_label.data<float>(), label.data(),
+                                  sizeof(float) * label.size());
+  nn::g_device.synchronize();
+  float loss = 0.0;
+  gpt.ForwardGPU(idx_m, d_label.const_tensor_3d<float>(B, T, vocab_size),
+                 logits_3d, d_loss.data<float>());
+  nn::g_device.memcpyDeviceToHost(&loss, d_loss.data<float>(), sizeof(float));
+
+  std::vector<float> expected_logits = {
+      0.412538,  1.435400,  -0.845702, -0.836272, -0.912762, 0.366170,
+      -1.017333, 0.049309,  0.443828,  0.382751,  0.405025,  -0.624728,
+      -0.233263, 0.605841,  -0.331391, 0.600770,  -0.219692, -0.349443,
+      0.020259,  -0.885378, 0.655647,  -0.468965, 0.474971,  -0.146528,
+      0.848733,  1.132179,  0.723393,  -0.373132, 0.341525,  0.446182,
+      0.678302,  0.421532,  0.378493,  -0.835950, 0.857062,  0.964537,
+      0.516393,  -0.197802, 0.534203,  1.200121,  -0.333841, 0.735604,
+      -0.513971, -0.085284, -1.131126, -0.249146, -0.997829, -0.158174,
+      0.046483,  -0.956481, 0.138260,  -0.737712, -0.238145, 0.771908,
+      -0.482225, 0.335722,  -0.248654, -0.296130, -0.121716, -1.160217,
+      0.330651,  -0.616385, 0.539336,  0.109500,  0.612342,  0.884791,
+      0.590758,  -0.489924, 0.210640,  -0.198728, 0.472574,  0.484028,
+      0.511667,  -0.864123, 0.911163,  0.713747,  0.539312,  -0.185592,
+      0.479005,  1.159166};
+  std::vector<float> logits(B * T * vocab_size);
+  nn::g_device.memcpyDeviceToHost(logits.data(), d_logits.data<float>(),
+                                  sizeof(float) * logits.size());
+  nn::g_device.synchronize();
+  for (size_t i = 0; i < expected_logits.size(); ++i) {
+    EXPECT_NEAR(expected_logits[i], logits[i], 1e-5);
+  }
+  EXPECT_NEAR(loss, 2.485592, 1e-5);
+
+  // Backward
+  gpt.BackwardGPU(idx_m);
+  auto d_wte_grad = gpt.wte_->weight_->span_grad<float>();
+  auto d_wpe_grad = gpt.wpe_->weight_->span_grad<float>();
+  std::vector<float> wte_grad(d_wte_grad.size()), wpe_grad(d_wpe_grad.size());
+  nn::g_device.memcpyDeviceToHost(wte_grad.data(), d_wte_grad.data(),
+                                  sizeof(float) * d_wte_grad.size());
+  nn::g_device.memcpyDeviceToHost(wpe_grad.data(), d_wpe_grad.data(),
+                                  sizeof(float) * d_wpe_grad.size());
+  nn::g_device.synchronize();
+
+  std::vector<float> expected_wte_grad = {
+      -1.274265e-01, -7.693546e-02, 1.870265e-01,  1.102872e-01,
+      -8.144964e-02, -1.150192e-02, 7.081421e-02,  -5.410360e-02,
+      -2.618172e-02, -3.396006e-02, -8.665409e-02, 1.300852e-01,
+      -3.946760e-02, 2.253419e-01,  -6.542038e-02, 2.730466e-03,
+      9.105621e-02,  -2.142406e-01, -8.473338e-02, -2.970357e-02,
+      1.036018e-01,  -1.241457e-01, 1.957041e-01,  -6.072314e-02,
+      5.077662e-01,  -9.879547e-02, -4.231800e-01, -1.456355e-01,
+      9.783387e-02,  6.201106e-02,  1.025773e-02,  -5.858323e-02,
+      -4.027011e-02, 1.477207e-01,  -1.223148e-01, 6.318975e-02,
+      -1.104821e-01, -1.816282e-02, 1.313495e-01,  1.263026e-01,
+      -7.210705e-02, -5.690017e-02, -9.386335e-05, -1.019029e-02,
+      2.964642e-02,  -3.682173e-02, -4.120179e-02, 5.866125e-02,
+      6.840312e-03,  -8.432365e-03, 3.812137e-02,  -7.966967e-02,
+      -4.943971e-02, 9.258006e-02,  8.474199e-02,  -5.575795e-02,
+      -1.460089e-01, 1.147824e-01,  3.205336e-02,  -2.981084e-02};
+  for (size_t i = 0; i < expected_wte_grad.size(); ++i) {
+    EXPECT_NEAR(expected_wte_grad[i], wte_grad[i], 1e-5);
+  }
+
+  std::vector<float> expected_wpe_grad = {
+      0.338320,  -0.198764, -0.204031, -0.057509, 0.055975,  0.066009,
+      0.028694,  -0.040975, 0.019426,  0.036110,  -0.040719, -0.002536,
+      -0.051870, 0.060403,  -0.010102, 0.067178,  -0.027745, -0.037864,
+      0.003073,  -0.005986, -0.016609, 0.035812,  -0.024031, 0.007741};
+  for (size_t i = 0; i < expected_wpe_grad.size(); ++i) {
+    EXPECT_NEAR(expected_wpe_grad[i], wpe_grad[i], 1e-5);
   }
 }

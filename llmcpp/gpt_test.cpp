@@ -29,7 +29,7 @@ loss.backward()
 
   nn::ManualSeed(42);
   int B = 4, n_embed = 3;
-  gpt::MLP<float> mlp(n_embed);
+  gpt::MLP mlp(n_embed);
 
   // initialize
   std::vector<float> x = {0.548416, -0.441472, 1.581529, -0.198127,
@@ -75,7 +75,7 @@ y = attn(x)
 
   nn::ManualSeed(42);
   int B = 2, T = 4, C = 6, nh = 2, hs = C / nh;
-  gpt::CausalSelfAttention<float> attn(T, nh, C);
+  gpt::CausalSelfAttention attn(T, nh, C);
 
   std::vector<float> x(B * T * C), y(B * T * C), x_grad(B * T * C),
       y_grad(B * T * C, 1.0f);
@@ -137,7 +137,7 @@ loss.backward()
 
   nn::ManualSeed(42);
   int B = 2, T = 4, C = 6, nh = 2, hs = C / nh;
-  gpt::Block<float> block(T, nh, C);
+  gpt::Block block(T, nh, C);
 
   std::vector<float> x(B * T * C), y(B * T * C);
   nn::NormalFill(absl::MakeSpan(x));
@@ -192,8 +192,7 @@ logits, loss = gpt2(idx)
   nn::ManualSeed(42);
   int block_size = 4, n_embd = 6, n_head = 2, n_layer = 12, vocab_size = 10;
   int B = 2, T = block_size, C = n_embd, nh = n_head, hs = n_embd / nh;
-  gpt::GPT<float> gpt(block_size, vocab_size, vocab_size, n_layer, n_head,
-                      n_embd);
+  gpt::GPT gpt(block_size, vocab_size, vocab_size, n_layer, n_head, n_embd);
 
   std::vector<int> idx = {1, 2, 4, 5, 4, 3, 2, 9};
   auto idx_m = TTypes<int>::ConstMatrix(idx.data(), B, T);
