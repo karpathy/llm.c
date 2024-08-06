@@ -58,7 +58,9 @@ struct GPT2 {
         config.max_seq_len, config.vocab_size, config.padded_vocab_size,
         config.num_layers, config.num_heads, config.channels);
     // allocate space for all the parameters and read them in
-    printf("num_parameters: %zu\n", gpt2_->NumParameters());
+    size_t num_parameters = gpt2_->NumParameters();
+    printf("num_parameters: %zu(%zu MB)\n", num_parameters,
+           num_parameters * sizeof(floatX) / 1024 / 1024);
 
     auto restore_fn = [&](nn::Parameter* p, const std::string& name) {
 #ifdef EIGEN_USE_GPU
