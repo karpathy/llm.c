@@ -7,7 +7,6 @@
 #include <memory>
 #include <random>
 
-#include "Eigen/Core"
 #include "absl/algorithm/container.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -15,7 +14,6 @@
 #include "absl/types/span.h"
 #include "llmc/rand.h"
 #include "tensor_util.hpp"
-#include "unsupported/Eigen/CXX11/ThreadPool"
 
 namespace nn {
 
@@ -30,9 +28,11 @@ Eigen::ThreadPoolDevice g_device(&g_thread_pool,
 
 mt19937_state g_mt19937_state;
 
-void ManualSeed(unsigned int seed) { manual_seed(&g_mt19937_state, seed); }
+inline void ManualSeed(unsigned int seed) {
+  manual_seed(&g_mt19937_state, seed);
+}
 
-void ConstantFill(absl::Span<float> weight, float C) {
+inline void ConstantFill(absl::Span<float> weight, float C) {
 #ifdef EIGEN_USE_GPU
   std::vector<float> w(weight.size(), C);
   g_device.memcpyHostToDevice(weight.data(), w.data(),
@@ -42,7 +42,8 @@ void ConstantFill(absl::Span<float> weight, float C) {
 #endif
 }
 
-void UniformFill(absl::Span<float> weight, float from = 0.0, float to = 1.0) {
+inline void UniformFill(absl::Span<float> weight, float from = 0.0,
+                        float to = 1.0) {
 #ifdef EIGEN_USE_GPU
   std::vector<float> w(weight.size());
   uniform_(w.data(), w.size(), from, to, &g_mt19937_state);
@@ -53,7 +54,8 @@ void UniformFill(absl::Span<float> weight, float from = 0.0, float to = 1.0) {
 #endif
 }
 
-void NormalFill(absl::Span<float> weight, float mean = 0.0, float std = 1.0) {
+inline void NormalFill(absl::Span<float> weight, float mean = 0.0,
+                       float std = 1.0) {
 #ifdef EIGEN_USE_GPU
   std::vector<float> w(weight.size());
   normal_(w.data(), w.size(), mean, std, &g_mt19937_state);
@@ -64,7 +66,7 @@ void NormalFill(absl::Span<float> weight, float mean = 0.0, float std = 1.0) {
 #endif
 }
 
-void KaimingUniformFill(absl::Span<float> weight, int in_features) {
+inline void KaimingUniformFill(absl::Span<float> weight, int in_features) {
   const float bound = std::sqrt(1.0f / in_features);
 #ifdef EIGEN_USE_GPU
   std::vector<float> w(weight.size());
@@ -76,7 +78,33 @@ void KaimingUniformFill(absl::Span<float> weight, int in_features) {
 #endif
 }
 
-std::pair<int, int> SplitRange(int total, int idx, int n) {
+inline void UpperTriangularWithNegativeInf(
+    typename TTypes<float>::Matrix matrix) {
+  using MatrixXf =
+      Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+  MatrixXf m = MatrixXf::Zero(matrix.dimension(0), matrix.dimension(1));
+  m.triangularView<Eigen::StrictlyUpper>().setConstant(
+      -std::numeric_limits<float>::infinity());
+#ifdef EIGEN_USE_GPU
+  g_device.memcpyHostToDevice(matrix.data(), m.data(),
+                              sizeof(float) * matrix.size());
+#else
+  g_device.memcpy(matrix.data(), m.data(), sizeof(float) * matrix.size());
+#endif
+}
+
+inline void OntHot(typename TTypes<int>::ConstFlat target,
+                   typename TTypes<float>::Matrix label) {
+  int batch_size = target.size(), num_class = label.dimension(1);
+  CHECK_EQ(batch_size, label.dimension(0));
+  for (int i = 0; i < batch_size; ++i) {
+    int ix = target(i);
+    CHECK_LT(ix, num_class);
+    label(i, ix) = 1.0f;
+  }
+}
+
+inline std::pair<int, int> SplitRange(int total, int idx, int n) {
   int q = total / n;
   int r = total % n;
   if (idx < r) {
@@ -140,8 +168,12 @@ struct Parameter {
   }
 
   ~Parameter() {
-    g_device.deallocate(data_);
-    g_device.deallocate(grad_);
+    if (data_ != nullptr) {
+      g_device.deallocate(data_);
+    }
+    if (grad_ != nullptr) {
+      g_device.deallocate(grad_);
+    }
   }
 
   int64_t size() const { return num_element_; }
@@ -337,11 +369,12 @@ struct Parameter {
 
 using Activation = Parameter;
 
-template <typename T>
 struct MatMul {
+  using T = floatX;
+
   static void Forward(typename TTypes<T>::ConstMatrix x1,
                       typename TTypes<T>::ConstMatrix x2,
-                      typename TTypes<T>::Matrix y) {
+                      typename TTypes<T>::Matrix y, T scale = 1.0f) {
     // x: [M, N], x2: [N, K], y: [M, K]
     CHECK_EQ(x1.dimension(0), y.dimension(0));
     CHECK_EQ(x1.dimension(1), x2.dimension(0));
@@ -351,14 +384,14 @@ struct MatMul {
     //    y.noalias() = x1 * x2;
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
         Eigen::IndexPair<int>(1, 0)};
-    y.device(g_device) = x1.contract(x2, product_dims);
+    y.device(g_device) = x1.contract(x2, product_dims) * scale;
   }
 
   static void Backward(typename TTypes<T>::ConstMatrix x1,
                        typename TTypes<T>::ConstMatrix x2,
                        typename TTypes<T>::ConstMatrix y_grad,
                        typename TTypes<T>::Matrix x1_grad,
-                       typename TTypes<T>::Matrix x2_grad) {
+                       typename TTypes<T>::Matrix x2_grad, T scale = 1.0) {
     // input:
     // x1: [M, N], x2:[N, K]
     // y_grad: [M, K]
@@ -376,7 +409,7 @@ struct MatMul {
     //        = [M, N]
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims = {
         Eigen::IndexPair<int>(1, 1)};
-    x1_grad.device(g_device) += y_grad.contract(x2, product_dims);
+    x1_grad.device(g_device) += y_grad.contract(x2, product_dims) * scale;
 
     // x2_grad = dL/dy * dy/dx2
     //        = x1^T(N, M) * y_grad(M, K)
@@ -384,12 +417,13 @@ struct MatMul {
 
     Eigen::array<Eigen::IndexPair<int>, 1> product_dims2 = {
         Eigen::IndexPair<int>(0, 0)};
-    x2_grad.device(g_device) += x1.contract(y_grad, product_dims2);
+    x2_grad.device(g_device) += x1.contract(y_grad, product_dims2) * scale;
   }
 };
 
-template <typename T>
 struct Residual {
+  using T = floatX;
+
   static void Forward(typename TTypes<T>::ConstFlat x,
                       typename TTypes<T>::ConstFlat Fx,
                       typename TTypes<T>::Flat Hx) {
@@ -411,8 +445,9 @@ struct Residual {
   }
 };
 
-template <typename T>
 struct Linear {
+  using T = floatX;
+
   Linear(int in_features, int out_features, bool bias = true)
       : in_features_(in_features),
         out_features_(out_features),
@@ -433,6 +468,7 @@ struct Linear {
     CHECK_EQ(x.dimension(1), in_features_);
     CHECK_EQ(y.dimension(1), out_features_);
     CHECK_EQ(x.dimension(0), y.dimension(0));
+    int B = x.dimension(0);
 
     auto weight = MakeMatrix(weight_->data<T>(), out_features_, in_features_);
     // y = x * w^T + b
@@ -440,10 +476,10 @@ struct Linear {
         Eigen::IndexPair<int>(1, 1)};
     if (has_bias_) {
       auto bias = MakeFlat(bias_->data<T>(), out_features_);
-      Eigen::array<int, 2> broadcast_dims = {static_cast<int>(y.dimension(0)),
-                                             1};
-      y.device(g_device) =
-          x.contract(weight, product_dims) + bias.broadcast(broadcast_dims);
+      Eigen::array<int, 2> batch_by_one = {B, 1},
+                           one_by_out = {1, out_features_};
+      y.device(g_device) = x.contract(weight, product_dims) +
+                           bias.reshape(one_by_out).broadcast(batch_by_one);
     } else {
       y.device(g_device) = x.contract(weight, product_dims);
     }
@@ -557,8 +593,9 @@ struct Embedding {
   std::unique_ptr<Parameter> weight_;
 };
 
-template <typename T>
 struct LayerNorm {
+  using T = floatX;
+
   LayerNorm(int normalized_shape)
       : normalized_shape_(normalized_shape), eps_(1e-5) {
     auto dtype = DataTypeToEnum<T>::value;
@@ -717,8 +754,9 @@ struct LayerNorm {
 
 // Careful there are a few versions of GeLU, this one is the exact one used by
 // OpenAI
-template <typename T>
 struct NewGELU {
+  using T = floatX;
+
   void Forward(typename TTypes<T>::ConstFlat x, typename TTypes<T>::Flat y) {
     CHECK_EQ(x.size(), y.size());
     const float sqrt_2_over_pi = std::sqrt(M_2_PI);
@@ -755,9 +793,8 @@ struct NewGELU {
   }
 };
 
-template <typename T>
 struct Softmax {
-  Softmax() {}
+  using T = floatX;
 
   void Forward(typename TTypes<T>::ConstMatrix x,
                typename TTypes<T>::Matrix y) {
@@ -834,13 +871,13 @@ struct Softmax {
   }
 };
 
-template <typename T>
 struct SoftmaxCrossEntropy {
+  using T = floatX;
   enum Reduction { MEAN, SUM };
 
   SoftmaxCrossEntropy(Reduction reduction = Reduction::MEAN)
       : reduction_(reduction) {
-    softmax_ = std::make_unique<Softmax<T>>();
+    softmax_ = std::make_unique<Softmax>();
   }
 
   void Forward(typename TTypes<T>::ConstMatrix logits,
@@ -935,11 +972,11 @@ struct SoftmaxCrossEntropy {
   }
 
   Reduction reduction_;
-  std::unique_ptr<Softmax<T>> softmax_;
+  std::unique_ptr<Softmax> softmax_;
 };
 
-template <typename T>
 struct CrossEntropy {
+  using T = floatX;
   enum Reduction { MEAN, SUM };
 
   CrossEntropy(Reduction reduction = Reduction::MEAN) : reduction_(reduction) {}

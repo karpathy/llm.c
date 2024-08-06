@@ -36,13 +36,20 @@ for i in range(10):
                           20, 99, 46, 85, 63, 0,  78, 75, 43, 94, 99,
                           78, 93, 14, 42, 54, 11, 63, 42, 99, 48};
   auto idx_m = TTypes<int>::ConstMatrix(idx.data(), B, T);
-  std::vector<float> logits(B * T * vocab_size);
-  auto logits_3d = Make3DTensor(logits.data(), B, T, vocab_size);
+  nn::Parameter d_logits(nn::DT_FLOAT, B * T * vocab_size);
+  auto logits_3d = d_logits.tensor_3d<float>(B, T, vocab_size);
 
   std::vector<int> target = {28, 51, 9,  81, 41, 30, 22, 99, 91, 96, 20,
                              99, 46, 85, 63, 0,  78, 75, 43, 94, 99, 78,
                              93, 14, 42, 54, 11, 63, 42, 99, 48, 0};
-  auto target_m = TTypes<int>::ConstMatrix(target.data(), B, T);
+  std::vector<float> label(B * T * vocab_size, 0.f);
+  nn::OntHot(MakeConstFlat(target.data(), target.size()),
+             MakeMatrix(label.data(), target.size(), vocab_size));
+  nn::Parameter d_label(nn::DT_FLOAT, label.size());
+  nn::g_device.memcpyHostToDevice(d_label.data<float>(), label.data(),
+                                  sizeof(float) * label.size());
+  nn::g_device.synchronize();
+  auto label_3d = d_label.const_tensor_3d<float>(B, T, vocab_size);
 
   std::vector<nn::Parameter*> parameters;
   gpt.Parameters(&parameters);
@@ -52,10 +59,10 @@ for i in range(10):
       4.583667, 4.563725, 4.544271, 4.525268, 4.506680,
   };
   for (int step = 0; step < 10; ++step) {
-    float loss = 0.0;
-    gpt.ForwardCPU(idx_m, target_m, logits_3d, &loss);
+    float loss = 0.0f;
+    gpt.ForwardGPU(idx_m, label_3d, logits_3d, &loss);
     optimizer.ZeroGrad();
-    gpt.BackwardCPU(idx_m, target_m);
+    gpt.BackwardGPU(idx_m);
     optimizer.Step();
     fprintf(stdout, "Step %d, loss = %.6f\n", step, loss);
     CHECK(std::abs(loss - expected_loss[step]) < 1e-5);

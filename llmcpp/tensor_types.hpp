@@ -1,7 +1,7 @@
 #ifndef LLM_CPP_LLMCPP_TENSOR_TYPES_HPP_
 #define LLM_CPP_LLMCPP_TENSOR_TYPES_HPP_
 
-#include "unsupported/Eigen/CXX11/Tensor"
+#include "pch.hpp"
 
 // Helper to define Tensor types given that the scalar is of type T.
 template <typename T, int NDIMS = 1, typename IndexType = Eigen::DenseIndex>

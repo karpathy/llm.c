@@ -8,6 +8,10 @@ set(BUILD_SHARED_LIBS OFF)
 #set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Ofast -march=native")
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Ofast -march=native")
 
+find_program(CCACHE_PROGRAM ccache)
+if (CCACHE_PROGRAM)
+    set(CMAKE_CXX_COMPILER_LAUNCHER ccache)
+endif ()
 
 enable_testing()
 include_directories(.)
@@ -42,8 +46,27 @@ add_executable(test_gpt2 test_gpt2.c)
 target_link_libraries(test_gpt2 m ${OpenMP_CXX_LIBRARIES})
 
 # llm.c GPU
+set(CMAKE_CUDA_ARCHITECTURES 60 61 70 75)
 find_package(CUDA)
 if (CUDA_FOUND)
+    set_source_files_properties(llmcpp/pch.hpp PROPERTIES HEADER_FILE_ONLY TRUE)
+    add_library(pch_gpu INTERFACE)
+    target_sources(pch_gpu INTERFACE llmcpp/pch.hpp)
+
+    add_library(nn_gpu llmcpp/nn.cu)
+    target_compile_definitions(nn_gpu PUBLIC EIGEN_USE_GPU)
+    target_link_libraries(nn_gpu
+            pch_gpu
+            absl::strings absl::log absl::check
+            ${CUDA_LIBRARIES}
+    )
+#    target_precompile_headers(nn_gpu PUBLIC llmcpp/pch.hpp)
+
+    add_library(gpt_gpu llmcpp/gpt.cu)
+    target_link_libraries(gpt_gpu
+            nn_gpu
+    )
+
     #    add_compile_definitions(EIGEN_USE_GPU)
     #SET(CMAKE_CUDA_FLAGS ${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr)
     add_compile_definitions(ENABLE_FP32)
@@ -55,7 +78,7 @@ if (CUDA_FOUND)
     target_link_libraries(train_gpt2cu ${CUDA_LIBRARIES} cublas cublasLt)
 
     add_executable(test_eigen_gpu llmcpp/test_eigen_gpu.cu)
-    target_compile_definitions(test_eigen_gpu PUBLIC EIGEN_USE_GPU)
+    #    target_compile_definitions(test_eigen_gpu PRIVATE EIGEN_USE_GPU)
     set_target_properties(test_eigen_gpu PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
             CUDA_ARCHITECTURES "61;70;75"
@@ -66,44 +89,70 @@ if (CUDA_FOUND)
     )
     #    target_compile_options(test_eigen_gpu PRIVATE -Xcompiler=-Ofast,-march=native)
 
-    # nn_test_cu
-    add_executable(nn_test_cu llmcpp/nn_test.cu)
-    target_compile_definitions(nn_test_cu PRIVATE EIGEN_USE_GPU)
-    set_target_properties(nn_test_cu PROPERTIES
-            CUDA_SEPARABLE_COMPILATION ON
-            CUDA_ARCHITECTURES "61;70;75"
-    )
-    target_link_libraries(nn_test_cu
-            absl::strings absl::log absl::check
+    # nn_test_gpu
+    add_executable(nn_test_gpu llmcpp/nn_test.cu)
+    target_link_libraries(nn_test_gpu
+            nn_gpu
             GTest::gtest_main
-            ${CUDA_LIBRARIES}
+    )
+
+    # gpt_test_gpu
+    add_executable(gpt_test_gpu llmcpp/gpt_test.cu)
+    target_link_libraries(gpt_test_gpu
+            gpt_gpu
+            GTest::gtest_main
+    )
+
+    # gpt_optim_gpu
+    add_executable(gpt_optim_gpu llmcpp/gpt_optim.cu)
+    target_link_libraries(gpt_optim_gpu
+            gpt_gpu
+    )
+
+    # train_gpt2_gpu
+    add_executable(train_gpt2_gpu llmcpp/train_gpt2.cu)
+    target_link_libraries(train_gpt2_gpu
+            gpt_gpu
     )
 endif ()
 
+set_source_files_properties(llmcpp/pch.hpp PROPERTIES HEADER_FILE_ONLY TRUE)
+add_library(pch INTERFACE)
+target_sources(pch INTERFACE llmcpp/pch.hpp)
+
 
 # llm.cpp
+add_library(nn llmcpp/nn.cpp)
+target_link_libraries(nn
+        pch
+        absl::strings absl::log absl::check)
+#target_precompile_headers(nn PUBLIC llmcpp/pch.hpp)
+
+add_library(gpt llmcpp/gpt.cpp)
+target_link_libraries(gpt nn)
+
 add_executable(test_gpt2_cpp llmcpp/test_gpt2.cpp)
-target_link_libraries(test_gpt2_cpp absl::strings absl::log absl::check)
+target_link_libraries(test_gpt2_cpp gpt)
 target_compile_options(test_gpt2_cpp PRIVATE -Ofast -march=native)
 
 add_executable(train_gpt2_cpp llmcpp/train_gpt2.cpp)
 target_link_libraries(train_gpt2_cpp
-        absl::strings absl::log absl::check
+        gpt
         profiler
 )
 target_compile_options(train_gpt2_cpp PRIVATE -Ofast -march=native)
 
 add_executable(nn_test llmcpp/nn_test.cpp)
-target_link_libraries(nn_test absl::strings absl::log absl::check GTest::gtest_main)
+target_link_libraries(nn_test nn GTest::gtest_main)
 
 add_executable(optim_test llmcpp/optim_test.cpp)
-target_link_libraries(optim_test absl::strings absl::log absl::check GTest::gtest_main)
+target_link_libraries(optim_test nn GTest::gtest_main)
 
 add_executable(gpt_test llmcpp/gpt_test.cpp)
-target_link_libraries(gpt_test absl::strings absl::log absl::check GTest::gtest_main)
+target_link_libraries(gpt_test gpt GTest::gtest_main)
 
 add_executable(gpt_optim llmcpp/gpt_optim.cpp)
-target_link_libraries(gpt_optim absl::strings absl::log absl::check GTest::gtest_main)
+target_link_libraries(gpt_optim gpt)
 
 add_executable(test_eigen_cpu llmcpp/test_eigen_cpu.cpp)
 target_link_libraries(test_eigen_cpu absl::strings absl::log absl::check GTest::gtest_main)

@@ -15,8 +15,9 @@ struct GPT2Config {
   int channels;           // number of channels, e.g. 768
 };
 
-template <typename Type>
 struct GPT2 {
+  using Type = floatX;
+
   void BuildFromCheckpoint(absl::string_view checkpoint_path) {
     // read in model from a checkpoint file
     FILE* model_file = fopenCheck(checkpoint_path.data(), "rb");
@@ -53,14 +54,23 @@ struct GPT2 {
     printf("num_heads: %zu\n", NH);
     printf("channels: %zu\n", C);
 
-    gpt2_ = std::make_unique<gpt::GPT<Type>>(
+    gpt2_ = std::make_unique<gpt::GPT>(
         config.max_seq_len, config.vocab_size, config.padded_vocab_size,
         config.num_layers, config.num_heads, config.channels);
     // allocate space for all the parameters and read them in
-    printf("num_parameters: %zu\n", gpt2_->NumParameters());
+    size_t num_parameters = gpt2_->NumParameters();
+    printf("num_parameters: %zu(%zu MB)\n", num_parameters,
+           num_parameters * sizeof(floatX) / 1024 / 1024);
 
     auto restore_fn = [&](nn::Parameter* p, const std::string& name) {
-      freadCheck(p->data<Type>(), sizeof(float), p->size(), model_file);
+#ifdef EIGEN_USE_GPU
+      std::vector<Type> cpu_data(p->size());
+      freadCheck(cpu_data.data(), sizeof(Type), p->size(), model_file);
+      nn::g_device.memcpyHostToDevice(p->data<Type>(), cpu_data.data(),
+                                      sizeof(Type) * p->size());
+#else
+      freadCheck(p->data<Type>(), sizeof(Type), p->size(), model_file);
+#endif
     };
     ApplyFn(restore_fn, L);
     fcloseCheck(model_file);
@@ -182,7 +192,7 @@ struct GPT2 {
   }
 
   GPT2Config config;
-  std::unique_ptr<gpt::GPT<Type>> gpt2_;
+  std::unique_ptr<gpt::GPT> gpt2_;
 };
 }  // namespace gpt2
 

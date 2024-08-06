@@ -18,7 +18,7 @@ for _ in range(10):
 
   nn::ManualSeed(42);
   int B = 4, in_features = 3, out_features = 2;
-  nn::Linear<float> m(in_features, out_features, true);
+  nn::Linear m(in_features, out_features, true);
 
   // forward
   std::vector<float> x(B * in_features), y(B * out_features);
@@ -76,7 +76,7 @@ for _ in range(10):
 
   nn::ManualSeed(42);
   int B = 4, in_features = 3, out_features = 2;
-  nn::Linear<float> m(in_features, out_features, true);
+  nn::Linear m(in_features, out_features, true);
 
   // forward
   std::vector<float> x(B * in_features), y(B * out_features);
