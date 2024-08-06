@@ -93,6 +93,13 @@ if (CUDA_FOUND)
             gpt_gpu
             GTest::gtest_main
     )
+
+    # gpt_optim_gpu
+    add_executable(gpt_optim_gpu llmcpp/gpt_optim.cu)
+    target_link_libraries(gpt_optim_gpu
+            gpt_gpu
+            GTest::gtest_main
+    )
 endif ()
 
 
