@@ -155,7 +155,7 @@ void gelu_backward(int kernel_num,
 int main(int argc, char **argv) {
     setup_main();
 
-    int B = 8;
+    int B = 128;
     int T = 1024;
     int C = 768;
 
@@ -192,9 +192,9 @@ int main(int argc, char **argv) {
         printf("Checking block size %d.\n", block_size);
         gelu_backward(kernel_num, d_dinp, d_inp, d_dout, B, T, C, block_size);
 #if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
-        float tol = 1e-5;
+        float tol = 1e-5f;
 #else
-        float tol = 1e-2f;
+        float tol = 1e-3f;
 #endif
         validate_result(d_dinp, dinp, "dinp", B * T * C, tol);
     }
@@ -213,7 +213,7 @@ int main(int argc, char **argv) {
         // napkin math: estimate the memory bandwidth achieved
         // for each (B,T,C) output element, we do 1 read and 1 write, 4 bytes each
         // and e.g. A100 40GB PCIe is advertised at 1,555GB/s
-        long memory_ops = B * T * C * 2 * 4;
+        long memory_ops = B * T * C * 3 * (int)sizeof(floatX);
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
 
         printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);

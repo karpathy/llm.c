@@ -141,7 +141,7 @@ void gelu_forward(int kernel_num,
 int main(int argc, const char **argv) {
     setup_main();
 
-    int B = 8;
+    int B = 128;
     int T = 1024;
     int C = 768;
 
@@ -173,9 +173,9 @@ int main(int argc, const char **argv) {
         printf("Checking block size %d.\n", block_size);
         gelu_forward(kernel_num, d_out, d_inp, B, T, C, block_size);
 #if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
-        float tol = 1e-5;
+        float tol = 1e-5f;
 #else
-        float tol = 1e-2f;
+        float tol = 1e-3f;
 #endif
         validate_result(d_out, out, "out", B * T * C, tol);
     }
