@@ -2,12 +2,9 @@
 #include <iostream>
 #include <memory>
 
-#include "Eigen/Core"
-#include "absl/types/span.h"
 #include "gpt2.hpp"
 #include "llmc/dataloader.h"
 #include "llmc/tokenizer.h"
-#include "llmc/utils.h"
 #include "optim.hpp"
 
 // sampler
@@ -111,6 +108,12 @@ int main(int argc, char** argv) {
         val_loss += loss;
       }
       val_loss /= val_num_batches;
+
+      if (step == 0) {
+        size_t num_activations = model.gpt2_->NumActivations();
+        printf("num_activations: %zu(%zu MB)\n", num_activations,
+               num_activations * sizeof(floatX) / 1024 / 1024);
+      }
       printf("val loss %f\n", val_loss);
     }
 

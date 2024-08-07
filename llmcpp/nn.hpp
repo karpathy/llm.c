@@ -534,6 +534,8 @@ struct Linear {
     return num_parameters;
   }
 
+  size_t NumActivations() const { return 0; }
+
   void Parameters(std::vector<Parameter*>* parameters) const {
     parameters->push_back(weight_.get());
     if (has_bias_) {
@@ -583,6 +585,8 @@ struct Embedding {
   }
 
   size_t NumParameters() const { return num_embeddings_ * embedding_dim_; }
+
+  size_t NumActivations() const { return 0; }
 
   void Parameters(std::vector<Parameter*>* parameters) const {
     parameters->push_back(weight_.get());
@@ -735,6 +739,11 @@ struct LayerNorm {
 
   size_t NumParameters() const { return normalized_shape_ * 2; }
 
+  size_t NumActivations() const {
+    return norm_->size() + dnorm_->size() + dnorm_mean_->size() +
+           dnorm_norm_mean_->size();
+  }
+
   void Parameters(std::vector<Parameter*>* parameters) const {
     parameters->push_back(weight_.get());
     parameters->push_back(bias_.get());
@@ -757,7 +766,8 @@ struct LayerNorm {
 struct NewGELU {
   using T = floatX;
 
-  void Forward(typename TTypes<T>::ConstFlat x, typename TTypes<T>::Flat y) {
+  static void Forward(typename TTypes<T>::ConstFlat x,
+                      typename TTypes<T>::Flat y) {
     CHECK_EQ(x.size(), y.size());
     const float sqrt_2_over_pi = std::sqrt(M_2_PI);
 
@@ -767,9 +777,9 @@ struct NewGELU {
         0.5 * x * (1.0 + ((sqrt_2_over_pi * (x + coeff * x * x * x)).tanh()));
   }
 
-  void Backward(typename TTypes<T>::ConstFlat x,
-                typename TTypes<T>::ConstFlat y_grad,
-                typename TTypes<T>::Flat x_grad) {
+  static void Backward(typename TTypes<T>::ConstFlat x,
+                       typename TTypes<T>::ConstFlat y_grad,
+                       typename TTypes<T>::Flat x_grad) {
     CHECK_EQ(x.size(), y_grad.size());
     CHECK_EQ(x.size(), x_grad.size());
 
@@ -796,8 +806,8 @@ struct NewGELU {
 struct Softmax {
   using T = floatX;
 
-  void Forward(typename TTypes<T>::ConstMatrix x,
-               typename TTypes<T>::Matrix y) {
+  static void Forward(typename TTypes<T>::ConstMatrix x,
+                      typename TTypes<T>::Matrix y) {
     // x: [B, D], y: [B, D]
     CHECK_EQ(x.dimension(0), y.dimension(0));
     CHECK_EQ(x.dimension(1), y.dimension(1));
@@ -819,9 +829,9 @@ struct Softmax {
                                  .broadcast(one_by_class);
   }
 
-  void Backward(typename TTypes<T>::ConstMatrix y,
-                typename TTypes<T>::ConstMatrix y_grad,
-                typename TTypes<T>::Matrix x_grad) {
+  static void Backward(typename TTypes<T>::ConstMatrix y,
+                       typename TTypes<T>::ConstMatrix y_grad,
+                       typename TTypes<T>::Matrix x_grad) {
     // y:[B, D], y_grad: [B, D], x_grad: [B, D]
     int B = y.dimension(0), D = y.dimension(1);
     CHECK(B == y_grad.dimension(0) && B == x_grad.dimension(0));
@@ -876,9 +886,7 @@ struct SoftmaxCrossEntropy {
   enum Reduction { MEAN, SUM };
 
   SoftmaxCrossEntropy(Reduction reduction = Reduction::MEAN)
-      : reduction_(reduction) {
-    softmax_ = std::make_unique<Softmax>();
-  }
+      : reduction_(reduction) {}
 
   void Forward(typename TTypes<T>::ConstMatrix logits,
                absl::Span<const int> targets, typename TTypes<T>::Matrix probs,
@@ -889,7 +897,7 @@ struct SoftmaxCrossEntropy {
     CHECK_EQ(C, probs.dimension(1));
 
     // apply softmax to convert logits to (normalized) probabilities
-    softmax_->Forward(logits, probs);
+    Softmax::Forward(logits, probs);
 
     // targets: [B,]
     *loss = 0.0f;
@@ -972,7 +980,6 @@ struct SoftmaxCrossEntropy {
   }
 
   Reduction reduction_;
-  std::unique_ptr<Softmax> softmax_;
 };
 
 struct CrossEntropy {
