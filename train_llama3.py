@@ -1192,7 +1192,17 @@ if __name__ == "__main__":
             and (step % args.sample_every == 0 or last_step)) \
             and master_process:
             model.eval()
-            prompts: List[str] = json.loads(open(os.path.join(os.path.dirname(__file__), 'llmc_py', 'prompts.json')).read())['prompts']
+            prompts: List[str] = [
+        "Clearly, the meaning of life is",
+        "Simply put, the theory of relativity states that",
+        """The repo llm.c on GitHub is""",
+        """Translate English to French:
+
+        sea otter => loutre de mer
+        peppermint => menthe poivrée
+        plush girafe => girafe peluche
+        cheese =>""",
+            ]
             if args.use_hf:
                 prompt_tokens = [model.tokenizer(x).input_ids for x in prompts]
             else:  # Meta
