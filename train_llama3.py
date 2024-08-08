@@ -321,6 +321,8 @@ class LLaMA(nn.Module):
 
     @staticmethod
     def adapt_llama_state_dict_keys(checkpoint, config: LlamaConfig):
+        # Modify key names from Meta's LLaMA to our LLaMA
+        # our key names are derived from GPT-2's key names
         checkpoint['transformer.wte.weight'] = checkpoint.pop('tok_embeddings.weight')
 
         for i in range(config.n_layer):
@@ -355,6 +357,8 @@ class LLaMA(nn.Module):
 
     @staticmethod
     def adapt_llama_state_dict_keys_hf(checkpoint, config: LlamaConfig):
+        # Modify key names from HuggingFace's LLaMA to our LLaMA
+        # our key names are derived from GPT-2's key names
         checkpoint['transformer.wte.weight'] = checkpoint.pop('model.embed_tokens.weight')
 
         # We need to unpermute K and V because HF script permuted the original Meta-LLaMA weights
@@ -432,9 +436,6 @@ class LLaMA(nn.Module):
         torch.set_default_tensor_type(torch.tensor([], dtype=original_default_type, device="cpu").type())  # restore default type
 
         tokenizer = Tokenizer(model_path=tokenizer_path)
-        # add <|end_of_text|> as the stop token for base model - this is an omission in the reference code
-        # the reference code only adds instruct model stop tokens...
-        tokenizer.stop_tokens = tokenizer.stop_tokens + [128001]
         model.tokenizer = tokenizer
         return model
 
@@ -676,9 +677,10 @@ class Tokenizer:
         self.eom_id: int = self.special_tokens["<|eom_id|>"]
         self.python_tag_id = self.special_tokens["<|python_tag|>"]
         self.pad_id: int = self.special_tokens["<|finetune_right_pad_id|>"]
+        # hardcoded stop tokens for the base model
         self.stop_tokens = [
-            self.special_tokens["<|eom_id|>"],
-            self.special_tokens["<|eot_id|>"],
+            self.special_tokens["<|begin_of_text|>"],
+            self.special_tokens["<|end_of_text|>"],
         ]
 
     def encode(
