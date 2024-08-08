@@ -780,6 +780,7 @@ class Tokenizer:
 # Our own simple Distributed Data Loader
 
 def _peek_data_shard(filename):
+    raise NotImplementedError("_peek_data_shard not yet implemented for llama 3")
     # only reads the header, returns header data
     with open(filename, "rb") as f:
         # first read the header, which is 256 int32 integers (4 bytes each)
@@ -795,6 +796,7 @@ def _peek_data_shard(filename):
     return ntok # for now just return the number of tokens
 
 def _load_data_shard(filename):
+    raise NotImplementedError("_load_data_shard not yet implemented for llama 3")
     with open(filename, "rb") as f:
         # first read the header, which is 256 int32 integers (4 bytes each)
         header = np.frombuffer(f.read(256*4), dtype=np.int32)
