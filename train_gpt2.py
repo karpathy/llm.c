@@ -261,6 +261,14 @@ class LlamaConfig:
     max_gen_batch_size: int = 4
     use_kv: bool = True
 
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+        assert self.n_kv_head <= self.n_head
+        assert self.n_head % self.n_kv_head == 0
+        assert self.n_embd % self.n_head == 0
+
 class LLaMA(nn.Module):
 
     def __init__(self, config):
