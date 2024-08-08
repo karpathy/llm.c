@@ -13,91 +13,59 @@ Matrix Multiplication, with help from cuBLASLt
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
-template<typename OutFloat, bool UseAuxBuffer>
-__global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
-                                             std::bool_constant<UseAuxBuffer>) {
-    constexpr const int bdx = 4;
-    constexpr const int bdy = WARP_SIZE / bdx;
-    assert(blockDim.x == bdx);
-    assert(blockDim.y == bdy);
+// (in the description below, we assume "column major" layout like cuBLAS/FORTRAN but unlike C/C++)
+// general reduction kernel for any minor axis, could be used for other things than bias backward!
+// bias backward: OC columns and B*T rows ==> per-column sum reduction with OC outputs in dbias
+// each block handles (blockIdx.x * x128::size) columns and (blockIdx.y) rows
+// data layout is column major => contiguous for column X and X+1 (row_stride elements across rows)
+// ==> 128B coalesced loads with BF16 require blockIdx.x >= 8 (64 columns per block)
+// with few columns (OC), we want smaller blockIdx.x to get more blocks and better GPU utilisation
+// (see comments in /dev/cuda/matmul_backward_bias.cu for even more information)
+template <int block_dim_x=2, int block_dim_y=512, bool accumulate=true, typename OutFloat=floatX>
+__global__ void column_reduction_kernel(OutFloat* output, const floatX* input,
+                                        int num_rows, int num_columns, int row_stride) {
+    assert(block_dim_x == blockDim.x && block_dim_y == blockDim.y); // check template parameters
+    assert(num_columns == gridDim.x * block_dim_x * x128::size); // must match, no partial blocks
+    constexpr int block_size = block_dim_x * block_dim_y;
+    __shared__ float smem[block_size * x128::size];
 
-    int warp_d = (int)threadIdx.x;
-    int warp_c = (int)threadIdx.y;
-    int block_d = (int)threadIdx.z;
+    float column_sum[x128::size] = {0.0f}; // per-thread (partial column) FP32 accumulator
+    int column_idx = (blockIdx.x * block_dim_x + threadIdx.x) * x128::size;
+    int smem_idx = threadIdx.x + threadIdx.y * block_dim_x; // smem idx for this thread with k=0
 
-    const int OC_per_warp = bdy * x128::size;  // 64 at BF16
-
-    int local_oc = warp_c * x128::size;
-    int global_oc = blockIdx.x * OC_per_warp + local_oc;
-
-    int local_bt = warp_d + bdx * block_d;
-    int bt_per_block = bdx * blockDim.z;
-
-    float accumulators[x128::size];
+    #pragma unroll 4
+    for (int row = threadIdx.y; row < num_rows; row += block_dim_y) {
+        x128 packed_dout = load128(input + column_idx + row * row_stride);
+        for (int k = 0; k < x128::size; k++) {
+            column_sum[k] += (float)packed_dout[k];
+        }
+    }
+    // todo - currently don't use f128 for smem, so we stride by block_size to avoid bank conflicts
     for (int k = 0; k < x128::size; k++) {
-        accumulators[k] = 0.0f;
+        smem[smem_idx + k * block_size] = column_sum[k]; // write column partial sums to shared mem
     }
 
-    if(global_oc < OC) {
-        // sum up over all bt within registers
-        for (int idx = blockIdx.y * bt_per_block + local_bt; idx < B * T; idx += gridDim.y * bt_per_block) {
-            x128 packed_dout = load128(dout + global_oc + idx*OC);
+    // blockDim.y threads are all processing the same column, so we need to add up their sums
+    // i.e. we calculate (blockDim.x * x128::size) final sums in parallel (one per column)
+    // so with blockDim.x = 8, we avoid the parts of the reduction with only 1/2/4 active threads
+    for (int stride = block_size/2; stride >= block_dim_x; stride /= 2) {
+        __syncthreads();
+        if (threadIdx.y * block_dim_x < stride) {
             for (int k = 0; k < x128::size; k++) {
-                accumulators[k] += (float)packed_dout[k];
+                int smem_idx_k = smem_idx + k * block_size;
+                smem[smem_idx_k] = smem[smem_idx_k] + smem[smem_idx_k + stride];
             }
         }
-    }
+    } // no __syncthreads() needed because smem read below was written by the same thread
 
-    __shared__ float sub_results[x128::size][WARP_SIZE][bdy];
-
-    // reduce within-warp results
-    for (int k = 0; k < x128::size; k++) {
-        float v = accumulators[k];
-        v += __shfl_down_sync(0xffffffff, v, 1, 4);
-        v += __shfl_down_sync(0xffffffff, v, 2, 4);
-        if(warp_d == 0) {
-            sub_results[k][block_d][warp_c] = v;
+    if (threadIdx.y == 0) {
+        // accumulate if necessary (e.g. gradient accumulation for multiple micro-batches per batch)
+        // one output per column (e.g. 1 bias parameter gradient per OC)
+        x128 output128 = accumulate ? load128(output + column_idx) : x128::zeros();
+        for (int k = 0; k < x128::size; k++) {
+            output128[k] = (OutFloat)((float)output128[k] + smem[threadIdx.x + k * block_size]);
         }
-    }
-    __syncthreads();
-
-    // block-wide reductions
-    for (int k = block_d; k < x128::size; k += blockDim.z) {
-        float a = 0.f;
-        for (int r = warp_d; r < blockDim.z; r += bdx) {
-            float v = sub_results[k][r][warp_c];
-            v += __shfl_down_sync(0xffffffff, v, 1, 4);
-            v += __shfl_down_sync(0xffffffff, v, 2, 4);
-            a += v;
-        }
-        if(warp_d == 0 && global_oc < OC) {
-            if constexpr (!UseAuxBuffer) {
-                dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
-            } else {
-                dbias[global_oc + k + blockIdx.y * OC] = a;
-            }
-        }
-    }
-}
-
-__global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, size_t m) {
-    const size_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * f128::size;
-    assert(n % x128::size == 0);
-    if (idx < n) {
-        f128 acc;
-        for(int k = 0; k < f128::size; ++k) {
-            acc[k] = 0.f;
-        }
-
-        for(int l = 0; l < m; ++l) {
-            f128 s = load128(src + idx + n * l);
-            for(int k = 0; k < f128::size; ++k) {
-                acc[k] += s[k];
-            }
-        }
-        for(int k = 0; k < f128::size; ++k) {
-            dst[idx + k] = (floatX) ((float)dst[idx + k] + acc[k]);
-        }
+        store128(output + column_idx, output128);
     }
 }
 
@@ -250,28 +218,30 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
 
     // backward to bias, if given, does a +=
     if (dbias != NULL) {
-        // Each warp is responsible for 8 * "x128::size" = 64 OCs at BF16 (OC must be a multiple of 64!)
-        // Block size is 1024 | 768 threads (32|24 warps) and we reduce those values into 1 at the end
+        // 1 block per SM and blockIdx.x=2 ==> need (2*2*x128::size) columns per SM ==> 16 at BF16
+        // 768/16 ==> 48 SMs (out of 132 on H100) active for small bias kernels on 124M GPT2 models
+        // 3072/16 ==> 192 which is good but 96 with blockIdx.x=4 is faster due to better coalescing
+        // ===>
+        // 1) Set block_size_x = 8. If we get less than 0.5 or 0.25 blocks per SM, reduce to 4 or 2.
+        // 2) 1024-wide blocks unless block_size_x=8 with more than 2 blocks per SM, then use 512-wide
+        int block_size_x = 8;
+        int total_blocks = OC / (block_size_x * x128::size);
+        int num_SMs = deviceProp.multiProcessorCount;
 
-        const int block_size = deviceProp.maxThreadsPerMultiProcessor == 1536 ? 768 : 1024;
+        if (total_blocks <= num_SMs / 4) { block_size_x = 2, total_blocks *= 4; }
+        else if (total_blocks <= num_SMs / 2) { block_size_x = 4, total_blocks *= 2; }
+        assert(OC == total_blocks * block_size_x * x128::size);
 
-        dim3 block_dim = {4, 8, (unsigned)block_size/WARP_SIZE};
-        const int OC_per_warp = block_dim.y * x128::size; // 64 at BF16
-        const int grid_size_x = CEIL_DIV(OC, OC_per_warp); // e.g. 12 horizontal blocks for 768 OCs at BF16
-        const int grid_size_y = max(1, deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / (block_size * grid_size_x)); // full GPU!
-
-        // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
-        // and write results directly to the output.
-        if(grid_size_y == 1) {
-            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim, 0, stream>>>(dbias, dout, B, T, OC, False);
-            cudaCheck(cudaGetLastError());
-        } else {
-            // kernel 9 overwrites temp buffer, so no need to memset
-            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim, 0, stream>>>(dbias_buffer, dout, B, T, OC, True);
-            cudaCheck(cudaGetLastError());
-            reduce_add_sum_kernel<<<CEIL_DIV(OC, 256 * f128::size), 256, 0, stream>>>(dbias, dbias_buffer, OC, grid_size_y);
-            cudaCheck(cudaGetLastError());
+        int block_size = (total_blocks <= num_SMs * 2) ? 1024 : 512;
+        //printf("block_size_x: %d, total_blocks: %d, block_size_512: %d\n", block_size_x, total_blocks, block_size_512);
+        switch (block_size_x) {
+            case 2: column_reduction_kernel<2, 512><<<total_blocks, dim3(2, 512)>>>(dbias, dout, B*T, OC, OC); break;
+            case 4: column_reduction_kernel<4, 256><<<total_blocks, dim3(4, 256)>>>(dbias, dout, B*T, OC, OC); break;
+            case 8: if (block_size == 1024) { column_reduction_kernel<8, 128><<<total_blocks, dim3(8, 128)>>>(dbias, dout, B*T, OC, OC); }
+                    else { column_reduction_kernel<8, 64><<<total_blocks, dim3(8, 64)>>>(dbias, dout, B*T, OC, OC); }
+                    break;
         }
+        cudaCheck(cudaGetLastError());
         dbias = NULL; // prevent dbias calculation from also being fused in matmul_cublaslt below (if we enabled fusion)
     }
 
