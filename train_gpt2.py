@@ -1,47 +1,28 @@
 """
-Reference code for LLaMA-3.1 training and inference.
+Reference code for GPT-2 training and inference.
 Will save the model weights into files, to be read from C as initialization.
 
-This code differs from GPT-2 very slightly, there are three main differences:
-1) RoPE: LLaMA uses a different positional encoding scheme called Relative Positional Encoding (RoPE).
-2) GQA: Grouped Query Attention (GQA) is used to reduce the number of attention heads.
-3) SwiGLU: Swish-Gated Linear Unit (SwiGLU) is used as the activation function in the MLP.
-
 References:
-# 1) https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/tokenizer.py
-# 2) https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/model.py
-# 3) https://github.com/meta-llama/llama3/blob/11817d47e1ba7a4959b025eb1ca308572e0e3963/llama/generation.py
+1) the official GPT-2 TensorFlow implementation released by OpenAI:
+https://github.com/openai/gpt-2/blob/master/src/model.py
+2) huggingface/transformers PyTorch implementation:
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 
 Example launches to only benchmark the speed of bfloat16 compiled GPU training:
 1 GPU:
-python train_llama3.py --write_tensors=0 --num_iterations=50 --sequence_length=8192 --compile=1 --tensorcores=1 --dtype=bfloat16
+python train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
 you can also turn on flash-attention by appending --flash=1
 4 GPU:
-torchrun --standalone --nproc_per_node=4 train_llama3.py --write_tensors=0 --num_iterations=50 --sequence_length=8192 --compile=1 --tensorcores=1 --dtype=bfloat16
+torchrun --standalone --nproc_per_node=4 train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
 """
 
 import os
 import math
 import glob
+import struct
 import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass
-import json
-from pathlib import Path
-from typing import (
-    AbstractSet,
-    Callable,
-    Collection,
-    Dict,
-    Iterator,
-    List,
-    Literal,
-    Optional,
-    Sequence,
-    Tuple,
-    Union,
-    cast,
-)
 
 import numpy as np
 import torch
@@ -53,153 +34,54 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.distributed.optim import ZeroRedundancyOptimizer
 import torch.distributed as dist
 
-import tiktoken
-from tiktoken.load import load_tiktoken_bpe
-
 # -----------------------------------------------------------------------------
-# PyTorch nn.Module definitions for the LLaMA 3.x model
+# PyTorch nn.Module definitions for the GPT-2 model
+
+class NewGELU(nn.Module):
+    """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
+    def forward(self, input):
+        return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
 
 # using a global to toggle flash-attention
 FLASH = 0
-
-# Used in Grouped Query Attention (GQA), broadcasts the key and value tensors
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
-
-# -----------------------------------------------------------------------------
-# RoPE related
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
-
-def apply_scaling(freqs: torch.Tensor):
-    # Values obtained from grid search
-    scale_factor = 8
-    low_freq_factor = 1
-    high_freq_factor = 4
-    old_context_len = 8192  # original llama3 length
-
-    low_freq_wavelen = old_context_len / low_freq_factor
-    high_freq_wavelen = old_context_len / high_freq_factor
-    new_freqs = []
-    for freq in freqs:
-        wavelen = 2 * math.pi / freq
-        if wavelen < high_freq_wavelen:
-            new_freqs.append(freq)
-        elif wavelen > low_freq_wavelen:
-            new_freqs.append(freq / scale_factor)
-        else:
-            assert low_freq_wavelen != high_freq_wavelen
-            smooth = (old_context_len / wavelen - low_freq_factor) / (
-                high_freq_factor - low_freq_factor
-            )
-            new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
-    return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
-
-def precompute_freqs_cis(
-    dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False
-):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    if use_scaled:
-        freqs = apply_scaling(freqs)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-# -----------------------------------------------------------------------------
-# LLaMA building blocks
-
-class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
 
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_rep = self.n_head // self.n_kv_head
-        self.hd = config.n_embd // config.n_head
-        self.use_kv = config.use_kv
-
-        self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.hd, bias=False)  # key, query, value projections
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)  # output projection
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        # regularization
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                     .view(1, 1, config.block_size, config.block_size))
 
-        # static KV cache - we could alternatively allocate it outside of the model and just pass it in when needed
-        if self.use_kv:
-            self.cache_k = torch.zeros((config.max_gen_batch_size, config.block_size, config.n_kv_head, self.hd))
-            self.cache_v = torch.zeros((config.max_gen_batch_size, config.block_size, config.n_kv_head, self.hd))
-
-    def forward(self, x, freqs_cis=None, start_pos=None, mask: Optional[torch.Tensor] = None):
+    def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
-        q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
-        q, k, v = map(lambda t: t.view(B, T, -1, self.hd), (q, k, v))  # (B, T, NH, HD)
-
-        q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)  <-- 1. difference compared to GPT-2
-
-        if self.use_kv and not self.training and start_pos >= 0:  # use kv-caching during inference
-            self.cache_k[:B, start_pos : start_pos + T] = k
-            self.cache_v[:B, start_pos : start_pos + T] = v
-            k = self.cache_k[:B, : start_pos + T]
-            v = self.cache_v[:B, : start_pos + T]
-
-        k = repeat_kv(k, self.n_rep)  # GQA <-- 2. difference compared to GPT-2
-        v = repeat_kv(v, self.n_rep)
-
-        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # (B, NH, T, HD)
-
+        q, k, v = qkv.split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         if FLASH:
             # flashattention
-            y = F.scaled_dot_product_attention(q, k, v, mask)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
             # manual implementation of attention
             # this materializes the large (T,T) matrix for all the queries and keys
-            scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.hd))
-            if mask is not None:
-                scores.masked_fill_(mask, torch.finfo(scores.dtype).min)
-            att = F.softmax(scores.float(), dim=-1).type_as(q)
-            y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        # output projection
         y = self.c_proj(y)
         return y
 
@@ -207,23 +89,14 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        hidden_dim = 4 * config.n_embd
-        hidden_dim = int(2 * hidden_dim / 3)
-        # custom dim factor multiplier
-        if config.ffn_dim_multiplier is not None:
-            hidden_dim = int(config.ffn_dim_multiplier * hidden_dim)
-        hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
-        self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_fc2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.gelu    = NewGELU()
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
     def forward(self, x):
-        # SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))  <-- 3. difference compared to GPT-2
-        x1 = self.c_fc(x)
-        x2 = self.c_fc2(x)
-        x2 = F.silu(x2)
-        x = x1 * x2
+        x = self.c_fc(x)
+        x = self.gelu(x)
         x = self.c_proj(x)
         return x
 
@@ -231,45 +104,28 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = RMSNorm(config.n_embd, config.norm_eps)
+        self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = RMSNorm(config.n_embd, config.norm_eps)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x, freqs_cis=None, start_pos=None, mask: Optional[torch.Tensor] = None):
-        x = x + self.attn(self.ln_1(x), freqs_cis, start_pos, mask)
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
 # -----------------------------------------------------------------------------
-# The main LLaMA 3.1 model
+# The main GPT-2 model
 
 @dataclass
-class LlamaConfig:
-    version: str = "3.1"
-    block_size: int = 8192
-    vocab_size: int = 128256
-    n_layer: int = 32
-    n_head: int = 32
-    n_kv_head: int = 8
-    n_embd: int = 4096
-    ffn_dim_multiplier: float = 1.3
-    multiple_of: int = 1024
-    norm_eps: float = 1e-5
-    rope_theta: float = 500000.0
-    use_scaled_rope: bool = True
-    max_gen_batch_size: int = 4
-    use_kv: bool = True
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50257
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
 
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            if hasattr(self, k):
-                setattr(self, k, v)
-        assert self.n_kv_head <= self.n_head
-        assert self.n_head % self.n_kv_head == 0
-        assert self.n_embd % self.n_head == 0
-
-class LLaMA(nn.Module):
+class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -277,43 +133,54 @@ class LLaMA(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = RMSNorm(config.n_embd, config.norm_eps),
+            ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
+        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights, use a torch rng object to be very careful
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(42)
+        self.apply(self._init_weights)
 
-        self.freqs_cis = precompute_freqs_cis(
-            config.n_embd // config.n_head,
-            config.block_size * 2,
-            config.rope_theta,
-            config.use_scaled_rope,
-        )
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # apply special scaled init to the residual projections, per GPT-2 paper
+            std = 0.02 if not hasattr(module, 'LLMC_RESIDUAL_SCALE_FLAG') else 0.02/math.sqrt(2 * self.config.n_layer)
+            # we want to skip initializing lm_head, which shares parameters with wte
+            # and wte was already initialized down below during the Embedding init
+            if not hasattr(module, 'LLMC_SKIP_INIT'):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=std, generator=self.init_rng)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
 
-    def forward(self, idx, targets=None, return_logits=True, start_pos=0):
-        _, t = idx.size()
+    def forward(self, idx, targets=None, return_logits=True):
+        device = idx.device
+        b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
-        # forward the LLaMA model itself
-        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        freqs_cis = self.freqs_cis[start_pos:start_pos+t]
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = tok_emb + pos_emb
 
-        mask = torch.triu(torch.ones((t, t), device=next(self.parameters()).device, dtype=torch.bool), diagonal=1)
-
-        for i, block in enumerate(self.transformer.h):
-            x = block(x, freqs_cis, start_pos, mask)
+        for block in self.transformer.h:
+            x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x).float()
+            logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]).float() # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
         # there are performance reasons why not returning logits is prudent, if not needed
@@ -322,123 +189,53 @@ class LLaMA(nn.Module):
 
         return logits, loss
 
-    @staticmethod
-    def adapt_llama_state_dict_keys(checkpoint, config: LlamaConfig):
-        checkpoint['transformer.wte.weight'] = checkpoint.pop('tok_embeddings.weight')
-
-        for i in range(config.n_layer):
-            for name in ['attention_norm', 'ffn_norm']:
-                old_key = f'layers.{i}.{name}.weight'  # e.g. layers.x.attention_norm.weight -> transformer.h.x.ln_1.weight
-                new_key = f'transformer.h.{i}.ln_{1 if name == "attention_norm" else 2}.weight'
-                checkpoint[new_key] = checkpoint.pop(old_key)
-
-        for i in range(config.n_layer):
-            for name in ['attention.wq', 'attention.wk', 'attention.wv']:
-                old_key = f'layers.{i}.{name}.weight'
-                new_key = f'transformer.h.{i}.attn.c_attn.weight'
-                if name == 'attention.wq':
-                    checkpoint[new_key] = checkpoint.pop(old_key)
-                else:  # merge 3 weights into transformer.h.x.attn.c_attn.weight
-                    checkpoint[new_key] = torch.cat((checkpoint[new_key], checkpoint.pop(old_key)), dim=0)
-            old_key = f'layers.{i}.attention.wo.weight'
-            new_key = f'transformer.h.{i}.attn.c_proj.weight'
-            checkpoint[new_key] = checkpoint.pop(old_key)
-
-        ffn_map = {'w1': 'c_fc2', 'w2': 'c_proj', 'w3': 'c_fc'}
-        for i in range(config.n_layer):
-            for name in ['feed_forward.w1', 'feed_forward.w2', 'feed_forward.w3']:
-                old_key = f'layers.{i}.{name}.weight'
-                new_key = f'transformer.h.{i}.mlp.{ffn_map[name.split(".")[-1]]}.weight'
-                checkpoint[new_key] = checkpoint.pop(old_key)
-
-        checkpoint['transformer.ln_f.weight'] = checkpoint.pop('norm.weight')
-        checkpoint['lm_head.weight'] = checkpoint.pop('output.weight')
-
-        return checkpoint
-
-    @staticmethod
-    def adapt_llama_state_dict_keys_hf(checkpoint, config: LlamaConfig):
-        checkpoint['transformer.wte.weight'] = checkpoint.pop('model.embed_tokens.weight')
-
-        # We need to unpermute K and V because HF script permuted the original Meta-LLaMA weights
-        # see: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/convert_llama_weights_to_hf.py
-        def unpermute(w, n_heads, dim1, dim2):
-            return w.view(n_heads, 2, dim1 // n_heads // 2, dim2).transpose(1, 2).reshape(dim1, dim2)
-
-        for i in range(config.n_layer):
-            for name in ['input_layernorm', 'post_attention_layernorm']:
-                old_key = f'model.layers.{i}.{name}.weight'  # e.g. layers.x.attention_norm.weight -> transformer.h.x.ln_1.weight
-                new_key = f'transformer.h.{i}.ln_{1 if name == "input_layernorm" else 2}.weight'
-                checkpoint[new_key] = checkpoint.pop(old_key)
-
-        for i in range(config.n_layer):
-            for name in ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj']:
-                old_key = f'model.layers.{i}.{name}.weight'
-                new_key = f'transformer.h.{i}.attn.c_attn.weight'
-                if name == 'self_attn.q_proj':
-                    checkpoint[new_key] = unpermute(checkpoint.pop(old_key), config.n_head, config.n_embd, config.n_embd)
-                else:  # merge 3 weights into transformer.h.x.attn.c_attn.weight
-                    tensor = checkpoint.pop(old_key)
-                    if name == 'self_attn.k_proj':
-                        tensor = unpermute(tensor, config.n_kv_head, config.n_kv_head * (config.n_embd // config.n_head), config.n_embd)
-                    checkpoint[new_key] = torch.cat((checkpoint[new_key], tensor), dim=0)
-            old_key = f'model.layers.{i}.self_attn.o_proj.weight'
-            new_key = f'transformer.h.{i}.attn.c_proj.weight'
-            checkpoint[new_key] = checkpoint.pop(old_key)
-
-        ffn_map = {'gate_proj': 'c_fc2', 'down_proj': 'c_proj', 'up_proj': 'c_fc'}
-        for i in range(config.n_layer):
-            for name in ['gate_proj', 'down_proj', 'up_proj']:
-                old_key = f'model.layers.{i}.mlp.{name}.weight'
-                new_key = f'transformer.h.{i}.mlp.{ffn_map[name]}.weight'
-                checkpoint[new_key] = checkpoint.pop(old_key)
-
-        checkpoint['transformer.ln_f.weight'] = checkpoint.pop('model.norm.weight')
-
-        return checkpoint
-
     @classmethod
-    def from_pretrained_llama3_hf(cls, model_id):
-        """Loads pretrained LLaMA model weights from HuggingFace"""
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        assert model_id == "meta-llama/Meta-Llama-3.1-8B", "Only the 8B-bae model is supported for now"
-        model_args = LlamaConfig()
+    def from_pretrained(cls, model_type):
+        """Loads pretrained GPT-2 model weights from huggingface"""
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        from transformers import GPT2LMHeadModel
+        print("loading weights from pretrained gpt: %s" % model_type)
 
-        model = AutoModelForCausalLM.from_pretrained(model_id)
-        checkpoint = LLaMA.adapt_llama_state_dict_keys_hf(model.state_dict(), model_args)
+        # n_layer, n_head and n_embd are determined from model_type
+        config_args = {
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+        }[model_type]
+        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+        # create a from-scratch initialized minGPT model
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
-        original_default_type = torch.get_default_dtype()  # save the default type
-        torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)  # much faster loading
-        model = LLaMA(model_args)
-        model.load_state_dict(checkpoint, strict=False)
-        torch.set_default_tensor_type(torch.tensor([], dtype=original_default_type, device="cpu").type())  # restore default type
+        # init a huggingface/transformers model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
 
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        tokenizer.pad_id = 128004  # this is the pad token id for LLaMA 3.1 base, we need to set this explicitly as our generate func expects it
-        tokenizer.stop_tokens = [tokenizer.eos_token_id]
-        model.tokenizer = tokenizer
-        return model
+        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # special treatment for the Conv1D weights we need to transpose
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                # vanilla copy over the other parameters
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
 
-    @classmethod
-    def from_pretrained_llama3_meta(cls, ckpt_dir, tokenizer_path):
-        """Loads pretrained LLaMA model weights from a checkpoint directory"""
-        model_args = LlamaConfig()
-
-        ckpt_path = sorted(Path(ckpt_dir).glob("*.pth"))[0]
-        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        checkpoint = LLaMA.adapt_llama_state_dict_keys(checkpoint, model_args)
-
-        original_default_type = torch.get_default_dtype()  # save the default type
-        torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)  # much faster loading
-        model = LLaMA(model_args)
-        model.load_state_dict(checkpoint, strict=False)
-        torch.set_default_tensor_type(torch.tensor([], dtype=original_default_type, device="cpu").type())  # restore default type
-
-        tokenizer = Tokenizer(model_path=tokenizer_path)
-        # add <|end_of_text|> as the stop token for base model - this is an omission in the reference code
-        # the reference code only adds instruct model stop tokens...
-        tokenizer.stop_tokens = tokenizer.stop_tokens + [128001]
-        model.tokenizer = tokenizer
         return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage):
@@ -472,314 +269,32 @@ class LLaMA(nn.Module):
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
         return optimizer
 
-    @torch.inference_mode()
-    def generate(
-        self,
-        prompt_tokens: List[List[int]],
-        max_gen_len: int,
-        temperature: float = 0.6,
-        top_p: float = 0.9,
-        logprobs: bool = False,
-        echo: bool = False,
-    ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Generate text sequences based on provided prompts using the language generation model.
-
-        Args:
-            prompt_tokens (List[List[int]]): List of tokenized prompts, where each prompt is represented as a list of integers.
-            max_gen_len (int): Maximum length of the generated text sequence.
-            temperature (float, optional): Temperature value for controlling randomness in sampling. Defaults to 0.6.
-            top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
-            logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
-            echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
-
-        Returns:
-            Tuple[List[List[int]], Optional[List[List[float]]]]: A tuple containing generated token sequences and, if logprobs is True, corresponding token log probabilities.
-
-        Note:
-            This method uses the provided prompts as a basis for generating text. It employs nucleus sampling to produce text with controlled randomness.
-            If logprobs is True, token log probabilities are computed for each generated token.
-
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        bsz = len(prompt_tokens)
-        assert bsz <= self.config.max_gen_batch_size, (bsz, self.config.max_gen_batch_size)
-        device = next(self.parameters()).device
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
 
-        min_prompt_len = min(len(t) for t in prompt_tokens)
-        max_prompt_len = max(len(t) for t in prompt_tokens)
-        assert max_prompt_len <= self.config.block_size
-        total_len = min(self.config.block_size, max_gen_len + max_prompt_len)
-
-        pad_id = self.tokenizer.pad_id
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
-        for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
-        if logprobs:
-            token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
-
-        prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device=device)
-        input_text_mask = tokens != pad_id
-
-        if min_prompt_len == total_len:
-            logits, _ = self.forward(tokens, start_pos=prev_pos)
-            token_logprobs = -F.cross_entropy(
-                input=logits.transpose(1, 2),
-                target=tokens,
-                reduction="none",
-                ignore_index=pad_id,
-            )
-
-        stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens)).to(device)
-
-        for cur_pos in range(min_prompt_len, total_len):
-            logits, _ = self.forward(tokens[:, prev_pos:cur_pos], start_pos=prev_pos)
-            if temperature > 0:
-                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-                next_token = sample_top_p(probs, top_p)
-            else:
-                next_token = torch.argmax(logits[:, -1], dim=-1)
-
-            next_token = next_token.reshape(-1)
-            # only replace token if prompt has already been generated
-            next_token = torch.where(
-                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
-            )
-            tokens[:, cur_pos] = next_token
-            if logprobs:
-                token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
-                    input=logits.transpose(1, 2),
-                    target=tokens[:, prev_pos + 1 : cur_pos + 1],
-                    reduction="none",
-                    ignore_index=pad_id,
-                )
-            eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                torch.isin(next_token, stop_tokens)
-            )
-            prev_pos = cur_pos
-            if all(eos_reached):
-                break
-
-        if logprobs:
-            token_logprobs = token_logprobs.tolist()
-        out_tokens, out_logprobs = [], []
-        for i, toks in enumerate(tokens.tolist()):
-            # cut to max gen len
-            start = 0 if echo else len(prompt_tokens[i])
-            toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
-            probs = None
-            if logprobs:
-                probs = token_logprobs[i][start : len(prompt_tokens[i]) + max_gen_len]
-            # cut to after eos tok if any
-            for stop_token in self.tokenizer.stop_tokens:
-                try:
-                    eos_idx = toks.index(stop_token)
-                    toks = toks[:eos_idx]
-                    probs = probs[:eos_idx] if logprobs else None
-                except ValueError:
-                    pass
-            out_tokens.append(toks)
-            out_logprobs.append(probs)
-        return (out_tokens, out_logprobs if logprobs else None)
-
-# -----------------------------------------------------------------------------
-# sampling utils
-
-def sample_top_p(probs, p):
-    """
-    Perform top-p (nucleus) sampling on a probability distribution.
-
-    Args:
-        probs (torch.Tensor): Probability distribution tensor.
-        p (float): Probability threshold for top-p sampling.
-
-    Returns:
-        torch.Tensor: Sampled token indices.
-
-    Note:
-        Top-p sampling selects the smallest set of tokens whose cumulative probability mass
-        exceeds the threshold p. The distribution is renormalized based on the selected tokens.
-    """
-    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    mask = probs_sum - probs_sort > p
-    probs_sort[mask] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    next_token = torch.multinomial(probs_sort, num_samples=1)
-    next_token = torch.gather(probs_idx, -1, next_token)
-    return next_token
-
-# -----------------------------------------------------------------------------
-# Llama 3.1 Tokenizer
-
-# The tiktoken tokenizer can handle <=400k chars without
-# pyo3_runtime.PanicException.
-TIKTOKEN_MAX_ENCODE_CHARS = 400_000
-
-# https://github.com/openai/tiktoken/issues/195
-# Here we iterate over subsequences and split if we exceed the limit
-# of max consecutive non-whitespace or whitespace characters.
-MAX_NO_WHITESPACES_CHARS = 25_000
-
-
-class Tokenizer:
-    """
-    Tokenizing and encoding/decoding text using the Tiktoken tokenizer.
-    """
-
-    special_tokens: Dict[str, int]
-
-    num_reserved_special_tokens = 256
-
-    pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"  # noqa: E501
-
-    def __init__(self, model_path: str):
-        """
-        Initializes the Tokenizer with a Tiktoken model.
-
-        Args:
-            model_path (str): The path to the Tiktoken model file.
-        """
-        assert os.path.isfile(model_path), model_path
-
-        mergeable_ranks = load_tiktoken_bpe(model_path)
-        num_base_tokens = len(mergeable_ranks)
-        special_tokens = [
-            "<|begin_of_text|>",
-            "<|end_of_text|>",
-            "<|reserved_special_token_0|>",
-            "<|reserved_special_token_1|>",
-            "<|finetune_right_pad_id|>",
-            "<|step_id|>",
-            "<|start_header_id|>",
-            "<|end_header_id|>",
-            "<|eom_id|>",  # end of message
-            "<|eot_id|>",  # end of turn
-            "<|python_tag|>",
-        ]
-        reserved_tokens = [
-            f"<|reserved_special_token_{2 + i}|>"
-            for i in range(self.num_reserved_special_tokens - len(special_tokens))
-        ]
-        special_tokens = special_tokens + reserved_tokens
-
-        self.special_tokens = {
-            token: num_base_tokens + i for i, token in enumerate(special_tokens)
-        }
-        self.model = tiktoken.Encoding(
-            name=Path(model_path).name,
-            pat_str=self.pat_str,
-            mergeable_ranks=mergeable_ranks,
-            special_tokens=self.special_tokens,
-        )
-
-        self.n_words: int = num_base_tokens + len(special_tokens)
-        # BOS / EOS token IDs
-        self.bos_id: int = self.special_tokens["<|begin_of_text|>"]
-        self.eos_id: int = self.special_tokens["<|end_of_text|>"]
-        self.eot_id: int = self.special_tokens["<|eot_id|>"]
-        self.eom_id: int = self.special_tokens["<|eom_id|>"]
-        self.python_tag_id = self.special_tokens["<|python_tag|>"]
-        self.pad_id: int = self.special_tokens["<|finetune_right_pad_id|>"]
-        self.stop_tokens = [
-            self.special_tokens["<|eom_id|>"],
-            self.special_tokens["<|eot_id|>"],
-        ]
-
-    def encode(
-        self,
-        s: str,
-        *,
-        bos: bool,
-        eos: bool,
-        allowed_special: Optional[Union[Literal["all"], AbstractSet[str]]] = None,
-        disallowed_special: Union[Literal["all"], Collection[str]] = (),
-    ) -> List[int]:
-        """
-        Encodes a string into a list of token IDs.
-
-        Args:
-            s (str): The input string to be encoded.
-            bos (bool): Whether to prepend the beginning-of-sequence token.
-            eos (bool): Whether to append the end-of-sequence token.
-            allowed_tokens ("all"|set[str]): allowed special tokens in string
-            disallowed_tokens ("all"|set[str]): special tokens that raise an error when in string
-
-        Returns:
-            list[int]: A list of token IDs.
-
-        By default, setting disallowed_special=() encodes a string by ignoring
-        special tokens. Specifically:
-        - Setting `disallowed_special` to () will cause all text corresponding
-          to special tokens to be encoded as natural text (insteading of raising
-          an error).
-        - Setting `allowed_special` to "all" will treat all text corresponding
-          to special tokens to be encoded as special tokens.
-        """
-        if allowed_special is None:
-            allowed_special = set()
-        assert type(s) is str
-
-        substrs = (
-            substr
-            for i in range(0, len(s), TIKTOKEN_MAX_ENCODE_CHARS)
-            for substr in self._split_whitespaces_or_nonwhitespaces(
-                s[i : i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
-            )
-        )
-        t: List[int] = []
-        for substr in substrs:
-            t.extend(
-                self.model.encode(
-                    substr,
-                    allowed_special=allowed_special,
-                    disallowed_special=disallowed_special,
-                )
-            )
-        if bos:
-            t.insert(0, self.bos_id)
-        if eos:
-            t.append(self.eos_id)
-        return t
-
-    def decode(self, t: Sequence[int]) -> str:
-        """
-        Decodes a list of token IDs into a string.
-
-        Args:
-            t (List[int]): The list of token IDs to be decoded.
-
-        Returns:
-            str: The decoded string.
-        """
-        # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
-        return self.model.decode(cast(List[int], t))
-
-    @staticmethod
-    def _split_whitespaces_or_nonwhitespaces(
-        s: str, max_consecutive_slice_len: int
-    ) -> Iterator[str]:
-        """
-        Splits the string `s` so that each substring contains no more than `max_consecutive_slice_len`
-        consecutive whitespaces or consecutive non-whitespaces.
-        """
-        current_slice_len = 0
-        current_slice_is_space = s[0].isspace() if len(s) > 0 else False
-        slice_start = 0
-
-        for i in range(len(s)):
-            is_now_space = s[i].isspace()
-
-            if current_slice_is_space ^ is_now_space:
-                current_slice_len = 1
-                current_slice_is_space = is_now_space
-            else:
-                current_slice_len += 1
-                if current_slice_len > max_consecutive_slice_len:
-                    yield s[slice_start:i]
-                    slice_start = i
-                    current_slice_len = 1
-        yield s[slice_start:]
+        return idx
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -878,54 +393,83 @@ def write_bf16(tensor, file):
     file.write(b)
 
 def write_tensors(model_tensors, L, file, dtype):
-    # writes LLaMA 3 model's weights to a binary file
+    # writes the GPT-2 model's weights to a binary file
     assert dtype in {"float32", "bfloat16"}
     write_fun = write_fp32 if dtype == "float32" else write_bf16
     write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
+    write_fun(model_tensors["transformer.wpe.weight"], file) # (T, C)
     for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+    for i in range(L): # (L, C)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
     for i in range(L): # (L, 3C, C)
         write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
+    for i in range(L): # (L, 3C)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.bias"], file)
     for i in range(L): # (L, C, C)
         write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
     for i in range(L): # (L, C)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
+    for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+    for i in range(L): # (L, C)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
     for i in range(L): # (L, 4C, C)
         write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
-    for i in range(L): # (L, 4C, C)
-        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc2.weight"], file)
+    for i in range(L): # (L, 4C)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.bias"], file)
     for i in range(L): # (L, C, 4C)
         write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
+    for i in range(L): # (L, C)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
     write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
-    write_fun(model_tensors["lm_head.weight"], file) # (V, C)
+    write_fun(model_tensors["transformer.ln_f.bias"], file) # (C, )
+
+@torch.no_grad()
+def pad_vocab(tensor, multiple=128, value=0):
+    """
+    The dimension of the vocab size in GPT-2 is 50,257
+    which is unfortunately a very unfriendly number for a lot of
+    matrix operations on the GPU. So we pad it to the nearest
+    friendlier multiple, e.g. 50,304 if multiple=128 when we
+    export the weights into C land. This is a NOOP algorithmically
+    and is only done to make the tensor operations more efficient.
+    """
+    assert tensor.ndim == 2
+    V, C = tensor.shape
+    assert V == 50257, "just being defensive here"
+    # calculate padded vocab size by rounding up to nearest multiple
+    Vp = ((V + multiple - 1) // multiple) * multiple
+    # pad the tensor
+    pad_rows = Vp - V
+    padded = tensor if pad_rows == 0 else F.pad(tensor, (0, 0, 0, pad_rows), value=value)
+    assert padded.shape == (Vp, C)
+    return padded
 
 def write_model(model, filename, dtype):
     # everything we need to instantiate the model
-    # 1) header is: version int, LLaMAConfig ints, padding to 1024 bytes
-    assert dtype in {"float32", "bfloat16"}
+    # 1) header is: version int, GPTConfig ints, padding to 1024 bytes
+    assert dtype in {"float32", "bfloat16"} # float16 todo maybe later
     version = {
-        "float32": 3, # 3: all tensors are fp32
-        "bfloat16": 5, # 5: all tensors are bf16
+        "float32": 3, # 3: all tensors are fp32, padded vocab
+        "bfloat16": 5, # 5: all tensors are bf16, padded vocab
     }[dtype]
     header = torch.zeros(256, dtype=torch.int32)
-    header[0] = 20240803 # magic
+    header[0] = 20240326 # magic
     header[1] = version # checkpoint version
     header[2] = model.config.block_size
     header[3] = model.config.vocab_size
     header[4] = model.config.n_layer
     header[5] = model.config.n_head
-    header[6] = model.config.n_kv_head
-    header[7] = model.config.n_embd
-    header[8] = model.config.ffn_dim_multiplier
-    header[9] = model.config.multiple_of
-    header[10] = model.config.norm_eps
-    header[11] = model.config.rope_theta
-    header[12] = model.config.use_scaled_rope
-    header[13] = model.config.max_gen_batch_size
-    header[14] = int(model.config.version.split('.')[0]) # major version
-    header[15] = int(model.config.version.split('.')[1]) # minor version
+    header[6] = model.config.n_embd
     # 2) the parameters follow the header
     params = {name: param.cpu() for name, param in model.named_parameters()}
+    # pad the vocab to a multiple of 128 here at export, for efficiency in C
+    wte = params["transformer.wte.weight"] # (V, C)
+    wte_padded = pad_vocab(wte) # (Vp, C)
+    params["transformer.wte.weight"] = wte_padded # (Vp, C)
+    print(f"padded vocab size from {wte.size(0)} to {wte_padded.size(0)}")
+    header[7] = wte_padded.size(0) # padded vocab size store in header
     # now write to file
     with open(filename, "wb") as file:
         file.write(header.numpy().tobytes()) # header
@@ -937,10 +481,16 @@ def write_state(model, x, y, logits, loss, filename):
     # it contains information about the input, logits, loss, and the parameter gradients
     # this can be used for checking the computation correctness in C
     header = torch.zeros(256, dtype=torch.int32)
-    header[0] = 20240803 # magic
-    header[1] = x.size(0) # batch size of the batch, B
-    header[2] = x.size(1) # temporal extent of the batch, T
+    header[0] = 20240327 # magic
+    header[1] = 2 # run state version = 2 (1 -> 2 for padded vocab changes)
+    header[2] = x.size(0) # batch size of the batch, B
+    header[3] = x.size(1) # temporal extent of the batch, T
     grads = {name: param.grad.cpu() for name, param in model.named_parameters()}
+    # pad the vocab grads here as well, to mirror write_model
+    wte_grad = grads["transformer.wte.weight"] # (V, C)
+    wte_grad_padded = pad_vocab(wte_grad, value=0) # (Vp, C) # TODO later maybe pad with nan?
+    grads["transformer.wte.weight"] = wte_grad_padded # (Vp, C)
+    print(f"padded vocab size in reference grads from {wte_grad.size(0)} to {wte_grad_padded.size(0)}")
     with open(filename, "wb") as file:
         # header
         file.write(header.numpy().tobytes())
@@ -956,6 +506,23 @@ def write_state(model, x, y, logits, loss, filename):
         write_tensors(grads, model.config.n_layer, file, "float32")
     print(f"wrote {filename}")
 
+def write_tokenizer(enc, filename):
+    n = enc.max_token_value + 1
+    header = torch.zeros(256, dtype=torch.int32)
+    header[0] = 20240328 # magic
+    header[1] = 2 # tokenizer version = 2 (1 -> 2: includes EOT token)
+    header[2] = n # number of tokens
+    header[3] = enc.eot_token # EOT token
+    with open(filename, "wb") as file:
+        file.write(header.numpy().tobytes())
+        for i in range(n):
+            b = enc.decode_bytes([i])
+            length = len(b)
+            assert length < 256, f"Token length exceeds 255: {length}"
+            file.write(struct.pack("<B", length))  # Write the length as a 1-byte unsigned integer
+            file.write(b)  # Write the actual bytes
+    print(f"wrote {filename}")
+
 # -----------------------------------------------------------------------------
 # int main
 
@@ -968,19 +535,17 @@ def print0(*args, **kwargs):
 if __name__ == "__main__":
     import time
     import argparse
+    import tiktoken
     print0(f"Running pytorch {torch.version.__version__}")
 
     # default settings will overfit a tiny batch of data
     # and save model weights and debug state to disk on the first iteration
     parser = argparse.ArgumentParser()
-    parser.add_argument("--use_hf", type=int, default=1, help="use HuggingFace (default) or use Meta's model")
-    parser.add_argument("--ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint")
-    parser.add_argument("--tokenizer_path", type=str, default=None, help="path to llama3 tokenizer")
     # file system input / output
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
-    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B", help="chose the llama model")
+    parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -1006,26 +571,17 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
     parser.add_argument("--flash", type=int, default=0, help="use flash attention")
-    parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|float16|bfloat16")
+    parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
     # python -> C bridge
-    parser.add_argument("--write_tensors", type=int, default=0, help="write tensors to disk")
+    parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     args = parser.parse_args()
 
     # args error checking and convenience variables
     B, T = args.batch_size, args.sequence_length
-    assert 1 <= T <= 8192, "sequence length must be between 1 and 8192"
+    assert 1 <= T <= 1024
     assert args.dtype in {"float32", "float16", "bfloat16"}
-    assert args.model in {"meta-llama/Meta-Llama-3.1-8B"}  # only 8B base model supported for now
-
-    # create the logging directory if it does not exist
-    logfile = None
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        logfile = os.path.join(args.output_dir, "main.log")
-        # create the log file "main.log" inside it, and wipe it clean
-        with open(logfile, "w") as f:
-            pass
+    assert args.model in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl", "d12", "d24", "d36", "d48"}
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -1061,7 +617,6 @@ if __name__ == "__main__":
                 device = "mps"
     print(f"using device: {device}")
     device_type = 'cuda' if 'cuda' in device else 'cpu'
-    assert device_type in {'cuda'}  # we need to load LLaMA as bf16 on CUDA
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
@@ -1072,7 +627,7 @@ if __name__ == "__main__":
 
     # set up a context manager following the desired dtype and device
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
-    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if (device_type == "cuda") else nullcontext()
+    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
 
     # rng / reproducibility
     torch.manual_seed(42)
@@ -1088,15 +643,26 @@ if __name__ == "__main__":
     assert args.flash in {0, 1}
     FLASH = args.flash
 
-    # init the model
-    assert args.ckpt_dir is not None and os.path.exists(args.ckpt_dir), f"llama3 ckpt dir {args.ckpt_dir} does not exist"
-    assert args.tokenizer_path is not None and os.path.exists(args.tokenizer_path), f"llama3 tokenizer path {args.tokenizer_path} does not exist"
-    if args.use_hf:
-        model = LLaMA.from_pretrained_llama3_hf(args.model)
-    else:  # use Meta's checkpoint
-        model = LLaMA.from_pretrained_llama3_meta(args.ckpt_dir, args.tokenizer_path)
+    # init (and write) the tokenizer
+    enc = tiktoken.get_encoding("gpt2")
+    if master_process and args.write_tensors: # tokenizer is technically not tensors but ok
+        write_tokenizer(enc, "gpt2_tokenizer.bin")
 
+    # init the model, either from scratch or from OpenAI pretrained checkpoint
+    if args.model[0] == "d":
+        # from scratch (random weights)
+        model_config = {
+            "d12": GPTConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768),
+            "d24": GPTConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024),
+            "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
+            "d48": GPTConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600),
+        }[args.model]
+        model = GPT(model_config)
+    else:
+        # load the GPT-2 model weights
+        model = GPT.from_pretrained(args.model)
     model.train()
+    model.to(device)
     if args.compile:
         if hasattr(config, "coordinate_descent_tuning"):
             config.coordinate_descent_tuning = True # suggested by @Chillee
@@ -1121,13 +687,15 @@ if __name__ == "__main__":
         x, y = x.to(device), y.to(device)
         logits, loss = model(x, y)
         loss.backward()
-        # save model params, in bfloat16
-        model_to_size = {"meta-llama/Meta-Llama-3.1-8B": "8B"}
-        model_size_str = model_to_size[args.model] # e.g. "8B"
-        write_model(model, os.path.join(args.output_dir, f"llama3.1_{model_size_str}_bf16.bin"), dtype="bfloat16")
+        # save model params, in both float32 and bfloat16
+        model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
+        model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
+        model_size_str = model_to_size[args.model] # e.g. "124M", or "d12"
+        write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
+        write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
         # save x, y, logits, loss, and parameter gradients, for debugging C
         # always store these in fp32 to have an accurate reference (?)
-        write_state(model, x, y, logits, loss, os.path.join(args.output_dir, f"llama3_{model_size_str}_debug_state.bin"))
+        write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
         # reset the train_loader for the optimization below
         train_loader.reset()
 
@@ -1158,6 +726,15 @@ if __name__ == "__main__":
         assert 0 <= decay_ratio <= 1
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
         return min_lr + coeff * (args.learning_rate - min_lr)
+
+    # create the logging directory if it does not exist
+    logfile = None
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        logfile = os.path.join(args.output_dir, "main.log")
+        # create the log file "main.log" inside it, and wipe it clean
+        with open(logfile, "w") as f:
+            pass
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -1192,18 +769,17 @@ if __name__ == "__main__":
             and (step % args.sample_every == 0 or last_step)) \
             and master_process:
             model.eval()
-            prompts: List[str] = json.loads(open(os.path.join(os.path.dirname(__file__), 'llmc_py', 'prompts.json')).read())['prompts']
-            if args.use_hf:
-                prompt_tokens = [model.tokenizer(x).input_ids for x in prompts]
-            else:  # Meta
-                prompt_tokens = [model.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
-
-            generation_tokens, _ = model.generate(prompt_tokens, max_gen_len=64, temperature=0.6, top_p=0.9, logprobs=False, echo=False)
-            results = [{"generation": model.tokenizer.decode(t)} for t in generation_tokens]
-            for prompt, result in zip(prompts, results):
-                print(prompt, end="")
-                print(f"{result['generation']}")
-                print("\n==================================\n")
+            # before we end, let's also do one round of inference
+            # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
+            start_ids = [enc.eot_token]
+            xg = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+            max_new_tokens = 32
+            temperature = 1.0
+            top_k = 40
+            yg = raw_model.generate(xg, max_new_tokens, temperature=temperature, top_k=top_k)
+            print0('---------------')
+            print0(enc.decode(yg[0].tolist()))
+            print0('---------------')
 
         # bit confusing: we want to make sure to eval and sample on 0th iteration
         # but also after the very last iteration. so we loop for step <= num_iterations
