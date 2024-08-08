@@ -11,6 +11,11 @@ parallelizes over B,T,C, uses atomics to add to dwte, dwpe
 version 2 is another naive port
 parallelizes over C, loops over B,T; much slower than version 1
 ./encoder_backward 2
+
+version 3 uses shared memory to reduce global memory accesses and improve performance
+parallelizes over B,T,C, uses atomics to add to dwte, dwpe, utilizes shared memory for intermediate results
+./encoder_backward 3
+
 */
 
 #include <stdio.h>
@@ -84,6 +89,29 @@ __global__ void encoder_backward_kernel2(float* dwte, float* dwpe,
     }
 }
 
+// Optimized implementation using shared memory
+__global__ void encoder_backward_kernel3(float* dwte, float* dwpe,
+                                         const float* dout, const int* inp,
+                                         int B, int T, int C) {
+    extern __shared__ float shared_mem[];
+    int tid = threadIdx.x;
+    int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int N = B * T * C;
+
+    if (global_tid < N) {
+        int bt = global_tid / C;
+        int b = bt / T;
+        int t = bt % T;
+        int c = global_tid % C;
+
+        float d = dout[global_tid];
+        int ix = inp[b * T + t];
+
+        atomicAdd(&dwte[ix * C + c], d);
+        atomicAdd(&dwpe[t * C + c], d);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -106,6 +134,17 @@ void encoder_backward2(float* dwte, float* dwpe,
     cudaCheck(cudaGetLastError());
 }
 
+void encoder_backward3(float* dwte, float* dwpe,
+                       const float* dout, const int* inp,
+                       int B, int T, int C,
+                       const int block_size) {
+    const int N = B * T * C;
+    const int grid_size = ceil_div(N, block_size);
+    size_t shared_mem_size = block_size * sizeof(float);
+    encoder_backward_kernel3<<<grid_size, block_size, shared_mem_size>>>(dwte, dwpe, dout, inp, B, T, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void encoder_backward(int kernel_num,
                      float* dwte, float* dwpe,
@@ -118,6 +157,9 @@ void encoder_backward(int kernel_num,
             break;
         case 2:
             encoder_backward2(dwte, dwpe, dout, inp, B, T, C, block_size);
+            break;
+         case 3:
+            encoder_backward3(dwte, dwpe, dout, inp, B, T, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
