@@ -123,6 +123,8 @@ int main(int argc, char *argv[]) {
         if (argv[i][1] == 'w') { model.use_master_weights = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { model.recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g' && argv[i][2] == 'e') { model.gelu_fusion = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm') { model.use_mup = atoi(argv[i+1]); }
+        else { exit(EXIT_FAILURE); }
     }
 
     // load additional information that we will use for debugging and error checking
@@ -171,7 +173,7 @@ int main(int argc, char *argv[]) {
     gpt2_allocate_state(&model, B, T);
 
     // First, do target-free forward pass to validate logits
-    gpt2_forward(&model, x, B, T);
+    gpt2_forward(&model, x, B, T, 0, NULL);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
     floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
@@ -186,7 +188,7 @@ int main(int argc, char *argv[]) {
     // FP16 and lower require very high tolerances unfortunately. TODO look into more
     #if defined(ENABLE_BF16) || defined(ENABLE_F16)
     logit_accuracy_threshold = 25.0f; // 15.0f was too low even without cuDNN?! :(
-    loss_diff_threshold = 0.05f;
+    loss_diff_threshold = model.use_mup ? 0.08f : 0.05f;
     #endif
 
     // compare the output logits from the forward pass
@@ -220,7 +222,7 @@ int main(int argc, char *argv[]) {
     for (int step = 0; step < 10; step++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
-        gpt2_forward(&model, x, B, T);
+        gpt2_forward(&model, x, B, T, step, NULL);
         gpt2_backward_and_reduce(&model, x, y, 1, 0);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
@@ -268,6 +270,13 @@ int main(int argc, char *argv[]) {
             // actual errors can be hardware specific.
 
             float grad_thresholds[NUM_PARAMETER_TENSORS] = {5e-1f, 4e-3f, 1e-1f, 3.5e-2f, 2e-2f, 3e-2f, 5e-2f, 5e-2f, 5e-2f, 1.5e-2f, 5e-4f, 8e-3f, 1.5e-3f, 2.5e-3f, 1e-1f, 2e-2f};
+            if (model.use_mup) {
+                grad_thresholds[4] = 3.3e-2f; // attprojw
+                grad_thresholds[6] = 1.6e-1f; // fcw
+                grad_thresholds[7] = 1.6e-1f; // fcb
+                grad_thresholds[8] = 1.6e-1f; // fcprojw
+                grad_thresholds[10] = 1.8e-3f; // ln1w
+            }
             #if defined(ENABLE_FP32)
             for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
                 grad_thresholds[i] = 1e-6f;  // we can be much more precise in FP32
@@ -305,7 +314,8 @@ int main(int argc, char *argv[]) {
     }
 
     // expected losses are as follows, from Python
-    float expected_losses[10] = {
+    float expected_losses[10];
+    float non_mup_expected_losses[10] = {
         5.270009f,
         4.060681f,
         3.320085f,
@@ -317,6 +327,29 @@ int main(int argc, char *argv[]) {
         0.401021f,
         0.187493f
     };
+
+    float mup_expected_losses[10] = {
+        7.100901,
+        5.798391,
+        4.955126,
+        4.334295,
+        3.815116,
+        3.337662,
+        2.913754,
+        2.504533,
+        2.103693,
+        1.707019
+    };
+
+    if (model.use_mup) {
+        for (int i = 0; i < 10; i++) {
+            expected_losses[i] = mup_expected_losses[i];
+        }
+    } else {
+        for (int i = 0; i < 10; i++) {
+            expected_losses[i] = non_mup_expected_losses[i];
+        }
+    }
 
     // compare
     for (int i = 0; i < 10; i++) {
@@ -337,7 +370,7 @@ int main(int argc, char *argv[]) {
     int tokens[10];
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
-        gpt2_forward(&model, loader.inputs, B, T);
+        gpt2_forward(&model, loader.inputs, B, T, step, NULL);
         gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, 0);
         gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
         losses[step] = model.mean_loss;
@@ -352,7 +385,7 @@ int main(int argc, char *argv[]) {
     load_state(&ld_step, &model, &loader, "test_gpt2cu_state.ckpt");
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
-        gpt2_forward(&model, loader.inputs, B, T);
+        gpt2_forward(&model, loader.inputs, B, T, step, NULL);
         gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, 0);
         gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
 

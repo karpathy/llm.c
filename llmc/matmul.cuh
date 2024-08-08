@@ -109,7 +109,7 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* bias,
                      int m, int n, int k, cudaStream_t stream=0, bool transA=true, bool transB=false,
                      int batch_count=0, size_t strideA=0, size_t strideB=0, size_t strideOut=0,
-                     bool accumulate=false, floatX* pre_gelu=NULL, bool backward=false)
+                     bool accumulate=false, floatX* pre_gelu=NULL, bool backward=false, float* coord_check_data=NULL, int cc_cnt=0)
 {
     NVTX_RANGE_FN();
     bool has_bias = (bias != NULL);
@@ -225,19 +225,32 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
     cublasCheck(cublasLtMatrixLayoutDestroy(CLayout));
     cublasCheck(cublasLtMatrixLayoutDestroy(DLayout));
     cudaCheck(cudaGetLastError());
+
+    // data collection
+    if (coord_check_data != NULL) {
+        float sum = 0.0;
+        float* sum_d;
+        cudaMalloc(&sum_d, sizeof(float));
+        cudaCheck(cudaMemsetAsync(sum_d, 0, sizeof(float), stream));
+        abs_sum_kernel<<<n, WARP_SIZE, 0, stream>>>(d, n, m, sum_d);
+        cudaCheck(cudaGetLastError());
+        cudaCheck(cudaMemcpy(&sum, sum_d, sizeof(float), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaFree(sum_d));
+        coord_check_data[cc_cnt] = sum / (n*m);
+    }
 }
 
 // small wrapper around matmul_cublaslt for the forward pass (keeping historical order of arguments)
 void matmul_forward_cublaslt(floatX* out,
                      floatX* inp, floatX* weight, floatX* bias,
-                     int B, int T, int C, int OC, cudaStream_t stream,
+                     int B, int T, int C, int OC, cudaStream_t stream, float* coord_check_data=NULL, int* cc_cnt=NULL,
                      floatX* pre_gelu=NULL, int gelu_fusion=1) {
     // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
     if (gelu_fusion < 1 && pre_gelu) {
-        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
-        gelu_forward(out, pre_gelu, B*T*OC, stream);
+        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false, coord_check_data, (*cc_cnt)++);
+        gelu_forward(out, pre_gelu, B*T*OC, coord_check_data, (*cc_cnt)++, stream);
     } else {
-        matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
+        matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false, coord_check_data, (*cc_cnt)++);
     }
 }
 

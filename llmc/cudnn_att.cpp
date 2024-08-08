@@ -222,7 +222,7 @@ auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
 void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
                              float* stats, // output for backward pass: (B, NH, T)
                              floatX* inp,  // input: (B, T, 3, NH, HS) QKV
-                             int B, int T, int NH, int C, cudaStream_t stream) {
+                             int B, int T, int NH, int C, int use_mup, float mup_attn_mult, cudaStream_t stream) {
     NVTX_RANGE_FN();
     int HS = C / NH; // number of features per head
     bool is_inference_only = (stats == nullptr);
@@ -236,7 +236,7 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
     void* devPtrQ = inp;
     void* devPtrK = (inp + C);
     void* devPtrV = (inp + 2 * C);
-    float attn_scale_cpu = 1.0 / sqrtf(HS);
+    float attn_scale_cpu = use_mup ? mup_attn_mult / (float)HS : 1.f / sqrtf((float)HS);
     void* devPtrO = out;
 
     // Build variant pack
@@ -255,7 +255,7 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
 
 void attention_backward_cudnn(floatX* dqkvr,                                       // output
                               floatX* dout, floatX* qkvr, floatX* o, float* stats, // inputs
-                              int B, int T, int NH, int C, cudaStream_t stream) {
+                              int B, int T, int NH, int C, int use_mup, float mup_attn_mult, cudaStream_t stream) {
     NVTX_RANGE_FN();
     int HS = C / NH; // number of features per head
 
@@ -269,7 +269,7 @@ void attention_backward_cudnn(floatX* dqkvr,                                    
     void* devPtrO = o;
     void* devPtrdO = dout;
     void* devPtrStats = stats;
-    float attn_scale_cpu = 1.0 / sqrtf(HS);
+    float attn_scale_cpu = use_mup ? mup_attn_mult / (float)HS : 1.f / sqrtf((float)HS);
 
     void* devPtrdQ = dqkvr;
     void* devPtrdK = (dqkvr + NH * HS);
