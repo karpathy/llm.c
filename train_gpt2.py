@@ -66,9 +66,13 @@ class CausalSelfAttention(nn.Module):
         self.hd = config.n_embd // config.n_head
         self.use_kv = config.use_kv
 
-        self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.hd, bias=False)  # key, query, value projections
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)  # output projection
-        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        # self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.hd, bias=False)  # key, query, value projections
+        # self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)  # output projection
+        self.wq = nn.Linear(config.n_embd, config.n_head * self.hd, bias=False)
+        self.wk = nn.Linear(config.n_embd, config.n_kv_head * self.hd, bias=False)
+        self.wv = nn.Linear(config.n_embd, config.n_kv_head * self.hd, bias=False)
+        self.wo = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        # self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
         # static KV cache - we could alternatively allocate it outside of the model and just pass it in when needed
         if self.use_kv:
@@ -82,8 +86,9 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, freqs_cis=None, start_pos=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
+        # qkv = self.c_attn(x)
+        # q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
+        q, k, v = self.wq(x), self.wk(x), self.wv(x)
         q, k, v = map(lambda t: t.view(B, T, -1, self.hd), (q, k, v))  # (B, T, NH, HD)
 
         q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)  <-- 1. difference compared to GPT-2
@@ -110,7 +115,7 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(scores.float(), dim=-1).type_as(q)
             y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
+        y = self.wo(y)
         return y
 
 class MLP(nn.Module):
@@ -157,7 +162,7 @@ class Block(nn.Module):
 @dataclass
 class LlamaConfig:
     version: str = "3.1"
-    block_size: int = 8192
+    block_size: int = 1024
     vocab_size: int = 128256
     n_layer: int = 32
     n_head: int = 32
@@ -186,7 +191,7 @@ class LLaMA(nn.Module):
 
         # init all weights, use a torch rng object to be very careful
         self.init_rng = torch.Generator()
-        self.init_rng.manual_seed(42)
+        self.init_rng.manual_seed(1)
 
         self.freqs_cis = precompute_freqs_cis(
             config.n_embd // config.n_head,
@@ -233,16 +238,19 @@ class LLaMA(nn.Module):
                 checkpoint[new_key] = checkpoint.pop(old_key)
 
         for i in range(config.n_layer):
-            for name in ['attention.wq', 'attention.wk', 'attention.wv']:
+            for name in ['attention.wq', 'attention.wk', 'attention.wv', 'attention.wo']:
                 old_key = f'layers.{i}.{name}.weight'
-                new_key = f'transformer.h.{i}.attn.c_attn.weight'
-                if name == 'attention.wq':
-                    checkpoint[new_key] = checkpoint.pop(old_key)
-                else:  # merge 3 weights into transformer.h.x.attn.c_attn.weight
-                    checkpoint[new_key] = torch.cat((checkpoint[new_key], checkpoint.pop(old_key)), dim=0)
-            old_key = f'layers.{i}.attention.wo.weight'
-            new_key = f'transformer.h.{i}.attn.c_proj.weight'
-            checkpoint[new_key] = checkpoint.pop(old_key)
+                new_key = f'transformer.h.{i}.attn.{name.split(".")[-1]}.weight'
+                checkpoint[new_key] = checkpoint.pop(old_key)
+                # old_key = f'layers.{i}.{name}.weight'
+                # new_key = f'transformer.h.{i}.attn.c_attn.weight'
+                # if name == 'attention.wq':
+                #     checkpoint[new_key] = checkpoint.pop(old_key)
+                # else:  # merge 3 weights into transformer.h.x.attn.c_attn.weight
+                #     checkpoint[new_key] = torch.cat((checkpoint[new_key], checkpoint.pop(old_key)), dim=0)
+            # old_key = f'layers.{i}.attention.wo.weight'
+            # new_key = f'transformer.h.{i}.attn.c_proj.weight'
+            # checkpoint[new_key] = checkpoint.pop(old_key)
 
         ffn_map = {'w1': 'c_fc2', 'w2': 'c_proj', 'w3': 'c_fc'}
         for i in range(config.n_layer):
@@ -674,7 +682,7 @@ if __name__ == "__main__":
     # default settings will overfit a tiny batch of data
     # and save model weights and debug state to disk on the first iteration
     parser = argparse.ArgumentParser()
-    parser.add_argument("--use_hf", type=int, default=1, help="use HuggingFace (default) or use Meta's model")
+    parser.add_argument("--use_hf", type=int, default=0, help="use HuggingFace (default) or use Meta's model")
     parser.add_argument("--ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint")
     parser.add_argument("--tokenizer_path", type=str, default=None, help="path to llama3 tokenizer")
     # file system input / output
@@ -776,9 +784,9 @@ if __name__ == "__main__":
     ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if (device_type == "cuda") else nullcontext()
 
     # rng / reproducibility
-    torch.manual_seed(42)
+    torch.manual_seed(1)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
+        torch.cuda.manual_seed(1)
 
     # set the torch precision mode to use TensorFloat32 (TF32) for matmuls
     # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
@@ -812,6 +820,20 @@ if __name__ == "__main__":
     val_loader = None
     if args.input_val_bin:
         val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+
+    model.eval()
+    prompts: List[str] = json.loads(open(os.path.join(os.path.dirname(__file__), 'llmc_py', 'prompts.json')).read())['prompts']
+    if args.use_hf:
+        prompt_tokens = [model.tokenizer(x).input_ids for x in prompts]
+    else:  # Meta
+        prompt_tokens = [model.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+
+    generation_tokens, _ = model.generate(prompt_tokens, max_gen_len=64, temperature=0.6, top_p=0.9, logprobs=False, echo=False)
+    results = [{"generation": model.tokenizer.decode(t)} for t in generation_tokens]
+    for prompt, result in zip(prompts, results):
+        print(prompt, end="")
+        print(f"{result['generation']}")
+        print("\n==================================\n")
 
     # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
