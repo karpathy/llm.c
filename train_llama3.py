@@ -740,15 +740,6 @@ class Tokenizer:
         return t
 
     def decode(self, t: Sequence[int]) -> str:
-        """
-        Decodes a list of token IDs into a string.
-
-        Args:
-            t (List[int]): The list of token IDs to be decoded.
-
-        Returns:
-            str: The decoded string.
-        """
         # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
         return self.model.decode(cast(List[int], t))
 
