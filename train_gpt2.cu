@@ -393,13 +393,13 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
     assert(model->m_memory == nullptr);
     assert(model->v_memory == nullptr);
-    cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
-    cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
+    cudaMallocConditionallyManaged((void**)&model->m_memory, shard_num_parameters * sizeof(float));
+    cudaMallocConditionallyManaged((void**)&model->v_memory, shard_num_parameters * sizeof(float));
 
     if (model->use_master_weights == 1) {
         assert(model->master_weights == nullptr);
         printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
-        cudaCheck(cudaMalloc((void**) &model->master_weights, shard_num_parameters * sizeof(float)));
+        cudaMallocConditionallyManaged((void**) &model->master_weights, shard_num_parameters * sizeof(float));
     }
 
     size_t free, total;
