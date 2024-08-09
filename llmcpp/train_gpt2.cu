@@ -2,10 +2,12 @@
 #include <iostream>
 #include <memory>
 
+#include <nvtx3/nvToolsExt.h>
 #include "gpt2.hpp"
 #include "llmc/dataloader.h"
 #include "llmc/tokenizer.h"
 #include "optim.hpp"
+#include "pch.hpp"
 
 // sampler
 
@@ -32,6 +34,16 @@ int sample_mult(float* probabilities, int n, float coin) {
   }
   return n - 1;  // in case of rounding errors
 }
+
+// CUDA error checking
+void cudaCheck(cudaError_t error, const char* file, int line) {
+  if (error != cudaSuccess) {
+    printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
+           cudaGetErrorString(error));
+    exit(EXIT_FAILURE);
+  }
+};
+#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
 
 int main(int argc, char** argv) {
   gpt2::GPT2 model;
@@ -74,7 +86,6 @@ int main(int argc, char** argv) {
   // train
   struct timespec start, end;
   int V = model.config.vocab_size;
-  //  std::unique_ptr<float[]> logit = std::make_unique<float[]>(B * T * V);
   std::unique_ptr<float[]> prob = std::make_unique<float[]>(B * T * V);
   std::unique_ptr<float[]> label = std::make_unique<float[]>(B * T * V);
   nn::Parameter d_label(nn::DT_FLOAT, B * T * V),
@@ -84,21 +95,24 @@ int main(int argc, char** argv) {
   model.Parameters(&parameters);
   optim::AdamW optimizer(parameters, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f);
   std::vector<double> timings;
-  for (int step = 0; step <= 10; step++) {
+  for (int step = 0; step <= 40; step++) {
+    NvtxRange step_range("Train step", step);
+
     // once in a while estimate the validation loss
     if (step % 10 == 0) {
       float val_loss = 0.0f;
       dataloader_reset(&val_loader);
       for (int i = 0; i < val_num_batches; i++) {
+        NvtxRange validation_range("validation");
         dataloader_next_batch(&val_loader);
         float loss = 0.0f;
         auto idx = TTypes<int>::ConstMatrix(val_loader.inputs, B, T);
         std::memset(label.get(), 0, sizeof(float) * B * T * V);
         nn::OntHot(MakeConstFlat(val_loader.targets, B * T),
                    MakeMatrix(label.get(), B * T, V));
-        nn::g_device.memcpyHostToDevice(d_label.data<float>(), label.get(),
-                                        sizeof(float) * B * T * V);
-        nn::g_device.synchronize();
+        cudaCheck(cudaMemcpy(d_label.data<float>(), label.get(),
+                             sizeof(float) * B * T * V,
+                             cudaMemcpyHostToDevice));
         auto label_3d = d_label.const_tensor_3d<float>(B, T, V);
         auto logit_3d = d_logit.tensor_3d<float>(B, T, V);
         model.gpt2_->ForwardGPU(idx, label_3d, logit_3d, &loss);
@@ -116,6 +130,7 @@ int main(int argc, char** argv) {
 
     // once in a while do model inference to print generated text
     if (step > 0 && step % 20 == 0) {
+      NvtxRange generation_range("generation");
       // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
       for (int i = 0; i < B * T; ++i) {
         gen_tokens[i] = tokenizer.eot_token;
@@ -167,9 +182,8 @@ int main(int argc, char** argv) {
     std::memset(label.get(), 0, sizeof(float) * B * T * V);
     nn::OntHot(MakeConstFlat(train_loader.targets, B * T),
                MakeMatrix(label.get(), B * T, V));
-    nn::g_device.memcpyHostToDevice(d_label.data<float>(), label.get(),
-                                    sizeof(float) * B * T * V);
-    nn::g_device.synchronize();
+    cudaCheck(cudaMemcpy(d_label.data<float>(), label.get(),
+                         sizeof(float) * B * T * V, cudaMemcpyHostToDevice));
     auto label_3d = d_label.const_tensor_3d<float>(B, T, V);
     auto logit_3d = d_logit.tensor_3d<float>(B, T, V);
     model.gpt2_->ForwardGPU(idx, label_3d, logit_3d, &loss);

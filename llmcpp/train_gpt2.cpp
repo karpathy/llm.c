@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
   model.Parameters(&parameters);
   optim::AdamW optimizer(parameters, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f);
   std::vector<double> timings;
-  for (int step = 0; step <= 10; step++) {
+  for (int step = 0; step <= 40; step++) {
     // once in a while estimate the validation loss
     if (step % 10 == 0) {
       float val_loss = 0.0f;

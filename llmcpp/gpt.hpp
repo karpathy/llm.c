@@ -3,6 +3,13 @@
 
 #include "nn.hpp"
 
+#ifdef EIGEN_USE_GPU
+#include "cuda_profile_util.hpp"
+#define PROFILE_TRACE_FN(prefix) NVTX_RANGE_FN(prefix)
+#else
+#define PROFILE_TRACE_FN(prefix)
+#endif
+
 namespace gpt {
 
 struct MLP {
@@ -20,6 +27,8 @@ struct MLP {
 
   void Forward(typename TTypes<T>::ConstMatrix x,
                typename TTypes<T>::Matrix y) {
+    PROFILE_TRACE_FN("MLP");
+
     // x: [B*T, 4*n_embed], y: [B*T, 4*n_embed]
     CHECK_EQ(x.dimension(1), n_embed_);
     // x.shape == y.shape
@@ -43,6 +52,8 @@ struct MLP {
   void Backward(typename TTypes<T>::ConstMatrix x,
                 typename TTypes<T>::ConstMatrix y_grad,
                 typename TTypes<T>::Matrix x_grad) {
+    PROFILE_TRACE_FN("MLP");
+
     // x: [B*T, 4*n_embed], y_grad: [B*T, 4*n_embed]
     // x_grad: [B*T, 4*n_embed]
     CHECK_EQ(x.dimension(1), n_embed_);
@@ -127,6 +138,8 @@ struct CausalSelfAttention {
 
   void Forward(typename TTypes<Type, 3>::ConstTensor x,
                typename TTypes<Type, 3>::Tensor y) {
+    PROFILE_TRACE_FN("CausalSelfAttention");
+
     const int B = x.dimension(0);  // batch size
     const int T = x.dimension(1);  // sequence length
     const int C = x.dimension(2);  // embedding dimensionality (n_embd)
@@ -226,6 +239,8 @@ struct CausalSelfAttention {
   void Backward(typename TTypes<Type, 3>::ConstTensor x,
                 typename TTypes<Type, 3>::ConstTensor y_grad,
                 typename TTypes<Type, 3>::Tensor x_grad) {
+    PROFILE_TRACE_FN("CausalSelfAttention");
+
     const int B = x.dimension(0);  // batch size
     const int T = x.dimension(1);  // sequence length
     const int C = x.dimension(2);  // embedding dimensionality (n_embd)
@@ -406,6 +421,8 @@ struct Block {
 
   void Forward(typename TTypes<Type, 3>::ConstTensor x,
                typename TTypes<Type, 3>::Tensor y) {
+    PROFILE_TRACE_FN("Block");
+
     // x: [B, T, C], y: [B, T, C]
     const int B = x.dimension(0);  // batch size
     const int T = x.dimension(1);  // sequence length
@@ -465,6 +482,8 @@ struct Block {
   void Backward(typename TTypes<Type, 3>::ConstTensor x,
                 typename TTypes<Type, 3>::ConstTensor y_grad,
                 typename TTypes<Type, 3>::Tensor x_grad) {
+    PROFILE_TRACE_FN("Block");
+
     // x: [B, T, C], y_grad: [B, T, C], x_grad: [B, T, C]
     const int B = x.dimension(0);  // batch size
     const int T = x.dimension(1);  // sequence length
@@ -616,6 +635,8 @@ struct GPT {
   }
 
   void __Forward(typename TTypes<int>::ConstMatrix idx) {
+    PROFILE_TRACE_FN("GPT");
+
     const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_,
               L = n_layer_;
     const int BT = B * T, TC = T * C;
@@ -668,6 +689,8 @@ struct GPT {
 
   void Forward(typename TTypes<int>::ConstMatrix idx,
                typename TTypes<Type, 3>::Tensor logits) {
+    PROFILE_TRACE_FN("GPT");
+
     const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_;
     const int BT = B * T;
     CHECK(logits.dimension(0) == B && logits.dimension(1) == T &&
@@ -691,6 +714,8 @@ struct GPT {
 
   void SoftmaxForwardCPU(typename TTypes<Type>::ConstMatrix logits,
                          absl::Span<const int> targets, float* loss) {
+    PROFILE_TRACE_FN("GPT");
+
     int BT = logits.dimension(0);
     CHECK_EQ(BT, targets.size());
     CHECK_EQ(vocab_size_, logits.dimension(1));
@@ -702,6 +727,8 @@ struct GPT {
   void SoftmaxForwardGPU(typename TTypes<Type>::ConstMatrix logits,
                          typename TTypes<Type>::ConstMatrix labels,
                          float* loss) {
+    PROFILE_TRACE_FN("GPT");
+
     int BT = logits.dimension(0);
     CHECK_EQ(BT, labels.dimension(0));
     CHECK_EQ(vocab_size_, logits.dimension(1));
@@ -733,6 +760,8 @@ struct GPT {
   void ForwardCPU(typename TTypes<int>::ConstMatrix idx,
                   typename TTypes<int>::ConstMatrix targets,
                   typename TTypes<Type, 3>::Tensor logits, float* loss) {
+    PROFILE_TRACE_FN("GPT");
+
     // idx: [B, T], targets: [B, T]
     // logits: [B, T, vocab_size]
     const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_;
@@ -760,6 +789,8 @@ struct GPT {
   void ForwardGPU(typename TTypes<int>::ConstMatrix idx,
                   typename TTypes<Type, 3>::ConstTensor labels,
                   typename TTypes<Type, 3>::Tensor logits, float* loss) {
+    PROFILE_TRACE_FN("GPT");
+
     // idx: [B, T], targets: [B, T]
     // logits: [B, T, vocab_size]
     const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_;
@@ -786,6 +817,8 @@ struct GPT {
   }
 
   void SoftmaxBackwardCPU(absl::Span<const int> targets) {
+    PROFILE_TRACE_FN("GPT");
+
     int BT = targets.size();
     logits_grad_->LazyAllocate(BT * vocab_size_);
     logits_grad_->ZeroData();
@@ -797,11 +830,15 @@ struct GPT {
 
   void BackwardCPU(typename TTypes<int>::ConstMatrix idx,
                    typename TTypes<int>::ConstMatrix targets) {
+    PROFILE_TRACE_FN("GPT");
+
     SoftmaxBackwardCPU(targets);
     BackwardGPU(idx);
   }
 
   void BackwardGPU(typename TTypes<int>::ConstMatrix idx) {
+    PROFILE_TRACE_FN("GPT");
+
     // idx: [B, T], targets: [B, T]
     const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_,
               L = n_layer_;

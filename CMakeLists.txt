@@ -118,6 +118,7 @@ if (CUDA_FOUND)
     target_link_libraries(train_gpt2_gpu
             gpt_gpu
     )
+    target_compile_options(train_gpt2_gpu PRIVATE -O3)
     target_precompile_headers(train_gpt2_gpu PUBLIC llmcpp/pch.hpp)
 endif ()
 
