@@ -42,8 +42,12 @@ download_file() {
     fi
 
     # Download the file
-    curl -s -L -o "$FILE_PATH" "$FILE_URL"
-    echo "Downloaded $FILE_NAME to $FILE_PATH"
+    status=$(curl -s -w "%{http_code}\n" -L -o "$FILE_PATH" "$FILE_URL")
+    if [ "$status" -ne 200 ]; then
+        echo "Error: HTTP status is $status"
+    else
+	echo "Downloaded $FILE_NAME to $FILE_PATH"
+    fi
 }
 
 # Export the function so it's available in subshells
