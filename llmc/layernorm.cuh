@@ -66,8 +66,9 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, float* __res
 
 __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
-                                    const floatX* __restrict__ bias, int N, int C) {
+                                    const floatX* __restrict__ bias, int use_kv, int kv_offset, int B, int T, int C) {
     assert(blockDim.x == WARP_SIZE);
+    int N = B * (use_kv ? 1 : T);
 
     // load weights and biases into shared memory
     // do this before we allow any threads to exit!
@@ -89,8 +90,8 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
     if(idx >= N) { return; } // guard
 
     // adjust pointers to current token
-    inp += idx * C;
-    out += idx * C;
+    inp += idx * C * (use_kv ? T : 1) + (use_kv ? kv_offset * C : 0);
+    out += idx * C * (use_kv ? T : 1) + (use_kv ? kv_offset * C : 0);
 
     const float eps = 1e-5f;
     float sum = 0.0f;
@@ -142,8 +143,9 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
 __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed, float* mean, float* rstd,
                                                const floatX* inp1, const floatX* inp2,
                                                const floatX* weight, const floatX* bias,
-                                               int N, int C) {
+                                               int use_kv, int kv_offset, int B, int T, int C) {
     assert(blockDim.x == WARP_SIZE);
+    int N = B * (use_kv ? 1 : T);
 
     // load weights and biases into shared memory
     // do this before we allow any threads to exit!
@@ -162,13 +164,13 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     __syncthreads();
 
     int idx = blockIdx.x * blockDim.y + threadIdx.y;
-    if(idx > N) return;
+    if(idx >= N) return;
 
     // adjust pointers to current token
-    residual += C * idx;
-    normed += C * idx;
-    inp1 += C * idx;
-    inp2 += C * idx;
+    residual += idx * C * (use_kv ? T : 1) + (use_kv ? kv_offset * C : 0);
+    normed += idx * C * (use_kv ? T : 1) + (use_kv ? kv_offset * C : 0);
+    inp1 += idx * C * (use_kv ? T : 1) + (use_kv ? kv_offset * C : 0);
+    inp2 += idx * C * (use_kv ? T : 1) + (use_kv ? kv_offset * C : 0);
 
     const float eps = 1e-5f;
     float sum = 0.0f;
@@ -432,11 +434,11 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
 // similar to `fused_residual_forward5`
 void layernorm_forward(floatX* out, float* mean, float* rstd,
                        floatX* inp, const floatX* weight, const floatX* bias,
-                       int B, int T, int C, cudaStream_t stream) {
+                       int use_kv, int kv_offset, int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
-    const int N = B * T;
+    const int N = B * (use_kv ? 1 : T);
     const int grid_size = CEIL_DIV(N, block_y);
     size_t smem = (2 + block_y) * C * sizeof(floatX);
 
@@ -446,8 +448,12 @@ void layernorm_forward(floatX* out, float* mean, float* rstd,
     auto status = cudaFuncSetAttribute(layernorm_forward_kernel6, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaCheck(cudaGetLastError());
     if (status == cudaSuccess) {
-        layernorm_forward_kernel6<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
+        layernorm_forward_kernel6<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(out, mean, rstd, inp, weight, bias, use_kv, kv_offset, B, T, C);
     } else {
+        if (use_kv) {
+            fprintf(stderr, "KV cache not used for suboptimal branches: layernorm_forward_kernel6 failed to set shared memory size - exiting.\n");
+            exit(EXIT_FAILURE);
+        }
         // fall back to the version without shared memory
         const int grid_size_fb = CEIL_DIV(N * WARP_SIZE, block_size);
         layernorm_forward_kernel3<<<grid_size_fb, block_size, 0, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
@@ -467,8 +473,9 @@ void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N
 void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, float* rstd,
                              const floatX* inp1, const floatX* inp2,
                              const floatX* weight, const floatX* bias,
-                             int N, int C, cudaStream_t stream) {
+                             int use_kv, int kv_offset, int B, int T, int C, cudaStream_t stream) {
     const int block_size = 256;
+    int N = B * (use_kv ? 1 : T);
     int block_y = block_size / WARP_SIZE;
     const int grid_size = CEIL_DIV(N, block_y);
     size_t smem = (2 + block_y) * C * sizeof(floatX);
@@ -481,10 +488,14 @@ void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, floa
     if(status == cudaSuccess) {
         fused_residual_forward_kernel5<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(residual, normed,
                                                                                               mean, rstd, inp1, inp2,
-                                                                                              weight, bias, N, C);
+                                                                                              weight, bias, use_kv, kv_offset, B, T, C);
     } else {
+        if (use_kv) {
+            fprintf(stderr, "KV cache not used for suboptimal branches: fused_residual_forward_kernel5 failed to set shared memory size - exiting.\n");
+            exit(EXIT_FAILURE);
+        }
         residual_forward(residual, inp1, inp2, N*C, stream);
-        layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C, stream);
+        layernorm_forward(normed, mean, rstd, residual, weight, bias, 0, 0, N, 1, C, stream);
     }
     cudaCheck(cudaGetLastError());
 }

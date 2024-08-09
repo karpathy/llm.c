@@ -10,8 +10,14 @@
 // CUDA kernels
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__global__ void gelu_forward_kernel2(floatX* out, const floatX* inp) {
+__global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int use_kv, int kv_offset, int B, int T, int C) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+
+    if (use_kv) {
+        int b = idx / C;
+        int c = idx % C;
+        idx = b * T * C + kv_offset * C + c;
+    }
 
     x128 packed_out;
     x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
@@ -47,12 +53,13 @@ __global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const floatX* inp
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-void gelu_forward(floatX* out, const floatX* inp, int N, cudaStream_t stream) {
+void gelu_forward(floatX* out, const floatX* inp, int use_kv, int kv_offset, int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
-    const int block_size = 512;
+    const int block_size = use_kv ? 128 : 512;
+    const int N = B * (use_kv ? 1 : T) * C;
     assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_forward_kernel2<<<grid_size, block_size, 0, stream>>>(out, inp);
+    gelu_forward_kernel2<<<grid_size, block_size, 0, stream>>>(out, inp, use_kv, kv_offset, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 

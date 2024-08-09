@@ -230,14 +230,30 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
 // small wrapper around matmul_cublaslt for the forward pass (keeping historical order of arguments)
 void matmul_forward_cublaslt(floatX* out,
                      floatX* inp, floatX* weight, floatX* bias,
-                     int B, int T, int C, int OC, cudaStream_t stream,
+                     int use_kv, int kv_offset, int B, int T, int C, int OC, cudaStream_t stream,
                      floatX* pre_gelu=NULL, int gelu_fusion=1) {
     // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
     if (gelu_fusion < 1 && pre_gelu) {
-        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
-        gelu_forward(out, pre_gelu, B*T*OC, stream);
+        if (use_kv) {
+            inp += kv_offset * C;
+            pre_gelu += kv_offset * OC;
+        }
+        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, use_kv ? B : B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
+        if (use_kv) {
+            inp -= kv_offset * C;
+            pre_gelu -= kv_offset * OC;
+        }
+        gelu_forward(out, pre_gelu, use_kv, kv_offset, B, T, OC, stream);
     } else {
-        matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
+        if (use_kv) {
+            inp += kv_offset * C;
+            out += kv_offset * OC;
+        }
+        matmul_cublaslt(out, weight, inp, bias, OC, use_kv ? B : B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
+        if (use_kv) {
+            inp -= kv_offset * C;
+            out -= kv_offset * OC;
+        }
     }
 }
 
