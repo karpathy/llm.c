@@ -10,7 +10,10 @@ set(BUILD_SHARED_LIBS OFF)
 
 find_program(CCACHE_PROGRAM ccache)
 if (CCACHE_PROGRAM)
+    message("--- ccache: ${CCACHE_PROGRAM}")
+    set(CMAKE_C_COMPILER_LAUNCHER ccache)
     set(CMAKE_CXX_COMPILER_LAUNCHER ccache)
+    set(CMAKE_CUDA_COMPILER_LAUNCHER ccache)
 endif ()
 
 enable_testing()
@@ -60,12 +63,13 @@ if (CUDA_FOUND)
             absl::strings absl::log absl::check
             ${CUDA_LIBRARIES}
     )
-#    target_precompile_headers(nn_gpu PUBLIC llmcpp/pch.hpp)
+    target_precompile_headers(nn_gpu PUBLIC llmcpp/pch.hpp)
 
     add_library(gpt_gpu llmcpp/gpt.cu)
     target_link_libraries(gpt_gpu
             nn_gpu
     )
+    target_precompile_headers(gpt_gpu PUBLIC llmcpp/pch.hpp)
 
     #    add_compile_definitions(EIGEN_USE_GPU)
     #SET(CMAKE_CUDA_FLAGS ${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr)
@@ -114,33 +118,40 @@ if (CUDA_FOUND)
     target_link_libraries(train_gpt2_gpu
             gpt_gpu
     )
+    target_compile_options(train_gpt2_gpu PRIVATE -O3)
+    target_precompile_headers(train_gpt2_gpu PUBLIC llmcpp/pch.hpp)
 endif ()
 
 set_source_files_properties(llmcpp/pch.hpp PROPERTIES HEADER_FILE_ONLY TRUE)
 add_library(pch INTERFACE)
 target_sources(pch INTERFACE llmcpp/pch.hpp)
 
-
 # llm.cpp
 add_library(nn llmcpp/nn.cpp)
 target_link_libraries(nn
         pch
         absl::strings absl::log absl::check)
-#target_precompile_headers(nn PUBLIC llmcpp/pch.hpp)
+target_precompile_headers(nn PUBLIC llmcpp/pch.hpp)
 
 add_library(gpt llmcpp/gpt.cpp)
 target_link_libraries(gpt nn)
 
-add_executable(test_gpt2_cpp llmcpp/test_gpt2.cpp)
-target_link_libraries(test_gpt2_cpp gpt)
-target_compile_options(test_gpt2_cpp PRIVATE -Ofast -march=native)
+add_library(gpt2 llmcpp/gpt2.cpp)
+target_link_libraries(gpt2 gpt)
 
-add_executable(train_gpt2_cpp llmcpp/train_gpt2.cpp)
-target_link_libraries(train_gpt2_cpp
-        gpt
+add_library(optim llmcpp/optim.cpp)
+target_link_libraries(optim nn)
+
+add_executable(test_gpt2_cpu llmcpp/test_gpt2.cpp)
+target_link_libraries(test_gpt2_cpu gpt2 optim)
+target_compile_options(test_gpt2_cpu PRIVATE -Ofast -march=native)
+
+add_executable(train_gpt2_cpu llmcpp/train_gpt2.cpp)
+target_link_libraries(train_gpt2_cpu
+        gpt2 optim
         profiler
 )
-target_compile_options(train_gpt2_cpp PRIVATE -Ofast -march=native)
+target_compile_options(train_gpt2_cpu PRIVATE -Ofast -march=native)
 
 add_executable(nn_test llmcpp/nn_test.cpp)
 target_link_libraries(nn_test nn GTest::gtest_main)

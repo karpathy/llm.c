@@ -5,9 +5,6 @@
 
 #include "gpt2.hpp"
 #include "optim.hpp"
-
-#include "Eigen/Core"
-#include "absl/types/span.h"
 #include "train_gpt2.c"
 
 // poor man's tensor checker

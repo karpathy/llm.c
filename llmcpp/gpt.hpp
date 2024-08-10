@@ -3,6 +3,13 @@
 
 #include "nn.hpp"
 
+#ifdef EIGEN_USE_GPU
+#include "cuda_profile_util.hpp"
+#define PROFILE_TRACE_FN(prefix) NVTX_RANGE_FN(prefix)
+#else
+#define PROFILE_TRACE_FN(prefix)
+#endif
+
 namespace gpt {
 
 struct MLP {
@@ -10,7 +17,6 @@ struct MLP {
 
   explicit MLP(int n_embed) : n_embed_(n_embed) {
     c_fc_ = std::make_unique<nn::Linear>(n_embed, 4 * n_embed);
-    gelu_ = std::make_unique<nn::NewGELU>();
     c_proj_ = std::make_unique<nn::Linear>(4 * n_embed, n_embed);
 
     // activation
@@ -21,6 +27,8 @@ struct MLP {
 
   void Forward(typename TTypes<T>::ConstMatrix x,
                typename TTypes<T>::Matrix y) {
+    PROFILE_TRACE_FN("MLP");
+
     // x: [B*T, 4*n_embed], y: [B*T, 4*n_embed]
     CHECK_EQ(x.dimension(1), n_embed_);
     // x.shape == y.shape
@@ -35,8 +43,8 @@ struct MLP {
     auto fch = fch_->matrix<T>(BT, 4 * n_embed_);
     auto fch_gelu = fch_gelu_->matrix<T>(BT, 4 * n_embed_);
     c_fc_->Forward(x, fch);
-    gelu_->Forward(MakeConstFlat(fch.data(), fch.size()),
-                   MakeFlat(fch_gelu.data(), fch_gelu.size()));
+    nn::NewGELU::Forward(MakeConstFlat(fch.data(), fch.size()),
+                         MakeFlat(fch_gelu.data(), fch_gelu.size()));
     auto fch_gelu_const = fch_gelu_->const_matrix<T>(BT, 4 * n_embed_);
     c_proj_->Forward(fch_gelu_const, y);
   }
@@ -44,6 +52,8 @@ struct MLP {
   void Backward(typename TTypes<T>::ConstMatrix x,
                 typename TTypes<T>::ConstMatrix y_grad,
                 typename TTypes<T>::Matrix x_grad) {
+    PROFILE_TRACE_FN("MLP");
+
     // x: [B*T, 4*n_embed], y_grad: [B*T, 4*n_embed]
     // x_grad: [B*T, 4*n_embed]
     CHECK_EQ(x.dimension(1), n_embed_);
@@ -67,7 +77,7 @@ struct MLP {
     auto fch = fch_->const_flat<T>();
     auto fch_gelu_grad_flat = fch_gelu_->const_flat_grad<T>();
     auto fch_grad = fch_->flat_grad<T>();
-    gelu_->Backward(fch, fch_gelu_grad_flat, fch_grad);
+    nn::NewGELU::Backward(fch, fch_gelu_grad_flat, fch_grad);
 
     auto fch_grad_2d = fch_->const_matrix_grad<T>(BT, 4 * n_embed_);
     c_fc_->Backward(x, fch_grad_2d, x_grad);
@@ -77,6 +87,11 @@ struct MLP {
     return c_fc_->NumParameters() + c_proj_->NumParameters();
   }
 
+  size_t NumActivations() const {
+    return c_fc_->NumActivations() + c_proj_->NumActivations() + fch_->size() +
+           fch_gelu_->size();
+  }
+
   void Parameters(std::vector<nn::Parameter*>* parameters) const {
     c_fc_->Parameters(parameters);
     c_proj_->Parameters(parameters);
@@ -84,7 +99,6 @@ struct MLP {
 
   int n_embed_;
   std::unique_ptr<nn::Linear> c_fc_;
-  std::unique_ptr<nn::NewGELU> gelu_;
   std::unique_ptr<nn::Linear> c_proj_;
 
   // activation tensors
@@ -96,7 +110,7 @@ struct CausalSelfAttention {
   using Type = floatX;
 
   CausalSelfAttention(int block_size, int n_head, int n_embed)
-      : n_head_(n_head), n_embed_(n_embed) {
+      : block_size_(block_size), n_head_(n_head), n_embed_(n_embed) {
     CHECK_EQ(n_embed % n_head, 0);
 
     // key, query, value projections for all heads, but in a batch
@@ -105,15 +119,11 @@ struct CausalSelfAttention {
     // output projection
     c_proj_ = std::make_unique<nn::Linear>(n_embed, n_embed);
 
-    softmax_ = std::make_unique<nn::Softmax>();
-
     // mask
     auto dtype = nn::DataTypeToEnum<Type>::value;
-    for (int i = 0; i <= block_size; ++i) {
-      bias_.emplace_back(std::make_unique<nn::Parameter>(dtype, i * i));
-      auto bias_2d = bias_.back()->matrix<Type>(i, i);
-      nn::UpperTriangularWithNegativeInf(bias_2d);
-    }
+    bias_ = std::make_unique<nn::Parameter>(dtype, block_size * block_size);
+    auto bias_2d = bias_->matrix<Type>(block_size, block_size);
+    nn::UpperTriangularWithNegativeInf(bias_2d);
 
     // activation tensors
     qkv_ = std::make_unique<nn::Activation>(dtype);     // [B, T, 3C]
@@ -128,9 +138,12 @@ struct CausalSelfAttention {
 
   void Forward(typename TTypes<Type, 3>::ConstTensor x,
                typename TTypes<Type, 3>::Tensor y) {
+    PROFILE_TRACE_FN("CausalSelfAttention");
+
     const int B = x.dimension(0);  // batch size
     const int T = x.dimension(1);  // sequence length
     const int C = x.dimension(2);  // embedding dimensionality (n_embd)
+    LOG_FIRST_N(INFO, 1) << "B: " << B << ", T: " << T << ", C: " << C;
     int NH = n_head_, HS = C / n_head_;
     CHECK_EQ(B, y.dimension(0));
     CHECK_EQ(T, y.dimension(1));
@@ -193,15 +206,18 @@ struct CausalSelfAttention {
             MakeMatrix(att_->data<Type>() + (b * NH + h) * T * HS, T, HS);
 
         nn::MatMul::Forward(q2d, k2d, preatt2d, factor);
-        auto bias_2d = bias_[T]->matrix<Type>(T, T);
-        preatt2d.device(nn::g_device) = preatt2d + bias_2d;
+        auto bias_2d = bias_->matrix<Type>(block_size_, block_size_);
+        Eigen::array<Eigen::Index, 2> offsets = {0, 0};
+        Eigen::array<Eigen::Index, 2> extents = {T, T};
+        preatt2d.device(nn::g_device) =
+            preatt2d + bias_2d.slice(offsets, extents);
 
         // softmax
         auto preatt2d_tensor =
             MakeConstMatrix(preatt_->data<Type>() + (b * NH + h) * T * T, T, T);
         auto preatt_softmax2d_tensor = MakeMatrix(
             preatt_softmax_->data<Type>() + (b * NH + h) * T * T, T, T);
-        softmax_->Forward(preatt2d_tensor, preatt_softmax2d_tensor);
+        nn::Softmax::Forward(preatt2d_tensor, preatt_softmax2d_tensor);
 
         // att * v
         typename TTypes<Type>::ConstMatrix v2d_const =
@@ -223,6 +239,8 @@ struct CausalSelfAttention {
   void Backward(typename TTypes<Type, 3>::ConstTensor x,
                 typename TTypes<Type, 3>::ConstTensor y_grad,
                 typename TTypes<Type, 3>::Tensor x_grad) {
+    PROFILE_TRACE_FN("CausalSelfAttention");
+
     const int B = x.dimension(0);  // batch size
     const int T = x.dimension(1);  // sequence length
     const int C = x.dimension(2);  // embedding dimensionality (n_embd)
@@ -298,8 +316,8 @@ struct CausalSelfAttention {
                              preatt_softmax_grad2d, v_grad2d);
 
         // backward: softmax
-        softmax_->Backward(preatt_softmax2d, preatt_softmax_grad2d_const,
-                           preatt_grad2d);
+        nn::Softmax::Backward(preatt_softmax2d, preatt_softmax_grad2d_const,
+                              preatt_grad2d);
 
         // backward: mask
         // backward: q * k
@@ -343,16 +361,25 @@ struct CausalSelfAttention {
     return c_attn_->NumParameters() + c_proj_->NumParameters();
   }
 
+  size_t NumActivations() const {
+    size_t num_activations =
+        c_attn_->NumActivations() + c_proj_->NumActivations() + qkv_->size() +
+        q_->size() + k_->size() + v_->size() + preatt_->size() +
+        preatt_softmax_->size() + att_->size() + att2_->size();
+    num_activations += bias_->size();
+    return num_activations;
+  }
+
   void Parameters(std::vector<nn::Parameter*>* parameters) const {
     c_attn_->Parameters(parameters);
     c_proj_->Parameters(parameters);
   }
 
+  int block_size_;
   int n_head_;
   int n_embed_;
   std::unique_ptr<nn::Linear> c_attn_;
   std::unique_ptr<nn::Linear> c_proj_;
-  std::unique_ptr<nn::Softmax> softmax_;
 
   // activation tensors
   std::unique_ptr<nn::Activation> qkv_;             // [B, T, 3C]
@@ -367,8 +394,7 @@ struct CausalSelfAttention {
   // not really a 'bias', more of a mask, but following the OpenAI/HF naming
   // though
   //  Eigen::MatrixXi bias_;
-  std::vector<std::unique_ptr<nn::Activation>>
-      bias_;  // [0x0], [1x1], ... [block_size, block_size]
+  std::unique_ptr<nn::Activation> bias_;  // [block_size, block_size]
 };
 
 struct Block {
@@ -395,6 +421,8 @@ struct Block {
 
   void Forward(typename TTypes<Type, 3>::ConstTensor x,
                typename TTypes<Type, 3>::Tensor y) {
+    PROFILE_TRACE_FN("Block");
+
     // x: [B, T, C], y: [B, T, C]
     const int B = x.dimension(0);  // batch size
     const int T = x.dimension(1);  // sequence length
@@ -454,6 +482,8 @@ struct Block {
   void Backward(typename TTypes<Type, 3>::ConstTensor x,
                 typename TTypes<Type, 3>::ConstTensor y_grad,
                 typename TTypes<Type, 3>::Tensor x_grad) {
+    PROFILE_TRACE_FN("Block");
+
     // x: [B, T, C], y_grad: [B, T, C], x_grad: [B, T, C]
     const int B = x.dimension(0);  // batch size
     const int T = x.dimension(1);  // sequence length
@@ -523,6 +553,14 @@ struct Block {
   size_t NumParameters() const {
     return ln1_->NumParameters() + attn_->NumParameters() +
            ln2_->NumParameters() + mlp_->NumParameters();
+  }
+
+  size_t NumActivations() const {
+    return ln1_->NumActivations() + attn_->NumActivations() +
+           ln2_->NumActivations() + mlp_->NumActivations() + ln1_y_->size() +
+           ln1_mean_->size() + ln2_rstd_->size() + att_y_->size() +
+           residual1_->size() + ln2_y_->size() + ln2_mean_->size() +
+           ln2_rstd_->size() + mlp_y_->size();
   }
 
   void Parameters(std::vector<nn::Parameter*>* parameters) const {
@@ -597,6 +635,8 @@ struct GPT {
   }
 
   void __Forward(typename TTypes<int>::ConstMatrix idx) {
+    PROFILE_TRACE_FN("GPT");
+
     const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_,
               L = n_layer_;
     const int BT = B * T, TC = T * C;
@@ -649,6 +689,8 @@ struct GPT {
 
   void Forward(typename TTypes<int>::ConstMatrix idx,
                typename TTypes<Type, 3>::Tensor logits) {
+    PROFILE_TRACE_FN("GPT");
+
     const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_;
     const int BT = B * T;
     CHECK(logits.dimension(0) == B && logits.dimension(1) == T &&
@@ -672,6 +714,8 @@ struct GPT {
 
   void SoftmaxForwardCPU(typename TTypes<Type>::ConstMatrix logits,
                          absl::Span<const int> targets, float* loss) {
+    PROFILE_TRACE_FN("GPT");
+
     int BT = logits.dimension(0);
     CHECK_EQ(BT, targets.size());
     CHECK_EQ(vocab_size_, logits.dimension(1));
@@ -683,6 +727,8 @@ struct GPT {
   void SoftmaxForwardGPU(typename TTypes<Type>::ConstMatrix logits,
                          typename TTypes<Type>::ConstMatrix labels,
                          float* loss) {
+    PROFILE_TRACE_FN("GPT");
+
     int BT = logits.dimension(0);
     CHECK_EQ(BT, labels.dimension(0));
     CHECK_EQ(vocab_size_, logits.dimension(1));
@@ -714,6 +760,8 @@ struct GPT {
   void ForwardCPU(typename TTypes<int>::ConstMatrix idx,
                   typename TTypes<int>::ConstMatrix targets,
                   typename TTypes<Type, 3>::Tensor logits, float* loss) {
+    PROFILE_TRACE_FN("GPT");
+
     // idx: [B, T], targets: [B, T]
     // logits: [B, T, vocab_size]
     const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_;
@@ -741,6 +789,8 @@ struct GPT {
   void ForwardGPU(typename TTypes<int>::ConstMatrix idx,
                   typename TTypes<Type, 3>::ConstTensor labels,
                   typename TTypes<Type, 3>::Tensor logits, float* loss) {
+    PROFILE_TRACE_FN("GPT");
+
     // idx: [B, T], targets: [B, T]
     // logits: [B, T, vocab_size]
     const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_;
@@ -767,6 +817,8 @@ struct GPT {
   }
 
   void SoftmaxBackwardCPU(absl::Span<const int> targets) {
+    PROFILE_TRACE_FN("GPT");
+
     int BT = targets.size();
     logits_grad_->LazyAllocate(BT * vocab_size_);
     logits_grad_->ZeroData();
@@ -778,11 +830,15 @@ struct GPT {
 
   void BackwardCPU(typename TTypes<int>::ConstMatrix idx,
                    typename TTypes<int>::ConstMatrix targets) {
+    PROFILE_TRACE_FN("GPT");
+
     SoftmaxBackwardCPU(targets);
     BackwardGPU(idx);
   }
 
   void BackwardGPU(typename TTypes<int>::ConstMatrix idx) {
+    PROFILE_TRACE_FN("GPT");
+
     // idx: [B, T], targets: [B, T]
     const int B = idx.dimension(0), T = idx.dimension(1), C = n_embed_,
               L = n_layer_;
@@ -871,6 +927,32 @@ struct GPT {
     }
     num_parameters += lnf_->NumParameters();
     return num_parameters;
+  }
+
+  size_t NumActivations() const {
+    size_t num_activations = 0;
+    num_activations += wte_->NumActivations();
+    num_activations += wpe_->NumActivations();
+    for (const auto& b : h_) {
+      num_activations += b->NumActivations();
+    }
+    num_activations += lnf_->NumActivations();
+    num_activations += tok_emb_->size();
+    num_activations += pos_emb_->size();
+    num_activations += encoded_->size();
+    num_activations += block_y_->size();
+    num_activations += lnf_y_->size();
+    num_activations += lnf_mean_->size();
+    num_activations += lnf_rstd_->size();
+#ifdef EIGEN_USE_GPU
+    num_activations += scratch_->size();
+    num_activations += loss_->size();
+    num_activations += loss_mean_->size();
+#else
+    num_activations += probs_->size();
+#endif
+    num_activations += logits_grad_->size();
+    return num_activations;
   }
 
   void Parameters(std::vector<nn::Parameter*>* parameters) const {
