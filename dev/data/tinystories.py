@@ -7,10 +7,11 @@ The output is written to a newly created tinystories/ folder.
 The script prints:
 
 For GPT-2:
+Number of shards: 50
 Tokenizing val split...
-Saved 19043638 tokens to tinystories/TinyStories_val.bin
+writing 19,043,638 tokens to tinystories/TinyStories_val.bin
 Tokenizing train split...
-Saved 925653391 tokens to tinystories/TinyStories_train.bin
+writing 925,653,391 tokens to tinystories/TinyStories_train.bin
 
 For LLaMA 3:
 Number of shards: 50
@@ -21,7 +22,7 @@ writing 907,021,844 tokens to tinystories/TinyStories_train.bin
 
 And runs in few minutes two depending on your internet
 connection and computer. The .bin files are raw byte
-streams of int32 numbers indicating the token ids.
+streams of uint16 (gpt-2) or uint32 (llama) numbers indicating the token ids.
 """
 
 import os
@@ -30,10 +31,12 @@ import json
 import random
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import tiktoken
+
 import numpy as np
-from data_common import download_file, write_datafile
+import tiktoken
 from transformers import AutoTokenizer
+
+from data_common import download_file, write_datafile
 
 # -----------------------------------------------------------------------------
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "tinystories")
