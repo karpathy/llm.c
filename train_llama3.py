@@ -477,7 +477,6 @@ class LLaMA(nn.Module):
         max_gen_len: int,
         temperature: float = 0.6,
         top_p: float = 0.9,
-        logprobs: bool = False,
         echo: bool = False,
     ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
         """
@@ -488,15 +487,13 @@ class LLaMA(nn.Module):
             max_gen_len (int): Maximum length of the generated text sequence.
             temperature (float, optional): Temperature value for controlling randomness in sampling. Defaults to 0.6.
             top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
-            logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
             echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
 
         Returns:
-            Tuple[List[List[int]], Optional[List[List[float]]]]: A tuple containing generated token sequences and, if logprobs is True, corresponding token log probabilities.
+            Tuple[List[List[int]], Optional[List[List[float]]]]: A tuple containing generated token sequences.
 
         Note:
             This method uses the provided prompts as a basis for generating text. It employs nucleus sampling to produce text with controlled randomness.
-            If logprobs is True, token log probabilities are computed for each generated token.
 
         """
         bsz = len(prompt_tokens)
@@ -512,8 +509,6 @@ class LLaMA(nn.Module):
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
         for idx, t in enumerate(prompt_tokens):
             tokens[idx, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
-        if logprobs:
-            token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
         prev_pos = 0
         eos_reached = torch.tensor([False] * bsz, device=device)
@@ -521,12 +516,6 @@ class LLaMA(nn.Module):
 
         if min_prompt_len == total_len:
             logits, _ = self.forward(tokens, start_pos=prev_pos)
-            token_logprobs = -F.cross_entropy(
-                input=logits.transpose(1, 2),
-                target=tokens,
-                reduction="none",
-                ignore_index=pad_id,
-            )
 
         stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens)).to(device)
 
@@ -542,39 +531,25 @@ class LLaMA(nn.Module):
             # only replace token if prompt has already been generated
             next_token = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token)
             tokens[:, cur_pos] = next_token
-            if logprobs:
-                token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
-                    input=logits.transpose(1, 2),
-                    target=tokens[:, prev_pos + 1 : cur_pos + 1],
-                    reduction="none",
-                    ignore_index=pad_id,
-                )
             eos_reached |= ~input_text_mask[:, cur_pos] & torch.isin(next_token, stop_tokens)
             prev_pos = cur_pos
             if all(eos_reached):
                 break
 
-        if logprobs:
-            token_logprobs = token_logprobs.tolist()
-        out_tokens, out_logprobs = [], []
+        out_tokens = []
         for i, toks in enumerate(tokens.tolist()):
             # cut to max gen len
             start = 0 if echo else len(prompt_tokens[i])
             toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
-            probs = None
-            if logprobs:
-                probs = token_logprobs[i][start : len(prompt_tokens[i]) + max_gen_len]
             # cut to after eos tok if any
             for stop_token in self.tokenizer.stop_tokens:
                 try:
                     eos_idx = toks.index(stop_token)
                     toks = toks[:eos_idx]
-                    probs = probs[:eos_idx] if logprobs else None
                 except ValueError:
                     pass
             out_tokens.append(toks)
-            out_logprobs.append(probs)
-        return (out_tokens, out_logprobs if logprobs else None)
+        return out_tokens
 
 # -----------------------------------------------------------------------------
 # sampling utils
@@ -1194,7 +1169,7 @@ if __name__ == "__main__":
             else:  # Meta
                 prompt_tokens = [model.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
 
-            generation_tokens, _ = model.generate(prompt_tokens, max_gen_len=64, temperature=0.6, top_p=0.9, logprobs=False, echo=False)
+            generation_tokens = model.generate(prompt_tokens, max_gen_len=64, temperature=0.6, top_p=0.9, echo=False)
             results = [{"generation": model.tokenizer.decode(t)} for t in generation_tokens]
             for prompt, result in zip(prompts, results):
                 print(prompt, end="")
