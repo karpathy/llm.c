@@ -36,7 +36,6 @@ int main(int argc, char *argv[]) {
 
     // setup cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
-    cublasCheck(cublasLtCreate(&cublaslt_handle));
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
     enable_tf32 = 0; // NOTE: disable TF32 for testing!!!
@@ -44,7 +43,6 @@ int main(int argc, char *argv[]) {
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
-    cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
@@ -100,7 +98,7 @@ int main(int argc, char *argv[]) {
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
     float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
-    cudaMemcpy(logits_cpu, model.acts.output, B * T * Vp * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaCheck(cudaMemcpy(logits_cpu, model.acts.output, B * T * Vp * sizeof(float), cudaMemcpyDeviceToHost));
 
     // compare the output logits from the forward pass
     // also careful that we don't access and compare the padded columns of logits
@@ -198,16 +196,16 @@ int main(int argc, char *argv[]) {
 
     // expected losses are as follows, from Python
     float expected_losses[10] = {
-        5.270007133483887,
-        4.059706687927246,
-        3.3751230239868164,
-        2.8007826805114746,
-        2.315382242202759,
-        1.8490285873413086,
-        1.3946564197540283,
-        0.9991465210914612,
-        0.6240804195404053,
-        0.37651097774505615
+        5.270007133483887f,
+        4.059706687927246f,
+        3.3751230239868164f,
+        2.8007826805114746f,
+        2.315382242202759f,
+        1.8490285873413086f,
+        1.3946564197540283f,
+        0.9991465210914612f,
+        0.6240804195404053f,
+        0.37651097774505615f
     };
 
     // compare
@@ -231,9 +229,7 @@ int main(int argc, char *argv[]) {
     free(expected_grads_memory);
     free(calculated_grads_memory);
     gpt2_free(&model);
-    cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
-    cublasCheck(cublasLtDestroy(cublaslt_handle));
 
     return 0;
 }

@@ -28,11 +28,18 @@ the profile.ncu-rep from a cloud box to local to pretty view.
 #include "train_gpt2.cu"
 
 int main(int argc, char *argv[]) {
-    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
+    char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
+    int num_processes = -1;  // doesn't matter when using MPI
+    int process_rank = -1;  // doesn't matter when using MPI
+    int gpus_per_node = -1;  // doesn't matter when using MPI
+    char server_ip[256] = "";  // doesn't matter when using MPI
+    char fs_path[256] = "";  // doesn't matter when using MPI
+    multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
     common_start(true, true);
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
+    gpt2_init_common(&model);
     gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
 
     int B = 24; // if program OOMs decrease this number, e.g. all the way down to 4 or etc
@@ -51,14 +58,17 @@ int main(int argc, char *argv[]) {
     model.config.num_layers = 1;
     set_zero_configs(&multi_gpu_config, 0, model.num_parameters);
 
+    gpt2_allocate_state(&model, B, T);
     // do a training step
-    gpt2_forward(&model, x, y, B, T);
-    gpt2_zero_grad(&model);
-    gpt2_backward(&model, x);
-    gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, 1.f, 1, &multi_gpu_config);
+    gpt2_forward(&model, x, B, T);
+    gpt2_backward_and_reduce(&model, x, y, 1, 0);
+    float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
+    float grad_scale = (grad_norm > 1.0f) ? 1.0f / grad_norm : 1.0f;
+    gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, grad_scale, 1, &multi_gpu_config);
     cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
 
     // free
+    gpt2_free(&model);
     common_free(model);
     return 0;
 }

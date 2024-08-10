@@ -32,6 +32,7 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from torch.distributed.optim import ZeroRedundancyOptimizer
+import torch.distributed as dist
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -767,21 +768,18 @@ if __name__ == "__main__":
         if (args.sample_every > 0 \
             and (step % args.sample_every == 0 or last_step)) \
             and master_process:
-            # TODO I'm not sure why this sampling code (which worked fine)
-            # doesn't work anymore when placed here debug later
-            if False:
-                model.eval()
-                # before we end, let's also do one round of inference
-                # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
-                start_ids = [enc.eot_token]
-                x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-                max_new_tokens = 32
-                temperature = 1.0
-                top_k = 40
-                y = raw_model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-                print0('---------------')
-                print0(enc.decode(y[0].tolist()))
-                print0('---------------')
+            model.eval()
+            # before we end, let's also do one round of inference
+            # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
+            start_ids = [enc.eot_token]
+            xg = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+            max_new_tokens = 32
+            temperature = 1.0
+            top_k = 40
+            yg = raw_model.generate(xg, max_new_tokens, temperature=temperature, top_k=top_k)
+            print0('---------------')
+            print0(enc.decode(yg[0].tolist()))
+            print0('---------------')
 
         # bit confusing: we want to make sure to eval and sample on 0th iteration
         # but also after the very last iteration. so we loop for step <= num_iterations
@@ -792,14 +790,21 @@ if __name__ == "__main__":
 
         # --------------- TRAINING SECTION BEGIN -----------------
         model.train()
+        optimizer.zero_grad(set_to_none=True)
+        # if we are trying to overfit a single batch, we reset the loader here
+        if args.overfit_single_batch:
+            train_loader.reset()
         # micro-batch loop where we do gradient accumulation to reach desired total batch size
         lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
         for micro_step in range(grad_accum_steps):
             # fetch a batch
-            if not args.overfit_single_batch \
-                or (args.overfit_single_batch and step == 0 and micro_step == 0):
-                x, y = train_loader.next_batch()
-                x, y = x.to(device), y.to(device)
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            if ddp:
+                # we want only the last micro-step to sync grads in a DDP model
+                # the official way to do this is with model.no_sync(), but that is a
+                # context manager that bloats the code, so we just toggle this variable
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             # forward pass
             with ctx:
                 _, loss = model(x, y, return_logits=False)
@@ -808,15 +813,13 @@ if __name__ == "__main__":
                 # addition of gradients corresponds to a SUM in the objective, but
                 # instead of a SUM we want MEAN, so we scale the loss here
                 loss = loss / grad_accum_steps
-                lossf += loss.item() # keep track of the mean loss
+                lossf += loss.detach() # keep track of the mean loss
             # backward pass
-            if ddp:
-                # we want only the last micro-step to sync grads in a DDP model
-                # the official way to do this is with model.no_sync(), but that is a
-                # context manager that bloats the code, so we just toggle this variable
-                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             if not args.inference_only:
                 loss.backward()
+        if ddp:
+            dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
+        lossf = lossf.item()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
@@ -824,7 +827,6 @@ if __name__ == "__main__":
             param_group['lr'] = lr
         # step the optimizer
         optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
 

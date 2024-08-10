@@ -13,7 +13,7 @@ CUDA_OUTPUT_FILE = -o $@
 
 # NVCC flags
 # -t=0 is short for --threads, 0 = number of CPUs on the machine
-NVCC_FLAGS = -O3 -t=0 --use_fast_math
+NVCC_FLAGS = -O3 -t=0 --use_fast_math -std=c++17
 NVCC_LDFLAGS = -lcublas -lcublasLt
 NVCC_INCLUDES =
 NVCC_LDLIBS =
@@ -21,6 +21,16 @@ NCLL_INCUDES =
 NVCC_CUDNN =
 # By default we don't build with cudnn because it blows up compile time from a few seconds to ~minute
 USE_CUDNN ?= 0
+
+# We will place .o files in the `build` directory (create it if it doesn't exist)
+BUILD_DIR = build
+ifeq ($(OS), Windows_NT)
+  $(shell if not exist $(BUILD_DIR) mkdir $(BUILD_DIR))
+  REMOVE_BUILD_OBJECT_FILES := del $(BUILD_DIR)\*.obj
+else
+  $(shell mkdir -p $(BUILD_DIR))
+  REMOVE_BUILD_OBJECT_FILES := rm -f $(BUILD_DIR)/*.o
+endif
 
 # Function to check if a file exists in the PATH
 ifneq ($(OS), Windows_NT)
@@ -34,16 +44,16 @@ endef
 endif
 
 ifneq ($(CI),true) # if not in CI, then use the GPU query
-  ifndef GPU_COMPUTE_CAPABILITY # set to defaults if: make GPU_COMPUTE_CAPABILITY= 
+  ifndef GPU_COMPUTE_CAPABILITY # set to defaults if: make GPU_COMPUTE_CAPABILITY=
     ifneq ($(call file_exists_in_path, __nvcc_device_query),)
-      GPU_COMPUTE_CAPABILITY = $(shell __nvcc_device_query) 
+      GPU_COMPUTE_CAPABILITY = $(shell __nvcc_device_query)
       GPU_COMPUTE_CAPABILITY := $(strip $(GPU_COMPUTE_CAPABILITY))
     endif
   endif
 endif
 
 # set to defaults if - make GPU_COMPUTE_CAPABILITY= otherwise use the compute capability detected above
-ifneq ($(GPU_COMPUTE_CAPABILITY),) 
+ifneq ($(GPU_COMPUTE_CAPABILITY),)
   NVCC_FLAGS += --generate-code arch=compute_$(GPU_COMPUTE_CAPABILITY),code=[compute_$(GPU_COMPUTE_CAPABILITY),sm_$(GPU_COMPUTE_CAPABILITY)]
 endif
 
@@ -52,6 +62,7 @@ $(info ---------------------------------------------)
 
 ifneq ($(OS), Windows_NT)
   NVCC := $(shell which nvcc 2>/dev/null)
+  NVCC_LDFLAGS += -lnvidia-ml
 
   # Function to test if the compiler accepts a given flag.
   define check_and_add_flag
@@ -73,7 +84,7 @@ else
     NVCC :=
   endif
   CC := cl
-  CFLAGS = /Idev /Zi /nologo /Wall /WX- /diagnostics:column /sdl /O2 /Oi /Ot /GL /D _DEBUG /D _CONSOLE /D _UNICODE /D UNICODE /Gm- /EHsc /MD /GS /Gy /fp:fast /Zc:wchar_t /Zc:forScope /Zc:inline /permissive- \
+  CFLAGS = /Idev /Zi /nologo /W4 /WX- /diagnostics:column /sdl /O2 /Oi /Ot /GL /D _DEBUG /D _CONSOLE /D _UNICODE /D UNICODE /Gm- /EHsc /MD /GS /Gy /fp:fast /Zc:wchar_t /Zc:forScope /Zc:inline /permissive- \
    /external:W3 /Gd /TP /wd4996 /Fd$@.pdb /FC /openmp:llvm
   LDFLAGS :=
   LDLIBS :=
@@ -108,8 +119,8 @@ ifeq ($(USE_CUDNN), 1)
     NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
     NVCC_LDFLAGS += -lcudnn
     NVCC_FLAGS += -DENABLE_CUDNN
-    NVCC_CUDNN = cudnn_att.o
-  else 
+    NVCC_CUDNN = $(BUILD_DIR)/cudnn_att.o
+  else
     ifneq ($(OS), Windows_NT)
       $(info → cuDNN is not supported on MAC OS right now)
     else
@@ -119,14 +130,14 @@ ifeq ($(USE_CUDNN), 1)
       else ifeq ($(shell if exist "cudnn-frontend\include" (echo exists)),exists)
         CUDNN_FRONTEND_PATH ?= cudnn-frontend\include #override on command line if different location
       else
-        $(error ✗ cuDNN not found. See the README for install instructions and the Makefile for hard-coded paths) 
+        $(error ✗ cuDNN not found. See the README for install instructions and the Makefile for hard-coded paths)
       endif
       CUDNN_INCLUDE_PATH ?= -I"C:\Program Files\NVIDIA\CUDNN\v9.1\include\12.4"
       CUDNN_FRONTEND_PATH += $(CUDNN_INCLUDE_PATH)
       NVCC_FLAGS += --std c++20 -Xcompiler "/std:c++20" -Xcompiler "/EHsc /W0 /nologo /Ox /FS" -maxrregcount=0 --machine 64
-      NVCC_CUDNN = cudnn_att.obj
+      NVCC_CUDNN = $(BUILD_DIR)\cudnn_att.obj
       NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
-      NVCC_LDFLAGS += -L"C:\Program Files\NVIDIA\CUDNN\v9.1\lib\12.4\x64" -lcudnn 
+      NVCC_LDFLAGS += -L"C:\Program Files\NVIDIA\CUDNN\v9.1\lib\12.4\x64" -lcudnn
       NVCC_FLAGS += -DENABLE_CUDNN
     endif
   endif
@@ -178,25 +189,39 @@ else
   endif
 endif
 
-# Check if OpenMPI and NCCL are available, include them if so, for multi-GPU training
+# Check if NCCL is available, include if so, for multi-GPU training
 ifeq ($(NO_MULTI_GPU), 1)
-  $(info → Multi-GPU (OpenMPI + NCCL) is manually disabled)
+  $(info → Multi-GPU (NCCL) is manually disabled)
 else
   ifneq ($(OS), Windows_NT)
     # Detect if running on macOS or Linux
     ifeq ($(SHELL_UNAME), Darwin)
-      $(info ✗ Multi-GPU on CUDA on Darwin is not supported, skipping OpenMPI + NCCL support)
-    else ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && [ -d /usr/lib/x86_64-linux-gnu/openmpi/include/ ] && echo "exists"), exists)
-      $(info ✓ OpenMPI found, OK to train with multiple GPUs)
-      NVCC_INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
-      NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
-      NVCC_LDLIBS += -lmpi -lnccl
+      $(info ✗ Multi-GPU on CUDA on Darwin is not supported, skipping NCCL support)
+    else ifeq ($(shell dpkg -l | grep -q nccl && echo "exists"), exists)
+      $(info ✓ NCCL found, OK to train with multiple GPUs)
       NVCC_FLAGS += -DMULTI_GPU
+      NVCC_LDLIBS += -lnccl
     else
-      $(info ✗ OpenMPI is not found, disabling multi-GPU support)
-      $(info ---> On Linux you can try install OpenMPI with `sudo apt install openmpi-bin openmpi-doc libopenmpi-dev`)
+      $(info ✗ NCCL is not found, disabling multi-GPU support)
+      $(info ---> On Linux you can try install NCCL with `sudo apt install libnccl2 libnccl-dev`)
     endif
   endif
+endif
+
+# Attempt to find and include OpenMPI on the system
+OPENMPI_DIR ?= /usr/lib/x86_64-linux-gnu/openmpi
+OPENMPI_LIB_PATH = $(OPENMPI_DIR)/lib/
+OPENMPI_INCLUDE_PATH = $(OPENMPI_DIR)/include/
+ifeq ($(NO_USE_MPI), 1)
+  $(info → MPI is manually disabled)
+else ifeq ($(shell [ -d $(OPENMPI_LIB_PATH) ] && [ -d $(OPENMPI_INCLUDE_PATH) ] && echo "exists"), exists)
+  $(info ✓ MPI enabled)
+  NVCC_INCLUDES += -I$(OPENMPI_INCLUDE_PATH)
+  NVCC_LDFLAGS += -L$(OPENMPI_LIB_PATH)
+  NVCC_LDLIBS += -lmpi
+  NVCC_FLAGS += -DUSE_MPI
+else
+  $(info ✗ MPI not found)
 endif
 
 # Precision settings, default to bf16 but ability to override
@@ -237,23 +262,24 @@ train_gpt2: train_gpt2.c
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
-$(NVCC_CUDNN): cudnn_att.cpp
-	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_INCLUDES) 
+$(NVCC_CUDNN): llmc/cudnn_att.cpp
+	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_INCLUDES) -o $@
 
 train_gpt2cu: train_gpt2.cu $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE) 
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 train_gpt2fp32cu: train_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 test_gpt2cu: test_gpt2.cu $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE) 
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 test_gpt2fp32cu: test_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE) 
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE)
 
 clean:
-	$(REMOVE_FILES) $(TARGETS) $(NVCC_CUDNN)
+	$(REMOVE_FILES) $(TARGETS)
+	$(REMOVE_BUILD_OBJECT_FILES)
