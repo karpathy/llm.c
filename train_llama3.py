@@ -773,35 +773,38 @@ class Tokenizer:
 # Our own simple Distributed Data Loader
 
 def _peek_data_shard(filename):
-    raise NotImplementedError("_peek_data_shard not yet implemented for llama 3")
     # only reads the header, returns header data
     with open(filename, "rb") as f:
         # first read the header, which is 256 int32 integers (4 bytes each)
         header = np.frombuffer(f.read(256*4), dtype=np.int32)
-    if header[0] != 20240520:
+    if header[0] != 20240801:
         print("ERROR: magic number mismatch in the data .bin file!")
-        print("---> HINT: Are you passing in a correct file with --input_bin?")
-        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
-        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
         exit(1)
-    assert header[1] == 1, "unsupported version"
+    assert header[1] == 7, "unsupported version"
     ntok = header[2] # number of tokens (claimed)
     return ntok # for now just return the number of tokens
 
 def _load_data_shard(filename):
-    raise NotImplementedError("_load_data_shard not yet implemented for llama 3")
     with open(filename, "rb") as f:
         # first read the header, which is 256 int32 integers (4 bytes each)
         header = np.frombuffer(f.read(256*4), dtype=np.int32)
-        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-        assert header[1] == 1, "unsupported version"
+        assert header[0] == 20240801, "magic number mismatch in the data .bin file"
+        assert header[1] == 7, "unsupported version"
         ntok = header[2] # number of tokens (claimed)
         # the rest of it are tokens, stored as uint16
-        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+        tokens = np.frombuffer(f.read(), dtype=np.uint32)
     assert len(tokens) == ntok, "number of tokens read does not match header?"
     return tokens
 
-class DistributedDataLoader:
+class DistributedShardedDataLoader:
+    """
+    This DataLoader is both:
+    - distributed (works correctly in case of multiple processes in DDP)
+    - sharded (supports datasets that are broken up into multiple data shards)
+    It is not *permuted*, meaning that it itearates over the data in the order
+    of the dataset on disk, so the user should make sure to shuffle their examples
+    during the creation of their data shards for best performance.
+    """
     def __init__(self, filename_pattern, B, T, process_rank, num_processes):
         self.process_rank = process_rank
         self.num_processes = num_processes
@@ -842,7 +845,7 @@ class DistributedDataLoader:
         B = self.B
         T = self.T
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        buf = torch.tensor(buf, dtype=torch.long)
         x = (buf[:-1]).view(B, T) # inputs
         y = (buf[1:]).view(B, T) # targets
         # advance the start pointer in current shard
@@ -1097,10 +1100,10 @@ if __name__ == "__main__":
     # Our own version of a simple DistributedDataLoader
 
     # load tokens
-    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    train_loader = DistributedShardedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
     val_loader = None
     if args.input_val_bin:
-        val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+        val_loader = DistributedShardedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 
     # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference

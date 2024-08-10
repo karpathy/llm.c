@@ -23,27 +23,30 @@ def download_file(url: str, fname: str, chunk_size=1024):
             bar.update(size)
 
 
-def write_datafile(filename, toks):
+HEADERS_INFO = {
+    "gpt-2": (20240520, 1),
+    "llama": (20240801, 7),
+}
+
+def write_datafile(filename, toks, model="gpt-2"):
     """
     Saves token data as a .bin file, for reading in C.
     - First comes a header with 256 int32s
-    - The tokens follow, each as a uint16
+    - The tokens follow, each as uint16 (gpt-2) or uint32 (llama)
     """
     assert len(toks) < 2**31, "token count too large" # ~2.1B tokens
+    assert model in ["gpt-2", "llama"], f"unknown model {model}"
     # construct the header
     header = np.zeros(256, dtype=np.int32)
-    header[0] = 20240520 # magic
-    header[1] = 1 # version
-    header[2] = len(toks) # number of tokens after the 256*4 bytes of header (each 2 bytes as uint16)
-    # construct the tokens numpy array, if not already
-    if not isinstance(toks, np.ndarray) or not toks.dtype == np.uint16:
-        # validate that no token exceeds a uint16
-        maxtok = 2**16
-        assert all(0 <= t < maxtok for t in toks), "token dictionary too large for uint16"
+    header[0] = HEADERS_INFO[model][0] # magic
+    header[1] = HEADERS_INFO[model][1] # version
+    header[2] = len(toks) # number of tokens after the 256*4 bytes of header
+    if model == "gpt-2":
         toks_np = np.array(toks, dtype=np.uint16)
+    elif model == "llama":
+        toks_np = np.array(toks, dtype=np.uint32)
     else:
-        toks_np = toks
-    # write to file
+        raise ValueError(f"unknown model {model}")
     print(f"writing {len(toks):,} tokens to {filename}")
     with open(filename, "wb") as f:
         f.write(header.tobytes())

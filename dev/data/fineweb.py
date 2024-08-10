@@ -99,7 +99,7 @@ with mp.Pool(nprocs) as pool:
             remainder = args.shard_size - token_count
             progress_bar.update(remainder)
             all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
-            write_datafile(filename, all_tokens_np)
+            write_datafile(filename, list(all_tokens_np))
             shard_index += 1
             progress_bar = None
             # populate the next shard with the leftovers of the current doc
@@ -110,4 +110,4 @@ with mp.Pool(nprocs) as pool:
     if token_count != 0:
         split = "val" if shard_index == 0 else "train"
         filename = os.path.join(DATA_CACHE_DIR, f"{name}_{split}_{shard_index:06d}.bin")
-        write_datafile(filename, all_tokens_np[:token_count])
+        write_datafile(filename, list(all_tokens_np[:token_count]))
