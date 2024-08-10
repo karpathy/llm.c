@@ -31,6 +31,7 @@ import json
 import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+import fire
 import tiktoken
 from transformers import AutoTokenizer
 
@@ -115,7 +116,10 @@ def tokenize(model):
         split_filename = os.path.join(DATA_CACHE_DIR, f"TinyStories_{split_name}.bin")
         write_datafile(split_filename, all_tokens, model)
 
-if __name__ == "__main__":
-    model = "gpt-2"  # gpt-2 or llama
+def process(model):
+    assert model in ["gpt-2", "llama"], f"unknown model {model} (choose from gpt-2, llama)"
     download()
     tokenize(model)
+
+if __name__ == "__main__":
+    fire.Fire(process)

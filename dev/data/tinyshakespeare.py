@@ -21,6 +21,7 @@ streams of uint16 (gpt-2) or uint32 (llama) numbers indicating the token ids.
 
 import os
 
+import fire
 import tiktoken
 from transformers import AutoTokenizer
 
@@ -68,7 +69,10 @@ def tokenize(model):
     write_datafile(val_filename, val_tokens, model)
     write_datafile(train_filename, train_tokens, model)
 
-if __name__ == "__main__":
-    model = "gpt-2"  # gpt-2 or llama
+def process(model):
+    assert model in ["gpt-2", "llama"], f"unknown model {model} (choose from gpt-2, llama)"
     download()
     tokenize(model)
+
+if __name__ == "__main__":
+    fire.Fire(process)
