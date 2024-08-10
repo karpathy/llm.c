@@ -22,11 +22,14 @@ python dev/data/fineweb.py -t edu -v 100B
 import os
 import argparse
 import multiprocessing as mp
+
 import numpy as np
 import tiktoken
 from datasets import load_dataset
 from tqdm import tqdm
-import argparse
+
+from transformers import AutoTokenizer
+
 
 from data_common import write_datafile
 # ------------------------------------------
@@ -34,6 +37,7 @@ from data_common import write_datafile
 parser = argparse.ArgumentParser(description="FineWeb and Edu-FineWeb dataset preprocessing")
 parser.add_argument("-t", "--type", type=str, default="classic", help="Fineweb type, edu|classic")
 parser.add_argument("-v", "--version", type=str, default="10B", help="Fineweb data sample size, 10B|100B")
+parser.add_argument("-m", "--model", type=str, default="gpt-2", help="Model type, gpt-2|llama")
 parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each data shard in the output .bin files, in tokens")
 args = parser.parse_args()
 
@@ -61,16 +65,33 @@ elif args.type =="edu":
     name = "edu_fineweb"
 
 # init the tokenizer
-enc = tiktoken.get_encoding("gpt2")
-eot = enc._special_tokens['<|endoftext|>'] # end of text token
-def tokenize(doc):
+def tokenize(doc, model):
+    if model == "gpt-2":
+        enc = tiktoken.get_encoding("gpt2")
+        encode = lambda s: enc.encode_ordinary(s)
+        eot = enc._special_tokens['<|endoftext|>'] # end of text token
+        tokens = [eot] # the special <|endoftext|> token delimits all documents
+    elif model == "llama":
+        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
+        def encode(x):
+            return tokenizer(x).input_ids
+        eot = None
+        tokens = []
+    else:
+        raise ValueError(f"unknown model {model}")
+
     # tokenizes a single document and returns a numpy array of uint16 tokens
-    tokens = [eot] # the special <|endoftext|> token delimits all documents
-    tokens.extend(enc.encode_ordinary(doc["text"]))
+    text = doc["text"]
+    tokens.extend(encode(text))
     tokens_np = np.array(tokens)
-    assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
-    tokens_np_uint16 = tokens_np.astype(np.uint16)
-    return tokens_np_uint16
+
+    if model == "gpt-2":
+        assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
+        tokens_np_uint = tokens_np.astype(np.uint16)
+    elif model == "llama":
+        assert (0 <= tokens_np).all() and (tokens_np < 2**32).all(), "token dictionary too large for uint32"
+        tokens_np_uint = tokens_np.astype(np.uint32)
+    return tokens_np_uint
 
 # tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
 nprocs = max(1, os.cpu_count() - 2) # don't hog the entire system
@@ -99,7 +120,7 @@ with mp.Pool(nprocs) as pool:
             remainder = args.shard_size - token_count
             progress_bar.update(remainder)
             all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
-            write_datafile(filename, list(all_tokens_np))
+            write_datafile(filename, list(all_tokens_np), args.model)
             shard_index += 1
             progress_bar = None
             # populate the next shard with the leftovers of the current doc
@@ -110,4 +131,4 @@ with mp.Pool(nprocs) as pool:
     if token_count != 0:
         split = "val" if shard_index == 0 else "train"
         filename = os.path.join(DATA_CACHE_DIR, f"{name}_{split}_{shard_index:06d}.bin")
-        write_datafile(filename, list(all_tokens_np[:token_count]))
+        write_datafile(filename, list(all_tokens_np[:token_count]), args.model)
