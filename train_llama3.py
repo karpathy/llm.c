@@ -500,18 +500,18 @@ class LLaMA(nn.Module):
 
         """
         bsz = len(prompt_tokens)
-        assert bsz <= self.config.max_gen_batch_size, (bsz, self.config.max_gen_batch_size)
+        assert bsz <= self.config.max_gen_batch_size, f"Batch size {bsz} exceeds the maximum generation batch size {self.config.max_gen_batch_size}"
         device = next(self.parameters()).device
 
         min_prompt_len = min(len(t) for t in prompt_tokens)
         max_prompt_len = max(len(t) for t in prompt_tokens)
-        assert max_prompt_len <= self.config.block_size
+        assert max_prompt_len <= self.config.block_size, f"Prompt length {max_prompt_len} exceeds the maximum block size {self.config.block_size}"
         total_len = min(self.config.block_size, max_gen_len + max_prompt_len)
 
         pad_id = self.tokenizer.pad_id
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
-        for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
+        for idx, t in enumerate(prompt_tokens):
+            tokens[idx, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
@@ -549,9 +549,7 @@ class LLaMA(nn.Module):
                     reduction="none",
                     ignore_index=pad_id,
                 )
-            eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                torch.isin(next_token, stop_tokens)
-            )
+            eos_reached |= ~input_text_mask[:, cur_pos] & torch.isin(next_token, stop_tokens)
             prev_pos = cur_pos
             if all(eos_reached):
                 break
