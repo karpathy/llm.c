@@ -1,3 +1,4 @@
+fire
 tqdm
 numpy<2
 torch
