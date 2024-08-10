@@ -434,7 +434,7 @@ __device__ void matmul_tri3(float* p, int PS, const float* k, int KS, const floa
         }
 
         for (int i = 0; i < 8; ++i) {
-            // no need to keep lhs around for the i loop, its only reused in the j loop anyway.
+            // no need to keep lhs around for the i loop, it's only reused in the j loop anyway.
             float4 lhs = ld_vec(q + i * QS + hs);
             for (int j = 0; j < 8; ++j) {
                 vals[i][j] += lhs.x * rhs[j].x;
@@ -643,6 +643,7 @@ int main(int argc, char **argv) {
     free(inp);
     cudaCheck(cudaFree(d_out));
     cudaCheck(cudaFree(d_inp));
+    cudaCheck(cudaFree(d_qkvr));
     cublasDestroy(cublas_handle);
 
     return 0;

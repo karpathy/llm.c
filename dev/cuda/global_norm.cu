@@ -16,6 +16,7 @@ nvcc -O3 --use_fast_math global_norm.cu -o global_norm
 #define ENABLE_BF16
 #include "common.h"
 
+cudaDeviceProp deviceProp;
 
 float global_norm_cpu(const float* data, size_t count) {
     // accumulate in double so we have an accurate numerical reference
@@ -89,6 +90,54 @@ __global__ void norm_kernel2(float* out, const T* data, size_t count) {
     }
 }
 
+template<class T>
+__global__ void norm_kernel3(float* out, const T* data, size_t count) {
+    size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t grid_width = blockDim.x * gridDim.x;
+    float accumulator = 0.f;
+    for(size_t i = index; i < count; i += grid_width) {
+        accumulator += (float)data[i] * (float)data[i];
+    }
+    // block-level reduce
+    float block_sum = blockReduce<warpReduceSum>(accumulator);
+    if(threadIdx.x == 0) {
+        atomicAdd(out, block_sum);
+    }
+}
+
+// Same as kernel3 but without atomic adds -> this allows us to have determinism due to the
+// non associativity of floating point operations. Roughly same performance as kernel3.
+template<class T>
+__global__ void norm_kernel4(float* out, const T* data, size_t count) {
+    size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t grid_width = blockDim.x * gridDim.x;
+    float accumulator = 0.f;
+    for(size_t i = index; i < count; i += grid_width) {
+        accumulator += (float)data[i] * (float)data[i];
+    }
+    // block-level reduce
+    float block_sum = blockReduce<warpReduceSum>(accumulator);
+    // each block accumulates its partial sum to out[blockIdx.x]
+    // we want to avoid using atomic add here so we combine this kernel with the aggregate kernel call
+    // that sums up the partial block sums
+    if(threadIdx.x == 0) {
+        out[blockIdx.x] = block_sum;
+    }
+}
+
+__global__ void global_norm_aggregate_kernel(float* out, size_t count) {
+    size_t index = threadIdx.x;
+    // grab block sums from the previous kernel, use 0. as the neutral sum element
+    float block_sum = (index < count) ? out[index] : 0.f;
+    float sum = blockReduce<warpReduceSum>(block_sum);
+    if(threadIdx.x == 0) {
+        out[0] = sum;  // out[0] ends up with the final norm squared
+    }
+}
+
+// ----------------------------------------------------------------------------
+// kernel launchers
+
 template<typename T>
 void global_norm1(float* out, const T* values, size_t count, int block_size) {
     // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
@@ -111,17 +160,54 @@ void global_norm2(float* out, const T* values, size_t count, int block_size) {
     cudaCheck(cudaGetLastError());
 }
 
+template<typename T>
+void global_norm3(float* out, const T* values, size_t count, int block_size) {
+    // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
+    // having one block less than possible is a tiny performance hit, having
+    // one block too many is catastrophic, since it only can start once all the other
+    // blocks finish. anyway, I think cuda_threads_per_SM should be a multiple of 512
+    // on all gpus, so the division really is going to be exact.
+    const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
+    assert(grid_size > 0);  // gives a better error than letting the call below fail
+    norm_kernel3<<<grid_size, block_size>>>(out, values, count);
+    cudaCheck(cudaGetLastError());
+}
+
+template<typename T>
+void global_norm4(float* out, const T* values, size_t count, int block_size) {
+    if (block_size <= 64) {
+        block_size = 128;  // to avoid triggering the assert below
+    }
+    // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
+    // having one block less than possible is a tiny performance hit, having
+    // one block too many is catastrophic, since it only can start once all the other
+    // blocks finish. anyway, I think cuda_threads_per_SM should be a multiple of 512
+    // on all gpus, so the division really is going to be exact.
+    const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
+    assert(grid_size > 0);      // gives a better error than letting the call below fail
+    assert(grid_size < 1024);  // we want to later accumulate the block sums in a single block
+    norm_kernel4<<<grid_size, block_size>>>(out, values, count);
+    cudaCheck(cudaGetLastError());
+    global_norm_aggregate_kernel<<<1, 1024>>>(out, grid_size);
+    cudaCheck(cudaGetLastError());
+}
+
 void global_norm(int kernel_num, float* out, const floatX* values, size_t count, int block_size) {
     switch (kernel_num) {
         case 1:
             return global_norm1(out, values, count, block_size);
         case 2:
             return global_norm2(out, values, count, block_size);
+        case 3:
+            return global_norm3(out, values, count, block_size);
+        case 4:
+            return global_norm4(out, values, count, block_size);
     }
 }
 
 int main(int argc, const char **argv) {
     setup_main();
+    cudaGetDeviceProperties(&deviceProp, 0);
 
     int C = 768;
     int L = 12;
@@ -148,7 +234,7 @@ int main(int argc, const char **argv) {
     // move to GPU
     float* d_out;
     floatX* d_inp;
-    cudaCheck(cudaMalloc(&d_out,  sizeof(float)));
+    cudaCheck(cudaMalloc(&d_out,  1024 * sizeof(float)));  // 1024 needed for kernel 4
     cudaCheck(cudaMalloc(&d_inp, num_params * sizeof(floatX)));
     cudaCheck(memcpy_convert(d_inp, inp, num_params));
 

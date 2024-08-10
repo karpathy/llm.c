@@ -23,7 +23,6 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 // GPU / CUDA related
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
-#include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 // our own utilities
@@ -60,12 +59,8 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 }
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
 
-// cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
-static size_t cublaslt_workspace_size = 32 * 1024 * 1024;
-static void* cublaslt_workspace = NULL;
 static cublasComputeType_t cublas_compute_type;
 cublasHandle_t cublas_handle;
-cublasLtHandle_t cublaslt_handle;
 
 namespace cg = cooperative_groups;
 
@@ -611,6 +606,87 @@ __global__ void fused_classifier_kernel3(float* logits, float* losses, float* pr
     }
 }
 
+__device__ float4 ld_vec(const float* address) {
+    return *reinterpret_cast<const float4*>(address);
+}
+
+__device__ void st_vec(float* address, float4 val) {
+    *reinterpret_cast<float4*>(address) = val;
+}
+
+__global__ void __launch_bounds__(16*16, 2) matmul_forward_kernel4(float* out,
+                                                                   const float* inp, const float* weight, const float* bias,
+                                                                   int C, int OC) {
+    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
+    // inp is (B,T,C), weight is (OC, C), bias is (OC)
+    // each thread handles 8x8 elements; each block 128 by 128 elements.
+    int oc = 8*(blockIdx.y * blockDim.y + threadIdx.y);
+
+    // buffers to cache chunks of the input matrices
+    __shared__ float lhs_s[128][32];
+    __shared__ float rhs_s[128][32];
+
+    // adjust our pointers for the current block
+    inp += 128 * blockIdx.x * C;
+    weight += 128 * blockIdx.y * C;
+    out += 128 * blockIdx.x * OC + 128 * blockIdx.y;
+
+    float vals[8][8] = {};
+    if(bias != NULL) {
+        for (int i = 0; i < 8; i++) {
+            for (int j = 0; j < 8; j += 4) {
+                float4 b = ld_vec(bias + oc + j);
+                vals[i][j+0] = b.x;
+                vals[i][j+1] = b.y;
+                vals[i][j+2] = b.z;
+                vals[i][j+3] = b.w;
+            }
+        }
+    }
+
+    int si_start = 4*(16 * threadIdx.y + threadIdx.x);
+    for (int so = 0; so < C; so += 32) {
+        __syncthreads();
+        int xmod8 = threadIdx.x % 8;
+        int xby8 = threadIdx.x / 8;
+        int xo = 4 * xmod8;
+        for(int y = 2 * threadIdx.y + xby8; y < 128; y += 32) {
+            st_vec(&lhs_s[y][xo], ld_vec(inp + y * C + so + xo));
+            st_vec(&rhs_s[y][xo], ld_vec(weight + y * C + so + xo));
+        }
+        __syncthreads();
+
+        for (int si = si_start; si < si_start + 32; si += 4) {
+            float4 rhs[8];
+            for (int u = 0; u < 8; ++u) {
+                rhs[u] = ld_vec(&rhs_s[u + 8 * threadIdx.y][si % 32]);
+            }
+
+            for (int ii = 0; ii < 8; ++ii) {
+                float4 lhs = ld_vec(&lhs_s[ii + 8 * threadIdx.x][si % 32]);
+                for (int ji = 0; ji < 8; ++ji) {
+                    vals[ii][ji] += lhs.x * rhs[ji].x;
+                    vals[ii][ji] += lhs.y * rhs[ji].y;
+                    vals[ii][ji] += lhs.z * rhs[ji].z;
+                    vals[ii][ji] += lhs.w * rhs[ji].w;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 8; j += 4) {
+            float4 result;
+            result.x = vals[i][j + 0];
+            result.y = vals[i][j + 1];
+            result.z = vals[i][j + 2];
+            result.w = vals[i][j + 3];
+            st_vec(out + (8*threadIdx.x+i) * OC + 8*threadIdx.y + j, result);
+        }
+    }
+}
+
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -645,77 +721,18 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
-// uses cuBLASLt to fuse the bias and gelu. does not work with OC = 50257 (last layer)
-// https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
-// https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtSgemm/sample_cublasLt_LtSgemm.cu
-void matmul_forward_cublaslt(float* out,
-                     float* inp, float* weight, float* bias,
-                     int B, int T, int C, int OC) {
-    int has_bias = (bias != NULL);
+// kernel 1 is the most naive matmul kernel
+void matmul_forward(float* out,
+                    const float* inp, const float* weight, const float* bias,
+                    int B, int T, int C, int OC) {
+    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
+    // inp is (B,T,C), weight is (OC, C), bias is (OC)
+    int sqrt_block_size = 16;
 
-    // check bias alignment
-    if(((uintptr_t)bias % 16) != 0) {
-        printf("Bias pointer is not aligned (cuBLASLt requirement)!\n");
-        exit(EXIT_FAILURE);
-    }
-
-    int returnedResults = 0;
-    cublasLtMatmulDesc_t operationDesc;
-    cublasLtMatmulPreference_t preference;
-    cublasLtMatrixLayout_t weightLayout;
-    cublasLtMatrixLayout_t inputLayout;
-    cublasLtMatrixLayout_t outputLayout;
-    cublasLtMatrixLayout_t biasLayout;
-    cublasLtMatmulHeuristicResult_t heuristic;
-
-    // create the operation descriptor
-    cublasOperation_t opNoTranspose = CUBLAS_OP_N;
-    cublasOperation_t opTranspose = CUBLAS_OP_T;
-    cublasLtEpilogue_t epilogueBias = CUBLASLT_EPILOGUE_BIAS;
-    cublasCheck(cublasLtMatmulDescCreate(&operationDesc, cublas_compute_type, CUDA_R_32F));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opNoTranspose, sizeof(opNoTranspose)));
-    if(has_bias) {
-        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias,
-                                                   sizeof(epilogueBias)));
-    }
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
-
-    // define matrix layouts
-    cublasCheck(cublasLtMatrixLayoutCreate(&weightLayout, CUDA_R_32F, C, OC, C));
-    cublasCheck(cublasLtMatrixLayoutCreate(&inputLayout, CUDA_R_32F, C, B*T, C));
-    cublasCheck(cublasLtMatrixLayoutCreate(&outputLayout, CUDA_R_32F, OC, B*T, OC));
-    cublasCheck(cublasLtMatrixLayoutCreate(&biasLayout, CUDA_R_32F, OC, 1, OC));
-
-    // create a preference handle with specified max workspace
-    cublasCheck(cublasLtMatmulPreferenceCreate(&preference));
-    cublasCheck(cublasLtMatmulPreferenceSetAttribute(preference,
-        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-        &cublaslt_workspace_size, sizeof(cublaslt_workspace_size)));
-
-    // find a suitable algorithm
-    cublasCheck(cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc,
-        weightLayout, inputLayout, outputLayout, outputLayout,
-        preference, 1, &heuristic, &returnedResults));
-    if (returnedResults == 0) {
-        printf("No cuBLASLt algorithm: B: %d, T: %d, C: %d, OC: %d, bias: %d\n", B, T, C, OC, has_bias);
-        exit(EXIT_FAILURE);
-    }
-
-    // call the matmul
-    const float alpha = 1.0f, beta = 0.0f;
-    cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
-        &alpha, weight, weightLayout, inp, inputLayout, &beta,
-        out, outputLayout, out, outputLayout, &heuristic.algo,
-        cublaslt_workspace, cublaslt_workspace_size, 0));
-
-    // cleanups
-    cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
-    cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
-    cublasCheck(cublasLtMatrixLayoutDestroy(weightLayout));
-    cublasCheck(cublasLtMatrixLayoutDestroy(inputLayout));
-    cublasCheck(cublasLtMatrixLayoutDestroy(outputLayout));
-    cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
+    dim3 gridDim(CEIL_DIV(B * T, 8*sqrt_block_size), CEIL_DIV(OC, 8*sqrt_block_size));
+    dim3 blockDim(sqrt_block_size, sqrt_block_size);
+    matmul_forward_kernel4<<<gridDim, blockDim>>>(out, inp, weight, bias, C, OC);
+    cudaCheck(cudaGetLastError());
 }
 
 void attention_forward(float* out, float* qkvr, float* att,
@@ -1255,20 +1272,20 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
-        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
 
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    matmul_forward(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
@@ -1594,13 +1611,11 @@ int main(int argc, char *argv[]) {
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
     // setup cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
-    cublasCheck(cublasLtCreate(&cublaslt_handle));
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
-    cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
     printf("| device                | %-50s |\n", deviceProp.name);
     printf("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
     printf("+-----------------------+----------------------------------------------------+\n");
@@ -1619,8 +1634,8 @@ int main(int argc, char *argv[]) {
 
     // build DataLoaders for both train and val
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1);
-    dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1);
+    dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, 1);
+    dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);
     int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
     int val_num_batches = val_loader.num_tokens / (B*T);
     if (val_num_batches > val_max_steps) { val_num_batches = val_max_steps; }
@@ -1732,9 +1747,7 @@ int main(int argc, char *argv[]) {
     gpt2_free(&model);
     free(cpu_logits);
     free(gen_tokens);
-    cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
-    cublasCheck(cublasLtDestroy(cublaslt_handle));
     logger_free(&logger);
 
     return 0;

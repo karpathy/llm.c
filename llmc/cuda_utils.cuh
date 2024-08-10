@@ -80,6 +80,36 @@ typedef Packed128<float> f128;
 typedef Packed128<floatX> x128;
 
 // ----------------------------------------------------------------------------
+// DType support
+
+// enumerator to indentify the datatype of a tensor.
+enum class DType : uint8_t {
+    FP32, FP16, BF16
+};
+
+// Given a datatype enum, returns the underlying number of bytes
+// for a scalar of that type
+size_t sizeof_dtype(DType type) {
+    switch (type) {
+        case DType::FP32:
+            return sizeof(float);
+        case DType::FP16:
+            return sizeof(half);
+        case DType::BF16:
+            return sizeof(nv_bfloat16);
+        default: // handle or get compiler warning
+            fprintf(stderr, "Unknown datatype\n");
+            exit(EXIT_FAILURE);
+    }
+}
+
+DType dtype_of(float* f) { return DType::FP32; }
+DType dtype_of(nv_bfloat16 * f) { return DType::BF16; }
+DType dtype_of(half * f) { return DType::FP16; }
+
+
+
+// ----------------------------------------------------------------------------
 // Copy, cast functions
 
 // device functions and the kernel to cast data between types
@@ -102,11 +132,11 @@ __device__ float cast_value<float, __nv_bfloat16>(__nv_bfloat16 val) {
 }
 
 template<typename Td, typename Ts>
-__global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n) {
+__global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n, ptrdiff_t stride_dst, ptrdiff_t stride_src) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // need to try grid stride looping for more perf later
     if (idx < n) {
-        dst[idx] = cast_value<Td, Ts>(src[idx]);
+        dst[idx + stride_dst * blockIdx.y] = cast_value<Td, Ts>(src[idx + stride_src * blockIdx.y]);
     }
 }
 
@@ -153,6 +183,28 @@ __device__ inline float blockReduce(float val, bool final_sync=false, float out_
     return block_val;
 }
 
+// Performs a _deterministic_ sum reduction. determinism is achieved by requiring that only
+// a single block be used.
+template<class Float>
+__global__ void global_sum_single_block_kernel(float* result, const Float* values, size_t count) {
+    assert(gridDim.x == 1);     // only a single block!
+    float thread_sum = 0;
+    for(size_t index = threadIdx.x; index < count; index += blockDim.x) {
+        thread_sum += (float)values[index];
+    }
+
+    float reduction = blockReduce<warpReduceSum>(thread_sum, true);
+    if(threadIdx.x == 0) {
+        *result = reduction;
+    }
+}
+
+template<class Float>
+void global_sum_deterministic(float* result, const Float* values, int count, cudaStream_t stream) {
+    global_sum_single_block_kernel<<<1, 1024, 0, stream>>>(result, values, count);
+    cudaCheck(cudaGetLastError());
+}
+
 // ----------------------------------------------------------------------------
 // Random Number Generation used in Stochastic Rounding
 
@@ -160,14 +212,14 @@ __device__ inline float blockReduce(float val, bool final_sync=false, float out_
 // This gives us a random number from threadIdx/blockIdx + a single seed for the entire GPU
 // todo - possibly overkill and we don't need such high quality random numbers? (tbd)
 // http://eiserloh.net/noise/SquirrelNoise5.hpp
-__device__ __host__ constexpr unsigned int SquirrelNoise5(int positionX, unsigned int seed)
+__device__ __host__ constexpr unsigned int SquirrelNoise5(unsigned int positionX, unsigned int seed)
 {
     constexpr unsigned int SQ5_BIT_NOISE1 = 0xd2a80a3f;	// 11010010101010000000101000111111
     constexpr unsigned int SQ5_BIT_NOISE2 = 0xa884f197;	// 10101000100001001111000110010111
     constexpr unsigned int SQ5_BIT_NOISE3 = 0x6C736F4B; // 01101100011100110110111101001011
     constexpr unsigned int SQ5_BIT_NOISE4 = 0xB79F3ABB;	// 10110111100111110011101010111011
     constexpr unsigned int SQ5_BIT_NOISE5 = 0x1b56c4f5;	// 00011011010101101100010011110101
-    unsigned int mangledBits = (unsigned int) positionX;
+    unsigned int mangledBits = positionX;
     mangledBits *= SQ5_BIT_NOISE1;
     mangledBits += seed;
     mangledBits ^= (mangledBits >> 9);
@@ -183,14 +235,18 @@ __device__ __host__ constexpr unsigned int SquirrelNoise5(int positionX, unsigne
 }
 __device__ __host__ constexpr unsigned int Get2dNoiseUint(int indexX, int indexY, unsigned int seed)
 {
-    constexpr int PRIME_NUMBER = 198491317; // Large prime number with non-boring bits
-    return SquirrelNoise5(indexX + (PRIME_NUMBER * indexY), seed);
+    constexpr unsigned int PRIME_NUMBER = 198491317u; // Large prime number with non-boring bits
+    unsigned int x = static_cast<unsigned int>(indexX);
+    unsigned int y = static_cast<unsigned int>(indexY);
+
+    return SquirrelNoise5(x + (PRIME_NUMBER * y), seed);
 }
 
 // stochastic rounding built on top of Squirel Noise above (with seed updated per step via xorshift)
 __device__ __forceinline__ void stochastic_rounding(float in, __nv_bfloat16 *out, unsigned int seed) {
     // todo - is this stochastic rounding *too good*? can we cut any corners?
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+    // makes sure each thread gets a different random number
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
     unsigned int threshold = random & 0xFFFF;
     unsigned int float_bits = __float_as_uint(in);
     unsigned int rounded_bits = float_bits & 0x0000FFFF;

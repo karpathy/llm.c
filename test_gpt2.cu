@@ -89,7 +89,13 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
 }
 
 int main(int argc, char *argv[]) {
-    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
+    char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
+    int num_processes = -1;  // doesn't matter when using MPI
+    int process_rank = -1;  // doesn't matter when using MPI
+    int gpus_per_node = -1;  // doesn't matter when using MPI
+    char server_ip[256] = "";  // doesn't matter when using MPI
+    char fs_path[256] = "";  // doesn't matter when using MPI
+    multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
     common_start(false, true);
 
     // set the right paths
@@ -101,6 +107,7 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
+    gpt2_init_common(&model);
 
     gpt2_build_from_checkpoint(&model, load_filename);
     size_t V = model.config.vocab_size;
@@ -111,9 +118,11 @@ int main(int argc, char *argv[]) {
 
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { exit(EXIT_FAILURE);  } // must have arg after flag
+        if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { exit(EXIT_FAILURE); } // must be -x[y] (one dash, one or two letters)
         if (argv[i][0] != '-') { exit(EXIT_FAILURE); } // must start with dash
         if (argv[i][1] == 'w') { model.use_master_weights = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { model.recompute = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'g' && argv[i][2] == 'e') { model.gelu_fusion = atoi(argv[i+1]); }
     }
 
     // load additional information that we will use for debugging and error checking
@@ -159,22 +168,25 @@ int main(int argc, char *argv[]) {
     // overall OK signal for the test
     int allok = 1;
 
+    gpt2_allocate_state(&model, B, T);
+
     // First, do target-free forward pass to validate logits
-    gpt2_forward(&model, x, NULL, B, T);
+    gpt2_forward(&model, x, B, T);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
     floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
     float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
-    cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost);
+    cudaCheck(cudaMemcpy(logits_cpu_raw, model.acts.output, B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B * T * Vp; i++) {
         logits_cpu[i] = (float)logits_cpu_raw[i];
     }
 
+    float logit_accuracy_threshold = 1e-3f;
+    float loss_diff_threshold = 1e-5f;
     // FP16 and lower require very high tolerances unfortunately. TODO look into more
-    float logit_accuracy_threshold = 1e-2f;
-    float loss_diff_threshold = 0.05f;
     #if defined(ENABLE_BF16) || defined(ENABLE_F16)
     logit_accuracy_threshold = 25.0f; // 15.0f was too low even without cuDNN?! :(
+    loss_diff_threshold = 0.05f;
     #endif
 
     // compare the output logits from the forward pass
@@ -208,25 +220,16 @@ int main(int argc, char *argv[]) {
     for (int step = 0; step < 10; step++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
-        gpt2_forward(&model, x, y, B, T);
-        gpt2_zero_grad(&model);
-        gpt2_backward(&model, x);
+        gpt2_forward(&model, x, B, T);
+        gpt2_backward_and_reduce(&model, x, y, 1, 0);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
         if (step == 0) {
             // error checking at step 0 for reference activations
 
-            // compare the achieved loss
-            if (fabsf(model.mean_loss - *expected_loss) >= loss_diff_threshold) {
-                printf("LOSS MISMATCH: %f %f\n", model.mean_loss, *expected_loss);
-                allok = 0;
-            } else {
-                printf("LOSS OK: %f %f\n", model.mean_loss, *expected_loss);
-            }
-
             // move the (mixed precision) grads from GPU to CPU
-            cudaMemcpy(grads_memory_cpu, model.grads_memory, model.num_parameters_bytes, cudaMemcpyDeviceToHost);
+            cudaCheck(cudaMemcpy(grads_memory_cpu, model.grads_memory, model.num_parameters_bytes, cudaMemcpyDeviceToHost));
 
             // convert all gradients to float on the CPU
             char* src_iterator = (char*)grads_memory_cpu; // can be lower precision, so we use char*
@@ -263,43 +266,56 @@ int main(int argc, char *argv[]) {
             // In that case it's ok to extend the tolerance by a bit, after a manual review.
             // Also, different GPUs may use different matrix multiplication algorithms, so the
             // actual errors can be hardware specific.
-            allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", 6e-1f); // hmm a bit high
-            allok = allok & check_tensor(tensors1[1], tensors2[1], maxT * C, "wpe", 4e-3f);
-            allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", 1e-1); // hmm a bit high
-            allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", 3.5e-2f);
-            allok = allok & check_tensor(tensors1[4], tensors2[4], L * C * C, "attprojw", 2e-2f);
-            allok = allok & check_tensor(tensors1[5], tensors2[5], L * C, "attprojb", 3e-2f);
-            allok = allok & check_tensor(tensors1[6], tensors2[6], L * 4*C * C, "fcw", 5e-2f); // hmm a bit high
-            allok = allok & check_tensor(tensors1[7], tensors2[7], L * 4*C, "fcb", 5e-2f); // hmm a bit high
-            allok = allok & check_tensor(tensors1[8], tensors2[8], L * C * 4*C, "fcprojw", 5e-2f); // hmm a bit high
-            allok = allok & check_tensor(tensors1[9], tensors2[9], L * C, "fcprojb", 1.5e-2f);
-            allok = allok & check_tensor(tensors1[10], tensors2[10], L * C, "ln1w", 6e-4f);
-            allok = allok & check_tensor(tensors1[11], tensors2[11], L * C, "ln1b", 9e-3f);
-            allok = allok & check_tensor(tensors1[12], tensors2[12], L * C, "ln2w", 2e-3f);
-            allok = allok & check_tensor(tensors1[13], tensors2[13], L * C, "ln2b", 2.5e-3f);
-            allok = allok & check_tensor(tensors1[14], tensors2[14], C, "lnfw", 0.12f); // hmm bit higher
-            allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", 2e-2f);
+
+            float grad_thresholds[NUM_PARAMETER_TENSORS] = {5e-1f, 4e-3f, 1e-1f, 3.5e-2f, 2e-2f, 3e-2f, 5e-2f, 5e-2f, 5e-2f, 1.5e-2f, 5e-4f, 8e-3f, 1.5e-3f, 2.5e-3f, 1e-1f, 2e-2f};
+            #if defined(ENABLE_FP32)
+            for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+                grad_thresholds[i] = 1e-6f;  // we can be much more precise in FP32
+            }
+            #endif
+
+            allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", grad_thresholds[0]);
+            allok = allok & check_tensor(tensors1[1], tensors2[1], maxT * C, "wpe", grad_thresholds[1]);
+            allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", grad_thresholds[2]);
+            allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", grad_thresholds[3]);
+            allok = allok & check_tensor(tensors1[4], tensors2[4], L * C * C, "attprojw", grad_thresholds[4]);
+            allok = allok & check_tensor(tensors1[5], tensors2[5], L * C, "attprojb", grad_thresholds[5]);
+            allok = allok & check_tensor(tensors1[6], tensors2[6], L * 4*C * C, "fcw", grad_thresholds[6]);
+            allok = allok & check_tensor(tensors1[7], tensors2[7], L * 4*C, "fcb", grad_thresholds[7]);
+            allok = allok & check_tensor(tensors1[8], tensors2[8], L * C * 4*C, "fcprojw", grad_thresholds[8]);
+            allok = allok & check_tensor(tensors1[9], tensors2[9], L * C, "fcprojb", grad_thresholds[9]);
+            allok = allok & check_tensor(tensors1[10], tensors2[10], L * C, "ln1w", grad_thresholds[10]);
+            allok = allok & check_tensor(tensors1[11], tensors2[11], L * C, "ln1b", grad_thresholds[11]);
+            allok = allok & check_tensor(tensors1[12], tensors2[12], L * C, "ln2w", grad_thresholds[12]);
+            allok = allok & check_tensor(tensors1[13], tensors2[13], L * C, "ln2b", grad_thresholds[13]);
+            allok = allok & check_tensor(tensors1[14], tensors2[14], C, "lnfw", grad_thresholds[14]);
+            allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", grad_thresholds[15]);
         }
 
-        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+1, &multi_gpu_config);
+        float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
+        float grad_scale = (grad_norm > 1.0f) ? 1.0f / grad_norm : 1.0f;
+        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, grad_scale, step+1, &multi_gpu_config);
 
         // print the timing information at the end
         printf("step %d: loss %f (took %f ms)\n", step+1, model.mean_loss, time_elapsed_s * 1000);
-        losses[step] = model.mean_loss;
+        // the expected losses from PyTorch were copied over after the print formatting rounded
+        // them to 6 decimal places, so we do the same here
+        float rounded_loss = roundf(model.mean_loss * 1000000) / 1000000;
+        losses[step] = rounded_loss;
     }
 
     // expected losses are as follows, from Python
     float expected_losses[10] = {
-        5.2700,
-        4.0607,
-        3.3202,
-        2.7176,
-        2.1811,
-        1.6538,
-        1.1680,
-        0.7367,
-        0.4008,
-        0.1874
+        5.270009f,
+        4.060681f,
+        3.320085f,
+        2.717550f,
+        2.181066f,
+        1.653923f,
+        1.168050f,
+        0.736873f,
+        0.401021f,
+        0.187493f
     };
 
     // compare
@@ -312,10 +328,58 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // Finally, let's check determinism
+    gpt2_write_to_checkpoint(&model, "test_gpt2cu_model.ckpt");
+
+    DataLoader loader;
+    dataloader_init(&loader, "dev/data/tinyshakespeare/tiny_shakespeare_val.bin", B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 1);
+    save_state("test_gpt2cu_state.ckpt", 10, &model, &loader);
+    int tokens[10];
+    for (int step = 0; step < 10; step++) {
+        dataloader_next_batch(&loader);
+        gpt2_forward(&model, loader.inputs, B, T);
+        gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, 0);
+        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
+        losses[step] = model.mean_loss;
+        tokens[step] = loader.inputs[0];
+    }
+
+    // reload
+    gpt2_free(&model);
+    gpt2_build_from_checkpoint(&model, "test_gpt2cu_model.ckpt");
+    int ld_step;
+    gpt2_allocate_state(&model, B, T);
+    load_state(&ld_step, &model, &loader, "test_gpt2cu_state.ckpt");
+    for (int step = 0; step < 10; step++) {
+        dataloader_next_batch(&loader);
+        gpt2_forward(&model, loader.inputs, B, T);
+        gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, 0);
+        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
+
+        if(loader.inputs[0] != tokens[step]) {
+            printf("Nondeterminism! Token mismatch at step %d: %d vs %d\n", step, tokens[step], loader.inputs[0]);
+            allok = false;
+            break;
+        }
+
+        if(losses[step] != model.mean_loss) {
+            printf("Nondeterminism! Loss mismatch at step %d: %.15f vs %.15f\n", step, losses[step], model.mean_loss);
+            allok = false;
+            break;
+        } else {
+            printf("loss ok at step %d: %f %f\n", step, losses[step], model.mean_loss);
+        }
+    }
+
     // final approval
     printf("overall okay: %d\n", allok);
 
+    // delete intermediate test files
+    remove("test_gpt2cu_model.ckpt");
+    remove("test_gpt2cu_state.ckpt");
+
     // free everything
+    dataloader_free(&loader);
     gpt2_free(&model);
     common_free(model);
     free(x);

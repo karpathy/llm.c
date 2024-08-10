@@ -1,0 +1,128 @@
+name: GPU Builds and Tests
+
+on:
+  create:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  build-and-test-gpu:
+    runs-on: ubicloud-gpu-standard-1-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install OpenMP
+        run: sudo apt-get update && sudo apt-get install -y libomp-dev
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run preprocessing
+        run: python dev/data/tinyshakespeare.py
+
+      - name: Train model
+        run: python train_gpt2.py
+
+      - name: Compile training and testing program
+        run: make test_gpt2cu train_gpt2cu test_gpt2fp32cu train_gpt2fp32cu
+
+      - name: Train model (With OpenMP)
+        run: OMP_NUM_THREADS=8 ./train_gpt2cu
+
+      - name: Train model (FP32) with gpt2_124M.bin
+        run: |
+          PRECISION=FP32 make train_gpt2cu
+          ./train_gpt2cu -b 1 -t 64 -d 256 -l 0.0001 -v 200 -s 200 -a 1 -x 10 -r 0 -f 0 -e "gpt2_124M.bin"
+
+      - name: Test for percent loss differential for FP32 
+        run: |
+          PRECISION=FP32 make train_gpt2cu
+          ./train_gpt2cu -b 1 -t 64 -d 256 -l 0.0001 -v 200 -s 200 -a 1 -x 10 -r 0 -f 0 -e "gpt2_124M.bin" > train_gpt2cu_fp32_precision.txt
+          python dev/loss_checker_ci.py -f train_gpt2cu_fp32_precision.txt -s 20 -e 28 -a 5.0
+
+      - name: Build FP32 precision
+        run: PRECISION=FP32 make test_gpt2cu profile_gpt2cu
+
+      - name: Run default
+        run: ./test_gpt2cu
+
+      - name: Run no recompute GeLU
+        run: ./test_gpt2cu -r 0
+
+      - name: Run recompute LN
+        run: ./test_gpt2cu -r 2
+
+      - name: Build BF16 precision
+        run: PRECISION=BF16 make train_gpt2cu test_gpt2cu profile_gpt2cu
+
+      - name: Run default
+        run: ./test_gpt2cu
+
+      - name: Run no recompute GeLU
+        run: ./test_gpt2cu -r 0
+
+      - name: Run no master weights
+        run: ./test_gpt2cu -w 0
+
+      - name: Run recompute LN
+        run: ./test_gpt2cu -r 2
+
+      - name: Train model fp32 (With OpenMP)
+        run: OMP_NUM_THREADS=8 ./train_gpt2fp32cu
+
+      - name: Execute testing program (With OpenMP)
+        run: OMP_NUM_THREADS=8 ./test_gpt2cu
+
+      - name: Execute testing program fp32 (With OpenMP)
+        run: OMP_NUM_THREADS=8 ./test_gpt2fp32cu
+
+      - name: Compile training and testing program without OpenMP
+        run: NO_OMP=1 make test_gpt2cu train_gpt2cu test_gpt2fp32cu train_gpt2fp32cu
+
+      - name: Train model (No OpenMP)
+        run: NO_OMP=1 ./train_gpt2cu
+
+      - name: Train model fp32 (No OpenMP)
+        run: NO_OMP=1 ./train_gpt2fp32cu
+
+      - name: Execute testing program (No OpenMP)
+        run: ./test_gpt2cu -b 32
+
+      - name: Execute testing program fp32 (No OpenMP)
+        run: ./test_gpt2fp32cu
+
+      - name: Install cuDNN-frontend
+        run:
+          git clone https://github.com/NVIDIA/cudnn-frontend.git
+
+      - name: Build with cuDNN
+        run: USE_CUDNN=1 make test_gpt2cu train_gpt2cu test_gpt2fp32cu train_gpt2fp32cu
+
+      - name: Train model with cuDNN
+        run: ./train_gpt2cu
+
+      - name: Train model fp32 with cuDNN
+        run: ./train_gpt2fp32cu
+
+      - name: Execute testing program with cuDNN
+        run: ./test_gpt2cu
+
+      - name: Execute testing program fp32 with cuDNN
+        run: ./test_gpt2fp32cu
+
+  unit-tests-gpu:
+    runs-on: ubicloud-gpu-standard-1-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Test Device<->File IO
+        run: cd dev/test && nvcc -o device_file_io device_file_io.cu && ./device_file_io
