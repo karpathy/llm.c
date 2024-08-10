@@ -6,24 +6,28 @@ Downloads and tokenizes the TinyShakespeare dataset.
 The output is written to a newly created tinyshakespeare/ folder.
 The script prints:
 
-Saved 32768 tokens to tinyshakespeare/tiny_shakespeare_val.bin
-Saved 305260 tokens to tinyshakespeare/tiny_shakespeare_train.bin
+For GPT-2:
+writing 32,768 tokens to tinyshakespeare/tiny_shakespeare_val.bin
+writing 305,260 tokens to tinyshakespeare/tiny_shakespeare_train.bin
+
+For LLaMA 3:
+writing 32,768 tokens to tinyshakespeare/tiny_shakespeare_val.bin
+writing 319,555 tokens to tinyshakespeare/tiny_shakespeare_train.bin
 
 And runs in a few seconds depending on your internet
 connection and computer. The .bin files are raw byte
-streams of int32 numbers indicating the token ids.
+streams of uint16 (gpt-2) or uint32 (llama) numbers indicating the token ids.
 """
 
 import os
+
 import tiktoken
-import numpy as np
+from transformers import AutoTokenizer
+
 from data_common import download_file, write_datafile
 
 # -----------------------------------------------------------------------------
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "tinyshakespeare")
-
-enc = tiktoken.get_encoding("gpt2")
-encode = lambda s: enc.encode(s, allowed_special={'<|endoftext|>'})
 
 def download():
     """Downloads the TinyShakespeare dataset to DATA_CACHE_DIR"""
@@ -37,7 +41,17 @@ def download():
     else:
         print(f"{data_filename} already exists, skipping download...")
 
-def tokenize():
+def tokenize(model):
+    if model == "gpt-2":
+        enc = tiktoken.get_encoding("gpt2")
+        encode = lambda s: enc.encode(s, allowed_special={'<|endoftext|>'})
+    elif model == "llama":
+        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
+        def encode(x):
+            return tokenizer(x).input_ids
+    else:
+        raise ValueError(f"unknown model {model}")
+
     data_filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare.txt")
     text = open(data_filename, 'r').read()
     # let's treat every person's statement in the dialog as a separate document
@@ -51,9 +65,10 @@ def tokenize():
     # save to file
     val_filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare_val.bin")
     train_filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare_train.bin")
-    write_datafile(val_filename, val_tokens)
-    write_datafile(train_filename, train_tokens)
+    write_datafile(val_filename, val_tokens, model)
+    write_datafile(train_filename, train_tokens, model)
 
 if __name__ == "__main__":
+    model = "gpt-2"  # gpt-2 or llama
     download()
-    tokenize()
+    tokenize(model)

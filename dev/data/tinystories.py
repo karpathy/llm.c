@@ -29,10 +29,8 @@ import os
 import glob
 import json
 import random
-from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import numpy as np
 import tiktoken
 from transformers import AutoTokenizer
 
