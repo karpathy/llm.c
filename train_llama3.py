@@ -55,9 +55,6 @@ from tiktoken.load import load_tiktoken_bpe
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the LLaMA 3.x model
 
-# using a global to toggle flash-attention
-FLASH = 0
-
 # Used in Grouped Query Attention (GQA), broadcasts the key and value tensors
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
@@ -157,6 +154,7 @@ class CausalSelfAttention(nn.Module):
         self.n_rep = self.n_head // self.n_kv_head
         self.hd = config.n_embd // config.n_head
         self.use_kv = config.use_kv
+        self.flash = config.flash
 
         self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.hd, bias=False)  # key, query, value projections
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)  # output projection
@@ -186,9 +184,12 @@ class CausalSelfAttention(nn.Module):
 
         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # (B, NH, T, HD)
 
-        if FLASH:
+        if self.flash:
             # flashattention
-            y = F.scaled_dot_product_attention(q, k, v, mask)
+            # if T == 1 no need to mask, otherwise the function complains
+            # scaled_dot_product_attention expects a mask where value of True indicates that the element should take part in attention
+            # our mask is the opposite, so we need to invert it
+            y = F.scaled_dot_product_attention(q, k, v, mask == 0 if T > 1 else None)
         else:
             # manual implementation of attention
             # this materializes the large (T,T) matrix for all the queries and keys
@@ -257,6 +258,7 @@ class LlamaConfig:
     use_scaled_rope: bool = True
     max_gen_batch_size: int = 4
     use_kv: bool = True
+    flash: bool = False  # use flashattention?
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -966,7 +968,6 @@ if __name__ == "__main__":
     # memory management
     parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
-    parser.add_argument("--flash", type=int, default=0, help="use flash attention")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|float16|bfloat16")
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
     # python -> C bridge
@@ -1044,10 +1045,6 @@ if __name__ == "__main__":
     # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
     if args.tensorcores:
         torch.set_float32_matmul_precision('high')
-
-    # turn on/off flash attention
-    assert args.flash in {0, 1}
-    FLASH = args.flash
 
     # init the model
     if args.use_hf:
