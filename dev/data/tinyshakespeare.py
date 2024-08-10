@@ -19,9 +19,9 @@ connection and computer. The .bin files are raw byte
 streams of uint16 (gpt-2) or uint32 (llama) numbers indicating the token ids.
 """
 
+import argparse
 import os
 
-import fire
 import tiktoken
 from transformers import AutoTokenizer
 
@@ -69,10 +69,9 @@ def tokenize(model):
     write_datafile(val_filename, val_tokens, model)
     write_datafile(train_filename, train_tokens, model)
 
-def process(model):
-    assert model in ["gpt-2", "llama"], f"unknown model {model} (choose from gpt-2, llama)"
-    download()
-    tokenize(model)
-
 if __name__ == "__main__":
-    fire.Fire(process)
+    parser = argparse.ArgumentParser(description="Tiny Shakespeare dataset preprocessing")
+    parser.add_argument("-m", "--model", type=str, default="gpt-2", choices=["gpt-2", "llama"], help="Model type, gpt-2|llama")
+    args = parser.parse_args()
+    download()
+    tokenize(args.model)
