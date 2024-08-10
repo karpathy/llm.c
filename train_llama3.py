@@ -970,7 +970,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint")
     parser.add_argument("--tokenizer_path", type=str, default=None, help="path to llama3 tokenizer")
     # file system input / output
-    parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
+    parser.add_argument("--input_bin", type=str, default="dev/data/tinystories/TinyStories_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B", help="chose the llama model")
