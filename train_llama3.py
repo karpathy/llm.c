@@ -16,17 +16,17 @@ Example launches to only benchmark the speed of bfloat16 compiled GPU training:
 TODO: add the actual commands
 """
 
+import argparse
 import os
 import math
 import glob
 import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass
-import json
 from pathlib import Path
+import time
 from typing import (
     AbstractSet,
-    Callable,
     Collection,
     Dict,
     Iterator,
@@ -402,7 +402,7 @@ class LLaMA(nn.Module):
     def from_pretrained_llama3_hf(cls, model_id):
         """Loads pretrained LLaMA model weights from HuggingFace"""
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        assert model_id == "meta-llama/Meta-Llama-3.1-8B", "Only the 8B-bae model is supported for now"
+        assert model_id == "meta-llama/Meta-Llama-3.1-8B", "Only the 8B-base model is supported for now"
         model_args = LlamaConfig()
 
         model = AutoModelForCausalLM.from_pretrained(model_id)
@@ -956,16 +956,14 @@ def print0(*args, **kwargs):
         print(*args, **kwargs)
 
 if __name__ == "__main__":
-    import time
-    import argparse
     print0(f"Running pytorch {torch.version.__version__}")
 
     # default settings will overfit a tiny batch of data
     # and save model weights and debug state to disk on the first iteration
     parser = argparse.ArgumentParser()
     parser.add_argument("--use_hf", type=int, default=1, help="use HuggingFace (default) or use Meta's model")
-    parser.add_argument("--ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint")
-    parser.add_argument("--tokenizer_path", type=str, default=None, help="path to llama3 tokenizer")
+    parser.add_argument("--ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint (needed if use_hf=0)")
+    parser.add_argument("--tokenizer_path", type=str, default=None, help="path to llama3 tokenizer (needed if use_hf=0)")
     # file system input / output
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
@@ -1049,9 +1047,9 @@ if __name__ == "__main__":
                 device = "cuda"
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 device = "mps"
-    print(f"using device: {device}")
     device_type = 'cuda' if 'cuda' in device else 'cpu'
-    assert device_type in {'cuda'}  # we need to load LLaMA as bf16 on CUDA
+    assert device_type in {'cuda'}, "GPU required to run LLaMA 3"  # we need to load LLaMA as bf16 on CUDA
+    print(f"using device: {device}")
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
@@ -1079,11 +1077,11 @@ if __name__ == "__main__":
     FLASH = args.flash
 
     # init the model
-    assert args.ckpt_dir is not None and os.path.exists(args.ckpt_dir), f"llama3 ckpt dir {args.ckpt_dir} does not exist"
-    assert args.tokenizer_path is not None and os.path.exists(args.tokenizer_path), f"llama3 tokenizer path {args.tokenizer_path} does not exist"
     if args.use_hf:
         model = LLaMA.from_pretrained_llama3_hf(args.model)
     else:  # use Meta's checkpoint
+        assert args.ckpt_dir is not None and os.path.exists(args.ckpt_dir), f"llama3 ckpt dir {args.ckpt_dir} does not exist"
+        assert args.tokenizer_path is not None and os.path.exists(args.tokenizer_path), f"llama3 tokenizer path {args.tokenizer_path} does not exist"
         model = LLaMA.from_pretrained_llama3_meta(args.ckpt_dir, args.tokenizer_path)
 
     model.train()
