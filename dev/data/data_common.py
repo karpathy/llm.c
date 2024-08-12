@@ -24,8 +24,14 @@ def download_file(url: str, fname: str, chunk_size=1024):
 
 
 HEADERS_INFO = {
-    "gpt-2": (20240520, 1),
-    "llama": (20240801, 7),
+    "gpt-2": {
+        "magic": 20240520,
+        "version": 1,
+    },
+    "llama": {
+        "magic": 20240801,
+        "version": 7,
+    },
 }
 
 def write_datafile(filename, toks, model="gpt-2"):
@@ -38,8 +44,8 @@ def write_datafile(filename, toks, model="gpt-2"):
     assert model in ["gpt-2", "llama"], f"unknown model {model}"
     # construct the header
     header = np.zeros(256, dtype=np.int32)
-    header[0] = HEADERS_INFO[model][0] # magic
-    header[1] = HEADERS_INFO[model][1] # version
+    header[0] = HEADERS_INFO[model]["magic"]
+    header[1] = HEADERS_INFO[model]["version"]
     header[2] = len(toks) # number of tokens after the 256*4 bytes of header
     if model == "gpt-2":
         toks_np = np.array(toks, dtype=np.uint16)
