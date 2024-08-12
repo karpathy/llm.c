@@ -64,33 +64,28 @@ elif args.type =="edu":
     fw = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train")
     name = "edu_fineweb"
 
-# init the tokenizer
-def tokenize(doc, model):
-    if model == "gpt-2":
-        enc = tiktoken.get_encoding("gpt2")
-        encode = lambda s: enc.encode_ordinary(s)
-        eot = enc._special_tokens['<|endoftext|>'] # end of text token
-        tokens = [eot] # the special <|endoftext|> token delimits all documents
-    elif model == "llama":
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
-        def encode(x):
-            return tokenizer(x).input_ids
-        eot = None
-        tokens = []
-    else:
-        raise ValueError(f"unknown model {model}")
+def tokenize_llama(doc):
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
+    def encode(x):
+        return tokenizer(x).input_ids
+    tokens_np = np.array(encode(doc["text"]))
+
+    assert (0 <= tokens_np).all() and (tokens_np < 2**32).all(), "token dictionary too large for uint32"
+    tokens_np_uint = tokens_np.astype(np.uint32)
+    return tokens_np_uint
+
+def tokenize_gpt2(doc):
+    enc = tiktoken.get_encoding("gpt2")
+    encode = lambda s: enc.encode_ordinary(s)
+    eot = enc._special_tokens['<|endoftext|>'] # end of text token
+    tokens = [eot] # the special <|endoftext|> token delimits all documents
 
     # tokenizes a single document and returns a numpy array of uint16 tokens
-    text = doc["text"]
-    tokens.extend(encode(text))
+    tokens.extend(encode(doc["text"]))
     tokens_np = np.array(tokens)
 
-    if model == "gpt-2":
-        assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
-        tokens_np_uint = tokens_np.astype(np.uint16)
-    elif model == "llama":
-        assert (0 <= tokens_np).all() and (tokens_np < 2**32).all(), "token dictionary too large for uint32"
-        tokens_np_uint = tokens_np.astype(np.uint32)
+    assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
+    tokens_np_uint = tokens_np.astype(np.uint16)
     return tokens_np_uint
 
 # tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
@@ -101,6 +96,15 @@ with mp.Pool(nprocs) as pool:
     all_tokens_np = np.empty((args.shard_size,), dtype=np.uint16)
     token_count = 0
     progress_bar = None
+
+    tokenize = lambda x: None
+    if args.model == "gpt-2":
+        tokenize = tokenize_gpt2
+    elif args.model == "llama":
+        tokenize = tokenize_llama
+    else:
+        raise ValueError(f"unknown model {args.model}")
+
     for tokens in pool.imap(tokenize, fw, chunksize=16):
 
         # is there enough space in the current shard for the new tokens?
