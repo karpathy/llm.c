@@ -11,9 +11,12 @@ REMOVE_FILES = rm -f
 OUTPUT_FILE = -o $@
 CUDA_OUTPUT_FILE = -o $@
 
+# Default O3 CPU optimization level for NVCC (0 for fastest compile time)
+FORCE_NVCC_O ?= 3
+
 # NVCC flags
 # -t=0 is short for --threads, 0 = number of CPUs on the machine
-NVCC_FLAGS = -O3 -t=0 --use_fast_math -std=c++17
+NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O$(FORCE_NVCC_O)
 NVCC_LDFLAGS = -lcublas -lcublasLt
 NVCC_INCLUDES =
 NVCC_LDLIBS =
@@ -45,8 +48,8 @@ endif
 
 ifneq ($(CI),true) # if not in CI, then use the GPU query
   ifndef GPU_COMPUTE_CAPABILITY # set to defaults if: make GPU_COMPUTE_CAPABILITY=
-    ifneq ($(call file_exists_in_path, __nvcc_device_query),)
-      GPU_COMPUTE_CAPABILITY = $(shell __nvcc_device_query)
+    ifneq ($(call file_exists_in_path, nvidia-smi),)
+      GPU_COMPUTE_CAPABILITY = $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader | sed 's/\.//g')
       GPU_COMPUTE_CAPABILITY := $(strip $(GPU_COMPUTE_CAPABILITY))
     endif
   endif
