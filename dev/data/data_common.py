@@ -27,33 +27,34 @@ HEADERS_INFO = {
     "gpt-2": {
         "magic": 20240520,
         "version": 1,
+        "token_dtype": np.uint16,
     },
-    "llama": {
+    "llama-3": {
         "magic": 20240801,
         "version": 7,
+        "token_dtype": np.uint32,
     },
 }
 
-def write_datafile(filename, toks, model="gpt-2"):
+def write_datafile(filename, toks, model_desc="gpt-2"):
     """
     Saves token data as a .bin file, for reading in C.
     - First comes a header with 256 int32s
     - The tokens follow, each as uint16 (gpt-2) or uint32 (llama)
     """
     assert len(toks) < 2**31, "token count too large" # ~2.1B tokens
-    assert model in ["gpt-2", "llama"], f"unknown model {model}"
+    assert model_desc in ["gpt-2", "llama-3"], f"unknown model descriptor {model_desc}"
+    info = HEADERS_INFO[model_desc]
     # construct the header
-    header = np.zeros(256, dtype=np.int32)
-    header[0] = HEADERS_INFO[model]["magic"]
-    header[1] = HEADERS_INFO[model]["version"]
+    header = np.zeros(256, dtype=np.int32) # header is always 256 int32 values
+    header[0] = info["magic"]
+    header[1] = info["version"]
     header[2] = len(toks) # number of tokens after the 256*4 bytes of header
-    if model == "gpt-2":
-        toks_np = np.array(toks, dtype=np.uint16)
-    elif model == "llama":
-        toks_np = np.array(toks, dtype=np.uint32)
-    else:
-        raise ValueError(f"unknown model {model}")
-    print(f"writing {len(toks):,} tokens to {filename}")
+    # construct the data (numpy array of tokens)
+    toks_np = np.array(toks, dtype=info["token_dtype"])
+    # write to file
+    num_bytes = (256 * 4) + (len(toks) * toks_np.itemsize)
+    print(f"writing {len(toks):,} tokens to {filename} ({num_bytes:,} bytes) in the {model_desc} format")
     with open(filename, "wb") as f:
         f.write(header.tobytes())
         f.write(toks_np.tobytes())
