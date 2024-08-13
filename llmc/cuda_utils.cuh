@@ -131,12 +131,26 @@ __device__ float cast_value<float, __nv_bfloat16>(__nv_bfloat16 val) {
     return __bfloat162float(val);
 }
 
+template<>
+__device__ __nv_bfloat16 cast_value<__nv_bfloat16, float>(float val) {
+    return __float2bfloat16(val);
+}
+
 template<typename Td, typename Ts>
 __global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n, ptrdiff_t stride_dst, ptrdiff_t stride_src) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // need to try grid stride looping for more perf later
     if (idx < n) {
         dst[idx + stride_dst * blockIdx.y] = cast_value<Td, Ts>(src[idx + stride_src * blockIdx.y]);
+    }
+}
+
+template<class  T>
+__global__ void fill_kernel(T* dst, T value, size_t n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // need to try grid stride looping for more perf later
+    if (idx < n) {
+        dst[idx] = value;
     }
 }
 
