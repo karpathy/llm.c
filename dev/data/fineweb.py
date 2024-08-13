@@ -67,8 +67,8 @@ elif args.type =="edu":
 def tokenize_llama(doc):
     # tokenizes a single document and returns a numpy array of uint32 tokens
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
-    encode = lambda s: tokenizer.encode(s, add_special_tokens=False, verbose=False)
-    eot = 128000 # BOS; hardcoding because I don't know how to get it properly TODO
+    encode = lambda s: tokenizer.encode(s, add_special_tokens=False, verbose=False, split_special_tokens=True)
+    eot = tokenizer.encode('')[0] # by default the tokenizer adds the EOT token (128000)
     tokens = [eot] # the special <|endoftext|> token delimits all documents
     tokens.extend(encode(doc["text"]))
     tokens_np = np.array(tokens)
