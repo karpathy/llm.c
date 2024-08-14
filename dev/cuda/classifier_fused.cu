@@ -766,6 +766,7 @@ int main(int argc, char **argv) {
     cudaCheck(cudaFree(d_logits));
     cudaCheck(cudaFree(d_dlosses));
     cudaCheck(cudaFree(d_targets));
+    cudaCheck(cudaFree(d_dlogits_no_pad));
 
     return 0;
 }

@@ -58,6 +58,7 @@ int main(int argc, char *argv[]) {
     model.config.num_layers = 1;
     set_zero_configs(&multi_gpu_config, 0, model.num_parameters);
 
+    gpt2_allocate_state(&model, B, T);
     // do a training step
     gpt2_forward(&model, x, B, T);
     gpt2_backward_and_reduce(&model, x, y, 1, 0);
