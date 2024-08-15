@@ -192,12 +192,13 @@ class GPT(nn.Module):
     @classmethod
     def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        assert model_type in {'gpt2-tiny', 'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
         # n_layer, n_head and n_embd are determined from model_type
         config_args = {
+            'gpt2-tiny':    dict(n_layer=6,  n_head=6,  n_embd=384),  # 30M params
             'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
             'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
             'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
@@ -542,29 +543,33 @@ if __name__ == "__main__":
     # and save model weights and debug state to disk on the first iteration
     parser = argparse.ArgumentParser()
     # file system input / output
-    parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
-    parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
-    parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
-    parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
+    parser.add_argument('-i', "--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_train.bin", help="input .bin to train on")
+    parser.add_argument('-j', "--input_val_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to eval validation loss on")
+    parser.add_argument('-o', "--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
+    parser.add_argument('-e', "--model", type=str, default="gpt2", help="gpt2-tiny|gpt2|gpt2-medium|gpt2-large|gpt2-xl|d6|d12|d24|d36|d48")
+    parser.add_argument('-n', "--checkpoint_every", type=int, default=0, help="save a checkpoint every N steps")
+    
+    #missing the resuming from a checkpoint
+    
     # token layout for each step of the optimization
-    parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
-    parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
-    parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
+    parser.add_argument('-b', "--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
+    parser.add_argument('-t', "--sequence_length", type=int, default=1024, help="sequence length")
+    parser.add_argument('-d', "--total_batch_size", type=int, default=-1, help="total desired batch size, in units of #tokens")
     # workload (number of steps)
-    parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
+    parser.add_argument('-x', "--num_iterations", type=int, default=-1, help="number of iterations to run")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
     # optimization
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
-    parser.add_argument("--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
-    parser.add_argument("--learning_rate_decay_frac", type=float, default=1.0, help="learning rate warmup iterations")
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
+    parser.add_argument('-l', "--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
+    parser.add_argument('-u', "--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
+    parser.add_argument('-q', "--learning_rate_decay_frac", type=float, default=1.0, help="learning rate warmup iterations")
+    parser.add_argument('-c', "--weight_decay", type=float, default=0.0, help="weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
     # evaluation
-    parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
-    parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
-    parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
+    parser.add_argument('-v',"--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
+    parser.add_argument('-m', "--val_max_steps", type=int, default=20, help="how many batches of val to average?")
+    parser.add_argument('-s',"--sample_every", type=int, default=0, help="how often to sample from the model?")
     # debugging
-    parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
+    parser.add_argument('-a', "--overfit_single_batch", type=int, default=0, help="overfit just one batch of data")
     # numerics
     parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
     # memory management
@@ -572,7 +577,7 @@ if __name__ == "__main__":
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
     parser.add_argument("--flash", type=int, default=0, help="use flash attention")
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
-    parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
+    parser.add_argument('-z', "--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
     # python -> C bridge
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     args = parser.parse_args()
@@ -581,7 +586,7 @@ if __name__ == "__main__":
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 1024
     assert args.dtype in {"float32", "float16", "bfloat16"}
-    assert args.model in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl", "d12", "d24", "d36", "d48"}
+    assert args.model in {"gpt2-tiny", "gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl", "d6", "d12", "d24", "d36", "d48"}
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -620,6 +625,10 @@ if __name__ == "__main__":
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
+    args.total_batch_size = args.total_batch_size if args.total_batch_size > 0 else tokens_per_fwdbwd
+    print(f"tokens per fwdbwd pass: {tokens_per_fwdbwd}")
+    print(f"total batch size: {args.total_batch_size}")
+    print(f"world size: {ddp_world_size}")
     assert args.total_batch_size % tokens_per_fwdbwd == 0
     grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
     print0(f"total desired batch size: {args.total_batch_size}")
@@ -652,6 +661,7 @@ if __name__ == "__main__":
     if args.model[0] == "d":
         # from scratch (random weights)
         model_config = {
+            "d6":  GPTConfig(block_size=1024, vocab_size=50257, n_layer=6, n_head=6, n_embd=384),
             "d12": GPTConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768),
             "d24": GPTConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024),
             "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
@@ -678,6 +688,7 @@ if __name__ == "__main__":
     if args.input_val_bin:
         val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 
+    args.num_iterations = args.num_iterations if args.num_iterations > 0 else len(train_loader.tokens) // args.total_batch_size
     # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
 
@@ -688,8 +699,8 @@ if __name__ == "__main__":
         logits, loss = model(x, y)
         loss.backward()
         # save model params, in both float32 and bfloat16
-        model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
-        model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
+        model_to_size = {"gpt2-tiny": "30M", "gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
+        model_to_size.update({f"d{d}": f"d{d}" for d in [6, 12, 24, 36, 48]})
         model_size_str = model_to_size[args.model] # e.g. "124M", or "d12"
         write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
         write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
@@ -743,7 +754,6 @@ if __name__ == "__main__":
     for step in range(args.num_iterations + 1):
         t0 = time.time()
         last_step = (step == args.num_iterations)
-
         # once in a while evaluate the validation dataset
         if (args.val_loss_every > 0 \
             and (step % args.val_loss_every == 0 or last_step)) \
@@ -844,7 +854,23 @@ if __name__ == "__main__":
         if master_process and logfile is not None:
             with open(logfile, "a") as f:
                 f.write("s:%d trl:%f\n" % (step, lossf))
-
+                
+        
+        if args.checkpoint_every > 0 \
+            and (step % args.checkpoint_every == 0 or last_step) \
+            and master_process:
+            # save a checkpoint
+                logits, loss = model(x, y)
+                # save model params, in both float32 and bfloat16
+                model_to_size = {"gpt2-tiny": "30M", "gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
+                model_to_size.update({f"d{d}": f"d{d}" for d in [6, 12, 24, 36, 48]})
+                model_size_str = model_to_size[args.model] # e.g. "124M", or "d12"
+                write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
+                write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
+                # save x, y, logits, loss, and parameter gradients, for debugging C
+                # always store these in fp32 to have an accurate reference (?)
+                write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
+                
         # keep track of smooth timings, last 20 iterations
         if step > 0 and step > args.num_iterations - 20:
             timings.append(t1-t0)
