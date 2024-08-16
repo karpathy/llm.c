@@ -38,7 +38,7 @@ metrics = [
     "dram__bytes_read.sum",                     # DRAM reads
     "dram__bytes_write.sum",                    # DRAM writes
     "lts__t_sectors_srcunit_tex_op_read.sum",   # L2 reads (sectors -- 32B)
-    "lts__t_sectors_srcunit_tex_op_write.sum",  # L2 reads (sectors -- 32B)
+    "lts__t_sectors_srcunit_tex_op_write.sum",  # L2 writes (sectors -- 32B)
     "sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_active", # % of peak tensor core utilization
     "smsp__inst_executed.sum",                  # instructions
 ]
