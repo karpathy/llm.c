@@ -208,23 +208,20 @@ void global_sum_deterministic(float* result, const Float* values, int count, cud
 // ----------------------------------------------------------------------------
 // memory management
 
-// allocate memory, preferrably on the
-void cudaMallocConditionallyManaged(void** out, size_t bytes, const char *file, int line) {
-    // try to allocate `bytes` on device
+// allocate memory, preferrably on the device
+// returns a status code. 0 = OK, 1 = fell back to managed memory
+int cudaMallocConditionallyManaged(void** out, size_t bytes, const char *file, int line) {
+    // try to allocate
     cudaError_t err = cudaMalloc(out, bytes);
     if(err == cudaErrorMemoryAllocation) {
-        // if that fails, fallback to a managed allocation. It will be slower, but at least
-        // it won't crash.
-        fprintf(stderr, "[WARN] Not enough space to allocate %zu MiB on device.\n"
-                        "       Falling back to managed allocation.\n"
-                        "       Speed may be negatively affected.\n",
-                bytes / 1024 / 1024);
-        // reset the error before the next API call
-        cudaGetLastError();
+        // if we OOM, fallback to a managed allocation. slower but at least won't crash.
+        cudaGetLastError(); // reset the error before the next API call
         cudaCheck_(cudaMallocManaged(out, bytes), file, line);
         cudaCheck_(cudaMemAdvise(*out, bytes, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId), file, line);
+        return 1;
     } else {
         cudaCheck_(err, file, line);
+        return 0;
     }
 }
 

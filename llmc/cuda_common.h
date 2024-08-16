@@ -48,7 +48,7 @@ constexpr std::bool_constant<true> False;
 // ----------------------------------------------------------------------------
 // Error checking
 
-// CUDA error checking
+// CUDA error checking. Underscore added so this function can be called directly not just via macro
 inline void cudaCheck_(cudaError_t error, const char *file, int line) {
   if (error != cudaSuccess) {
     printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line, cudaGetErrorString(error));
