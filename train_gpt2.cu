@@ -408,9 +408,10 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
         memory_status |= cudaMallocConditionallyManaged((void**) &model->master_weights, shard_num_parameters * sizeof(float));
     }
 
-    // report on mixed memory allocation status
-    if (memory_status == 1) {
-        printf0("WARNING: fell back to cudaMallocManaged when initializing m,v,master_weights.\n");
+    // report on mixed memory allocation status (re-using our float reduce function, bit awk ok)
+    int readuced_memory_status = (int) multi_gpu_cpu_float_sum((float)memory_status, &multi_gpu_config);
+    if (readuced_memory_status >= 1) {
+        printf0("WARNING: Fell back to cudaMallocManaged when initializing m,v,master_weights on %d GPUs\n", readuced_memory_status);
         printf0("         Prevents an OOM, but code may run much slower due to device <-> host memory movement\n");
     }
     // report on device memory usage
