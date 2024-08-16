@@ -37,7 +37,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/cuda_common.h"
 // defines:
 // Packed128, f128, x128
-// warpReduceSum, warpReduceMax, blockReduce, copy_and_cast_kernel
+// warpReduceSum, warpReduceMax, blockReduce, copy_and_cast_kernel, cudaMallocConditionallyManaged
 #include "llmc/cuda_utils.cuh"
 // defines: CUBLAS_LOWP, cublasCheck, cublaslt_workspace_size, cublaslt_workspace
 // defines: cublas_compute, cublaslt_handle, cublas_handle
@@ -388,24 +388,36 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     model->workload_indices = (int*)mallocCheck(sizeof(int) * model->batch_size * model->seq_len * num_c_groups);
     model->bucket_info = (int4*)mallocCheck(sizeof(int4) * model->batch_size * model->seq_len * num_c_groups);
 
+    // cudaMallocConditionallyManaged can fall back to cudaMallocManaged if not enough memory on device
+    // and returns a status code of 1 if it had to fall back, in that case we want to print warning.
+    int memory_status = 0;
+
+    // we will now init the optimizer states and master weights
+    // this is usually a substantial amount of memory allocation right here.
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters; // num parameters we are responsible for
     printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
     printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
     assert(model->m_memory == nullptr);
     assert(model->v_memory == nullptr);
-    cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
-    cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
+    memory_status |= cudaMallocConditionallyManaged((void**)&model->m_memory, shard_num_parameters * sizeof(float));
+    memory_status |= cudaMallocConditionallyManaged((void**)&model->v_memory, shard_num_parameters * sizeof(float));
 
     if (model->use_master_weights == 1) {
         assert(model->master_weights == nullptr);
         printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
-        cudaCheck(cudaMalloc((void**) &model->master_weights, shard_num_parameters * sizeof(float)));
+        memory_status |= cudaMallocConditionallyManaged((void**) &model->master_weights, shard_num_parameters * sizeof(float));
     }
 
+    // report on mixed memory allocation status (re-using our float reduce function, bit awk ok)
+    int reduced_memory_status = (int) multi_gpu_cpu_float_sum((float)memory_status, &multi_gpu_config);
+    if (reduced_memory_status >= 1) {
+        printf0("WARNING: Fell back to cudaMallocManaged when initializing m,v,master_weights on %d GPUs\n", reduced_memory_status);
+        printf0("         Prevents an OOM, but code may run much slower due to device <-> host memory movement\n");
+    }
+    // report on device memory usage
     size_t free, total;
     cudaCheck(cudaMemGetInfo(&free, &total));
     printf0("device memory usage: %zd MiB / %zd MiB\n", (total-free) / 1024 / 1024, total / 1024 / 1024);
-
     // give an estimate of the maximum batch size
     size_t bytes_per_sequence = 0;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
