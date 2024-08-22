@@ -553,7 +553,11 @@ void multi_gpu_async_reduce_gradient(
 }
 
 // convenience macro that only prints if the rank of process is zero
-#define printf0(...) if (::multi_gpu_config.process_rank == 0) { printf(__VA_ARGS__); }
+#define printf0(...)                                                           \
+  if (::multi_gpu_config.process_rank == 0) {                                  \
+    printf("[%s:%d] ", __FILE__, __LINE__);                                    \
+    printf(__VA_ARGS__);                                                       \
+  }
 
 void set_zero_configs(MultiGpuConfig* config, int zero_stage, size_t total_parameters) {
     config->zero_stage = 0;
