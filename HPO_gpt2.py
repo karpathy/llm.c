@@ -165,13 +165,14 @@ def main_smac(args):
     if args.multiobjective:
         scenario = Scenario(
                     cs,
+                    # name="SMAC",
                     objectives=["val_loss", "train_time"],
                     walltime_limit=60*60*23,  
-                    n_trials=500, #500,  # Evaluate max 500 different trials
+                    n_trials=args.n_trials, #500,  # Evaluate max 500 different trials
                     min_budget=10**3,  # Train the MLP using a hyperparameter configuration for at least 5 epochs
                     max_budget=2*10**4,  # Train the MLP using a hyperparameter configuration for at most 25 epochs
                     n_workers=1,
-                    deterministic="true"
+                    deterministic=True
         )
     else:
         scenario = Scenario(
@@ -182,23 +183,26 @@ def main_smac(args):
             min_budget=10**3,  # Train the MLP using a hyperparameter configuration for at least 5 epochs
             max_budget=2*10**4,  # Train the MLP using a hyperparameter configuration for at most 25 epochs
             n_workers=1,
-            deterministic="true"
+            deterministic=True
         )
 
     logger.info(f"\t{print_with_tabs(scenario,1)}")
 
     # # Set up the Gaussian Process model with Matern Kernel
     # kernel = MaternKernel(nu=2.5)  # Matern kernel with nu=2.5 (commonly used)
-    kernel = MaternKernel(nu=2.5) * ConstantKernel(1.0, constant_value_bounds="fixed")  # Radial Basis Function (RBF) kernel
-    gp_model = GaussianProcess(configspace=cs, kernel=kernel)
-
+    if args.surrogate == "gp":
+        kernel = MaternKernel(nu=2.5) * ConstantKernel(1.0, constant_value_bounds="fixed")  # Radial Basis Function (RBF) kernel
+        model = GaussianProcess(configspace=cs, kernel=kernel)
+    else:
+        model = RandomForest(configspace=cs)
+        
     multi_objective_algorithm = ParEGO(scenario)
 
     # rf_model = RandomForest(configspace=cs)
     # Use Expected Improvement (EI) as the acquisition function
     # acquisition_function = EI(model=gp_model)
     initial_design = MultiFidelityFacade.get_initial_design(scenario, n_configs=args.n_initial)
-    intensifier = MultiFidelityFacade.get_intensifier(scenario, eta=args.eta)
+    intensifier = Hyperband(scenario, eta=args.eta, incumbent_selection="highest_budget")
     
     logger.info("\t== Creating SMAC MultiFidelityFacade ==")
 
@@ -209,8 +213,8 @@ def main_smac(args):
             initial_design=initial_design,
             intensifier=intensifier,
             multi_objective_algorithm=multi_objective_algorithm,
-            # overwrite=True,            
-            model=gp_model,
+            overwrite=True,            
+            model=model,
             # acquisition_function=acquisition_function,
         )
     else:
@@ -219,8 +223,8 @@ def main_smac(args):
             target_function=partial_function,
             initial_design=initial_design,
             intensifier=intensifier,
-            # overwrite=True,            
-            model=gp_model,
+            overwrite=True,            
+            model=model,
             # acquisition_function=acquisition_function,
         )
 
@@ -277,6 +281,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_initial", type=int, default=5, help="number of initial configurations to evaluate")
     parser.add_argument("--n_trials", type=int, default=500, help="number of trials to evaluate")
     parser.add_argument("--eta", type=int, default=2, help="eta parameter for Hyperband")
+    parser.add_argument("--surrogate", type=str, default="gp", help="surrogate model to use")
     args = parser.parse_args()
     
     if args.slurm == True:
