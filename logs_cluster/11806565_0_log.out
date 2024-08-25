@@ -1,0 +1,2 @@
+submitit INFO (2024-08-25 17:02:34,040) - Starting with JobEnvironment(job_id=11806565, hostname=dlcgpu05, local_rank=0(1), node=0(1), global_rank=0(1))
+submitit INFO (2024-08-25 17:02:34,040) - Loading pickle: /work/dlclarge1/swelamo-LLMs/llm.c_project/llm.c/logs_cluster/11806565_submitted.pkl

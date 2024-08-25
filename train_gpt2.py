@@ -687,8 +687,8 @@ if __name__ == "__main__":
     val_loader = None
     if args.input_val_bin:
         val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
-
-    args.num_iterations = args.num_iterations if args.num_iterations > 0 else len(train_loader.tokens) // args.total_batch_size
+    print0(f"number of tokens in train set: {train_loader.ntok_total:,} and in this shard only {len(train_loader.tokens):,}")
+    args.num_iterations = args.num_iterations if args.num_iterations > 0 else train_loader.ntok_total // args.total_batch_size
     # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
 

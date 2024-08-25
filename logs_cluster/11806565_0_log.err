@@ -1,0 +1,16 @@
+cpu-bind=MASK - dlcgpu05, task  0  0 [1906]: mask 0x7fff00007fff0000 set
+cpu-bind=MASK - dlcgpu05, task  0  0 [1949]: mask 0x7fff00007fff0000 set
+Traceback (most recent call last):
+  File "/work/dlclarge1/swelamo-LLMs/miniconda3/envs/LLMs/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/work/dlclarge1/swelamo-LLMs/miniconda3/envs/LLMs/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/work/dlclarge1/swelamo-LLMs/miniconda3/envs/LLMs/lib/python3.10/site-packages/submitit/core/_submit.py", line 11, in <module>
+    submitit_main()
+  File "/work/dlclarge1/swelamo-LLMs/miniconda3/envs/LLMs/lib/python3.10/site-packages/submitit/core/submission.py", line 76, in submitit_main
+    process_job(args.folder)
+  File "/work/dlclarge1/swelamo-LLMs/miniconda3/envs/LLMs/lib/python3.10/site-packages/submitit/core/submission.py", line 48, in process_job
+    raise RuntimeError(
+RuntimeError: Waited for 60 seconds but could not find submitted jobs in path:
+/work/dlclarge1/swelamo-LLMs/llm.c_project/llm.c/logs_cluster/11806565_submitted.pkl
+srun: error: dlcgpu05: task 0: Exited with exit code 1
