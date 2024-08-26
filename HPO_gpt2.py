@@ -240,6 +240,12 @@ def main_smac(args):
 
     logger.info(f"\t Multi-objective optimization: {args.multiobjective}")
     print(f"Multi-objective optimization: {args.multiobjective}")
+    logger.info(f"\t Number of initial configurations: {args.n_initial}")
+    print(f"Number of initial configurations: {args.n_initial}")
+    logger.info(f"\t Number of trials: {args.n_trials}")
+    print(f"Number of trials: {args.n_trials}")
+    logger.info(f"\t eta: {args.eta}")
+    print(f"eta: {args.eta}")
     logger.info("\t== Starting the optimization ==")
     
     # Start the optimization
