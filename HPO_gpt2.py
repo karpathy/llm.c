@@ -18,6 +18,9 @@ import logging
 import datetime
 from smac.facade.abstract_facade import AbstractFacade
 import submitit
+import pickle
+
+global log_file_name
 
 def set_queue(q_, log_folder, maximum_runtime=None):
     global ex
@@ -83,9 +86,9 @@ def plot_pareto(smac: AbstractFacade, incumbents: list[Configuration]) -> None:
     plt.xlabel(smac.scenario.objectives[0])
     plt.ylabel(smac.scenario.objectives[1])
     plt.legend()
-    
+    global log_file_name
     # Save the plot to a file
-    plt.savefig("pareto_front.png", format='png', dpi=300)  # Save as PNG with high resolution
+    plt.savefig(f"pareto_front_{log_file_name}.png", format='png', dpi=300)  # Save as PNG with high resolution
     plt.show()
     
 
@@ -100,6 +103,8 @@ def setup_logger():
     # File handler
     file_handler = logging.FileHandler(f'logs/smac_{formatted_date}.log')
 
+    global log_file_name
+    log_file_name = f'logs/smac_{formatted_date}'
     #formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     formatter = logging.Formatter('%(message)s',  datefmt='%H:%M:%S')
     file_handler.setFormatter(formatter)
@@ -254,8 +259,14 @@ def main_smac(args):
     # Print the best configuration
     print(f"Best found configuration: {incumbents}")
     
-    plot_pareto(smac, incumbents)
+    if args.multiobjective:
+        plot_pareto(smac, incumbents)
     
+    global log_file_name
+    pickle.dump(incumbents, open(f"{log_file_name}_incumbents.pkl", "wb"))
+    pickle.dump(smac, open(f"{log_file_name}_smac.pkl", "wb"))
+
+
 
 if __name__ == "__main__":
 
