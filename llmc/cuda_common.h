@@ -82,13 +82,16 @@ enum PrecisionMode {
 #if defined(ENABLE_FP32)
 typedef float floatX;
 #define PRECISION_MODE PRECISION_FP32
+#define DTYPE_FLOATX DType::FP32
 // use fp16 (note: this may require gradient scaler, currently not implemented!)
 #elif defined(ENABLE_FP16)
 typedef half floatX;
 #define PRECISION_MODE PRECISION_FP16
+#define DTYPE_FLOATX DType::FP16
 #else // Default to bfloat16
 typedef __nv_bfloat16 floatX;
 #define PRECISION_MODE PRECISION_BF16
+#define DTYPE_FLOATX DType::BF16
 #endif
 
 // ----------------------------------------------------------------------------

@@ -1,6 +1,8 @@
 /*
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
+bool UNIQUE_TENSOR_MEMORY = false;
+
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,6 +86,27 @@ constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
 
+enum TT : uint8_t {
+    PARAMETER=0, PARAMETER_GRADIENT, PARAMETER_MASTER, PARAMETER_OPT_M, PARAMETER_OPT_V,
+    MULTIUSE, ACTIVATION, ACTIVATION_GRADIENT,
+    DEFAULT, COUNT=DEFAULT
+};
+
+typedef struct {
+    int wte, wpe, lnfw, lnfb; // not per layer
+    int ln1w, ln1b, qkvw, qkvb, attprojw, attprojb, ln2w, ln2b, fcw, fcb, fcprojw, fcprojb; // per layer
+} ParameterTensors;
+
+typedef struct {
+    int encoded, lnf, lnf_mean, lnf_rstd, losses, output; // not per layer
+    int ln1, ln1_mean, ln1_rstd, atty, att, attproj, residual2, ln2, ln2_mean, ln2_rstd, fch, fch_gelu, fcproj, residual3, qkvr; // per layer
+} ActivationTensors;
+
+typedef struct {
+    int bt4c;   // (B, T, 4*C)
+    int btc;    // (B, T, C)
+} MultiuseTensors;
+
 typedef struct {
     int max_seq_len; // max sequence length, e.g. 1024
     int vocab_size; // vocab size, e.g. 50257
@@ -93,134 +116,173 @@ typedef struct {
     int channels; // number of channels, e.g. 768
 } GPT2Config;
 
-// the parameters of the model
-constexpr const int NUM_PARAMETER_TENSORS = 16;
 typedef struct {
-    floatX* wte; // (V, C)
-    floatX* wpe; // (maxT, C)
-    floatX* ln1w; // (L, C)
-    floatX* ln1b; // (L, C)
-    floatX* qkvw; // (L, 3*C, C)
-    floatX* qkvb; // (L, 3*C)
-    floatX* attprojw; // (L, C, C)
-    floatX* attprojb; // (L, C)
-    floatX* ln2w; // (L, C)
-    floatX* ln2b; // (L, C)
-    floatX* fcw; // (L, 4*C, C)
-    floatX* fcb; // (L, 4*C)
-    floatX* fcprojw; // (L, C, 4*C)
-    floatX* fcprojb; // (L, C)
-    floatX* lnfw; // (C)
-    floatX* lnfb; // (C)
-} ParameterTensors;
-static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
+    GPT2Config config;
+    ParameterTensors params;
+    ParameterTensors params_grads;
+    ParameterTensors params_master;
+    ParameterTensors params_opt_m;
+    ParameterTensors params_opt_v;
+    ActivationTensors acts;
+    ActivationTensors acts_grads;
+    MultiuseTensors multiuse;
 
-void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
-    size_t Vp = config.padded_vocab_size;
-    size_t C = config.channels;
-    size_t maxT = config.max_seq_len;
-    size_t L = config.num_layers;
-    param_sizes[0] = Vp * C; // wte
-    param_sizes[1] = maxT * C; // wpe
-    param_sizes[2] = L * C; // ln1w
-    param_sizes[3] = L * C; // ln1b
-    param_sizes[4] = L * (3 * C) * C; // qkvw
-    param_sizes[5] = L * (3 * C); // qkvb
-    param_sizes[6] = L * C * C; // attprojw
-    param_sizes[7] = L * C; // attprojb
-    param_sizes[8] = L * C; // ln2w
-    param_sizes[9] = L * C; // ln2b
-    param_sizes[10] = L * (4 * C) * C; // fcw
-    param_sizes[11] = L * (4 * C); // fcb
-    param_sizes[12] = L * C * (4 * C); // fcprojw
-    param_sizes[13] = L * C; // fcprojb
-    param_sizes[14] = C; // lnfw
-    param_sizes[15] = C; // lnfb
+    size_t num_parameters;
+    size_t num_parameters_bytes;
 
-    // populate the parameter sizes in bytes (all the same for now, keeping for future use)
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        param_sizeof[i] = sizeof(floatX);
-    }
-}
-
-// allocate memory for the parameters and point the individual tensors to the right places
-void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof) {
-    // calculate the total number of parameters and bytes across all tensors
-    size_t num_parameters_bytes = 0;
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        num_parameters_bytes += param_elements[i] * param_sizeof[i];
-    }
-    // malloc all parameters all at once on the device
+    char* gpu_mem;
     void* params_memory;
-    cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
-    // assign all the tensors their place in the array
-    floatX** ptrs[] = {
-        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
-        &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
-    };
-    char* params_memory_iterator = (char*)params_memory;
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        *(ptrs[i]) = (floatX*)params_memory_iterator;
-        params_memory_iterator += param_elements[i] * param_sizeof[i];
+    void* grads_memory;
+    float* m_memory;
+    float* v_memory;
+    float* master_weights;
+
+    // other run state configuration
+    int batch_size = 0; // the batch size (B) of current forward pass
+    int seq_len = 0; // the sequence length (T) of current forward pass
+    int* inputs = NULL; // the input tokens for the current forward pass
+    int* targets = NULL; // the target tokens for the current forward pass
+    float mean_loss = -1.0f; // after the last backward micro-batch, will be populated with mean loss across all GPUs and micro-steps
+    float* accumulated_mean_loss = NULL; // GPU buffer used to accumulate loss across micro-steps
+    float* cpu_losses = NULL; // CPU buffer to copy the losses to, allocated with cudaMallocHost
+    bool init_state = true;   // set to true if master weights need to be initialized
+    int use_master_weights = 1; // keep master weights copy in float for optim update? 0|1
+    int gelu_fusion = 0; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
+    int recompute = 0; // recompute gelu | layernorm forward during model backward? 0|1|2
+    // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
+    int* workload_indices = NULL; // encoder_backward, B*T*num_c_groups (int)
+    int4* bucket_info = NULL;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
+
+    unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
+    unsigned long long rng_state_last_update; // RNG before last gpt2_update() to re-round identically from master weights
+} GPT2;
+
+typedef struct {
+    char name[16];
+    size_t offset; // into base pointer
+    size_t num_elements; // per shard
+    size_t num_shards;
+    DType data_type;
+    TT tensor_type;
+} TensorSpec;
+
+TensorSpec tensor_specs[16*1024];
+size_t num_tensor_specs = 0;
+size_t current_tensor_offset = 0;
+TT current_tensor_type = TT::PARAMETER;
+size_t tensors_start[TT::COUNT] = {0};
+size_t tensors_bytes[TT::COUNT] = {0};
+size_t tensors_elements[TT::COUNT] = {0};
+
+int add_tensor_spec(const char* name, size_t num_elements, size_t num_shards, DType data_type, int copy_offset_from=-1, TT tensor_type=TT::DEFAULT) {
+    assert(num_tensor_specs < 16*1024);
+    assert((num_elements % num_shards) == 0);
+    TensorSpec* spec = &tensor_specs[num_tensor_specs++];
+
+    strncpy(spec->name, name, 16);
+    spec->num_elements = num_elements / num_shards;
+    spec->num_shards = num_shards;
+    spec->data_type = data_type;
+    spec->tensor_type = (tensor_type == TT::DEFAULT) ? current_tensor_type : tensor_type;
+    tensors_elements[spec->tensor_type] += spec->num_elements;
+
+
+    if (copy_offset_from >= 0) {
+        spec->offset = tensor_specs[copy_offset_from].offset;
+        size_t original_tensor_bytes = tensor_specs[copy_offset_from].num_elements * sizeof_dtype(tensor_specs[copy_offset_from].data_type);
+        size_t new_tensor_bytes = spec->num_elements * sizeof_dtype(data_type);
+        assert(new_tensor_bytes <= original_tensor_bytes);
+    } else {
+        spec->offset = current_tensor_offset;
+        current_tensor_offset += spec->num_elements * sizeof_dtype(data_type);
+
+        tensors_bytes[spec->tensor_type] += spec->num_elements * sizeof_dtype(data_type);
+        if (tensors_start[spec->tensor_type] == 0 && spec->tensor_type != 0) {
+            tensors_start[spec->tensor_type] = spec->offset;
+        }
     }
-    return params_memory;
+    return num_tensor_specs - 1;
 }
 
-constexpr int NUM_ACTIVATION_TENSORS = 21;
-typedef struct {
-    floatX* encoded; // (B, T, C)
-    floatX* ln1; // (L, B, T, C)
-    float* ln1_mean; // (L, B, T)
-    float* ln1_rstd; // (L, B, T)
-    floatX* atty; // (L, B, T, C)
-    // cuDNN saves only some statistics information
-#if ENABLE_CUDNN
-    float* att;  // (L, B, NH, T)
-#else
-    floatX* att; // (L, B, NH, T, T)
-#endif
+int add_layer_specs(int num_layers, const char* name, size_t num_elements, size_t num_shards, DType data_type, int copy_offset_from=-1, bool copy_per_layer=false, TT tensor_type=TT::DEFAULT) {
+    int first_tensor_id = num_tensor_specs;
+    for (int l = 0; l < num_layers; l++) {
+        char layer_name[16];
+        assert(snprintf(layer_name, 16, "%s_%d", name, l) >= 0);
+        add_tensor_spec(num_layers > 1 ? layer_name : name, num_elements, num_shards, data_type, copy_offset_from, tensor_type);
+        if (copy_per_layer) {
+            copy_offset_from++;
+        }
+    }
+    return first_tensor_id;
+}
 
-    floatX* residual2; // (L, B, T, C)
-    floatX* ln2; // (L, B, T, C)
-    float* ln2_mean; // (L, B, T)
-    float* ln2_rstd; // (L, B, T)
-    floatX* fch; // (L, B, T, 4*C)
-    floatX* fch_gelu; // (L, B, T, 4*C)
-    floatX* residual3; // (L, B, T, C)
-    floatX* lnf; // (B, T, C);   if LN recomputation is enabled (-r 2 and above), will be used for _all_ layernorms
-    float* lnf_mean; // (B, T)
-    float* lnf_rstd; // (B, T)
-    float* losses; // (B, T), will be accumulated in micro-steps
-    // adding these two compared to the CPU .c code, needed for attention kernel as buffers
-    floatX* qkvr; // (L, B, T, 3*C)
-    // in inference mode, this buffer will store the logits
-    // in training mode, this buffer will contain the *gradients* of the logits.
-    // during the processing of transformer blocks, we will also use this as a
-    // general scratchpad buffer. Allocation is made large enough to hold (B, T, 3C),
-    // (B, NH, T, T), and (B, T, V) shaped tensors.
-    floatX* output;
+#define TENSOR_SPECS(name, dim1, dim2) spec->name = add_layer_specs(dim1, #name, dim2, shards, dtype)
+#define TENSOR_SPECS_LOWP(name, dim1, dim2) spec->name = add_layer_specs(dim1, #name, dim2, shards, dtype_lowp)
+#define TENSOR_SPECS_FP32(name, dim1, dim2) spec->name = add_layer_specs(dim1, #name, dim2, shards, DType::FP32) // todo - won't work loading model
 
-    // some additional scratch buffers
-    floatX* scratch_bt4c;   // (B, T, 4*C)
-    floatX* scratch_btc;    // (B, T, C)
-} ActivationTensors;
+void gpt2_allocate(GPT2 *model) {
+    size_t Vp = model->config.padded_vocab_size;
+    size_t C = model->config.channels;
+    size_t maxT = model->config.max_seq_len;
+    size_t L = model->config.num_layers;
+    size_t B = model->batch_size;
+    size_t T = model->seq_len;
+    size_t NH = model->config.num_heads;
+    size_t output_size = B*T * max(4*C, max(NH*T, Vp));
+    size_t BTC = B*T*C;
 
+    size_t shards = 1;
+    int num_gpu = multi_gpu_config.num_processes;
+    int shards_opt = (multi_gpu_config.zero_stage >= 1) ? num_gpu : 1;
+    int shards_grad = (multi_gpu_config.zero_stage >= 2) ? num_gpu : 1;
 
-struct TensorSpec {
-    void** ptr;
-    size_t size;
-    DType type;
-};
+    // 1) parameters & optimizer state
+    for (int t = TT::PARAMETER; t <= TT::PARAMETER_OPT_V; t++) {
+        DType dtype = (t <= TT::PARAMETER_GRADIENT) ? DTYPE_FLOATX : DType::FP32;
+        DType dtype_lowp = (t <= TT::PARAMETER_GRADIENT) ? DTYPE_FLOATX : DType::FP32; // FP8 in the future
 
+        current_tensor_type = (TT)t;
+        ParameterTensors* spec;
+        switch (t) {
+            case TT::PARAMETER: spec = &model->params; shards = 1; break;
+            case TT::PARAMETER_GRADIENT: spec = &model->params_grads; shards = shards_grad; break;
+            case TT::PARAMETER_MASTER: spec = &model->params_master; shards = shards_opt; break;
+            case TT::PARAMETER_OPT_M: spec = &model->params_opt_m; shards = shards_opt; break;
+            case TT::PARAMETER_OPT_V: spec = &model->params_opt_v; shards = shards_opt; break;
+        }
+        if (t == PARAMETER_MASTER && !model->use_master_weights) {
+            continue;
+        }
 
-#define TENSOR_SPEC(pointer, size) TensorSpec{(void**)(&pointer), (size), dtype_of(pointer)};
+        TENSOR_SPECS     (wte,        1, Vp * C);
+        TENSOR_SPECS     (wpe,        1, maxT * C);
+        TENSOR_SPECS     (ln1w,       L, C);
+        TENSOR_SPECS     (ln1b,       L, C);
+        TENSOR_SPECS_LOWP(qkvw,       L, 3 * C * C);
+        TENSOR_SPECS     (qkvb,       L, 3 * C);
+        TENSOR_SPECS_LOWP(attprojw,   L, C * C);
+        TENSOR_SPECS     (attprojb,   L, C);
+        TENSOR_SPECS     (ln2w,       L, C);
+        TENSOR_SPECS     (ln2b,       L, C);
+        TENSOR_SPECS_LOWP(fcw,        L, 4 * C * C);
+        TENSOR_SPECS_LOWP(fcb,        L, 4 * C);
+        TENSOR_SPECS_LOWP(fcprojw,    L, 4 * C * C);
+        TENSOR_SPECS     (fcprojb,    L, C);
+        TENSOR_SPECS     (lnfw,       1, C);
+        TENSOR_SPECS     (lnfb,       1, C);
+    }
 
-void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS], size_t B, size_t T, GPT2Config config, int recompute) {
-    size_t Vp = config.padded_vocab_size;
-    size_t L = config.num_layers;
-    size_t NH = config.num_heads;
-    size_t C = config.channels;
+    // 2) multiuse & scratch tensors
+    if (UNIQUE_TENSOR_MEMORY) {
+        model->multiuse.bt4c = -1;
+        model->multiuse.btc = -1;
+    } else {
+        model->multiuse.bt4c = add_tensor_spec("multiuse_bt4c", 4 * BTC, 1, DTYPE_FLOATX, -1, TT::MULTIUSE);
+        model->multiuse.btc = add_tensor_spec("multiuse_btc", BTC, 1, DTYPE_FLOATX, -1, TT::MULTIUSE);
+    }
+
+    /*
     tensors[0] = TENSOR_SPEC(data->encoded, B * T * C);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
     tensors[1] = TENSOR_SPEC(data->ln1,  (recompute < 2) ? L * B * T * C : 0);
@@ -251,132 +313,138 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
 
     tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * 4 * C);
     tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
-}
+    */
 
-void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]) {
-    size_t bytes = 0;
-    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-        bytes += tensors[i].size * sizeof_dtype(tensors[i].type);
+
+    // 3) activations
+    current_tensor_type = TT::ACTIVATION;
+    ActivationTensors* spec = &model->acts;
+    DType dtype = DTYPE_FLOATX;
+    DType dtype_lowp = DTYPE_FLOATX; // todo FP8
+    shards = 1;
+
+    TENSOR_SPECS     (encoded,    1, BTC);
+    TENSOR_SPECS     (lnf,        1, BTC);
+    TENSOR_SPECS_FP32(lnf_mean,   1, B*T);
+    TENSOR_SPECS_FP32(lnf_rstd,   1, B*T);
+    TENSOR_SPECS_FP32(losses,     1, B*T);
+    TENSOR_SPECS     (output,     1, output_size);
+    TENSOR_SPECS_FP32(ln1_mean,   L, B*T);
+    TENSOR_SPECS_FP32(ln1_rstd,   L, B*T);
+    TENSOR_SPECS     (atty,       L, BTC);
+    TENSOR_SPECS     (residual2,  L, BTC);
+    TENSOR_SPECS_FP32(ln2_mean,   L, B*T);
+    TENSOR_SPECS_FP32(ln2_rstd,   L, B*T);
+    TENSOR_SPECS     (residual3,  L, BTC);
+    TENSOR_SPECS_LOWP(fch,        L, 4 * BTC);
+    TENSOR_SPECS     (qkvr,       L, 3 * BTC);
+    #ifdef ENABLE_CUDNN
+    TENSOR_SPECS_FP32(att,        L, NH * B * T);
+    #else
+    TENSOR_SPECS     (att,        L, NH * B * T * T);
+    #endif
+
+    if (UNIQUE_TENSOR_MEMORY) {
+        TENSOR_SPECS_LOWP(fcproj,   L, BTC);
+        TENSOR_SPECS_LOWP(attproj,  L, BTC);
+    } else {
+        spec->fcproj = add_layer_specs(L, "fcproj", BTC, L, dtype_lowp, model->multiuse.btc);
+        spec->attproj = add_layer_specs(L, "attproj", BTC, L, dtype_lowp, model->multiuse.btc);
     }
 
-    printf0("allocating %d MiB for activations\n", (int)round(bytes / (1024 * 1024)));
-
-    void* acts_memory;
-    cudaCheck(cudaMalloc((void**)&acts_memory, bytes));
-
-    // cudaMalloc does not guarantee initial memory values so we memset the allocation here
-    // this matters because e.g. non-cuDNN attention assumes the attention buffer is zeroed
-    // todo - up to ~100ms on slow GPUs, could theoretically be more selective, but this is safer
-    cudaCheck(cudaMemset(acts_memory, 0, bytes));
-
-    char* acts_memory_iterator = (char*)acts_memory;
-    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-        // extra protection so we don't accidentally use an empty buffer
-        if(tensors[i].size == 0) {
-            *(tensors[i].ptr) = NULL;
-        }else {
-            *(tensors[i].ptr) = acts_memory_iterator;
-            acts_memory_iterator += tensors[i].size * sizeof_dtype(tensors[i].type);
-        }
+    if (model->recompute < 1 || UNIQUE_TENSOR_MEMORY) {
+        TENSOR_SPECS(ln1,           L, BTC);
+        TENSOR_SPECS(ln2,           L, BTC);
+        TENSOR_SPECS(fch_gelu,      L, 4 * BTC);
+    } else if (model->recompute < 2) {
+        TENSOR_SPECS(ln1,           L, BTC);
+        TENSOR_SPECS(ln2,           L, BTC);
+        spec->fch_gelu = add_layer_specs(L, "fch_gelu", 4 * BTC, L, dtype_lowp, model->acts.output);
+    } else {
+        spec->ln1 = add_layer_specs(L, "ln1", BTC, L, dtype, model->acts.output);
+        spec->ln2 = add_layer_specs(L, "ln2", BTC, L, dtype, model->acts.output);
+        spec->fch_gelu = add_layer_specs(L, "fch_gelu", 4 * BTC, L, dtype_lowp, model->acts.output);
     }
-    return acts_memory;
-}
 
-typedef struct {
-    GPT2Config config;
-    // the weights of the model, and their sizes
-    ParameterTensors params;
-    size_t param_elements[NUM_PARAMETER_TENSORS];
-    size_t param_sizeof[NUM_PARAMETER_TENSORS];
-    void* params_memory;
-    size_t num_parameters;
-    size_t num_parameters_bytes;
-    // gradients of the weights
-    ParameterTensors grads;
-    void* grads_memory;
-    // buffers for the AdamW optimizer
-    float* m_memory;
-    float* v_memory;
-    float* master_weights;     // is NULL unless fp32 weights is enabled.
-    // the activations of the model, and their sizes
-    ActivationTensors acts;
-    TensorSpec acts_specs[NUM_ACTIVATION_TENSORS];
-    void* acts_memory;
-    // other run state configuration
-    int batch_size; // the batch size (B) of current forward pass
-    int seq_len; // the sequence length (T) of current forward pass
-    int* inputs; // the input tokens for the current forward pass
-    int* targets; // the target tokens for the current forward pass
-    float mean_loss; // after the last backward micro-batch, will be populated with mean loss across all GPUs and micro-steps
-    float* accumulated_mean_loss; // GPU buffer used to accumulate loss across micro-steps
-    float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
-    unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
-    unsigned long long rng_state_last_update; // RNG before last gpt2_update() to re-round identically from master weights
-    int use_master_weights; // keep master weights copy in float for optim update? 0|1
-    bool init_state;   // set to true if master weights need to be initialized
-    int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
-    int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
-    // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
-    int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
-    int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
-} GPT2;
+    // 4) activation gradients
+    current_tensor_type = TT::ACTIVATION_GRADIENT;
+    dtype_lowp = DTYPE_FLOATX; // todo FP8
+    shards = 1;
 
-void gpt2_init_common(GPT2 *model) {
-    // common inits outside of the model weights
-    // memory lazily initialized in forward()
-    model->acts_memory = NULL;
-    model->inputs = NULL;
-    model->targets = NULL;
-    model->accumulated_mean_loss = NULL;
-    model->cpu_losses = NULL;
-    // the B,T params are determined and set, fixed on first batch in forward()
-    model->batch_size = 0;
-    model->seq_len = 0;
-    model->mean_loss = -1.0f; // -1.0f designates no loss, set at end of forward()
-    model->params_memory = NULL;
-    // memory lazily initialized in backward()
-    model->grads_memory = NULL;
-    model->workload_indices = NULL; // on cpu, for encoder_backward
-    model->bucket_info = NULL; // on cpu, for encoder_backward
-    // memory lazily initialized in update()
-    model->m_memory = NULL;
-    model->v_memory = NULL;
-    model->master_weights = NULL;
-    // other default settings
-    model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
-    model->use_master_weights = 1; // safe default: do keep master weights in fp32
-    model->init_state = true;
-    model->recompute = 1; // good default: recompute gelu but not layernorm
-    model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
-}
-
-void gpt2_allocate_weights(GPT2 *model) {
-    // fill in all the parameter tensor dimensions and types
-    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
-    model->num_parameters = 0;
-    model->num_parameters_bytes = 0;
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        model->num_parameters += model->param_elements[i];
-        model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
+    if (UNIQUE_TENSOR_MEMORY) {
+        TENSOR_SPECS(output,     1, B*T * max(3*C, max(NH*T, Vp)));
+        TENSOR_SPECS(lnf,        1, BTC);
+        TENSOR_SPECS(ln1,        L, BTC);
+        TENSOR_SPECS(atty,       L, BTC);
+        TENSOR_SPECS(residual2,  L, BTC);
+        TENSOR_SPECS(ln2,        L, BTC);
+        TENSOR_SPECS(fch,        L, 4 * BTC);
+        TENSOR_SPECS(fch_gelu,   L, 4 * BTC);
+        TENSOR_SPECS(residual3,  L, BTC);
+        TENSOR_SPECS(qkvr,       L, 3 * BTC);
+    } else {
+        spec->output = add_layer_specs(1, "output", output_size, 1, dtype, model->acts.output);
+        spec->lnf = add_layer_specs(1, "lnf", BTC, 1, dtype, model->multiuse.btc);
+        spec->ln1 = add_layer_specs(L, "ln1", BTC, 1, dtype, model->multiuse.btc);
+        spec->atty = add_layer_specs(L, "atty", BTC, 1, dtype, model->multiuse.btc);
+        spec->residual2 = add_layer_specs(L, "residual2", BTC, 1, dtype, model->multiuse.btc);
+        spec->ln2 = add_layer_specs(L, "ln2", BTC, 1, dtype, model->multiuse.btc);
+        spec->fch = add_layer_specs(L, "fch", 4 * BTC, 1, dtype, model->multiuse.bt4c);
+        spec->fch_gelu = add_layer_specs(L, "fch_gelu", 4 * BTC, 1, dtype, model->multiuse.bt4c);
+        spec->residual3 = add_layer_specs(L, "residual3", BTC, 1, dtype, model->multiuse.btc);
+        spec->qkvr = add_layer_specs(L, "qkvr", 3 * BTC, 1, dtype, model->multiuse.bt4c);
     }
-    // create memory for model parameters on the device
-    assert(model->params_memory == nullptr);
-    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
-}
 
-void gpt2_allocate_state(GPT2 *model, int B, int T) {
-    printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
-    assert(model->grads_memory == nullptr);
-    model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
+    // allocate a single huge GPU buffer for all the tensors
+    printf("Current tensor offset in MiB: %zu", current_tensor_offset / (1024*1024));
+    cudaCheck(cudaMalloc(&model->gpu_mem, current_tensor_offset));
 
-    // record the current B,T as well
-    model->batch_size = B;
-    model->seq_len = T;
+    //initialise helper variables
+    model->num_parameters = tensors_elements[TT::PARAMETER];
+    model->num_parameters_bytes = tensors_bytes[TT::PARAMETER];
 
+    model->params_memory = (void*)(model->gpu_mem + tensors_start[TT::PARAMETER]);
+    model->grads_memory = (void*)(model->gpu_mem + tensors_start[TT::PARAMETER_GRADIENT]);
+    model->m_memory = (float*)(model->gpu_mem + tensors_start[TT::PARAMETER_OPT_M]);
+    model->v_memory = (float*)(model->gpu_mem + tensors_start[TT::PARAMETER_OPT_V]);
+    if (model->use_master_weights) {
+        model->master_weights = (float*)(model->gpu_mem + tensors_start[TT::PARAMETER_MASTER]);
+    }
+
+    // printf gpu_mem and params_memory
+    printf("gpu_mem: %p\n", model->gpu_mem);
+    printf("params_memory: %p\n", model->params_memory);
+    printf("number of parameters: %zu\n", model->num_parameters);
+    printf("number of parameters bytes: %zu\n", model->num_parameters_bytes);
+
+    // parameter gradient bytes
+    size_t param_grad_bytes = tensors_bytes[TT::PARAMETER_GRADIENT];
+    printf("number of parameter gradient bytes: %zu\n", param_grad_bytes / (1024*1024));
+    // number of master weight bytes
+    size_t master_weight_bytes = tensors_bytes[TT::PARAMETER_MASTER];
+    printf("number of master weight bytes: %zu\n", master_weight_bytes / (1024*1024));
+    // opt state m
+    size_t m_bytes = tensors_bytes[TT::PARAMETER_OPT_M];
+    printf("number of m bytes: %zu\n", m_bytes / (1024*1024));
+    // opt state v
+    size_t v_bytes = tensors_bytes[TT::PARAMETER_OPT_V];
+    printf("number of v bytes: %zu\n", v_bytes / (1024*1024));
+    // number of act bytes
+    size_t act_bytes = tensors_bytes[TT::ACTIVATION];
+    printf("number of act bytes: %zu\n", act_bytes / (1024*1024));
+    // number of act gradient bytes
+    size_t act_grad_bytes = tensors_bytes[TT::ACTIVATION_GRADIENT];
+    printf("number of act grad bytes: %zu\n", act_grad_bytes / (1024*1024));
+    // number of multiuse bytes
+    size_t multiuse_bytes = tensors_bytes[TT::MULTIUSE];
+    printf("number of multiuse bytes: %zu\n", multiuse_bytes / (1024*1024));
+
+    printf("number of act+actgrad+multiuse bytes: %zu\n", (multiuse_bytes + act_bytes + act_grad_bytes) / (1024*1024));
+
+    // =======================
+    // allocate_state stuff
+    // =======================
     // allocate the space
-    fill_in_activation_sizes(&model->acts, model->acts_specs, B, T, model->config, model->recompute);
-    model->acts_memory = malloc_and_point_activations(model->acts_specs);
-    // also create memory for caching inputs and targets
     cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
     cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
     cudaCheck(cudaMalloc(((void**)&model->accumulated_mean_loss), sizeof(float)));
@@ -388,31 +456,21 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     model->workload_indices = (int*)mallocCheck(sizeof(int) * model->batch_size * model->seq_len * num_c_groups);
     model->bucket_info = (int4*)mallocCheck(sizeof(int4) * model->batch_size * model->seq_len * num_c_groups);
 
-    size_t shard_num_parameters = multi_gpu_config.shard_num_parameters; // num parameters we are responsible for
-    printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
-    printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
-    assert(model->m_memory == nullptr);
-    assert(model->v_memory == nullptr);
-    cudaCheck(cudaMalloc((void**)&model->m_memory, shard_num_parameters * sizeof(float)));
-    cudaCheck(cudaMalloc((void**)&model->v_memory, shard_num_parameters * sizeof(float)));
-
-    if (model->use_master_weights == 1) {
-        assert(model->master_weights == nullptr);
-        printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
-        cudaCheck(cudaMalloc((void**) &model->master_weights, shard_num_parameters * sizeof(float)));
-    }
-
     size_t free, total;
     cudaCheck(cudaMemGetInfo(&free, &total));
     printf0("device memory usage: %zd MiB / %zd MiB\n", (total-free) / 1024 / 1024, total / 1024 / 1024);
 
     // give an estimate of the maximum batch size
-    size_t bytes_per_sequence = 0;
-    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-        bytes_per_sequence += model->acts_specs[i].size * sizeof_dtype(model->acts_specs[i].type) / B;
-    }
+    size_t bytes_per_sequence = tensors_bytes[TT::ACTIVATION] / B;
+    bytes_per_sequence += tensors_bytes[TT::ACTIVATION_GRADIENT] / B;
+    bytes_per_sequence += tensors_bytes[TT::MULTIUSE] / B; // pessimistic?
     printf0("memory per sequence: %zu MiB\n", bytes_per_sequence / 1024 / 1024);
     printf0(" -> estimated maximum batch size: %zu\n", B + free / bytes_per_sequence);
+}
+
+void gpt2_init_common(GPT2 *model) {
+    // other default settings
+    model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
 }
 
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -433,8 +491,7 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model_header[7] = model->config.padded_vocab_size;
     fwriteCheck(model_header, sizeof(int), 256, model_file);
     // write the parameters
-    device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
-                   IO_BUF_SIZE, main_stream);
+    device_to_file(model_file, model->params_memory, model->num_parameters_bytes,  IO_BUF_SIZE, main_stream);
     // close file, we're done
     fcloseCheck(model_file);
 }
@@ -490,12 +547,10 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     model->config.channels = model_header[6];
     model->config.padded_vocab_size = model_header[7];
 
-    // allocate memory for the model parameters
-    gpt2_allocate_weights(model);
+    gpt2_allocate(model);
 
     // read in the parameters if weight_init is true
     if (weight_init) {
-        assert(model->params_memory != NULL);
         file_to_device(model->params_memory, model_file, model->num_parameters_bytes, IO_BUF_SIZE, main_stream);
     }
     fcloseCheck(model_file);
@@ -570,7 +625,7 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     model->config.vocab_size = 50257;
     model->config.padded_vocab_size = 50304; // padded to 128 for CUDA kernel efficiency
 
-    gpt2_allocate_weights(model);
+    gpt2_allocate(model);
 
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
@@ -583,6 +638,7 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     float residual_scale = 1.0f / sqrtf(2.0f * model->config.num_layers);
     // we have to init all these tensors exactly in the order that PyTorch initializes them
     // so that we can match them up and get correctness and exactly the same initial conditions
+    /*
     size_t L = model->config.num_layers;
     size_t offset = 0;
     for (int l = 0; l < L; l++) {
@@ -623,11 +679,14 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
             offset += model->param_elements[i];
         }
     }
-
+    */
     // copy them to GPU
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     free(params_memory_cpu);
 }
+
+#define GPU_X(x) (floatX*)((char*)model->gpu_mem + tensor_specs[x].offset)
+#define GPU_F32(x) (float*)((char*)model->gpu_mem + tensor_specs[x].offset)
 
 // propagate inputs through the network to produce logits.
 // right now, this function is fully synchronous with the host
@@ -635,12 +694,6 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     NVTX_RANGE_FN();
     // we must be careful and use size_t instead of int, otherwise
     // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
-
-    // ensure the model was initialized or error out
-    if (model->params_memory == NULL) {
-        printf("Error: model was not initialized properly.\n");
-        exit(EXIT_FAILURE);
-    }
 
     // convenience parameters
     const size_t V = model->config.vocab_size;
@@ -665,42 +718,42 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    encoder_forward(GPU_X(acts.encoded), model->inputs, GPU_X(params.wte), GPU_X(params.wpe), B, T, C, main_stream); // encoding goes into residual[0]
 
     // first layernorm isn't fused
-    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
+    layernorm_forward(GPU_X((model->recompute < 2) ? acts.ln1 : acts.lnf), GPU_F32(acts.ln1_mean), GPU_F32(acts.ln1_rstd), GPU_X(acts.encoded), GPU_X(params.ln1w), GPU_X(params.ln1b), B, T, C, main_stream);
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
 
-        floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
+        floatX* residual = GPU_X(l == 0 ? acts.encoded : (acts.residual3 + l - 1));
 
         // get the pointers of the weights for this layer
-        floatX* l_qkvw = params.qkvw + l * 3*C * C;
-        floatX* l_qkvb = params.qkvb + l * 3*C;
-        floatX* l_attprojw = params.attprojw + l * C * C;
-        floatX* l_attprojb = params.attprojb + l * C;
-        floatX* l_ln2w = params.ln2w + l * C;
-        floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcb = params.fcb + l * 4*C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
-        floatX* l_fcprojb = params.fcprojb + l * C;
+        floatX* l_qkvw = GPU_X(params.qkvw + l);
+        floatX* l_qkvb = GPU_X(params.qkvb + l);
+        floatX* l_attprojw = GPU_X(params.attprojw);
+        floatX* l_attprojb = GPU_X(params.attprojb);
+        floatX* l_ln2w = GPU_X(params.ln2w);
+        floatX* l_ln2b = GPU_X(params.ln2b);
+        floatX* l_fcw = GPU_X(params.fcw);
+        floatX* l_fcb = GPU_X(params.fcb);
+        floatX* l_fcprojw = GPU_X(params.fcprojw);
+        floatX* l_fcprojb = GPU_X(params.fcprojb);
 
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
-        floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
-        floatX* l_atty = acts.atty + l * B * T * C;
-        floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
-        float* l_ln2_mean = acts.ln2_mean + l * B * T;
-        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch = acts.fch + l * B * T * 4*C;
+        floatX* l_ln1 = GPU_X((model->recompute < 2) ? acts.ln1 + l : acts.lnf);
+        floatX* l_qkvr = GPU_X(acts.qkvr + l);
+        floatX* l_atty = GPU_X(acts.atty + l);
+        floatX* l_residual2 = GPU_X(acts.residual2 + l);
+        floatX* l_ln2 = GPU_X((model->recompute < 2) ? acts.ln2 + l : acts.lnf);
+        float* l_ln2_mean = GPU_F32(acts.ln2_mean + l);
+        float* l_ln2_rstd = GPU_F32(acts.ln2_rstd + l);
+        floatX* l_fch = GPU_X(acts.fch + l);
         // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
-        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
-        floatX* l_residual3 = acts.residual3 + l * B * T * C;
-        floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
+        floatX* l_fch_gelu = GPU_X((model->recompute < 1) ? acts.fch_gelu + l : acts.fch_gelu);
+        floatX* l_residual3 = GPU_X(acts.residual3 + l);
+        floatX* scratch = GPU_X(acts.output); // used for non-cudnn attention, fcproj, attproj, etc.
 
         // now do the forward pass
         #ifdef ENABLE_CUDNN
@@ -708,7 +761,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
-        floatX* l_att = acts.att + l * B * NH * T * T;
+        floatX* l_att = GPU_X(acts.att + l);
         if (T != model->seq_len) { // unused parts of attention buffer must be zeroed (T-dependent)
             cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX)));
         }
@@ -724,21 +777,21 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
         // OK, fusion across blocks.
         if(l+1 != L) {
-            floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
-            float* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
-            float* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
-            const floatX* l_ln1w = params.ln1w + (l + 1) * C;
-            const floatX* l_ln1b = params.ln1b + (l + 1) * C;
+            floatX* l_ln1 = GPU_X((model->recompute < 2) ? acts.ln1 + (l + 1) : acts.lnf);
+            float* l_ln1_mean = GPU_F32(acts.ln1_mean + (l + 1));
+            float* l_ln1_rstd = GPU_F32(acts.ln1_rstd + (l + 1));
+            const floatX* l_ln1w = GPU_X(params.ln1w + (l + 1));
+            const floatX* l_ln1b = GPU_X(params.ln1b + (l + 1));
             fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
                                     B * T, C, main_stream);
         } else {
-            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
-                                    params.lnfw, params.lnfb,
+            fused_residual_forward5(l_residual3, GPU_X(acts.lnf), GPU_F32(acts.lnf_mean), GPU_F32(acts.lnf_rstd), l_residual2, scratch,
+                                    GPU_X(params.lnfw), GPU_X(params.lnfb),
                                     B * T, C, main_stream);
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    matmul_forward_cublaslt(GPU_X(acts.output), GPU_X(acts.lnf), GPU_X(params.wte), NULL, B, T, C, Vp, main_stream);
     cudaCheck(cudaDeviceSynchronize());
 }
 
@@ -760,11 +813,11 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
     // fused classifier: does the forward pass and first part of the backward pass
     const float dloss = 1.0f / (B * T); // results in the uniform average loss over all elements
     // note: we don't need to generate dlogits here
-    cudaCheck(cudaMemset(acts.losses, 0, B*T*sizeof(float)));
+    cudaCheck(cudaMemset(GPU_F32(acts.losses), 0, B*T*sizeof(float)));
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B*T, V); // while the memcpy is underway, validate the targets
-    fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, False, main_stream);
-    cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
+    fused_classifier(GPU_X(acts.output), GPU_F32(acts.losses), dloss, model->targets, B, T, V, Vp, False, main_stream);
+    cudaCheck(cudaMemcpy(model->cpu_losses, GPU_F32(acts.losses), B * T * sizeof(float), cudaMemcpyDeviceToHost));
     for (int i = 0; i < B*T; i++) {
         mean_loss += model->cpu_losses[i];
     }
@@ -774,6 +827,8 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
 }
 
 void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
+    return; // debugging forward only first...
+
     if(model->grads_memory == nullptr) {
         fprintf(stderr, "Need to allocate gradients before backward");
         exit(EXIT_FAILURE);
@@ -785,8 +840,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // there are currently two state vars during the gradient accumulation inner loop:
         // 1) the losses accumulate += into acts.losses, reset here
         // 2) the gradients accumulate += into grads_memory, reset here
-        cudaCheck(cudaMemsetAsync(model->acts.losses, 0, model->batch_size * model->seq_len * sizeof(float), main_stream));
-        cudaCheck(cudaMemsetAsync(model->grads_memory, 0, model->num_parameters * sizeof(floatX), main_stream));
+        cudaCheck(cudaMemsetAsync(GPU_X(model->acts.losses), 0, model->batch_size * model->seq_len * sizeof(float), main_stream));
+        cudaCheck(cudaMemsetAsync(model->grads_memory, 0, tensors_bytes[TT::PARAMETER_GRADIENT], main_stream));
     }
 
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
@@ -799,7 +854,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     const size_t C = model->config.channels;
 
     ParameterTensors params = model->params; // for brevity
-    ParameterTensors grads = model->grads;
+    ParameterTensors grads = model->params_grads;
     ActivationTensors acts = model->acts;
 
     // accumulate the losses inside acts.losses, and kick off the backward pass inside the fused classifier
@@ -807,27 +862,27 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     const float dloss = 1.0f / (float)(B * T * grad_accum_steps); // results in the uniform average loss over all elements
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B*T, V);
-    fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, True, main_stream);
+    fused_classifier(GPU_X(acts.output), GPU_F32(acts.losses), dloss, model->targets, B, T, V, Vp, True, main_stream);
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
 
     // reset residual stream gradients (put here to work with gradient accumulation)
-    floatX* dresidual = (floatX*)model->acts.scratch_btc; // the main buffer holding the gradient in the backward pass
+    floatX* dresidual = GPU_X(model->multiuse.btc); // the main buffer holding the gradient in the backward pass
     cudaCheck(cudaMemset(dresidual, 0, B * T * C * sizeof(floatX)));
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
-    float*  scratchF = (float*)acts.output;
-    floatX* scratchX = (floatX*)acts.output;
+    float*  scratchF = GPU_F32(acts.output);
+    floatX* scratchX = GPU_X(acts.output);
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // this was done in the fused classifier kernel as last step of forward pass
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    matmul_backward(GPU_X(model->multiuse.bt4c), GPU_X(grads.wte), NULL, GPU_X(acts.output), GPU_X(acts.lnf), GPU_X(params.wte), NULL, B, T, C, Vp, main_stream);
     // backward the final layernorm
-    floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
+    floatX* residual = GPU_X(acts.residual3 + (L-1)); // last residual is in residual3
+    layernorm_backward(dresidual, GPU_X(grads.lnfw), GPU_X(grads.lnfb), scratchF, GPU_X(model->multiuse.bt4c), residual, GPU_X(params.lnfw), GPU_F32(acts.lnf_mean), GPU_F32(acts.lnf_rstd), B, T, C, main_stream);
 
     // from this point on, we no longer need the values stored in the last residual, so we can reuse that memory as generic
     // scratch for backward computations
@@ -837,47 +892,47 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     for (int l = L-1; l >= 0; l--) {
         NvtxRange layer_range("Layer", l);
 
-        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
+        residual = GPU_X(l == 0 ? acts.encoded : acts.residual3 + (l-1));
 
         // get the pointers of the weights for this layer
-        floatX* l_ln1w = params.ln1w + l * C;
-        floatX* l_ln1b = params.ln1b + l * C;
-        floatX* l_qkvw = params.qkvw + l * 3*C * C;
-        floatX* l_attprojw = params.attprojw + l * C * C;
-        floatX* l_ln2w = params.ln2w + l * C;
-        floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
+        floatX* l_ln1w = GPU_X(params.ln1w + l);
+        floatX* l_ln1b = GPU_X(params.ln1b + l);
+        floatX* l_qkvw = GPU_X(params.qkvw + l);
+        floatX* l_attprojw = GPU_X(params.attprojw + l);
+        floatX* l_ln2w = GPU_X(params.ln2w + l);
+        floatX* l_ln2b = GPU_X(params.ln2b + l);
+        floatX* l_fcw = GPU_X(params.fcw + l);
+        floatX* l_fcprojw = GPU_X(params.fcprojw + l);
         // get the pointers of the gradients of the weights for this layer
-        floatX* dl_ln1w = grads.ln1w + l * C;
-        floatX* dl_ln1b = grads.ln1b + l * C;
-        floatX* dl_qkvw = grads.qkvw + l * 3*C * C;
-        floatX* dl_qkvb = grads.qkvb + l * 3*C;
-        floatX* dl_attprojw = grads.attprojw + l * C * C;
-        floatX* dl_attprojb = grads.attprojb + l * C;
-        floatX* dl_ln2w = grads.ln2w + l * C;
-        floatX* dl_ln2b = grads.ln2b + l * C;
-        floatX* dl_fcw = grads.fcw + l * 4*C * C;
-        floatX* dl_fcb = grads.fcb + l * 4*C;
-        floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
-        floatX* dl_fcprojb = grads.fcprojb + l * C;
+        floatX* dl_ln1w = GPU_X(grads.ln1w + l);
+        floatX* dl_ln1b = GPU_X(grads.ln1b + l);
+        floatX* dl_qkvw = GPU_X(grads.qkvw + l);
+        floatX* dl_qkvb = GPU_X(grads.qkvb + l);
+        floatX* dl_attprojw = GPU_X(grads.attprojw + l);
+        floatX* dl_attprojb = GPU_X(grads.attprojb + l);
+        floatX* dl_ln2w = GPU_X(grads.ln2w + l);
+        floatX* dl_ln2b = GPU_X(grads.ln2b + l);
+        floatX* dl_fcw = GPU_X(grads.fcw + l);
+        floatX* dl_fcb = GPU_X(grads.fcb + l);
+        floatX* dl_fcprojw = GPU_X(grads.fcprojw + l);
+        floatX* dl_fcprojb = GPU_X(grads.fcprojb + l);
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
-        float* l_ln1_mean = acts.ln1_mean + l * B * T;
-        float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
-        floatX* l_atty = acts.atty + l * B * T * C;
-        floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
-        float* l_ln2_mean = acts.ln2_mean + l * B * T;
-        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch_pre_gelu = acts.fch + l * B * T * 4*C;
-        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+        floatX* l_ln1 = GPU_X((model->recompute < 2) ? acts.ln1 + l : acts.lnf);
+        float* l_ln1_mean = GPU_F32(acts.ln1_mean + l);
+        float* l_ln1_rstd = GPU_F32(acts.ln1_rstd + l);
+        floatX* l_qkvr = GPU_X(acts.qkvr + l * B * T * 3*C);
+        floatX* l_atty = GPU_X(acts.atty + l * B * T * C);
+        floatX* l_residual2 = GPU_X(acts.residual2 + l);
+        floatX* l_ln2 = GPU_X((model->recompute < 2) ? acts.ln2 + l : acts.lnf);
+        float* l_ln2_mean = GPU_F32(acts.ln2_mean + l);
+        float* l_ln2_rstd = GPU_F32(acts.ln2_rstd + l);
+        floatX* l_fch_pre_gelu = GPU_X(acts.fch + l);
+        floatX* l_fch_gelu = GPU_X((model->recompute < 1) ? acts.fch_gelu + l : acts.fch_gelu);
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
 
-        floatX* dl_bt4c = (floatX*)model->acts.scratch_bt4c;
+        floatX* dl_bt4c = (floatX*)GPU_X(model->multiuse.bt4c);
 
         // start the backward pass for this layer
         if(model->recompute >= 1) {
@@ -899,7 +954,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
         attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C, main_stream);
         #else
-        floatX* l_att = acts.att + l * B * NH * T * T;
+        floatX* l_att = GPU_X(acts.att + l);
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
@@ -934,20 +989,20 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
         }
     }
-    encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
+    encoder_backward(GPU_X(grads.wte), GPU_X(grads.wpe), scratchX, model->workload_indices, model->bucket_info,
                      dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
 
     // Aggregate all gradients that are not part of the transformer blocks
     if(last_step) {
         // reduce all the losses within the current GPU (across all microsteps)
-        global_sum_deterministic(model->accumulated_mean_loss, acts.losses, B*T, main_stream);
+        global_sum_deterministic(model->accumulated_mean_loss, GPU_X(acts.losses), B*T, main_stream);
         // reduce loss across GPUs to a single, final float across all microsteps and GPUs
         #if MULTI_GPU
         ncclCheck(ncclAllReduce(model->accumulated_mean_loss, model->accumulated_mean_loss, sizeof(float), ncclFloat, ncclAvg, multi_gpu_config.nccl_comm, main_stream));
         #endif
         cudaCheck(cudaMemcpyAsync(&model->mean_loss, model->accumulated_mean_loss, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
         // reduce the gradients for non-transformer block parameters
-        floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
+        floatX* const pointers[] = {GPU_X(grads.wte), GPU_X(grads.wpe), GPU_X(grads.lnfw), GPU_X(grads.lnfb)};
         const size_t nelem[] = {Vp * C, T * C, C, C};
         multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
     }
@@ -962,6 +1017,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
 // Gets the offset of a specific tensor for a specific layer in the GPT2 model
 // layer_id is ignored for weights that are not part of a transformer block
+/*
 ShardInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_tensor_id) {
     // first offset our way to the parameter tensor start
     ptrdiff_t offset = 0;
@@ -976,14 +1032,17 @@ ShardInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_te
     }
     return {offset, size};
 }
+*/
 
 float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
     floatX* grads_memory = (floatX*)model->grads_memory;
 
     // repurposing this buffer (which isn't needed now) to write grad norm into it
-    float* grad_norm_squared = (float*)model->acts.output;
+    float* grad_norm_squared = GPU_F32(model->acts.output);
     float grad_norm_squared_cpu = 0.0f;
+
+    /*
 
     int num_slices[2] = {1, model->config.num_layers};
     int max_num_block_sums = get_max_num_block_sums(num_slices, 2);
@@ -1016,12 +1075,16 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
         global_sum_deterministic(grad_norm_squared, grad_norm_squared, max_num_block_sums, main_stream);
     }
     cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
+    */
+
     float grad_norm_cpu = sqrtf(grad_norm_squared_cpu);
     return grad_norm_cpu;
 }
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_scale, int t,
                  MultiGpuConfig* multi_gpu_config, bool init_from_master_only=false) {
+    return; // debugging forward only for now
+
     // update the model parameters using the AdamW optimizer
     // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
     // so we may not be responsible for the entire parameter tensor
@@ -1047,6 +1110,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 
     // AdamW update
     // handle adamw for all the transformer blocks
+    /*
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         // generate a unique seed for each tensor
         unsigned int seed = random_u32(&model->rng_state);
@@ -1107,6 +1171,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 #endif
         }
     }
+    */
 
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -1141,12 +1206,7 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
 }
 
 void gpt2_free(GPT2 *model) {
-    cudaFreeCheck(&model->params_memory);
-    cudaFreeCheck(&model->grads_memory);
-    cudaFreeCheck(&model->m_memory);
-    cudaFreeCheck(&model->v_memory);
-    cudaFreeCheck(&model->master_weights);
-    cudaFreeCheck(&model->acts_memory);
+    cudaFreeCheck(&model->gpu_mem);
     cudaFreeCheck(&model->inputs);
     cudaFreeCheck(&model->targets);
     cudaFreeCheck(&model->accumulated_mean_loss);
@@ -1559,6 +1619,12 @@ int main(int argc, char *argv[]) {
     // build the GPT-2 model
     GPT2 model;
     gpt2_init_common(&model);
+    model.use_master_weights = use_master_weights;
+    model.gelu_fusion = gelu_fusion;
+    model.recompute = recompute;
+    model.batch_size = B;
+    model.seq_len = T;
+
     if (resuming == 1) {
         // if `-y 1` was set, then we are resuming from the latest checkpoint
         // if we are using master weights, we'll init them later inside load_state()
@@ -1573,9 +1639,6 @@ int main(int argc, char *argv[]) {
         gpt_build_from_descriptor(&model, load_filename);
     }
 
-    model.use_master_weights = use_master_weights;
-    model.gelu_fusion = gelu_fusion;
-    model.recompute = recompute;
     printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : load_filename);
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
@@ -1662,7 +1725,6 @@ int main(int argc, char *argv[]) {
 
     // if we found a checkpoint to resume from, load the optimization state
     int step = 0;
-    gpt2_allocate_state(&model, B, T);
     if (resuming == 1) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
         load_state(&step, &model, &train_loader, filename_buffer);
@@ -1759,7 +1821,7 @@ int main(int argc, char *argv[]) {
                 // note this is still somewhat wasteful because we don't have a KV cache!
                 gpt2_forward(&model, gen_tokens, 1, CEIL_DIV(t, min(T,256)) * min(T,256));
                 // get the V-dimensional vector probs[0, t-1, :]
-                floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
+                floatX* logits = (floatX*)(model.gpu_mem + tensors_start[model.acts.output] + (t - 1) * model.config.padded_vocab_size);
                 // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
                 cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost));
                 // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
