@@ -230,8 +230,9 @@ __global__ void residual_forward_kernel(floatX* out, const floatX* inp1, const f
     store128(out + idx, packed_out);
 }
 
+template <bool zero_dinp_old=false>
 __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with only 1024 threads?
-    layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+    layernorm_backward_kernel10(floatX* dinp_new, floatX* dinp_old, floatX* dweight, floatX* dbias, float* scratch,
                                 const floatX* dout, const floatX* inp, const floatX* weight,
                                 const float* mean, const float* rstd,
                                 int B, int T, int C) {
@@ -266,7 +267,8 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
     for (int bt = baseIdx; bt < B * T; bt += warpsInGrid) {
         const floatX* dout_bt = dout + bt * C;
         const floatX* inp_bt = inp +bt * C;
-        floatX* dinp_bt = dinp + bt * C;
+        floatX* dinp_bt = dinp_old + bt * C;
+        floatX* dinp_new_bt = dinp_new + bt * C;
 
         // first: two reduce operations
         float dnorm_mean = 0.0f;
@@ -298,8 +300,10 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
             if(global_index < C) {
                 dout128 = load128cs(dout_bt + global_index);
                 inp128 = load128cs(inp_bt + global_index);
-                dinp128 = load128(dinp_bt + global_index);
                 weight128 = load128(weight + global_index);
+                if constexpr (!zero_dinp_old) {
+                    dinp128 = load128(dinp_bt + global_index);
+                }
             }
 
             for(int o = 0; o < x128::size / f128::size; ++o) {
@@ -353,7 +357,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
             }
             if(global_index < C) {
                 // cache in L2 as this is read by the next kernel, but bypass L1 to minimise thrashing
-                store128cg(dinp_bt + global_index, dinp128);
+                store128cg(dinp_new_bt + global_index, dinp128);
             }
         }
     }
@@ -489,7 +493,7 @@ void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, floa
     cudaCheck(cudaGetLastError());
 }
 
-void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+void layernorm_backward(floatX* dinp_new, floatX* dinp_old, floatX* dweight, floatX* dbias, float* scratch,
                         const floatX* dout, const floatX* inp, const floatX* weight, const float* mean, const float* rstd,
                         int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
@@ -500,6 +504,10 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - 32) * f128::size) * sizeof(float);
 
     cudaCheck(cudaMemsetAsync(scratch, 0, 1 * sizeof(float), stream)); // only need to reset the flag to 0
-    layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+    if (dinp_old == nullptr) {
+        layernorm_backward_kernel10<true><<<grid_size, block_size, shared_mem_size, stream>>>(dinp_new, dinp_old, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+    } else {
+        layernorm_backward_kernel10<false><<<grid_size, block_size, shared_mem_size, stream>>>(dinp_new, dinp_old, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+    }
     cudaCheck(cudaGetLastError());
 }

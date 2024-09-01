@@ -67,7 +67,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
 // split both loops in "multiple-of-x128-size" and "bounds-checked remainder" parts
 template <bool WriteDLogits = true, bool WriteProbs = false>
 __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
-    fused_classifier_kernel5(floatX* logits, float* losses, floatX* probs,
+    fused_classifier_kernel5(floatX* dlogits, floatX* logits, float* losses, floatX* probs,
                                 const float dloss, const int* targets,
                                 int B, int T, int V, int P, std::bool_constant<WriteDLogits>) {
     // note: idx is small enough that it easily fits into 32 bit;
@@ -109,7 +109,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
         if (WriteDLogits){
             // reduce cache persistence for the overwritten logits
             // to maximise probability that logits remain in cache between prepare_softmax and here
-            store128cs(logits + idx * P + i * x128::size, packed_logits_vec);
+            store128cs(dlogits + idx * P + i * x128::size, packed_logits_vec);
         }
         if (WriteProbs) {
             store128(probs + idx * P + i * x128::size, packed_probs);
@@ -124,7 +124,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
         float indicator = (i == ix) ? 1.0f : 0.0f;
         float dlogit = (prob - indicator) * dloss;
         if (WriteDLogits){
-            __stcs(logits + idx * P + i, (floatX)dlogit);
+            __stcs(dlogits + idx * P + i, (floatX)dlogit);
         }
         if (WriteProbs) {
             probs[idx * P + i] = (floatX)prob;
@@ -137,13 +137,13 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
 
 // replaces logits with logit gradients
 template <typename Type, bool WriteDLogits>
-void fused_classifier(Type* logits, float* losses,
+void fused_classifier(Type* dlogits, Type* logits, float* losses,
                       const float dloss, const int* targets,
                       int B, int T, int V, int P, std::bool_constant<WriteDLogits> write_dlogits, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 1024;
     const int N = B * T;
     const int grid_size = N;
-    fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P, write_dlogits);
+    fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(dlogits, logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P, write_dlogits);
     cudaCheck(cudaGetLastError());
 }
