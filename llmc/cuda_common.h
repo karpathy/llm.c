@@ -26,6 +26,9 @@ Common utilities for CUDA code.
 // but it is actually created and instantiated in the main program file
 extern cudaDeviceProp deviceProp;
 
+// Main stream used by default for all CUDA operations
+extern cudaStream_t main_stream;
+
 // WarpSize is not a compile time constant
 // Defining here like this possibly allows the compiler to optimize better
 #define WARP_SIZE 32U
@@ -130,7 +133,7 @@ class NvtxRange {
 // Utilities to Read & Write between CUDA memory <-> files
 
 // copy num_bytes from device pointer src into file dest, using double buffering running on the given stream.
-inline void device_to_file(FILE* dest, void* src, size_t num_bytes, size_t buffer_size, cudaStream_t stream) {
+inline void device_to_file(FILE* dest, void* src, size_t num_bytes, size_t buffer_size, cudaStream_t stream=main_stream) {
     // allocate pinned buffer for faster, async transfer
     char* buffer_space;
     cudaCheck(cudaMallocHost(&buffer_space, 2*buffer_size));
@@ -169,7 +172,7 @@ inline void device_to_file(FILE* dest, void* src, size_t num_bytes, size_t buffe
 }
 
 // copy num_bytes from file src into device pointer dest, using double buffering running on the given stream.
-inline void file_to_device(void* dest, FILE* src, size_t num_bytes, size_t buffer_size, cudaStream_t stream) {
+inline void file_to_device(void* dest, FILE* src, size_t num_bytes, size_t buffer_size, cudaStream_t stream=main_stream) {
      // allocate pinned buffer for faster, async transfer
      // from the docs (https://developer.download.nvidia.com/compute/DevZone/docs/html/C/doc/html/group__CUDART__HIGHLEVEL_ge439496de696b166ba457dab5dd4f356.html)
      // WC memory is a good option for buffers that will be written by the CPU and read by the device via mapped pinned memory or host->device transfers.

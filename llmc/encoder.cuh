@@ -156,7 +156,7 @@ __global__ void wpe_backward_kernel(floatX* dwpe,
 
 void encoder_forward(floatX* out,
                      const int* inp, const floatX* wte, const floatX* wpe,
-                     int B, int T, int C, cudaStream_t stream) {
+                     int B, int T, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int N = B * T * C;
@@ -169,7 +169,7 @@ void encoder_forward(floatX* out,
 void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu outputs & scratch
                       int* workload_indices, int4* bucket_info,    // cpu scratch buffers
                       const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
-                      int B, int T, int C, unsigned int seed, cudaStream_t stream) {
+                      int B, int T, int C, unsigned int seed, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
 
     // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)

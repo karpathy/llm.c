@@ -594,4 +594,3 @@ float multi_gpu_cpu_float_sum(float value, MultiGpuConfig* config) {
 }
 
 #endif
-

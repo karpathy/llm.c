@@ -14,7 +14,7 @@ Matrix Multiplication, with help from cuBLASLt
 // CUDA kernels
 
 template<typename OutFloat, bool UseAuxBuffer>
-__global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
+__global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout, int BT, int OC,
                                              std::bool_constant<UseAuxBuffer>) {
     constexpr const int bdx = 4;
     constexpr const int bdy = WARP_SIZE / bdx;
@@ -40,7 +40,7 @@ __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout
 
     if(global_oc < OC) {
         // sum up over all bt within registers
-        for (int idx = blockIdx.y * bt_per_block + local_bt; idx < B * T; idx += gridDim.y * bt_per_block) {
+        for (int idx = blockIdx.y * bt_per_block + local_bt; idx < BT; idx += gridDim.y * bt_per_block) {
             x128 packed_dout = load128(dout + global_oc + idx*OC);
             for (int k = 0; k < x128::size; k++) {
                 accumulators[k] += (float)packed_dout[k];
@@ -230,22 +230,22 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
 // small wrapper around matmul_cublaslt for the forward pass (keeping historical order of arguments)
 void matmul_forward_cublaslt(floatX* out,
                      floatX* inp, floatX* weight, floatX* bias,
-                     int B, int T, int C, int OC, cudaStream_t stream,
-                     floatX* pre_gelu=NULL, int gelu_fusion=1) {
+                     int BT, int C, int OC,
+                     floatX* pre_gelu=NULL, int gelu_fusion=1, cudaStream_t stream=main_stream) {
     // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
     if (gelu_fusion < 1 && pre_gelu) {
-        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
-        gelu_forward(out, pre_gelu, B*T*OC, stream);
+        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, BT, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
+        gelu_forward(out, pre_gelu, BT*OC, stream);
     } else {
-        matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
+        matmul_cublaslt(out, weight, inp, bias, OC, BT, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
     }
 }
 
 void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
                      floatX* dout, floatX* inp, floatX* weight,
                      float* dbias_buffer,
-                     int B, int T, int C, int OC, cudaStream_t stream,
-                     floatX* pre_gelu=NULL, int gelu_fusion=1) {
+                     int BT, int C, int OC,
+                     floatX* pre_gelu=NULL, int gelu_fusion=1, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
 
     // backward to bias, if given, does a +=
@@ -263,11 +263,11 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
         // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation
         // and write results directly to the output.
         if(grid_size_y == 1) {
-            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim, 0, stream>>>(dbias, dout, B, T, OC, False);
+            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim, 0, stream>>>(dbias, dout, BT, OC, False);
             cudaCheck(cudaGetLastError());
         } else {
             // kernel 9 overwrites temp buffer, so no need to memset
-            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim, 0, stream>>>(dbias_buffer, dout, B, T, OC, True);
+            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim, 0, stream>>>(dbias_buffer, dout, BT, OC, True);
             cudaCheck(cudaGetLastError());
             reduce_add_sum_kernel<<<CEIL_DIV(OC, 256 * f128::size), 256, 0, stream>>>(dbias, dbias_buffer, OC, grid_size_y);
             cudaCheck(cudaGetLastError());
@@ -276,15 +276,15 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
     }
 
     // backward to input, uses = in the backward pass (set the gradient)
-    matmul_cublaslt(dinp, weight, dout, NULL, C, B*T, OC, stream, false, false, 0, 0, 0, 0, false,
+    matmul_cublaslt(dinp, weight, dout, NULL, C, BT, OC, stream, false, false, 0, 0, 0, 0, false,
                     gelu_fusion >= 2 ? pre_gelu : NULL, true);
 
     // backward GELU (if it wasn't fused into the matmul above)
     if (gelu_fusion < 2 && pre_gelu) {
-        gelu_backward_inplace(dinp, pre_gelu, B*T*C, stream);
+        gelu_backward_inplace(dinp, pre_gelu, BT*C, stream);
     }
 
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
-    matmul_cublaslt(dweight, inp, dout, NULL /*dbias*/, C, OC, B*T, stream, false, true, 0, 0, 0, 0,
+    matmul_cublaslt(dweight, inp, dout, NULL /*dbias*/, C, OC, BT, stream, false, true, 0, 0, 0, 0,
                     true /* accumulate */, NULL, true);
 }

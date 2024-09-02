@@ -66,7 +66,7 @@ int get_max_num_block_sums(int* num_slices_all, int numel) {
 }
 
 template<typename T>
-void global_norm_squared(float* out, const T* values, size_t count, ptrdiff_t stride, int num_slices, int max_num_block_sums, bool reset, cudaStream_t stream) {
+void global_norm_squared(float* out, const T* values, size_t count, ptrdiff_t stride, int num_slices, int max_num_block_sums, bool reset, cudaStream_t stream=main_stream) {
     const int block_size = 512;
     // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
     // having one block less than possible is a tiny performance hit, having

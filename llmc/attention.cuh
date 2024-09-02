@@ -194,7 +194,7 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
 
 void attention_forward(floatX* out, floatX* qkvr, floatX* att,
                        floatX* inp,
-                       int B, int T, int C, int NH, cudaStream_t stream) {
+                       int B, int T, int C, int NH, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
     // Its contents will be overwritten by this function.
@@ -239,7 +239,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
                         const floatX* dout,
                         const floatX* qkvr, const floatX* att,
-                        int B, int T, int C, int NH, cudaStream_t stream) {
+                        int B, int T, int C, int NH, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int HS = C / NH; // head size

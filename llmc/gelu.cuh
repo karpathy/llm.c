@@ -47,7 +47,7 @@ __global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const floatX* inp
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-void gelu_forward(floatX* out, const floatX* inp, int N, cudaStream_t stream) {
+void gelu_forward(floatX* out, const floatX* inp, int N, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 512;
     assert(N % (block_size * x128::size) == 0);
@@ -56,7 +56,7 @@ void gelu_forward(floatX* out, const floatX* inp, int N, cudaStream_t stream) {
     cudaCheck(cudaGetLastError());
 }
 
-void gelu_backward_inplace(floatX* d_in_out, const floatX* inp, const int N, cudaStream_t stream) {
+void gelu_backward_inplace(floatX* d_in_out, const floatX* inp, const int N, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 128;
     assert(N % (block_size * x128::size) == 0);

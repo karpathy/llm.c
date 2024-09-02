@@ -222,7 +222,7 @@ auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
 void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
                              float* stats, // output for backward pass: (B, NH, T)
                              floatX* inp,  // input: (B, T, 3, NH, HS) QKV
-                             int B, int T, int NH, int C, cudaStream_t stream) {
+                             int B, int T, int NH, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     int HS = C / NH; // number of features per head
     bool is_inference_only = (stats == nullptr);
@@ -255,7 +255,7 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
 
 void attention_backward_cudnn(floatX* dqkvr,                                       // output
                               floatX* dout, floatX* qkvr, floatX* o, float* stats, // inputs
-                              int B, int T, int NH, int C, cudaStream_t stream) {
+                              int B, int T, int NH, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     int HS = C / NH; // number of features per head
 

@@ -235,7 +235,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
     layernorm_backward_kernel10(floatX* dinp_new, floatX* dinp_old, floatX* dweight, floatX* dbias, float* scratch,
                                 const floatX* dout, const floatX* inp, const floatX* weight,
                                 const float* mean, const float* rstd,
-                                int B, int T, int C) {
+                                int BT, int C) {
     int BLOCK_SIZE = blockDim.x;
     int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
     extern __shared__ float shared[];
@@ -264,7 +264,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
     }
     __syncthreads();
 
-    for (int bt = baseIdx; bt < B * T; bt += warpsInGrid) {
+    for (int bt = baseIdx; bt < BT; bt += warpsInGrid) {
         const floatX* dout_bt = dout + bt * C;
         const floatX* inp_bt = inp +bt * C;
         floatX* dinp_bt = dinp_old + bt * C;
@@ -436,11 +436,10 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
 // similar to `fused_residual_forward5`
 void layernorm_forward(floatX* out, float* mean, float* rstd,
                        floatX* inp, const floatX* weight, const floatX* bias,
-                       int B, int T, int C, cudaStream_t stream) {
+                       int N, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
-    const int N = B * T;
     const int grid_size = CEIL_DIV(N, block_y);
     size_t smem = (2 + block_y) * C * sizeof(floatX);
 
@@ -459,7 +458,7 @@ void layernorm_forward(floatX* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
-void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N, cudaStream_t stream) {
+void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     assert(N % (block_size * x128::size) == 0);
@@ -471,7 +470,7 @@ void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N
 void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, float* rstd,
                              const floatX* inp1, const floatX* inp2,
                              const floatX* weight, const floatX* bias,
-                             int N, int C, cudaStream_t stream) {
+                             int N, int C, cudaStream_t stream=main_stream) {
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
     const int grid_size = CEIL_DIV(N, block_y);
@@ -488,14 +487,14 @@ void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, floa
                                                                                               weight, bias, N, C);
     } else {
         residual_forward(residual, inp1, inp2, N*C, stream);
-        layernorm_forward(normed, mean, rstd, residual, weight, bias, N, 1, C, stream);
+        layernorm_forward(normed, mean, rstd, residual, weight, bias, N, C, stream);
     }
     cudaCheck(cudaGetLastError());
 }
 
 void layernorm_backward(floatX* dinp_new, floatX* dinp_old, floatX* dweight, floatX* dbias, float* scratch,
                         const floatX* dout, const floatX* inp, const floatX* weight, const float* mean, const float* rstd,
-                        int B, int T, int C, cudaStream_t stream) {
+                        int BT, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 512;
     const int blocks_per_sm = 2; // supported on every architecture and less cache thrashing than 3
@@ -505,9 +504,9 @@ void layernorm_backward(floatX* dinp_new, floatX* dinp_old, floatX* dweight, flo
 
     cudaCheck(cudaMemsetAsync(scratch, 0, 1 * sizeof(float), stream)); // only need to reset the flag to 0
     if (dinp_old == nullptr) {
-        layernorm_backward_kernel10<true><<<grid_size, block_size, shared_mem_size, stream>>>(dinp_new, dinp_old, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+        layernorm_backward_kernel10<true><<<grid_size, block_size, shared_mem_size, stream>>>(dinp_new, dinp_old, dweight, dbias, scratch, dout, inp, weight, mean, rstd, BT, C);
     } else {
-        layernorm_backward_kernel10<false><<<grid_size, block_size, shared_mem_size, stream>>>(dinp_new, dinp_old, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+        layernorm_backward_kernel10<false><<<grid_size, block_size, shared_mem_size, stream>>>(dinp_new, dinp_old, dweight, dbias, scratch, dout, inp, weight, mean, rstd, BT, C);
     }
     cudaCheck(cudaGetLastError());
 }
