@@ -20,7 +20,7 @@ __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp) {
         float cube = 0.044715f * xi * xi * xi;
 
         float tanh_in_out = GELU_SCALING_FACTOR * (xi + cube);
-        #if !defined(PRECISE_GELU_TANH) && __CUDA_ARCH__ >= 750
+        #if !defined(PRECISE_GELU_TANH) && !defined(ENABLE_FP32) && __CUDA_ARCH__ >= 750
         asm ("tanh.approx.f32 %0,%1;" : "=f"(tanh_in_out) : "f"(tanh_in_out));
         #else
         tanh_in_out = tanhf(tanh_in_out);
@@ -47,7 +47,7 @@ __global__ void gelu_backward_kernel(Tdinp* dinp, const Tdout* dout, const Ti* i
         float cube = 0.044715f * x * x * x;
 
         float tanh_in_out = GELU_SCALING_FACTOR * (x + cube);
-        #if !defined(PRECISE_GELU_TANH) && __CUDA_ARCH__ >= 750
+        #if !defined(PRECISE_GELU_TANH) && !defined(ENABLE_FP32) && __CUDA_ARCH__ >= 750
         asm ("tanh.approx.f32 %0,%1;" : "=f"(tanh_in_out) : "f"(tanh_in_out));
         #else
         tanh_in_out = tanhf(tanh_in_out);
