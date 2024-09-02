@@ -67,7 +67,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
 // split both loops in "multiple-of-x128-size" and "bounds-checked remainder" parts
 template <bool WriteDLogits = true, bool WriteProbs = false>
 __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
-    fused_classifier_kernel5(floatX* dlogits, floatX* logits, float* losses, floatX* probs,
+    fused_classifier_kernel5(floatX* dlogits, const floatX* logits, float* losses, floatX* probs,
                                 const float dloss, const int* targets,
                                 int B, int T, int V, int P, std::bool_constant<WriteDLogits>) {
     // note: idx is small enough that it easily fits into 32 bit;
@@ -137,7 +137,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
 
 // replaces logits with logit gradients
 template <typename Type, bool WriteDLogits>
-void fused_classifier(Type* dlogits, Type* logits, float* losses,
+void fused_classifier(Type* dlogits, const Type* logits, float* losses,
                       const float dloss, const int* targets,
                       int B, int T, int V, int P, std::bool_constant<WriteDLogits> write_dlogits, cudaStream_t stream) {
     NVTX_RANGE_FN();
