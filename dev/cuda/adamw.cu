@@ -98,12 +98,13 @@ __global__ void adamw_kernel2(float* params_memory, const float* grads_memory, f
    params_memory[i] -= learning_rate * (m / (sqrtf(v) + eps) + weight_decay * params_memory[i]);
 }
 
+// kernel with thread coarsening
 __global__ void adamw_kernel3(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
 
-    for (; i < num_parameters; i += stride) {
+    for (int i = tid; i < num_parameters; i += stride) {
         #pragma unroll
         for (int c = 0; c < COARSE_FACTOR; c++) {
             int idx = i + c * stride;
@@ -157,7 +158,7 @@ void adamw_dispatch2(float* params_memory, const float* grads_memory, float* m_m
     cudaCheck(cudaGetLastError());
 }
 
-// version 3
+// version 3: naive dispatch to thread coarsening kernel
 void adamw_dispatch3(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                      float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
     unsigned int block_size = 512;
@@ -253,7 +254,7 @@ int main(int argc, char **argv) {
     printf("All results match.\n\n");
 
     // now benchmark the kernel
-    int repeat_times = 1000;
+    int repeat_times = 100;
     float elapsed_time = benchmark_kernel(repeat_times, adamw, kernel_num,
       d_params_memory, d_grads_memory, d_m_memory, d_v_memory, t, num_parameters,
       learning_rate, beta1, beta2, eps, weight_decay);
