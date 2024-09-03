@@ -25,6 +25,7 @@ thread coarsening/ILP
 #include <cuda_runtime.h>
 #include "common.h"
 
+#define COARSE_FACTOR 4
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -81,42 +82,56 @@ __global__ void adamw_kernel1(float* params_memory, const float* grads_memory, f
 // * using optimized linear interpolation for the moment updates.
 __global__ void adamw_kernel2(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
-
-    extern __shared__ float shared_memory[];
-    float* shared_g = shared_memory;
-    float* shared_m = &shared_memory[blockDim.x];
-    float* shared_v = &shared_memory[2 * blockDim.x];
-    float* shared_p = &shared_memory[3 * blockDim.x];
-
-    int local_i = threadIdx.x;
-	
-	
-	for(int i = blockIdx.x*blockDim.x + threadIdx.x; i < num_parameters; i += blockDim.x*gridDim.x){
-        shared_g[local_i] = grads_memory[i];
-        shared_m[local_i] = m_memory[i];
-        shared_v[local_i] = v_memory[i];
-        shared_p[local_i] = params_memory[i];
-        
-	    float grad = shared_g[local_i];
-        float m = shared_m[local_i];
-        float v = shared_v[local_i];
-        float p = shared_p[local_i];
-
-        // update the first moment (momentum)
-        m = lerp(grad, m, beta1);
-        m_memory[i] = m;
-
-        // update the second moment (RMSprop)
-        v = lerp(grad * grad, v, beta2);
-        v_memory[i] = v;
-
-        m /= beta1_correction;  // m_hat
-        v /= beta2_correction;  // v_hat
-
-        params_memory[i] -= learning_rate * (m / (sqrtf(v) + eps) + weight_decay * p);
-    }	
+   int i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= num_parameters) return;  // guard
+   float grad = grads_memory[i];
+   float m = m_memory[i];
+   float v = v_memory[i];
+   // update the first moment (momentum)
+   m = lerp(grad, m, beta1);
+   m_memory[i] = m;
+   // update the second moment (RMSprop)
+   v = lerp(grad * grad, v, beta2);
+   v_memory[i] = v;
+   m /= beta1_correction;  // m_hat
+   v /= beta2_correction;  // v_hat
+   params_memory[i] -= learning_rate * (m / (sqrtf(v) + eps) + weight_decay * params_memory[i]);
 }
 
+__global__ void adamw_kernel3(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    for (; i < num_parameters; i += stride) {
+        #pragma unroll
+        for (int c = 0; c < COARSE_FACTOR; c++) {
+            int idx = i + c * stride;
+            if (idx >= num_parameters) break;
+
+            float grad = grads_memory[idx];
+            float m = m_memory[idx];
+            float v = v_memory[idx];
+            float param = params_memory[idx];
+
+            // Update first moment (momentum)
+            m = lerp(grad, m, beta1);
+            m_memory[idx] = m;
+
+            // Update second moment (RMSprop)
+            v = lerp(grad * grad, v, beta2);
+            v_memory[idx] = v;
+
+            // Compute bias-corrected moments
+            float m_hat = m / beta1_correction;
+            float v_hat = v / beta2_correction;
+
+            // Update parameters
+            param -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
+            params_memory[idx] = param;
+        }
+    }
+}
 
 // ----------------------------------------------------------------------------
 // kernel launcher
@@ -137,8 +152,17 @@ void adamw_dispatch2(float* params_memory, const float* grads_memory, float* m_m
                      float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
     unsigned int block_size = 512;
     unsigned int num_blocks = ceil_div(num_parameters, (long) block_size);
-	 unsigned int shared_size = 4*block_size*sizeof(float);
-    adamw_kernel2<<<num_blocks, block_size, shared_size>>>(params_memory, grads_memory, m_memory, v_memory, num_parameters,
+    adamw_kernel2<<<num_blocks, block_size>>>(params_memory, grads_memory, m_memory, v_memory, num_parameters,
+                                              learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+    cudaCheck(cudaGetLastError());
+}
+
+// version 3
+void adamw_dispatch3(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
+                     float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+    unsigned int block_size = 512;
+    unsigned int num_blocks = ceil_div(num_parameters, (long) block_size);
+    adamw_kernel3<<<num_blocks, block_size>>>(params_memory, grads_memory, m_memory, v_memory, num_parameters,
                                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
     cudaCheck(cudaGetLastError());
 }
@@ -158,27 +182,14 @@ void adamw(int kernel_num,
             adamw_dispatch2(params_memory, grads_memory, m_memory, v_memory, num_parameters,
                             learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
             break;
+        case 3:
+            adamw_dispatch3(params_memory, grads_memory, m_memory, v_memory, num_parameters,
+                            learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay);
+            break;
         default:
             printf("Invalid kernel number\n");
             exit(1);
     }
-}
-
-// ----------------------------------------------------------------------------
-float calculate_gflops(long num_parameters, float execution_time_ms) {
-    // Count floating point operations per element
-    const int flops_per_element = 15;  // Approximate count, adjust if necessary
-    
-    // Total floating point operations
-    long total_flops = num_parameters * flops_per_element;
-    
-    // Convert ms to seconds
-    float execution_time_s = execution_time_ms / 1000.0f;
-    
-    // Calculate GFLOPS
-    float gflops = (total_flops / execution_time_s) / 1e9;
-    
-    return gflops;
 }
 
 int main(int argc, char **argv) {
@@ -242,7 +253,7 @@ int main(int argc, char **argv) {
     printf("All results match.\n\n");
 
     // now benchmark the kernel
-    int repeat_times = 3;
+    int repeat_times = 1000;
     float elapsed_time = benchmark_kernel(repeat_times, adamw, kernel_num,
       d_params_memory, d_grads_memory, d_m_memory, d_v_memory, t, num_parameters,
       learning_rate, beta1, beta2, eps, weight_decay);
