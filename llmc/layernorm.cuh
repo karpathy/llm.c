@@ -434,7 +434,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
 // kernel launchers
 
 // similar to `fused_residual_forward5`
-void layernorm_forward(floatX* out, float* mean, float* rstd,
+void layernorm_forward(TensorGPU<floatX> out, float* mean, float* rstd,
                        floatX* inp, const floatX* weight, const floatX* bias,
                        int N, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
@@ -467,9 +467,8 @@ void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N
     cudaCheck(cudaGetLastError());
 }
 
-void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, float* rstd,
-                             const floatX* inp1, const floatX* inp2,
-                             const floatX* weight, const floatX* bias,
+void fused_residual_forward5(tensorX residual, tensorX normed, tensorFP32 mean, tensorFP32 rstd,
+                             tensorX inp1, tensorX inp2, tensorX weight, tensorX bias,
                              int N, int C, cudaStream_t stream=main_stream) {
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;

@@ -89,24 +89,6 @@ constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
 
-enum TT : uint8_t {
-    PARAMETER=0, PARAMETER_GRAD, PARAMETER_MASTER, PARAMETER_OPT_M, PARAMETER_OPT_V, // 1 allocation each
-    ACTIVATIONS_MULTIUSE, // single buffer shared for activations, activation gradients, and scratch
-    DEFAULT, COUNT=DEFAULT, NUM_TYPES_PARAM=PARAMETER_OPT_V+1
-};
-
-enum TFlags : uint8_t {
-    NONE=0,
-    REUSED_MEMORY=1,
-    GRADIENT=2,
-    TENSOR_2D=4,
-    BIAS=8,
-    LAYERNORM=16,
-    RESIDUAL=32,
-    EMBEDDING=64,
-    STATS=128
-};
-
 typedef struct {
     int wte, wpe, lnfw, lnfb; // not per layer
     int ln1w, ln1b, qkvw, qkvb, attprojw, attprojb, ln2w, ln2b, fcw, fcb, fcprojw, fcprojb; // per layer
@@ -167,34 +149,12 @@ typedef struct {
     unsigned long long rng_state_last_update; // RNG before last gpt2_update() to re-round identically from master weights
 } GPT2;
 
-// todo: need flags, subtypes (e.g. act gradient), etc...
-typedef struct {
-    char* ptr;
-    size_t offset; // into base pointer
-    size_t num_elements; // per shard
-    int id;
-    short num_shards;
-    short remaining_layers;
-    DType data_type;
-    TT tensor_type;
-    int flags;
-    char name[16];
+int num_tensor_specs = 0;
+int current_absmax_index = 0;
+void* gpu_tensor_scale_memory = NULL;
+void* gpu_tensor_absmax_memory = NULL;
 
-    template <typename T>
-    operator T*() const {
-        if (std::is_same<T, float>::value && data_type != DType::FP32 ||
-            std::is_same<T, __half>::value && data_type != DType::FP16 ||
-            std::is_same<T, nv_bfloat16>::value && data_type != DType::BF16) {
-            printf("ERROR: Unexpected data type (%d) for tensor %s\n", (int)data_type, name);
-            exit(EXIT_FAILURE);
-        }
-        return reinterpret_cast<T*>(ptr);
-    }
-} TensorSpec;
-
-constexpr size_t MAX_TENSORS = 16*1024;
 TensorSpec tensor_specs[MAX_TENSORS] = {0};
-size_t num_tensor_specs = 0;
 TT current_tensor_type = TT::PARAMETER;
 size_t tensors_start[TT::COUNT] = {0};
 size_t tensors_bytes[TT::COUNT] = {0};
@@ -473,7 +433,12 @@ void gpt2_allocate(GPT2 *model) {
     // =======================
     // allocate_state stuff
     // =======================
-    // allocate the space
+    // absmax/scaling/descaling buffers for FP8 & Friends
+    cudaMalloc(&gpu_tensor_scale_memory,   sizeof(float) * num_tensor_specs);
+    cudaMemset(gpu_tensor_scale_memory, 0, sizeof(float) * num_tensor_specs);
+    cudaMalloc(&gpu_tensor_absmax_memory,   sizeof(float) * num_tensor_specs * MAX_ABSMAX_HISTORY);
+    cudaMemset(gpu_tensor_absmax_memory, 0, sizeof(float) * num_tensor_specs * MAX_ABSMAX_HISTORY);
+
     cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
     cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
     cudaCheck(cudaMalloc(((void**)&model->accumulated_mean_loss), sizeof(float)));
@@ -809,7 +774,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
     for (; l < L; l++) {
         NvtxRange layer_range("Layer", l);
-        floatX* residual = (l == 0) ? ACT(encoded) : ACT_L(residual3, l-1);
+        tensorX residual = (l == 0) ? ACT(encoded) : ACT_L(residual3, l-1);
 
         matmul_forward_cublaslt(CUDNN_ENABLED ? ACT(qkvr) : MULTI(output_scratch), ACT(ln1), PARAM(qkvw), PARAM(qkvb), B*T, C, 3*C);
         #ifdef ENABLE_CUDNN
@@ -914,8 +879,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     // now backward all the layers
     for (; l >= 0; l--) {
         NvtxRange layer_range("Layer", l);
-        floatX* residual = (l == 0) ? ACT(encoded) : ACT_L(residual3, l-1);
-        floatX* dresidual = (l == 0) ? AGRAD(encoded) : AGRAD_L(residual3, l-1);
+        tensorX residual = (l == 0) ? ACT(encoded) : ACT_L(residual3, l-1);
+        tensorX dresidual = (l == 0) ? AGRAD(encoded) : AGRAD_L(residual3, l-1);
 
         if(model->recompute >= 1) { // recompute >= 1 means we recompute gelu
             gelu_forward(ACT(fch_gelu), ACT(fch), B*T*4*C);
@@ -973,7 +938,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             for (int i = 0; i < LAYERS_PER_ACTIVATION_CHECKPOINT; i++, l++) {
                 // non-fused layernorm as we already (only!) have the residual
                 // (for the original forward pass, residual of l-1 is fused with layernorm of l)
-                floatX* residual = (l == 0) ? ACT(encoded) : ACT_L(residual3, l-1);
+                tensorX residual = (l == 0) ? ACT(encoded) : ACT_L(residual3, l-1);
                 layernorm_forward(ACT(ln1), ACT(ln1_mean), ACT(ln1_rstd), residual, PARAM(ln1w), PARAM(ln1b), B*T, C);
 
                 matmul_forward_cublaslt(CUDNN_ENABLED ? ACT(qkvr) : MULTI(output_scratch), ACT(ln1), PARAM(qkvw), PARAM(qkvb), B*T, C, 3*C);
@@ -1018,25 +983,6 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         model->mean_loss = -1.f; // no loss available yet
     }
 }
-
-// Gets the offset of a specific tensor for a specific layer in the GPT2 model
-// layer_id is ignored for weights that are not part of a transformer block
-/*
-ShardInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_tensor_id) {
-    // first offset our way to the parameter tensor start
-    ptrdiff_t offset = 0;
-    for (int i = 0; i < param_tensor_id; i++) {
-        offset += (ptrdiff_t)model->param_elements[i];
-    }
-    size_t size = model->param_elements[param_tensor_id] ;
-    // if we are in the transformer block, we need to additionally offset by the layer id
-    if(2 <= param_tensor_id && param_tensor_id <= 13) {
-        size /= model->config.num_layers;
-        offset += (ptrdiff_t)(layer_id * size);
-    }
-    return {offset, size};
-}
-*/
 
 float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
