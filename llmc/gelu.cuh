@@ -10,57 +10,84 @@
 // CUDA kernels
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__global__ void gelu_forward_kernel2(floatX* out, const floatX* inp) {
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+__global__ void gelu_forward_kernel2(tensorFP8e4 out, tensorFP8e4 inp) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * inp.num_per_128();
 
-    x128 packed_out;
-    x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
-    for(int k = 0; k < packed_inp.size; ++k) {
-        float xi = (float)packed_inp[k];
+    auto out128 = new_tensor128(out);
+    auto inp128 = load_tensor128(inp, idx, true);
+    for(int k = 0; k < inp.num_per_128(); ++k) {
+        float xi = inp128.get(k);
         float cube = 0.044715f * xi * xi * xi;
-        packed_out[k] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
+
+        float tanh_in_out = GELU_SCALING_FACTOR * (xi + cube);
+        #if !defined(PRECISE_GELU_TANH) && !defined(ENABLE_FP32) && __CUDA_ARCH__ >= 750
+        asm ("tanh.approx.f32 %0,%1;" : "=f"(tanh_in_out) : "f"(tanh_in_out));
+        #else
+        tanh_in_out = tanhf(tanh_in_out);
+        #endif
+
+        // the following uses FMUL+FMA instead of FMUL+FADD+FMUL for "0.5f * x * (1.0f + tanh_out)"
+        float half_xi = 0.5f * xi;
+        out128.set(k, half_xi * tanh_in_out + half_xi);
     }
-    // store instead of storecs (without cache streaming) in case it is useful for the
-    // data to be in the cache for the next operation after this GeLU
-    store128(out + idx, packed_out);
+    out128.store_same_length<floatX>(idx, false);
+
+    // Update absmax
+    out128.update_absmax(threadIdx.x, blockDim.x, true);
 }
 
-__global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const floatX* inp) {
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+//template<typename Tinp=floatX>
+template<typename Tinp=floatX>
+__global__ void gelu_backward_kernel(tensorFP8e5 dinp, tensorFP8e5 dout, TensorGPU<Tinp> inp) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * dout.num_per_128();
 
-    x128 packed_dinp;
-    x128 packed_inp = load128cs(inp + idx);
-    x128 packed_dout = load128(d_in_out + idx);
-    for (int k = 0; k < packed_inp.size; ++k) {
-        float x = (float)packed_inp[k];
+    auto packed_dinp = new_tensor128(dinp);
+    auto packed_inp = load_tensor128(inp, idx, true);
+    auto packed_dout = load_tensor128(dout, idx);
+    for (int k = 0; k < dout.num_per_128(); ++k) {
+        float x = packed_inp.get(k);
         float cube = 0.044715f * x * x * x;
-        float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
-        float tanh_out = tanhf(tanh_arg);
-        float coshf_out = coshf(tanh_arg);
-        float sech_out = 1.0f / (coshf_out * coshf_out);
-        float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
-        packed_dinp[k] = (floatX)(local_grad * (float)packed_dout[k]);
+
+        float tanh_in_out = GELU_SCALING_FACTOR * (x + cube);
+        #if !defined(PRECISE_GELU_TANH) && !defined(ENABLE_FP32) && __CUDA_ARCH__ >= 750
+        asm ("tanh.approx.f32 %0,%1;" : "=f"(tanh_in_out) : "f"(tanh_in_out));
+        #else
+        tanh_in_out = tanhf(tanh_in_out);
+        #endif
+
+        float sech_out = 1.0f - (tanh_in_out * tanh_in_out);
+        float local_grad = 0.5f * ((1.0f + tanh_in_out) + x * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x));
+        float result = local_grad * (float)packed_dout.get(k);
+        packed_dinp.set(k, result);
     }
-    store128(d_in_out + idx, packed_dinp);
+    packed_dinp.store_same_length<floatX>(idx, false);
+
+    // Update absmax
+    packed_dinp.update_absmax(threadIdx.x, blockDim.x, true);
 }
 
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-void gelu_forward(floatX* out, const floatX* inp, int N, cudaStream_t stream=main_stream) {
+void gelu_forward(tensorX out, tensorX inp, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
-    const int block_size = 512;
-    assert(N % (block_size * x128::size) == 0);
-    const int grid_size = CEIL_DIV(N, block_size * x128::size);
+    const int block_size = 256;
+    assert(out.num_per_128() == inp.num_per_128());
+    assert(inp.num_elements % (block_size * inp.num_per_128()) == 0);
+
+    const int grid_size = CEIL_DIV(inp.num_elements, block_size * inp.num_per_128());
     gelu_forward_kernel2<<<grid_size, block_size, 0, stream>>>(out, inp);
     cudaCheck(cudaGetLastError());
 }
 
-void gelu_backward_inplace(floatX* d_in_out, const floatX* inp, const int N, cudaStream_t stream=main_stream) {
+void gelu_backward(tensorX dinp, tensorX dout, tensorX inp, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
-    const int block_size = 128;
-    assert(N % (block_size * x128::size) == 0);
-    const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    gelu_backward_inplace_kernel<<<grid_size, block_size, 0, stream>>>(d_in_out, inp);
+    const int block_size = 512;
+    assert(dout.num_per_128() == inp.num_per_128());
+    assert(inp.num_elements % (block_size * inp.num_per_128()) == 0);
+    assert(dout.num_elements == inp.num_elements && dout.num_elements == dinp.num_elements);
+
+    const int grid_size = CEIL_DIV(inp.num_elements, block_size * inp.num_per_128());
+    gelu_backward_kernel<<<grid_size, block_size, 0, stream>>>(dinp, dout, inp);
     cudaCheck(cudaGetLastError());
 }

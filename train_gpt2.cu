@@ -83,6 +83,7 @@ char filename_buffer[512];
 // global vars containing information about the GPU this process is running on
 cudaDeviceProp deviceProp; // fills in common_start()
 cudaStream_t main_stream;
+TensorGPU<floatX> null_tensorX;
 // buffer size to use for device <-> disk io
 constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 
@@ -593,7 +594,6 @@ void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
     config->num_heads = channels / head_size;
     config->max_seq_len = 2048; // NOTE: GPT-3 uses context length of 2048 tokens, up from 1024 in GPT-2
 }
-
 void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     // The model descriptor can be:
     // - legacy format "dX", where X is number, e.g. "d12". This creates GPT-2 model with 12 layers.
@@ -762,7 +762,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     if (!CUDNN_ENABLED && T != model->seq_len) {
         cudaCheck(cudaMemset(ACT_L(att, 0), 0, L * B * NH * T * T * sizeof(floatX)));
     }
-    // validate inputs, all indices must be in the range [0, V)
+    // validate inputs, all indices mucst be in the range [0, V)
     tokenCheck(inputs, B*T, V);
 
     // copy inputs/targets to the model (fully synchronous with the host for now)
@@ -785,7 +785,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
         matmul_forward_cublaslt(ACT(attproj), ACT(atty), PARAM(attprojw), PARAM(attprojb), B*T, C, C);
         fused_residual_forward5(ACT(residual2), ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), residual, ACT(attproj), PARAM(ln2w), PARAM(ln2b), B*T, C);
-        matmul_forward_cublaslt(ACT(fch_gelu), ACT(ln2), PARAM(fcw), PARAM(fcb), B*T, C, 4*C, ACT(fch), model->gelu_fusion);
+        matmul_forward_cublaslt<floatX>(ACT(fch_gelu), ACT(ln2), PARAM(fcw), PARAM(fcb), B*T, C, 4*C, ACT(fch), model->gelu_fusion);
         matmul_forward_cublaslt(ACT(fcproj), ACT(fch_gelu), PARAM(fcprojw), PARAM(fcprojb), B*T, 4*C, C);
 
         if(l+1 != L) {
@@ -797,7 +797,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         }
     }
 
-    matmul_forward_cublaslt(ACT(output), ACT(lnf), PARAM(wte), NULL, B*T, C, Vp);
+    matmul_forward_cublaslt(ACT(output), ACT(lnf), PARAM(wte), null_tensorX, B*T, C, Vp);
 }
 
 
@@ -861,8 +861,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     fused_classifier(AGRAD(output), ACT(output), ACT(losses), dloss, model->targets, B*T, V, Vp, True); // todo - split output & doutput
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass + dedicated buffer
-    float*  scratchF = MULTI_L(local_scratch, 0);
-    floatX* scratchX_HUGE = MULTI_L(output_scratch, 0);
+    tensorFP32 scratchF = MULTI_L(local_scratch, 0);
+    tensorX scratchX_HUGE = MULTI_L(output_scratch, 0);
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
 
@@ -871,9 +871,9 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(AGRAD(lnf), PGRAD(wte), NULL, AGRAD(output), ACT(lnf), PARAM(wte), NULL, B*T, C, Vp);
+    matmul_backward<floatX>(AGRAD(lnf), PGRAD(wte), null_tensorX, AGRAD(output), ACT(lnf), PARAM(wte), scratchF, B*T, C, Vp);
     // backward the final layernorm
-    layernorm_backward(AGRAD_L(residual3, L-1), NULL, PGRAD(lnfw), PGRAD(lnfb), scratchF, AGRAD(lnf), ACT_L(residual3, L-1),
+    layernorm_backward(AGRAD_L(residual3, L-1), null_tensorX, PGRAD(lnfw), PGRAD(lnfb), scratchF, AGRAD(lnf), ACT_L(residual3, L-1),
                        PARAM(lnfw), ACT(lnf_mean), ACT(lnf_rstd), B*T, C);
 
     // now backward all the layers
@@ -883,9 +883,9 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         tensorX dresidual = (l == 0) ? AGRAD(encoded) : AGRAD_L(residual3, l-1);
 
         if(model->recompute >= 1) { // recompute >= 1 means we recompute gelu
-            gelu_forward(ACT(fch_gelu), ACT(fch), B*T*4*C);
+            gelu_forward(ACT(fch_gelu), ACT(fch));
         }
-        matmul_backward(AGRAD(fch), PGRAD(fcprojw), PGRAD(fcprojb), AGRAD(residual3), ACT(fch_gelu), PARAM(fcprojw), scratchF, B*T, 4*C, C, ACT(fch), model->gelu_fusion);
+        matmul_backward<floatX>(AGRAD(fch), PGRAD(fcprojw), PGRAD(fcprojb), AGRAD(residual3), ACT(fch_gelu), PARAM(fcprojw), scratchF, B*T, 4*C, C, ACT(fch), model->gelu_fusion);
 
         if(model->recompute >= 2) { // recompute >= 2 means we recompute layernorm
             layernorm_forward(ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), ACT(residual2), PARAM(ln2w), PARAM(ln2b), B*T, C);
@@ -950,7 +950,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
                 matmul_forward_cublaslt(ACT(attproj), ACT(atty), PARAM(attprojw), PARAM(attprojb), B*T, C, C);
                 fused_residual_forward5(ACT(residual2), ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), residual, ACT(attproj), PARAM(ln2w), PARAM(ln2b), B*T, C);
-                matmul_forward_cublaslt(ACT(fch_gelu), ACT(ln2), PARAM(fcw), PARAM(fcb), B*T, C, 4*C, ACT(fch), model->gelu_fusion);
+                matmul_forward_cublaslt<floatX>(ACT(fch_gelu), ACT(ln2), PARAM(fcw), PARAM(fcb), B*T, C, 4*C, ACT(fch), model->gelu_fusion);
                 matmul_forward_cublaslt(ACT(fcproj), ACT(fch_gelu), PARAM(fcprojw), PARAM(fcprojb), B*T, 4*C, C);
             }
             l = old_l;
@@ -1221,6 +1221,11 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
         printf("[System]\n");
         printf("Device %d: %s\n", multi_gpu_config.local_device_idx, deviceProp.name);
     }
+
+    null_tensorX.data_ptr = nullptr;
+    null_tensorX.absmax_ptr = nullptr;
+    null_tensorX.scale_descale_ptr = nullptr;
+    null_tensorX.num_elements = 0;
 
     // set up the cuda streams. atm everything is on the single main stream
     cudaCheck(cudaStreamCreate(&main_stream));

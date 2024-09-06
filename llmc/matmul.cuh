@@ -13,8 +13,8 @@ Matrix Multiplication, with help from cuBLASLt
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
-template<typename OutFloat, bool UseAuxBuffer>
-__global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout, int BT, int OC,
+template<typename OutFloat=floatX, bool UseAuxBuffer>
+__global__ void matmul_backward_bias_kernel9(TensorGPU<OutFloat> dbias, tensorX dout, int BT, int OC,
                                              std::bool_constant<UseAuxBuffer>) {
     constexpr const int bdx = 4;
     constexpr const int bdy = WARP_SIZE / bdx;
@@ -227,29 +227,31 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
     cudaCheck(cudaGetLastError());
 }
 
+template<typename T=floatX>
 // small wrapper around matmul_cublaslt for the forward pass (keeping historical order of arguments)
-void matmul_forward_cublaslt(floatX* out,
-                     floatX* inp, floatX* weight, floatX* bias,
+void matmul_forward_cublaslt(tensorX out,
+                     tensorX inp, tensorX weight, tensorX bias,
                      int BT, int C, int OC,
-                     floatX* pre_gelu=NULL, int gelu_fusion=1, cudaStream_t stream=main_stream) {
+                     TensorGPU<T> pre_gelu=null_tensorX, int gelu_fusion=1, cudaStream_t stream=main_stream) {
     // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
-    if (gelu_fusion < 1 && pre_gelu) {
+    if (gelu_fusion < 1 && pre_gelu != null_tensorX) {
         matmul_cublaslt(pre_gelu, weight, inp, bias, OC, BT, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
-        gelu_forward(out, pre_gelu, BT*OC, stream);
+        gelu_forward(out, pre_gelu, stream);
     } else {
         matmul_cublaslt(out, weight, inp, bias, OC, BT, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
     }
 }
 
-void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
-                     floatX* dout, floatX* inp, floatX* weight,
-                     float* dbias_buffer,
+template<typename T=floatX>
+void matmul_backward(tensorX dinp, tensorX dweight, tensorX dbias,
+                     tensorX dout, tensorX inp, tensorX weight,
+                     tensorFP32 dbias_buffer,
                      int BT, int C, int OC,
-                     floatX* pre_gelu=NULL, int gelu_fusion=1, cudaStream_t stream=main_stream) {
+                     TensorGPU<T> pre_gelu=null_tensorX, int gelu_fusion=1, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
 
     // backward to bias, if given, does a +=
-    if (dbias != NULL) {
+    if (dbias != null_tensorX) {
         // Each warp is responsible for 8 * "x128::size" = 64 OCs at BF16 (OC must be a multiple of 64!)
         // Block size is 1024 | 768 threads (32|24 warps) and we reduce those values into 1 at the end
 
@@ -272,16 +274,15 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
             reduce_add_sum_kernel<<<CEIL_DIV(OC, 256 * f128::size), 256, 0, stream>>>(dbias, dbias_buffer, OC, grid_size_y);
             cudaCheck(cudaGetLastError());
         }
-        dbias = NULL; // prevent dbias calculation from also being fused in matmul_cublaslt below (if we enabled fusion)
     }
 
     // backward to input, uses = in the backward pass (set the gradient)
     matmul_cublaslt(dinp, weight, dout, NULL, C, BT, OC, stream, false, false, 0, 0, 0, 0, false,
-                    gelu_fusion >= 2 ? pre_gelu : NULL, true);
+                    gelu_fusion >= 2 ? pre_gelu.data_ptr : NULL, true);
 
     // backward GELU (if it wasn't fused into the matmul above)
-    if (gelu_fusion < 2 && pre_gelu) {
-        gelu_backward_inplace(dinp, pre_gelu, BT*C, stream);
+    if (gelu_fusion < 2 && pre_gelu != null_tensorX) {
+        gelu_backward(dinp, dinp, pre_gelu, stream);
     }
 
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one

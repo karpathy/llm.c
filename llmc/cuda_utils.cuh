@@ -145,12 +145,24 @@ struct TensorGPU {
     size_t num_elements;
 
     template<typename T>
-    T* as() {
+    __device__ __host__ T* as() {
         return reinterpret_cast<T*>(data_ptr);
     }
 
-    operator ElementType*() const {
+    __device__ __host__  operator ElementType*() const {
         return data_ptr;
+    }
+
+    __device__ __host__ ElementType& operator[](size_t index) {
+        return data_ptr[index];
+    }
+
+    __device__ __host__ const ElementType& operator[](size_t index) const {
+        return data_ptr[index];
+    }
+
+    __device__ __host__ int num_per_128() const {
+        return sizeof(int4) / sizeof(ElementType);
     }
 };
 
@@ -159,6 +171,12 @@ typedef TensorGPU<floatX> tensorX;
 typedef TensorGPU<float> tensorFP32;
 typedef TensorGPU<half> tensorFP16;
 typedef TensorGPU<nv_bfloat16> tensorBF16;
+
+typedef TensorGPU<floatX> tensorFP8e4;
+typedef TensorGPU<floatX> tensorFP8e5;
+
+extern TensorGPU<floatX> null_tensorX;
+extern TensorGPU<floatX> null_tensorFP32;
 
 template<typename ElementType=float>
 struct tensor128 {
@@ -173,7 +191,7 @@ private:
     bool wrote_absmax = false;
 
 public:
-    bool scaling = (sizeof(ElementType) <= 4); // todo - fp8 only
+    bool scaling = (sizeof(ElementType) <= 1); // todo - fp8 only
     static constexpr const size_t elements = sizeof(int4) / sizeof(ElementType);
 
     __device__ tensor128(TensorGPU<ElementType> tensor, bool disable_scaling=false) {
@@ -182,9 +200,11 @@ public:
         scale = scale_descale.x;
         descale = scale_descale.y;
         data_ptr = tensor.data_ptr;
+        absmax_ptr = tensor.absmax_ptr;
         if (disable_scaling) {
             scaling = false;
         }
+        scaling = false;
     }
 
     __device__ void load(size_t offset, bool cache_streaming=false) {
@@ -211,6 +231,10 @@ public:
         wrote_data = true;
     }
 
+    __device__ Packed128<ElementType> get128() {
+        return data128;
+    }
+
     __device__ float get(int index) {
         return (float)data128[index] * (scaling ? descale : 1.0f);
     }
@@ -220,9 +244,9 @@ public:
         data128[index] = (ElementType)(value * (scaling ? scale : 1.0f));
     }
 
-    __device__ void update_absmax(int thread_id, int num_threads, bool exit=false, bool forced=false) {
+    __device__ bool update_absmax(int thread_id, int num_threads, bool exit=false, bool forced=false) {
         if (!forced && !scaling) {
-            return;
+            return false; // if we return true, we can skip __syncthreads() in some kernels
         }
         wrote_absmax = true;
 
@@ -251,7 +275,7 @@ public:
         bool done = (warp_id != 0 || lane_id >= num_warps);
         if (done && exit) asm volatile("exit;");
         __syncthreads();
-        if (done && !exit) return;
+        if (done && !exit) return true;
 
         // one more warp reduction then global memory atomic
         // we want as few global atomics as possible (i.e. 1 per threadblock)
@@ -260,6 +284,7 @@ public:
         if (lane_id == 0) {
             atomicMax(absmax_ptr, absmax_uint);
         }
+        return true;
     }
     __device__ void update_absmax_1D(bool exit=false) {
         update_absmax(threadIdx.x & 31, blockDim.x >> 5, exit);
@@ -297,7 +322,7 @@ __device__ tensor128<T> new_tensor128(TensorGPU<T> tensor, bool disable_scaling=
 
 template <typename T>
 __device__ tensor128<T> load_tensor128(TensorGPU<T> tensor, size_t offset,
-                                       bool disable_scaling=false, bool cache_streaming = false) {
+                                       bool cache_streaming = false, bool disable_scaling=false) {
     tensor128<T> t128(tensor, disable_scaling);
     t128.load(offset, cache_streaming);
     return t128;
@@ -384,8 +409,8 @@ __global__ void copy_advanced_kernel(TensorGPU<T1> in, TensorGPU<T2> out) {
     size_t idx = (adjusted_blockidx * blockDim.x + threadIdx.x) * vec_size;
     if (idx >= in.num_elements) { return; }
 
-    auto inp128 = load_tensor128(in, idx, disable_scaling, true);
-    auto out128 = new_tensor128(out, disable_scaling);
+    auto inp128 = load_tensor128(in, idx, true, disable_scaling);
+    auto out128 = new_tensor128(out);
     for (int k = 0; k < vec_size; k++) {
         float out_fp32 = elementwise_func(inp128.get(k));
         out128.set(k, out_fp32);

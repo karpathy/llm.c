@@ -16,8 +16,8 @@ In the backward pass, the gradients flow to both, handled by different kernels
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
-__global__ void encoder_forward_kernel3(floatX* out,
-                               const int* inp, const floatX* wte, const floatX* wpe,
+__global__ void encoder_forward_kernel3(tensorX out,
+                               const int* inp, const tensorX wte, const tensorX wpe,
                                int B, int T, int C) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     int N = B * T * C;
@@ -27,25 +27,23 @@ __global__ void encoder_forward_kernel3(floatX* out,
     int b = bt / T;
     int t = bt % T;
     int c = idx % C;
-
     int ix = inp[b * T + t];
 
-    floatX* out_btc = out + b * T * C + t * C + c;
-    const floatX* wte_ix = wte + ix * C + c;
-    const floatX* wpe_tc = wpe + t * C + c;
+    auto out128 = new_tensor128(out);
+    auto wte128 = load_tensor128(wte, ix * C + c);
+    auto wpe128 = load_tensor128(wpe, t * C + c);
 
     x128 packed_out;
-    x128 wte128 = load128cs(wte_ix);
-    x128 wpe128 = load128cs(wpe_tc);
     for (int k = 0; k < x128::size; k++) {
-        packed_out[k] = (floatX)((float)wte128[k] + (float)wpe128[k]);
+        out128.set(k, wte128.get(k) + wpe128.get(k));
     }
-    store128(out_btc, packed_out);
+    out128.store(b * T * C + t * C + c);
+    out128.update_absmax(threadIdx.x, blockDim.x, true);
 }
 
 template <int BLOCK_SIZE=256>
-__global__ void wte_backward_kernel(floatX* dwte,
-                                    const int4* bucket_info, const int* workload_indices, const floatX* dout, const int* inp,
+__global__ void wte_backward_kernel(tensorX dwte,
+                                    const int4* bucket_info, const int* workload_indices, const tensorX dout, const int* inp,
                                     unsigned int seed, int B, int T, int C) {
     // In order to be deterministic, we preprocess the inputs on the cpu into "buckets"
     // Each bucket corresponds to (WARP_SIZE * x128::size) channels for a single vocabulary token
@@ -116,8 +114,8 @@ __global__ void wte_backward_kernel(floatX* dwte,
     store128(dwte_ix, packed_in_out);
 }
 
-__global__ void wpe_backward_kernel(floatX* dwpe,
-                                    const floatX* dout, const int* inp,
+__global__ void wpe_backward_kernel(tensorX dwpe,
+                                    const tensorX dout, const int* inp,
                                     int B, int T, int C, unsigned int seed) {
     // Each thread handles x128::size "channel positions", e.g. 256 per warp for BF16
     // For gpt2-124M BF16, C=768 and T=1024, so 3 warps per channel and 3072 warps in total
@@ -154,8 +152,8 @@ __global__ void wpe_backward_kernel(floatX* dwpe,
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-void encoder_forward(floatX* out,
-                     const int* inp, const floatX* wte, const floatX* wpe,
+void encoder_forward(tensorX out,
+                     const int* inp, const tensorX wte, const tensorX wpe,
                      int B, int T, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
@@ -166,9 +164,9 @@ void encoder_forward(floatX* out,
 }
 
 // Fully deterministic (see comments in wte_backward_kernel and wpe_backward_kernel for more details)
-void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu outputs & scratch
+void encoder_backward(tensorX dwte, tensorX dwpe, tensorX scratch, // gpu outputs & scratch
                       int* workload_indices, int4* bucket_info,    // cpu scratch buffers
-                      const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
+                      const tensorX dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
                       int B, int T, int C, unsigned int seed, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
 
@@ -222,7 +220,7 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
 
     // Step 3: Copy data from host to device (async until the last one to avoid synchronising CPU/GPU twice)
     // todo - could use CUDA events (even without streams) to avoid CPU/GPU synchronisation completely
-    int4* d_bucket_info = (int4*)scratch;
+    int4* d_bucket_info = (int4*)scratch.data_ptr;
     int*  d_workload_indices = (int*)(scratch + B*T*num_c_groups * sizeof(int4));
     cudaCheck(cudaMemcpyAsync(d_bucket_info, bucket_info, num_buckets * sizeof(int4), cudaMemcpyHostToDevice, stream));
     cudaCheck(cudaMemcpyAsync(d_workload_indices, workload_indices, total_items * sizeof(int), cudaMemcpyHostToDevice, stream));
