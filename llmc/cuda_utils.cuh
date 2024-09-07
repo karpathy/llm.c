@@ -136,6 +136,111 @@ DType dtype_of(nv_bfloat16 * f) { return DType::BF16; }
 DType dtype_of(half * f) { return DType::FP16; }
 
 // ----------------------------------------------------------------------------
+// Random Number Generation used in Stochastic Rounding (defined here as used by TensorGPU)
+
+// SquirrelNoise5 - Squirrel's Raw Noise utilities (version 5)
+// This gives us a random number from threadIdx/blockIdx + a single seed for the entire GPU
+// todo - possibly overkill and we don't need such high quality random numbers? (tbd)
+// http://eiserloh.net/noise/SquirrelNoise5.hpp
+__device__ __host__ unsigned int SquirrelNoise5(unsigned int positionX, unsigned int seed) {
+    constexpr unsigned int SQ5_BIT_NOISE1 = 0xd2a80a3f;	// 11010010101010000000101000111111
+    constexpr unsigned int SQ5_BIT_NOISE2 = 0xa884f197;	// 10101000100001001111000110010111
+    constexpr unsigned int SQ5_BIT_NOISE3 = 0x6C736F4B; // 01101100011100110110111101001011
+    constexpr unsigned int SQ5_BIT_NOISE4 = 0xB79F3ABB;	// 10110111100111110011101010111011
+    constexpr unsigned int SQ5_BIT_NOISE5 = 0x1b56c4f5;	// 00011011010101101100010011110101
+    unsigned int mangledBits = positionX;
+    mangledBits *= SQ5_BIT_NOISE1;
+    mangledBits += seed;
+    mangledBits ^= (mangledBits >> 9);
+    mangledBits += SQ5_BIT_NOISE2;
+    mangledBits ^= (mangledBits >> 11);
+    mangledBits *= SQ5_BIT_NOISE3;
+    mangledBits ^= (mangledBits >> 13);
+    mangledBits += SQ5_BIT_NOISE4;
+    mangledBits ^= (mangledBits >> 15);
+    mangledBits *= SQ5_BIT_NOISE5;
+    mangledBits ^= (mangledBits >> 17);
+    return mangledBits;
+}
+
+// rely on default values of 0 being optimised away for 1D/2D/3D (shorter than original code)
+__device__ __host__ unsigned int get_random_noise(unsigned int seed, unsigned int x,
+                                                  unsigned int y=0, unsigned int z=0, unsigned int t=0) {
+	constexpr unsigned int PRIME1 = 198491317u; // Large prime number with non-boring bits
+	constexpr unsigned int PRIME2 = 6542989u; // Large prime number with distinct and non-boring bits
+	constexpr unsigned int PRIME3 = 357239u; // Large prime number with distinct and non-boring bits
+	return SquirrelNoise5(x + (PRIME1 * y) + (PRIME2 * z) + (PRIME3 * t), seed);
+}
+
+// stochastic rounding (typicalling using Squirel Noise above to go from a seed to a random number)
+// new algorithm that calculates distance from rounded up/down values to correctly handle denorms
+// (didn't matter with BF16 because denorms are so tiny they're irrelevant, unlike in FP8/FP16)
+template<bool noise=true, typename highp=float, typename Ti=__nv_fp8_e4m3>
+__device__ __forceinline__ void stochastic_rounding(float in, Ti *out, unsigned int seed, float prob_offset=0.0f) {
+    unsigned int random = noise ? get_random_noise(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed) : seed;
+
+    // prob_offset allows rounding towards gradient more of the time (one paper recommends that)
+    // e.g. +0.3f ==> 65% chance up, 35% chance down
+    highp threshold_percentage = ((highp)random / (highp)0xFFFFFFFF) - prob_offset;
+
+    Ti rounded_down, rounded_up;
+    if constexpr (std::is_same<Ti, half>::value) {
+        rounded_down = __float2half_rd(in);
+        rounded_up = __float2half_ru(in);
+    } else if constexpr (std::is_same<Ti, __nv_bfloat16>::value) {
+        rounded_down = __float2bfloat16_rd(in);
+        rounded_up = __float2bfloat16_ru(in);
+    } else if constexpr (std::is_same<Ti, __nv_fp8_e4m3>::value) {
+        // CUDA doesn't have round down/up instructions for FP8 (in SW or HW) so we do it ourselves
+        // ARM-Intel-NVIDIA style FP8 E4M3 (different for AMD-Graphcore-Qualcomm format!)
+        Ti rounded = __nv_fp8_e4m3(in);
+        unsigned char rounded_bits = rounded.__x;
+        unsigned char absolute_bits = rounded_bits & 127;
+        unsigned char rounded_up_bits = absolute_bits + 1;
+        unsigned char rounded_down_bits = absolute_bits - 1;
+
+        // compiler likes the following code atm, but small changes may increase instructions by a lot
+        // as it may suddenly decide to use branches rather than predication...
+        if (absolute_bits >= 126) { // maximum normal value (+NaN)
+            rounded_up_bits = absolute_bits;
+            if (absolute_bits == 127) { // NaN (not always preserving sign)
+                rounded_down_bits = 127;
+            }
+        } else if (absolute_bits == 0) { // zero
+            rounded_down_bits = 0;
+        } else {
+            unsigned char mantissa_bits = absolute_bits & 7;
+            if (mantissa_bits == 7) { // maximum mantissa (already known non-NaN/non-max)
+                rounded_up_bits = (absolute_bits - mantissa_bits) + 8; // clear mantissa, add 1 to exponent
+            } else if (mantissa_bits == 0) { // minimum mantissa (already known non-zero)
+                rounded_down_bits = (absolute_bits + 7) - 8; // max mantissa, subtract 1 from exponent
+            }
+        }
+        if (in < 0) { // negative input: swap rounded up/down and add negative sign
+            unsigned char swap_tmp = rounded_down_bits | 128;
+            rounded_down_bits = rounded_up_bits | 128;
+            rounded_up_bits = swap_tmp;
+        }
+
+        // rounding to nearest even already gave us 1 of the 2 rounded values surrounding the input
+        // we only need the other one (but no point skipping anything above given SIMT divergence)
+        rounded_down.__x = ((float)rounded <= in) ? rounded.__x : rounded_down_bits;
+        rounded_up.__x = ((float)rounded >= in) ? rounded.__x : rounded_up_bits;
+    } else if constexpr (std::is_same<Ti, __nv_fp8_e5m2>::value) {
+        assert(false); // todo
+    } else {
+        assert(false);
+    }
+
+    highp diff = (highp)rounded_up - (highp)rounded_down;
+    highp lerp = ((highp)in - (highp)rounded_down) / diff; // division by 0 is OK as it means (up == down) anyway
+    *out = (lerp > threshold_percentage) ? rounded_up : rounded_down;
+}
+__device__ __forceinline__ void stochastic_rounding(float in, float *out, unsigned int random) {
+    *out = in; // dummy function for when floatX is float (FP32 mode)
+}
+
+// ----------------------------------------------------------------------------
 // ...
 template<typename ElementType=float>
 struct TensorGPU {
@@ -143,6 +248,12 @@ struct TensorGPU {
     float* scale_descale_ptr;
     unsigned int* absmax_ptr;
     size_t num_elements;
+
+    static __device__ __host__ TensorGPU from(ElementType* ptr=nullptr) {
+        TensorGPU tmp = {0};
+        tmp.data_ptr = ptr;
+        return tmp;
+    }
 
     template<typename T>
     __device__ __host__ T* as() {
@@ -163,6 +274,25 @@ struct TensorGPU {
 
     __device__ __host__ int num_per_128() const {
         return sizeof(int4) / sizeof(ElementType);
+    }
+
+    __device__ __host__ float get_scalar(size_t index, bool disable_scaling=true) const {
+        ElementType* __restrict__ data_ptr_restricted = data_ptr;
+        float* __restrict__ scale_ptr_restricted = scale_descale_ptr;
+
+        float value = (float)data_ptr_restricted[index];
+        float descale = (scale_descale_ptr && !disable_scaling) ? scale_ptr_restricted[1] : 1.0f;
+        return value * descale; // [1] = descale
+    }
+
+    __device__ __host__ ElementType set_scalar(size_t index, float value, bool disable_scaling=true) {
+        ElementType* __restrict__ data_ptr_restricted = data_ptr;
+        float* __restrict__ scale_ptr_restricted = scale_descale_ptr;
+
+        float scale = (scale_descale_ptr && !disable_scaling) ? scale_ptr_restricted[0] : 1.0f;
+        ElementType output = (ElementType)(value * scale);
+        data_ptr_restricted[index] = output;
+        return output;
     }
 };
 
@@ -191,7 +321,7 @@ private:
     bool wrote_absmax = false;
 
 public:
-    bool scaling = (sizeof(ElementType) <= 1); // todo - fp8 only
+    bool scaling = (sizeof(ElementType) == 33); // todo - fp8 only
     static constexpr const size_t elements = sizeof(int4) / sizeof(ElementType);
 
     __device__ tensor128(TensorGPU<ElementType> tensor, bool disable_scaling=false) {
@@ -231,8 +361,18 @@ public:
         wrote_data = true;
     }
 
-    __device__ Packed128<ElementType> get128() {
+    __device__ const Packed128<ElementType>& get128() const {
         return data128;
+    }
+
+    __device__ Packed128<ElementType>& get128() {
+        return data128;
+    }
+
+    // call this manually if e.g. you use set_scalar() to update the tensor
+    // todo - in the future, this could consider more than just absmax
+    __device__ void add_value_stats(float value, ElementType output) {
+        new_absmax = max(new_absmax, fabsf(value));
     }
 
     __device__ float get(int index) {
@@ -240,8 +380,35 @@ public:
     }
 
     __device__ void set(int index, float value) {
-        new_absmax = max(new_absmax, fabsf(value));
         data128[index] = (ElementType)(value * (scaling ? scale : 1.0f));
+        add_value_stats(value, data128[index]);
+    }
+
+    __device__ void set_stochastic(int index, float value, unsigned int random_number,
+                                   bool rotate_by_index=true, bool non_deterministic_rng=false) {
+        float scaled_value = value * (scaling ? scale : 1.0f);
+
+        // rotate the random number by the index so we can cheaply reuse the same RNG
+        // obviously less good than having true per-index RNG, but should be good enough
+        // when rounding FP32 to FP8, most of the bits make extremely little difference anyway...
+        // x10 is used so that it never repeats for indices [0;15] with a minimum difference of 2 etc.
+        if (rotate_by_index) {
+            assert(index < 16); // >=16 would repeat and be extremely bad RNG
+            random_number = __funnelshift_l(random_number, random_number, index * 10);
+        }
+        // RNG without a seed from the host for quick testing, but obviously not deterministic!
+        #ifdef FORCE_NON_DETERMINISM
+        non_deterministic_rng = true;
+        #endif
+        if (non_deterministic_rng) {
+            unsigned int clock, laneid;
+            asm volatile("mov.u32 %0, %%clock;" : "=r"(clock));
+            asm volatile("mov.u32 %0, %%laneid;" : "=r"(laneid));
+            random_number = get_random_noise(clock, laneid, blockIdx.x * blockDim.x);
+        }
+
+        stochastic_rounding<false>(scaled_value, &data128[index], random_number);
+        add_value_stats(value, data128[index]);
     }
 
     __device__ bool update_absmax(int thread_id, int num_threads, bool exit=false, bool forced=false) {
@@ -523,61 +690,6 @@ template<class Float>
 void global_sum_deterministic(float* result, const Float* values, int count, cudaStream_t stream) {
     global_sum_single_block_kernel<<<1, 1024, 0, stream>>>(result, values, count);
     cudaCheck(cudaGetLastError());
-}
-
-// ----------------------------------------------------------------------------
-// Random Number Generation used in Stochastic Rounding
-
-// SquirrelNoise5 - Squirrel's Raw Noise utilities (version 5)
-// This gives us a random number from threadIdx/blockIdx + a single seed for the entire GPU
-// todo - possibly overkill and we don't need such high quality random numbers? (tbd)
-// http://eiserloh.net/noise/SquirrelNoise5.hpp
-__device__ __host__ constexpr unsigned int SquirrelNoise5(unsigned int positionX, unsigned int seed)
-{
-    constexpr unsigned int SQ5_BIT_NOISE1 = 0xd2a80a3f;	// 11010010101010000000101000111111
-    constexpr unsigned int SQ5_BIT_NOISE2 = 0xa884f197;	// 10101000100001001111000110010111
-    constexpr unsigned int SQ5_BIT_NOISE3 = 0x6C736F4B; // 01101100011100110110111101001011
-    constexpr unsigned int SQ5_BIT_NOISE4 = 0xB79F3ABB;	// 10110111100111110011101010111011
-    constexpr unsigned int SQ5_BIT_NOISE5 = 0x1b56c4f5;	// 00011011010101101100010011110101
-    unsigned int mangledBits = positionX;
-    mangledBits *= SQ5_BIT_NOISE1;
-    mangledBits += seed;
-    mangledBits ^= (mangledBits >> 9);
-    mangledBits += SQ5_BIT_NOISE2;
-    mangledBits ^= (mangledBits >> 11);
-    mangledBits *= SQ5_BIT_NOISE3;
-    mangledBits ^= (mangledBits >> 13);
-    mangledBits += SQ5_BIT_NOISE4;
-    mangledBits ^= (mangledBits >> 15);
-    mangledBits *= SQ5_BIT_NOISE5;
-    mangledBits ^= (mangledBits >> 17);
-    return mangledBits;
-}
-__device__ __host__ constexpr unsigned int Get2dNoiseUint(int indexX, int indexY, unsigned int seed)
-{
-    constexpr unsigned int PRIME_NUMBER = 198491317u; // Large prime number with non-boring bits
-    unsigned int x = static_cast<unsigned int>(indexX);
-    unsigned int y = static_cast<unsigned int>(indexY);
-
-    return SquirrelNoise5(x + (PRIME_NUMBER * y), seed);
-}
-
-// stochastic rounding built on top of Squirel Noise above (with seed updated per step via xorshift)
-__device__ __forceinline__ void stochastic_rounding(float in, __nv_bfloat16 *out, unsigned int seed) {
-    // todo - is this stochastic rounding *too good*? can we cut any corners?
-    // makes sure each thread gets a different random number
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
-    unsigned int threshold = random & 0xFFFF;
-    unsigned int float_bits = __float_as_uint(in);
-    unsigned int rounded_bits = float_bits & 0x0000FFFF;
-    float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
-    *out = __float2bfloat16_rn(__uint_as_float(float_bits));
-}
-__device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigned int random) {
-    *out = (float)in; // todo - implement this...
-}
-__device__ __forceinline__ void stochastic_rounding(float in, float *out, unsigned int random) {
-    *out = in; // dummy function for when floatX is float (FP32 mode)
 }
 
 #endif

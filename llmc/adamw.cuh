@@ -47,7 +47,7 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
 }
 
 template <typename Tp, typename Tg>
-__global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+__global__ void adamw_kernel3(TensorGPU<Tp> params_memory, float* master_params_memory, TensorGPU<Tg> grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                               ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                               float grad_scale, unsigned int seed) {
@@ -72,7 +72,7 @@ __global__ void init_from_master_kernel(Tp* params_memory, float* master_params_
 }
 
 template <typename Tp, typename Tg>
-void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+void adamw_update(TensorGPU<Tp> params_memory, float* master_params_memory, TensorGPU<Tg> grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                   ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride,  int num_slices, float learning_rate, float beta1, float beta2, int t, float eps, float weight_decay,
                   float grad_scale, unsigned int seed, cudaStream_t stream=main_stream) {
     // AdamW update

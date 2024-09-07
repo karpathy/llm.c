@@ -342,52 +342,43 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-// similar to `fused_residual_forward5`
-void layernorm_forward(tensorX out, tensorFP32 mean, tensorFP32 rstd,
-                       tensorX inp, const tensorX weight, const tensorX bias,
-                       int N, int C, cudaStream_t stream=main_stream) {
-    NVTX_RANGE_FN();
-    int block_size = 256; // hardcoded in kernel as well
+// Helper function to set the block size based on available shared memory and launch the kernel
+template<typename KernelFunc, typename... Args>
+void launch_layernorm_kernel(KernelFunc kernel, int N, int C, cudaStream_t stream, Args... args) {
+    int block_size = 256;
     int block_y = block_size / WARP_SIZE;
     size_t smem = block_y * C * sizeof(floatX);
-    auto status = cudaFuncSetAttribute(layernorm_forward_kernel6, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    // todo - comment + retry to unify into one function? (failed when I tried due to kernel argument not sure why)
+    auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+
+    // if we don't have enough shared memory, try smaller block sizes down to 32 threads
+    // should fit on practically every modern GPU even for very large numbers of channels
+    // todo - do we want to manually set the shared memory vs L1 carveout as well?
     while (status != cudaSuccess) {
         if (block_y == 1) {
-            printf("ERROR: not enough shared memory for layernorm_forward\n");
+            printf("ERROR: not enough shared memory for kernel\n");
             exit(EXIT_FAILURE);
         }
         block_y /= 2, block_size /= 2;
         smem = (2 + block_y) * C * sizeof(floatX);
-        status = cudaFuncSetAttribute(layernorm_forward_kernel6, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     }
     int grid_size = CEIL_DIV(N, block_y);
-    layernorm_forward_kernel6<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
+    kernel<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(args..., N, C);
     cudaCheck(cudaGetLastError());
+}
+
+void layernorm_forward(tensorX out, tensorFP32 mean, tensorFP32 rstd,
+                       tensorX inp, const tensorX weight, const tensorX bias,
+                       int N, int C, cudaStream_t stream=main_stream) {
+    NVTX_RANGE_FN();
+    launch_layernorm_kernel(layernorm_forward_kernel6, N, C, stream, out, mean, rstd, inp, weight, bias);
 }
 
 void fused_residual_forward5(tensorX residual, tensorX normed, tensorFP32 mean, tensorFP32 rstd,
                              tensorX inp1, tensorX inp2, tensorX weight, tensorX bias,
                              int N, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
-    int block_size = 256;
-    int block_y = block_size / WARP_SIZE;
-    size_t smem = (2 + block_y) * C * sizeof(floatX);
-    auto status = cudaFuncSetAttribute(fused_residual_forward_kernel5, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    while (status != cudaSuccess) {
-        if (block_y == 1) {
-            printf("ERROR: not enough shared memory for fused_residual_forward\n");
-            exit(EXIT_FAILURE);
-        }
-        block_y /= 2, block_size /= 2;
-        smem = (2 + block_y) * C * sizeof(floatX);
-        status = cudaFuncSetAttribute(fused_residual_forward5, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    }
-    int grid_size = CEIL_DIV(N, block_y);
-    fused_residual_forward_kernel5<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(residual, normed,
-                                                                                          mean, rstd, inp1, inp2,
-                                                                                          weight, bias, N, C);
-    cudaCheck(cudaGetLastError());
+    launch_layernorm_kernel(fused_residual_forward_kernel5, N, C, stream, residual, normed, mean, rstd, inp1, inp2, weight, bias);
 }
 
 void layernorm_backward(tensorX dinp_new, tensorX dinp_old, tensorX dweight, tensorX dbias, tensorFP32 scratch,

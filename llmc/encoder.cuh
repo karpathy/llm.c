@@ -33,7 +33,6 @@ __global__ void encoder_forward_kernel3(tensorX out,
     auto wte128 = load_tensor128(wte, ix * C + c);
     auto wpe128 = load_tensor128(wpe, t * C + c);
 
-    x128 packed_out;
     for (int k = 0; k < x128::size; k++) {
         out128.set(k, wte128.get(k) + wpe128.get(k));
     }
@@ -73,11 +72,9 @@ __global__ void wte_backward_kernel(tensorX dwte,
 
     for(int item = warp_id; item < bucket_size; item += BLOCK_SIZE/WARP_SIZE) {
         int bt = workload_indices[bucket_start_idx + item];
-
-        const floatX* dout_btc = dout + bt * C + c;
-        x128 packed_inp1 = load128cs(dout_btc);
-        for (int k = 0; k < packed_inp1.size; k++) {
-            accum[k] += (float)packed_inp1[k];
+        auto dout128 = load_tensor128(dout, bt * C + c, true);
+        for (int k = 0; k < dout128.elements; k++) {
+            accum[k] += dout128.get(k);
         }
     }
 
@@ -90,8 +87,7 @@ __global__ void wte_backward_kernel(tensorX dwte,
     }
 
     // Read dwte for warp 0 even if other warps are not finished yet to maximise latency tolerance
-    floatX* dwte_ix = dwte + bucket_ix * C + c;
-    x128 packed_in_out = load128(dwte_ix);
+    auto dwte128 = load_tensor128(dwte, bucket_ix * C + c, false, true);
 
     // note: threads which have returned are considered synchronised by CUDA so no risk of deadlock
     __syncthreads();
@@ -103,15 +99,15 @@ __global__ void wte_backward_kernel(tensorX dwte,
         }
     }
 
-    // Add the result to dwte and write back to global memory (read-modify-write)
+    // add the result to dwte and write back to global memory (read-modify-write)
+    // we use stochastic rounding to go from FP32 to BF16/whatever (the seed is deterministic)
+    // reusing same random value but shifting based on the index in set_stochastic ("good enough")
+    unsigned int random = get_random_noise(seed, threadIdx.x, bucket);
     for (unsigned int k = 0; k < x128::size; k++) {
-        // We use stochastic rounding to go from FP32 to BF16
-        // The seed is deterministic and unique for each parameter to guarantee we have determinism AND
-        // to avoid **potential** issues with positionX int SquirrelNoise5 argument overflowing which is UB
-        // and that somehow messing the quality of random numbers
-        stochastic_rounding(accum[k] + (float)packed_in_out[k], &packed_in_out[k], seed + bucket * WARP_SIZE + threadIdx.x + k);
+        dwte128.set_stochastic(k, accum[k] + dwte128.get(k), random);
     }
-    store128(dwte_ix, packed_in_out);
+    dwte128.store(bucket_ix * C + c);
+    dwte128.update_absmax(threadIdx.x, blockDim.x, true);
 }
 
 __global__ void wpe_backward_kernel(tensorX dwpe,
@@ -131,22 +127,23 @@ __global__ void wpe_backward_kernel(tensorX dwpe,
     float accum[x128::size] = {0.0f};
 
     for (int b = 0; b < B; b++) {
-        x128 packed_dout = load128cs(dout + (b * T * C) + (t * C) + c); // will never be read again
+        auto dout128 = load_tensor128(dout, b * T * C + t * C + c, true);
         for (int k = 0; k < x128::size; k++) {
-            accum[k] += (float)packed_dout[k];
+            accum[k] += dout128.get(k);
         }
     }
 
-    floatX* dwpe_tc = dwpe + (t * C) + c;
-    x128 packed_dwpe = load128(dwpe_tc);
+    auto dwpe128 = load_tensor128(dwpe, t * C + c);
+    unsigned int random = get_random_noise(seed, t, c);
     for (unsigned int k = 0; k < x128::size; k++) {
         // We use stochastic rounding to go from FP32 to BF16
         // The seed is deterministic and unique for each parameter to guarantee we have determinism AND
         // to avoid **potential** issues with positionX int SquirrelNoise5 argument overflowing which is UB
         // and that somehow messing the quality of random numbers
-        stochastic_rounding(accum[k] + (float)packed_dwpe[k], &packed_dwpe[k], seed + idx + k);
+        dwpe128.set_stochastic(k, accum[k] + dwpe128.get(k), random);
     }
-    store128(dwpe_tc, packed_dwpe);
+    dwpe128.store(t * C + c);
+    dwpe128.update_absmax(threadIdx.x, blockDim.x, true);
 }
 
 // ----------------------------------------------------------------------------

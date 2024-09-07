@@ -15,6 +15,7 @@ Common utilities for CUDA code.
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include "utils.h"
 

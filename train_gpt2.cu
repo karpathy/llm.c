@@ -105,7 +105,7 @@ typedef struct {
     int btc;    // (B, T, C)
     int local_scratch; // (B, T, C)
     int output_scratch; // huge
-    int output_scratch_fp32; // typically same buffer as above
+    int output_scratch_fp32; // same memory as FP32
 } MultiuseTensors;
 
 typedef struct {
@@ -126,7 +126,6 @@ typedef struct {
 
     size_t num_parameters;
     size_t num_parameters_bytes;
-
     char* multiuse_memory = NULL;
     char* params_memory[NUM_TYPES_PARAM] = {0};
 
@@ -156,6 +155,7 @@ void* gpu_tensor_scale_memory = NULL;
 void* gpu_tensor_absmax_memory = NULL;
 
 TensorSpec tensor_specs[MAX_TENSORS] = {0};
+TensorSpec* tensor_specs_gpu = NULL;
 TT current_tensor_type = TT::PARAMETER;
 size_t tensors_start[TT::COUNT] = {0};
 size_t tensors_bytes[TT::COUNT] = {0};
@@ -197,6 +197,9 @@ int add_tensor_spec(const char* name, size_t total_elements, size_t num_shards, 
             printf("ERROR: tensor_type mismatch for %s: %d vs %d\n",
                    spec->name, (int)base_spec.tensor_type, (int)spec->tensor_type);
             assert(false);
+        }
+        if (flags & REUSED_MEMORY) {
+            base_spec.flags |= REUSED_MEMORY;
         }
         assert(base_spec.tensor_type == spec->tensor_type);
         assert(new_tensor_bytes <= original_tensor_bytes);
@@ -395,7 +398,7 @@ void gpt2_allocate(GPT2 *model) {
         spec->qkvr = add_layer_specs(L, "qkvr", 3 * BTC, 1, dtype, model->multiuse.bt4c, GRADIENT);
     }
 
-    // allocate a single huge GPU buffer for all the tensors
+    // allocate a single huge GPU buffer for all the tensors of a given type
     cudaCheck(cudaMalloc(&model->multiuse_memory, tensors_bytes[ACTIVATIONS_MULTIUSE]));
     cudaCheck(cudaMemset(model->multiuse_memory, 0, tensors_bytes[ACTIVATIONS_MULTIUSE]));
 
@@ -419,6 +422,10 @@ void gpt2_allocate(GPT2 *model) {
                 spec->ptr = model->params_memory[spec->tensor_type] + spec->offset;
         }
     }
+
+    // we are finished creating the tensors specs and can copy them to the GPU (effectively read-only)
+    cudaMalloc(&tensor_specs_gpu, sizeof(TensorSpec) * num_tensor_specs);
+    cudaMemcpy(tensor_specs_gpu, tensor_specs, sizeof(TensorSpec) * num_tensor_specs, cudaMemcpyHostToDevice);
 
     //initialise helper variables
     model->num_parameters = tensors_elements[TT::PARAMETER];
@@ -776,11 +783,13 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         NvtxRange layer_range("Layer", l);
         tensorX residual = (l == 0) ? ACT(encoded) : ACT_L(residual3, l-1);
 
-        matmul_forward_cublaslt(CUDNN_ENABLED ? ACT(qkvr) : MULTI(output_scratch), ACT(ln1), PARAM(qkvw), PARAM(qkvb), B*T, C, 3*C);
+        tensorX qkvr = MULTI(output_scratch); // non-cudnn reuses tensor with different memory pre/post-permute
+        qkvr.data_ptr = CUDNN_ENABLED ? ACT(qkvr) : MULTI(output_scratch);
+        matmul_forward_cublaslt(qkvr, ACT(ln1), PARAM(qkvw), PARAM(qkvb), B*T, C, 3*C);
         #ifdef ENABLE_CUDNN
         attention_forward_cudnn(ACT(atty), ACT(att), ACT(qkvr), B, T, NH, C);
         #else
-        attention_forward(ACT(atty), ACT(qkvr), ACT(att), MULTI(output_scratch), B, T, C, NH);
+        attention_forward(ACT(atty), ACT(qkvr), ACT(att), qkvr, B, T, C, NH);
         #endif
 
         matmul_forward_cublaslt(ACT(attproj), ACT(atty), PARAM(attprojw), PARAM(attprojb), B*T, C, C);
@@ -941,11 +950,13 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
                 tensorX residual = (l == 0) ? ACT(encoded) : ACT_L(residual3, l-1);
                 layernorm_forward(ACT(ln1), ACT(ln1_mean), ACT(ln1_rstd), residual, PARAM(ln1w), PARAM(ln1b), B*T, C);
 
-                matmul_forward_cublaslt(CUDNN_ENABLED ? ACT(qkvr) : MULTI(output_scratch), ACT(ln1), PARAM(qkvw), PARAM(qkvb), B*T, C, 3*C);
+                tensorX qkvr = ACT(qkvr);
+                qkvr.data_ptr = CUDNN_ENABLED ? ACT(qkvr) : MULTI(output_scratch);
+                matmul_forward_cublaslt(qkvr, ACT(ln1), PARAM(qkvw), PARAM(qkvb), B*T, C, 3*C);
                 #ifdef ENABLE_CUDNN
                 attention_forward_cudnn(ACT(atty), ACT(att), ACT(qkvr), B, T, NH, C);
                 #else
-                attention_forward(ACT(atty), ACT(qkvr), ACT(att), MULTI(output_scratch), B, T, C, NH);
+                attention_forward(ACT(atty), ACT(qkvr), ACT(att), qkvr, B, T, C, NH);
                 #endif
 
                 matmul_forward_cublaslt(ACT(attproj), ACT(atty), PARAM(attprojw), PARAM(attprojb), B*T, C, C);
@@ -1064,7 +1075,6 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         TensorSpec opt_v_spec = tensor_specs[i + tensors_start[PARAMETER_OPT_V]];
 
         // todo - adjust offset into params/grads when optimiser state is sharded
-        floatX* param_ptr = (floatX*)param_spec.ptr;
         float* master_ptr = NULL;
         if (model->params_memory[PARAMETER_MASTER] != NULL) {
             master_ptr = (float*)master_spec.ptr;
@@ -1076,7 +1086,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 
         if(init_state && model->use_master_weights) {
             size_t grid_size = CEIL_DIV(shard_elements, 512);
-            copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, param_ptr, shard_elements, shard_elements, tensor_elements);
+            copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, ((tensorX)param_spec).data_ptr, shard_elements, shard_elements, tensor_elements);
             cudaCheck(cudaGetLastError());
         }
 
@@ -1089,7 +1099,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
             assert(false);
         } else {
             // ok finally call the kernel to update the weights with AdamW
-            adamw_update(param_ptr, master_ptr, (floatX*)grad_spec.ptr,
+            adamw_update((tensorX)param_spec, master_ptr, (tensorX)grad_spec,
                         (float*)opt_m_spec.ptr, (float*)opt_v_spec.ptr,
                         shard_elements, tensor_elements, tensor_elements, shard_elements, num_layers,
                         learning_rate,

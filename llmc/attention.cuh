@@ -12,11 +12,11 @@ Attention, as a fallback when we do not use the Flash Attention from cuDNN
 
 // inputs floatX, outputs FP32 (for current FP32-only activation path for this WIP)
 __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
-                               const floatX* inp,
+                               tensorX inp,
                                int B, int N, int NH, int d) {
     // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
     // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * inp.num_per_128();
     if (idx >= B * NH * N * d) { return; }
 
     // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
@@ -27,15 +27,21 @@ __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
     int n = rest / d;
     int d_ = rest % d;
     int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-    q[idx] = __ldcs(&inp[inp_idx]);
-    k[idx] = __ldcs(&inp[inp_idx + NH * d]);
-    v[idx] = __ldcs(&inp[inp_idx + 2 * (NH * d)]);
+
+    auto inp128_q = load_tensor128(inp, inp_idx, true);
+    auto inp128_k = load_tensor128(inp, inp_idx + NH * d, true);
+    auto inp128_v = load_tensor128(inp, inp_idx + 2 * (NH * d), true);
+    for (int i = 0; i < inp.num_per_128(); i++) {
+        q[idx+i] = inp128_q.get(i);
+        k[idx+i] = inp128_k.get(i);
+        v[idx+i] = inp128_v.get(i);
+    }
 }
 
-__global__ void permute_kernel_backward(floatX* dinp,
+__global__ void permute_kernel_backward(tensorX dinp,
                                         const floatX* dq, const floatX* dk, const floatX* dv,
                                         int B, int N, int NH, int d) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * dinp.num_per_128();
     if (idx >= B * NH * N * d) { return; }
 
     int b = idx / (NH * N * d);
@@ -49,12 +55,28 @@ __global__ void permute_kernel_backward(floatX* dinp,
     dinp[inp_idx] = dq[idx];
     dinp[inp_idx + NH * d] = dk[idx];
     dinp[inp_idx + 2 * (NH * d)] = dv[idx];
+
+    auto dinp128_q = new_tensor128(dinp);
+    auto dinp128_k = new_tensor128(dinp);
+    auto dinp128_v = new_tensor128(dinp);
+    for (int i = 0; i < dinp.num_per_128(); i++) {
+        dinp128_q.set(i, dq[idx+i]);
+        dinp128_k.set(i, dk[idx+i]);
+        dinp128_v.set(i, dv[idx+i]);
+        // to allow us to update the absmax only once
+        dinp128_k.add_value_stats(dk[idx+i], dinp128_k.get128()[i]);
+        dinp128_v.add_value_stats(dv[idx+i], dinp128_v.get128()[i]);
+    }
+    dinp128_q.store(inp_idx);
+    dinp128_k.store(inp_idx + NH * d);
+    dinp128_v.store(inp_idx + 2 * (NH * d));
+    dinp128_q.update_absmax(threadIdx.x, blockDim.x, true);
 }
 
-__global__ void unpermute_kernel(floatX* inp, floatX *out, int B, int N, int NH, int d) {
+__global__ void unpermute_kernel(tensorX out, floatX* inp, int B, int N, int NH, int d) {
    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
 
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x);
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * out.num_per_128();
     // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
     if (idx >= B * NH * N * d) { return; }
 
@@ -65,11 +87,16 @@ __global__ void unpermute_kernel(floatX* inp, floatX *out, int B, int N, int NH,
     int n = rest / d;
     int d_ = rest % d;
     int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-    out[other_idx] = __ldcs(&inp[idx]);
+    auto out128 = new_tensor128(out);
+    for (int i = 0; i < out.num_per_128(); i++) {
+        out128.set(i, __ldcs(&inp[idx + i]));
+    }
+    out128.store(other_idx);
+    out128.update_absmax(threadIdx.x, blockDim.x, true);
 }
 
-__global__ void unpermute_kernel_backward(floatX* dinp, const floatX *dout, int B, int N, int NH, int d) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void unpermute_kernel_backward(floatX* dout_permuted, tensorX dout, int B, int N, int NH, int d) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * dout.num_per_128();
     if (idx >= B * NH * N * d) { return; }
 
     int b = idx / (NH * N * d);
@@ -79,10 +106,13 @@ __global__ void unpermute_kernel_backward(floatX* dinp, const floatX *dout, int 
     int n = rest / d;
     int d_ = rest % d;
     int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-    dinp[idx] = (floatX)dout[other_idx];
+    auto dout128 = load_tensor128(dout, other_idx);
+    for (int k = 0; k < dout128.elements; k++) {
+        dout_permuted[idx+k] = (floatX)dout128.get(k);
+    }
 }
 
-__global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, const floatX* inp, int N, int T) {
+__global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, floatX* inp, int N, int T) {
     // inp, out shape: (N, T, T), where N = B * NH
     // fuses the multiplication by scale inside attention
     // directly autoregressive, so we only compute the lower triangular part
@@ -149,7 +179,7 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     }
 }
 
-__global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, const floatX* att,
+__global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, floatX* att,
                                                                int B, int T, int C, float scale) {
     constexpr const int BlockSize = 256;
     constexpr int T_per_block = 4;
@@ -192,8 +222,8 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-void attention_forward(floatX* out, floatX* qkvr, floatX* att,
-                       floatX* inp,
+void attention_forward(tensorX out, floatX* qkvr, floatX* att,
+                       tensorX inp,
                        int B, int T, int C, int NH, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
@@ -211,11 +241,11 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     k = qkvr + 1 * B * T * C;
     v = qkvr + 2 * B * T * C;
     int total_threads = B * NH * T * HS;
-    int num_blocks = CEIL_DIV(total_threads, block_size);
+    int num_blocks = CEIL_DIV(total_threads, block_size * inp.num_per_128());
     permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, B, T, NH, HS);
 
     floatX* preatt = inp; // reuse inp as scratch buffer
-    matmul_cublaslt(preatt, k, q, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
+    matmul_cublaslt(tensorX::from(preatt), tensorX::from(k), tensorX::from(q), nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
 
     // multiply all elements of preatt elementwise by scale
     float scale = 1.f / sqrtf(HS);
@@ -225,27 +255,26 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // new approach: first cuBLAS another batched matmul
     floatX* vaccum = inp;
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    matmul_cublaslt(vaccum, v, att, nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
+    matmul_cublaslt(tensorX::from(vaccum), tensorX::from(v), tensorX::from(att), nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-    num_blocks = CEIL_DIV(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size, 0, stream>>>(vaccum, out, B, T, NH, HS);
+    num_blocks = CEIL_DIV(B * T * C, block_size * out.num_per_128());
+    unpermute_kernel<<<num_blocks, block_size, 0, stream>>>(out, vaccum, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
 
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
-void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
-                        const floatX* dout,
-                        const floatX* qkvr, const floatX* att,
+void attention_backward(tensorX dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
+                        tensorX dout, tensorX qkvr, floatX* att,
                         int B, int T, int C, int NH, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int HS = C / NH; // head size
 
     // unpack convenience pointers into q, k, v
-    const floatX *q, *k, *v;
+    floatX *q, *k, *v;
     q = qkvr + 0 * B * T * C;
     k = qkvr + 1 * B * T * C;
     v = qkvr + 2 * B * T * C;
@@ -255,22 +284,22 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     dv = dqkvr + 2 * B * T * C;
 
     // backward through the unpermute operation
-    int num_blocks = CEIL_DIV(B * T * C, block_size);
+    int num_blocks = CEIL_DIV(B * T * C, block_size * dout.num_per_128());
     unpermute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(scratch, dout, B, T, NH, HS);
     // backward into datt
-    matmul_cublaslt(datt, v, scratch, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
+    matmul_cublaslt(tensorX::from(datt), tensorX::from(v), tensorX::from(scratch), nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
     // backward into dv
-    matmul_cublaslt(dv, scratch, att, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
+    matmul_cublaslt(tensorX::from(dv), tensorX::from(scratch), tensorX::from(att), nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
     const float scale = 1.0f / sqrtf((float)HS);
     // backward into preatt. this is an in-place operation; datt turns into dpreatt here
     softmax_autoregressive_backward_inplace_kernel<<<dim3(T / 4, B * NH), 256>>>(datt, att, B, T, C, scale);
-    const floatX* dpreatt = datt;
+    floatX* dpreatt = datt;
     // backward into q
-    matmul_cublaslt(dq, k, dpreatt, nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
+    matmul_cublaslt(tensorX::from(dq), tensorX::from(k), tensorX::from(dpreatt), nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
     // backward into k
-    matmul_cublaslt(dk, q, dpreatt, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
+    matmul_cublaslt(tensorX::from(dk), tensorX::from(q), tensorX::from(dpreatt), nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
     // backward into inp
-    num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
+    num_blocks = CEIL_DIV(B * NH * T * HS, block_size * dinp.num_per_128());
     permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dinp, dq, dk, dv, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
