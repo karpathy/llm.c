@@ -83,7 +83,8 @@ char filename_buffer[512];
 // global vars containing information about the GPU this process is running on
 cudaDeviceProp deviceProp; // fills in common_start()
 cudaStream_t main_stream;
-TensorGPU<floatX> null_tensorX;
+TensorGPU<floatX> null_tensorX = {0};
+TensorGPU<float> null_tensorFP32 = {0};
 // buffer size to use for device <-> disk io
 constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 
@@ -149,17 +150,18 @@ typedef struct {
     unsigned long long rng_state_last_update; // RNG before last gpt2_update() to re-round identically from master weights
 } GPT2;
 
-int num_tensor_specs = 0;
-int current_absmax_index = 0;
-void* gpu_tensor_scale_memory = NULL;
-void* gpu_tensor_absmax_memory = NULL;
-
 TensorSpec tensor_specs[MAX_TENSORS] = {0};
 TensorSpec* tensor_specs_gpu = NULL;
+
 TT current_tensor_type = TT::PARAMETER;
 size_t tensors_start[TT::COUNT] = {0};
 size_t tensors_bytes[TT::COUNT] = {0};
 size_t tensors_elements[TT::COUNT] = {0};
+
+int num_tensor_specs = 0;
+int current_absmax_index = 0;
+float* gpu_scale_memory = NULL;
+unsigned int* gpu_absmax_memory = NULL;
 
 TensorSpec get_tensor(int spec_index, TT tensor_type, int layer) {
     TensorSpec spec = tensor_specs[spec_index];
@@ -258,7 +260,7 @@ void gpt2_allocate(GPT2 *model) {
     int shards_grad = (multi_gpu_config.zero_stage >= 2) ? num_gpu : 1;
 
     // 1) parameters & optimizer state
-    for (int t = PARAMETER; t <= PARAMETER_OPT_V; t++) {
+    for (int t = PARAMETER; t <= PARAMETER_MASTER; t++) {
         DType dtype = (t <= PARAMETER_GRAD) ? DTYPE_FLOATX : DType::FP32;
         DType dtype_lowp = (t <= PARAMETER_GRAD) ? DTYPE_FLOATX : DType::FP32; // FP8 in the future
 
@@ -418,7 +420,7 @@ void gpt2_allocate(GPT2 *model) {
                 spec->ptr = model->multiuse_memory + spec->offset;
                 break;
             default:
-                assert(spec->tensor_type <= PARAMETER_OPT_V);
+                assert(spec->tensor_type <= PARAMETER_MASTER);
                 spec->ptr = model->params_memory[spec->tensor_type] + spec->offset;
         }
     }
@@ -442,10 +444,22 @@ void gpt2_allocate(GPT2 *model) {
     // allocate_state stuff
     // =======================
     // absmax/scaling/descaling buffers for FP8 & Friends
-    cudaMalloc(&gpu_tensor_scale_memory,   sizeof(float) * num_tensor_specs);
-    cudaMemset(gpu_tensor_scale_memory, 0, sizeof(float) * num_tensor_specs);
-    cudaMalloc(&gpu_tensor_absmax_memory,   sizeof(float) * num_tensor_specs * MAX_ABSMAX_HISTORY);
-    cudaMemset(gpu_tensor_absmax_memory, 0, sizeof(float) * num_tensor_specs * MAX_ABSMAX_HISTORY);
+    cudaMalloc(&gpu_absmax_memory,   sizeof(unsigned int) * num_tensor_specs * MAX_ABSMAX_HISTORY);
+    cudaMemset(gpu_absmax_memory, 0, sizeof(unsigned int) * num_tensor_specs * MAX_ABSMAX_HISTORY);
+
+    // Initialize gpu_scale_memory with 1.0f for all elements
+    size_t scale_memory_elements = 2 * num_tensor_specs;
+    cudaMalloc(&gpu_scale_memory, scale_memory_elements * sizeof(float));
+    float* h_scale_memory = (float*)malloc(scale_memory_elements * sizeof(float));
+    for (size_t i = 0; i < scale_memory_elements; ++i) {
+        h_scale_memory[i] = 1.0f;
+    }
+    cudaMemcpy(gpu_scale_memory, h_scale_memory, scale_memory_elements * sizeof(float), cudaMemcpyHostToDevice);
+    free(h_scale_memory);
+
+    // copy to constant buffers
+    cudaMemcpyToSymbol(gpu_scale_memory_ptr, gpu_scale_memory, sizeof(float*));
+    cudaMemcpyToSymbol(gpu_absmax_memory_ptr, gpu_absmax_memory, sizeof(unsigned int*));
 
     cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
     cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
@@ -466,6 +480,7 @@ void gpt2_allocate(GPT2 *model) {
     size_t bytes_per_sequence = tensors_bytes[TT::ACTIVATIONS_MULTIUSE] / B; // pessimistic (output buffer etc.)
     printf0("memory per sequence: %zu MiB\n", bytes_per_sequence / 1024 / 1024);
     printf0(" -> estimated maximum batch size: %zu\n", B + free / bytes_per_sequence);
+    cudaCheck(cudaGetLastError());
 }
 
 void gpt2_init_common(GPT2 *model) {
@@ -1064,49 +1079,35 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     // save RNG state at this point so we can round from master weights identically when restoring from a checkpoint
     model->rng_state_last_update = model->rng_state;
 
-    // todo: merge everything into 1 kernel call
-    for (int i = 0; i < tensors_start[PARAMETER_GRAD];) {
-        unsigned int seed = random_u32(&model->rng_state);
+    float beta1_correction = 1.0f - powf(beta1, t);
+    float beta2_correction = 1.0f - powf(beta2, t);
+    unsigned int seed = random_u32(&model->rng_state);
+    int num_shards = tensor_specs[tensors_start[PARAMETER_OPT_M]].num_shards;
 
-        TensorSpec param_spec = tensor_specs[i];
-        TensorSpec grad_spec = tensor_specs[i + tensors_start[PARAMETER_GRAD]];
-        TensorSpec master_spec = tensor_specs[i + tensors_start[PARAMETER_MASTER]];
-        TensorSpec opt_m_spec = tensor_specs[i + tensors_start[PARAMETER_OPT_M]];
-        TensorSpec opt_v_spec = tensor_specs[i + tensors_start[PARAMETER_OPT_V]];
-
-        // todo - adjust offset into params/grads when optimiser state is sharded
-        float* master_ptr = NULL;
-        if (model->params_memory[PARAMETER_MASTER] != NULL) {
-            master_ptr = (float*)master_spec.ptr;
-        }
-
-        size_t tensor_elements = param_spec.num_elements;
-        size_t shard_elements = master_spec.num_elements;
-        int num_layers = param_spec.remaining_layers + 1;
-
-        if(init_state && model->use_master_weights) {
-            size_t grid_size = CEIL_DIV(shard_elements, 512);
-            copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, ((tensorX)param_spec).data_ptr, shard_elements, shard_elements, tensor_elements);
-            cudaCheck(cudaGetLastError());
-        }
-
-        // todo - make it configurable whether weight decay applies to e.g. bias or not
-        float wd = (param_spec.flags & TENSOR_2D) ? weight_decay : 0.0f;
-
-        if (init_from_master_only) {
-            // when resuming training from a checkpoint with master weights (allows changing precision)
-            //init_from_master(param_ptr, master_ptr, shard.size, tensor.size, shard.size, num_layers, seed, main_stream);
-            assert(false);
+    const int block_size = 64;
+    const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
+    if (model->use_master_weights) {
+        if (init_state || init_from_master_only) {
+            // reads regular weights & writes to master+regular weights
+            // or init_from_master_only: reads master & write to regular weights as-is
+            adamw_full_update<true, true><<<grid_size, block_size, 0, main_stream>>>(
+                                    tensor_specs_gpu, seed, tensors_start[PARAMETER_GRAD],
+                                    model->num_parameters, model->num_parameters / num_shards,
+                                    learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, grad_scale, t,
+                                    init_from_master_only);
         } else {
-            // ok finally call the kernel to update the weights with AdamW
-            adamw_update((tensorX)param_spec, master_ptr, (tensorX)grad_spec,
-                        (float*)opt_m_spec.ptr, (float*)opt_v_spec.ptr,
-                        shard_elements, tensor_elements, tensor_elements, shard_elements, num_layers,
-                        learning_rate,
-                        beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+            // reads master weights & writes to master+regular weights
+            adamw_full_update<true, false><<<grid_size, block_size, 0, main_stream>>>(
+                                    tensor_specs_gpu, seed, tensors_start[PARAMETER_GRAD],
+                                    model->num_parameters, model->num_parameters / num_shards,
+                                    learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, grad_scale, t);
         }
-
-        i += num_layers;
+    } else {
+        // reads & writes regular weights only
+        adamw_full_update<false><<<grid_size, block_size, 0, main_stream>>>(
+                                tensor_specs_gpu, seed, tensors_start[PARAMETER_GRAD],
+                                model->num_parameters, model->num_parameters / num_shards,
+                                learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, grad_scale, t);
     }
 
     // AdamW update
@@ -1231,11 +1232,6 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
         printf("[System]\n");
         printf("Device %d: %s\n", multi_gpu_config.local_device_idx, deviceProp.name);
     }
-
-    null_tensorX.data_ptr = nullptr;
-    null_tensorX.absmax_ptr = nullptr;
-    null_tensorX.scale_descale_ptr = nullptr;
-    null_tensorX.num_elements = 0;
 
     // set up the cuda streams. atm everything is on the single main stream
     cudaCheck(cudaStreamCreate(&main_stream));

@@ -276,7 +276,7 @@ struct TensorGPU {
         return sizeof(int4) / sizeof(ElementType);
     }
 
-    __device__ __host__ float get_scalar(size_t index, bool disable_scaling=true) const {
+    __device__ __host__ float get_scalar(size_t index, bool disable_scaling=false) const {
         ElementType* __restrict__ data_ptr_restricted = data_ptr;
         float* __restrict__ scale_ptr_restricted = scale_descale_ptr;
 
@@ -285,7 +285,7 @@ struct TensorGPU {
         return value * descale; // [1] = descale
     }
 
-    __device__ __host__ ElementType set_scalar(size_t index, float value, bool disable_scaling=true) {
+    __device__ __host__ ElementType set_scalar(size_t index, float value, bool disable_scaling=false) {
         ElementType* __restrict__ data_ptr_restricted = data_ptr;
         float* __restrict__ scale_ptr_restricted = scale_descale_ptr;
 
@@ -306,35 +306,39 @@ typedef TensorGPU<floatX> tensorFP8e4;
 typedef TensorGPU<floatX> tensorFP8e5;
 
 extern TensorGPU<floatX> null_tensorX;
-extern TensorGPU<floatX> null_tensorFP32;
+extern TensorGPU<float> null_tensorFP32;
 
 template<typename ElementType=float>
 struct tensor128 {
 private:
     Packed128<ElementType> data128;
     ElementType* data_ptr;
-    unsigned int *absmax_ptr;
-    float scale;
-    float descale;
+    unsigned int *absmax_ptr = nullptr;
+    float scale = 1.0f;
+    float descale = 1.0f;
     float new_absmax = 0.0f;
     bool wrote_data = false;
     bool wrote_absmax = false;
 
 public:
-    bool scaling = (sizeof(ElementType) == 33); // todo - fp8 only
+    bool scaling = true; // todo - fp8 only
     static constexpr const size_t elements = sizeof(int4) / sizeof(ElementType);
 
     __device__ tensor128(TensorGPU<ElementType> tensor, bool disable_scaling=false) {
-        float2* __restrict__ ptr_restricted = (float2*)tensor.scale_descale_ptr;
-        float2 scale_descale = *ptr_restricted;
-        scale = scale_descale.x;
-        descale = scale_descale.y;
         data_ptr = tensor.data_ptr;
-        absmax_ptr = tensor.absmax_ptr;
-        if (disable_scaling) {
+
+        if (!disable_scaling) {
+            float2* __restrict__ ptr_restricted = (float2*)tensor.scale_descale_ptr;
+            if (tensor.scale_descale_ptr == nullptr) {
+                printf("tensor.scale_descale_ptr: %p\n", tensor.scale_descale_ptr);
+            }
+            float2 scale_descale = *ptr_restricted;
+            scale = scale_descale.x;
+            descale = scale_descale.y;
+            absmax_ptr = tensor.absmax_ptr;
+        } else {
             scaling = false;
         }
-        scaling = false;
     }
 
     __device__ void load(size_t offset, bool cache_streaming=false) {
@@ -416,6 +420,7 @@ public:
             return false; // if we return true, we can skip __syncthreads() in some kernels
         }
         wrote_absmax = true;
+        return false;
 
         // use native integer reductions as much as possible (supported on all GPUs with FP8)
         // this might treat NaN/INF slightly differently but that is the least of our problems
@@ -502,13 +507,16 @@ constexpr size_t MAX_TENSORS = 16*1024;
 constexpr size_t MAX_ABSMAX_HISTORY = 32; // todo - should make this a command line option
 extern int num_tensor_specs;
 extern int current_absmax_index;
-extern void* gpu_tensor_scale_memory;
-extern void* gpu_tensor_absmax_memory;
+extern float* gpu_scale_memory;
+extern unsigned int* gpu_absmax_memory;
+
+__constant__ float* gpu_scale_memory_ptr;
+__constant__ unsigned int* gpu_absmax_memory_ptr;
 
 enum TT : uint8_t {
-    PARAMETER=0, PARAMETER_GRAD, PARAMETER_MASTER, PARAMETER_OPT_M, PARAMETER_OPT_V, // 1 allocation each
+    PARAMETER=0, PARAMETER_GRAD, PARAMETER_OPT_M, PARAMETER_OPT_V, PARAMETER_MASTER, // 1 allocation each
     ACTIVATIONS_MULTIUSE, // single buffer shared for activations, activation gradients, and scratch
-    DEFAULT, COUNT=DEFAULT, NUM_TYPES_PARAM=PARAMETER_OPT_V+1
+    DEFAULT, COUNT=DEFAULT, NUM_TYPES_PARAM=PARAMETER_MASTER+1
 };
 
 enum TFlags : uint8_t {
@@ -536,25 +544,33 @@ typedef struct {
     char name[16];
 
     template <typename T>
-    operator T*() const {
+    __host__ __device__ operator T*() const {
+        // TODO !!! make it work device side!
+        /*
         if (std::is_same<T, float>::value && data_type != DType::FP32 ||
             std::is_same<T, __half>::value && data_type != DType::FP16 ||
             std::is_same<T, nv_bfloat16>::value && data_type != DType::BF16) {
             printf("ERROR: Unexpected data type (%d) for tensor %s\n", (int)data_type, name);
             exit(EXIT_FAILURE);
         }
+        */
         return reinterpret_cast<T*>(ptr);
     }
 
     template <typename T>
-    operator TensorGPU<T>() const {
+    __device__ __host__ operator TensorGPU<T>() const {
         TensorGPU<T> tensor;
-        int absmax_idx = id + (current_absmax_index * num_tensor_specs);
-
         tensor.num_elements = num_elements;
         tensor.data_ptr = this->operator T*();
-        tensor.scale_descale_ptr = reinterpret_cast<float*>(gpu_tensor_scale_memory) + id;
-        tensor.absmax_ptr = reinterpret_cast<unsigned int*>(gpu_tensor_absmax_memory) + absmax_idx;
+
+        #ifdef __CUDA_ARCH__
+        printf("gpu_scale_memory_ptr: %p\n", gpu_scale_memory_ptr);
+        tensor.scale_descale_ptr = gpu_scale_memory_ptr + 2*id;
+        tensor.absmax_ptr = gpu_absmax_memory_ptr + id;
+        #else
+        tensor.scale_descale_ptr = gpu_scale_memory + 2*id;
+        tensor.absmax_ptr = gpu_absmax_memory + id;
+        #endif
 
         return tensor;
     }
