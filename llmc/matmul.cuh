@@ -106,17 +106,17 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 
 // Wrapper around cublasLtMatmul that is meant to support everything we need in llm.c
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
-void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* bias,
+void matmul_cublaslt(tensorX d, const tensorX a, const tensorX b, const tensorX bias,
                      int m, int n, int k, cudaStream_t stream=0, bool transA=true, bool transB=false,
                      int batch_count=0, size_t strideA=0, size_t strideB=0, size_t strideOut=0,
-                     bool accumulate=false, floatX* pre_gelu=NULL, bool backward=false)
+                     bool accumulate=false, tensorX pre_gelu=null_tensorX, bool backward=false)
 {
     NVTX_RANGE_FN();
-    bool has_bias = (bias != NULL);
-    bool has_gelu = (pre_gelu != NULL);
+    bool has_bias = (bias.data_ptr != NULL);
+    bool has_gelu = (pre_gelu.data_ptr != NULL);
 
     // check alignment (some modes work unaligned but it always best to be aligned for performance)
-    if(((uintptr_t)a % 16) != 0 || ((uintptr_t)b % 16) != 0 || ((uintptr_t)d % 16) != 0 || ((uintptr_t)bias % 16) != 0) {
+    if(((uintptr_t)a.data_ptr % 16) != 0 || ((uintptr_t)b.data_ptr % 16) != 0 || ((uintptr_t)d.data_ptr % 16) != 0 || ((uintptr_t)bias.data_ptr % 16) != 0) {
         printf("All cuBLASLt pointers must be aligned!\n");
         exit(EXIT_FAILURE);
     }
@@ -176,12 +176,22 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
     if (has_gelu) {
         int64_t gelu_ld = m; // todo - is this affected by anything else?
         cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD, &gelu_ld, sizeof(gelu_ld)));
-        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER, &pre_gelu, sizeof(pre_gelu)));
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER, &pre_gelu.data_ptr, sizeof(pre_gelu.data_ptr)));
         if (backward) {
             assert(!has_bias); // we shouldn't have any backward matmuls that use both GELU and bias
             epilogue = CUBLASLT_EPILOGUE_DGELU;
+            if (pre_gelu.scale_descale_ptr) { // descale input
+                float* gelu_descale_ptr = pre_gelu.scale_descale_ptr + 1;
+                //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_SCALE_POINTER, &gelu_descale_ptr, sizeof(float*)));
+            }
         } else {
             epilogue = has_bias ? CUBLASLT_EPILOGUE_GELU_AUX_BIAS : CUBLASLT_EPILOGUE_GELU_AUX;
+            if (pre_gelu.absmax_ptr) {
+                //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_AMAX_POINTER, &pre_gelu.absmax_ptr, sizeof(pre_gelu.absmax_ptr)));
+            }
+            if (pre_gelu.scale_descale_ptr) { // scale output
+                //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_SCALE_POINTER, &pre_gelu.scale_descale_ptr, sizeof(float*)));
+            }
         }
     } else if(has_bias){
         epilogue = backward ? CUBLASLT_EPILOGUE_BGRADB : CUBLASLT_EPILOGUE_BIAS;
@@ -194,7 +204,23 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
         // cuBLASLt requires bias in FP8 mode to be BF16... (sigh)
         cublasDataType_t bias_data_type = (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP; // force BF16 bias for FP8 mode
         cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_data_type, sizeof(bias_data_type)));
-        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias.data_ptr, sizeof(bias.data_ptr)));
+    }
+
+    // scale factors
+    if (a.scale_descale_ptr) {
+        //float* a_descale_ptr = a.scale_descale_ptr + 1;
+        //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_descale_ptr, sizeof(float*)));
+    }
+    if (b.scale_descale_ptr) {
+        //float* b_descale_ptr = b.scale_descale_ptr + 1;
+        //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_descale_ptr, sizeof(float*)));
+    }
+    if (d.scale_descale_ptr) {
+        //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, &d.scale_descale_ptr, sizeof(float*)));
+    }
+    if (d.absmax_ptr) {
+        //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_AMAX_D_POINTER, &d.absmax_ptr, sizeof(float*)));
     }
 
     // set scale type to FP32 (needs to be FP16 if and only if using CUBLAS_COMPUTE_16F, so it's FP32 even for FP8!)
@@ -235,7 +261,7 @@ void matmul_forward_cublaslt(tensorX out,
                      TensorGPU<T> pre_gelu=null_tensorX, int gelu_fusion=1, cudaStream_t stream=main_stream) {
     // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
     if (gelu_fusion < 1 && pre_gelu != null_tensorX) {
-        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, BT, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
+        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, BT, C, stream, true, false, 0, 0, 0, 0, false, null_tensorX, false);
         gelu_forward(out, pre_gelu, stream);
     } else {
         matmul_cublaslt(out, weight, inp, bias, OC, BT, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
@@ -277,8 +303,8 @@ void matmul_backward(tensorX dinp, tensorX dweight, tensorX dbias,
     }
 
     // backward to input, uses = in the backward pass (set the gradient)
-    matmul_cublaslt(dinp, weight, dout, NULL, C, BT, OC, stream, false, false, 0, 0, 0, 0, false,
-                    gelu_fusion >= 2 ? pre_gelu.data_ptr : NULL, true);
+    matmul_cublaslt(dinp, weight, dout, null_tensorX, C, BT, OC, stream, false, false, 0, 0, 0, 0, false,
+                    gelu_fusion >= 2 ? pre_gelu : null_tensorX, true);
 
     // backward GELU (if it wasn't fused into the matmul above)
     if (gelu_fusion < 2 && pre_gelu != null_tensorX) {
@@ -286,6 +312,6 @@ void matmul_backward(tensorX dinp, tensorX dweight, tensorX dbias,
     }
 
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
-    matmul_cublaslt(dweight, inp, dout, NULL /*dbias*/, C, OC, BT, stream, false, true, 0, 0, 0, 0,
-                    true /* accumulate */, NULL, true);
+    matmul_cublaslt(dweight, inp, dout, null_tensorX /*dbias*/, C, OC, BT, stream, false, true, 0, 0, 0, 0,
+                    true /* accumulate */, null_tensorX, true);
 }

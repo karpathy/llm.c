@@ -63,7 +63,9 @@ __global__ void adamw_full_update(TensorSpec* specs, unsigned int seed,
         // todo - make it configurable whether weight decay applies to e.g. bias or not
         float wd = (opt_spec.flags & TENSOR_2D) ? weight_decay : 0.0f;
 
-        if (specs[spec_id].data_type == DType::BF16) {
+        if (specs[spec_id].data_type == DType::BF16 || specs[spec_id].data_type == DType::FP16) {
+            // todo - this is actually "EQUAL FLOATX" right now, doesn't work for mix and match
+            // !!!
             TensorGPU<__nv_bfloat16> param_tensor = specs[spec_id];
             auto out_param128 = new_tensor128(param_tensor);
 
@@ -125,6 +127,8 @@ __global__ void adamw_full_update(TensorSpec* specs, unsigned int seed,
                 idx_blk += stride;
                 idx += stride;
             }
+        } else {
+            assert(false); // TODO
         }
     }
 }

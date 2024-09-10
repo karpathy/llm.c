@@ -70,7 +70,11 @@ __global__ void permute_kernel_backward(tensorX dinp,
     dinp128_q.store(inp_idx);
     dinp128_k.store(inp_idx + NH * d);
     dinp128_v.store(inp_idx + 2 * (NH * d));
-    dinp128_q.update_absmax(threadIdx.x, blockDim.x, true);
+
+    // todo - merge this into 1 update
+    dinp128_q.update_absmax(threadIdx.x, blockDim.x, false);
+    dinp128_k.update_absmax(threadIdx.x, blockDim.x, false);
+    dinp128_v.update_absmax(threadIdx.x, blockDim.x, true);
 }
 
 __global__ void unpermute_kernel(tensorX out, floatX* inp, int B, int N, int NH, int d) {
@@ -245,7 +249,7 @@ void attention_forward(tensorX out, floatX* qkvr, floatX* att,
     permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, B, T, NH, HS);
 
     floatX* preatt = inp; // reuse inp as scratch buffer
-    matmul_cublaslt(tensorX::from(preatt), tensorX::from(k), tensorX::from(q), nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
+    matmul_cublaslt(tensorX::from(preatt), tensorX::from(k), tensorX::from(q), null_tensorX, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
 
     // multiply all elements of preatt elementwise by scale
     float scale = 1.f / sqrtf(HS);
@@ -255,7 +259,7 @@ void attention_forward(tensorX out, floatX* qkvr, floatX* att,
     // new approach: first cuBLAS another batched matmul
     floatX* vaccum = inp;
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    matmul_cublaslt(tensorX::from(vaccum), tensorX::from(v), tensorX::from(att), nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
+    matmul_cublaslt(tensorX::from(vaccum), tensorX::from(v), tensorX::from(att), null_tensorX, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -286,18 +290,20 @@ void attention_backward(tensorX dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     // backward through the unpermute operation
     int num_blocks = CEIL_DIV(B * T * C, block_size * dout.num_per_128());
     unpermute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(scratch, dout, B, T, NH, HS);
+    cudaCheck(cudaGetLastError());
     // backward into datt
-    matmul_cublaslt(tensorX::from(datt), tensorX::from(v), tensorX::from(scratch), nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
+    matmul_cublaslt(tensorX::from(datt), tensorX::from(v), tensorX::from(scratch), null_tensorX, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
     // backward into dv
-    matmul_cublaslt(tensorX::from(dv), tensorX::from(scratch), tensorX::from(att), nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
+    matmul_cublaslt(tensorX::from(dv), tensorX::from(scratch), tensorX::from(att), null_tensorX, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
     const float scale = 1.0f / sqrtf((float)HS);
     // backward into preatt. this is an in-place operation; datt turns into dpreatt here
     softmax_autoregressive_backward_inplace_kernel<<<dim3(T / 4, B * NH), 256>>>(datt, att, B, T, C, scale);
+    cudaCheck(cudaGetLastError());
     floatX* dpreatt = datt;
     // backward into q
-    matmul_cublaslt(tensorX::from(dq), tensorX::from(k), tensorX::from(dpreatt), nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
+    matmul_cublaslt(tensorX::from(dq), tensorX::from(k), tensorX::from(dpreatt), null_tensorX, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
     // backward into k
-    matmul_cublaslt(tensorX::from(dk), tensorX::from(q), tensorX::from(dpreatt), nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
+    matmul_cublaslt(tensorX::from(dk), tensorX::from(q), tensorX::from(dpreatt), null_tensorX, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
     // backward into inp
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size * dinp.num_per_128());
     permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dinp, dq, dk, dv, B, T, NH, HS);

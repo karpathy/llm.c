@@ -5,6 +5,12 @@
 
 #include "cuda_common.h"
 
+struct TensorSpec;  // Forward declaration
+
+__device__ __constant__ TensorSpec* tensor_specs_ptr;
+__device__ __constant__ float* gpu_scale_memory_ptr;
+__device__ __constant__ unsigned int* gpu_absmax_memory_ptr;
+
 // ----------------------------------------------------------------------------
 // Packed128 data structure that forces the compiler to use 128-bit loads/stores
 // in GPUs that support (the LDG.128 and STS.128 instructions)
@@ -177,8 +183,12 @@ __device__ __host__ unsigned int get_random_noise(unsigned int seed, unsigned in
 // (didn't matter with BF16 because denorms are so tiny they're irrelevant, unlike in FP8/FP16)
 template<bool noise=true, typename highp=float, typename Ti=__nv_fp8_e4m3>
 __device__ __forceinline__ void stochastic_rounding(float in, Ti *out, unsigned int seed, float prob_offset=0.0f) {
-    unsigned int random = noise ? get_random_noise(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed) : seed;
+    if constexpr (std::is_same<Ti, float>::value) {
+            *out = in;
+            return;
+    }
 
+    unsigned int random = noise ? get_random_noise(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed) : seed;
     // prob_offset allows rounding towards gradient more of the time (one paper recommends that)
     // e.g. +0.3f ==> 65% chance up, 35% chance down
     highp threshold_percentage = ((highp)random / (highp)0xFFFFFFFF) - prob_offset;
@@ -236,15 +246,13 @@ __device__ __forceinline__ void stochastic_rounding(float in, Ti *out, unsigned 
     highp lerp = ((highp)in - (highp)rounded_down) / diff; // division by 0 is OK as it means (up == down) anyway
     *out = (lerp > threshold_percentage) ? rounded_up : rounded_down;
 }
-__device__ __forceinline__ void stochastic_rounding(float in, float *out, unsigned int random) {
-    *out = in; // dummy function for when floatX is float (FP32 mode)
-}
 
 // ----------------------------------------------------------------------------
 // ...
 template<typename ElementType=float>
 struct TensorGPU {
     ElementType* data_ptr;
+    int id;
     float* scale_descale_ptr;
     unsigned int* absmax_ptr;
     size_t num_elements;
@@ -252,6 +260,7 @@ struct TensorGPU {
     static __device__ __host__ TensorGPU from(ElementType* ptr=nullptr) {
         TensorGPU tmp = {0};
         tmp.data_ptr = ptr;
+        tmp.id = -1;
         return tmp;
     }
 
@@ -319,18 +328,21 @@ private:
     float new_absmax = 0.0f;
     bool wrote_data = false;
     bool wrote_absmax = false;
+    int id = -1;
 
 public:
     bool scaling = true; // todo - fp8 only
     static constexpr const size_t elements = sizeof(int4) / sizeof(ElementType);
+    __device__ tensor128() { scaling = false; }
 
     __device__ tensor128(TensorGPU<ElementType> tensor, bool disable_scaling=false) {
         data_ptr = tensor.data_ptr;
+        id = tensor.id;
 
         if (!disable_scaling) {
             float2* __restrict__ ptr_restricted = (float2*)tensor.scale_descale_ptr;
             if (tensor.scale_descale_ptr == nullptr) {
-                printf("tensor.scale_descale_ptr: %p\n", tensor.scale_descale_ptr);
+                assert(false);
             }
             float2 scale_descale = *ptr_restricted;
             scale = scale_descale.x;
@@ -483,7 +495,10 @@ public:
 
     __device__ ~tensor128() {
         // this should ~always be optimised away by the compiler
-        assert(wrote_absmax || !scaling || !wrote_data);
+        if (!wrote_absmax && scaling && wrote_data) {
+            printf("id: %d\n", id);
+            assert(false);
+        }
     }
 };
 
@@ -510,9 +525,6 @@ extern int current_absmax_index;
 extern float* gpu_scale_memory;
 extern unsigned int* gpu_absmax_memory;
 
-__constant__ float* gpu_scale_memory_ptr;
-__constant__ unsigned int* gpu_absmax_memory_ptr;
-
 enum TT : uint8_t {
     PARAMETER=0, PARAMETER_GRAD, PARAMETER_OPT_M, PARAMETER_OPT_V, PARAMETER_MASTER, // 1 allocation each
     ACTIVATIONS_MULTIUSE, // single buffer shared for activations, activation gradients, and scratch
@@ -530,8 +542,7 @@ enum TFlags : uint8_t {
     EMBEDDING=64,
     STATS=128
 };
-
-typedef struct {
+struct TensorSpec {
     char* ptr;
     size_t offset; // into base pointer
     size_t num_elements; // per shard
@@ -562,9 +573,9 @@ typedef struct {
         TensorGPU<T> tensor;
         tensor.num_elements = num_elements;
         tensor.data_ptr = this->operator T*();
+        tensor.id = id;
 
         #ifdef __CUDA_ARCH__
-        printf("gpu_scale_memory_ptr: %p\n", gpu_scale_memory_ptr);
         tensor.scale_descale_ptr = gpu_scale_memory_ptr + 2*id;
         tensor.absmax_ptr = gpu_absmax_memory_ptr + id;
         #else
@@ -574,7 +585,7 @@ typedef struct {
 
         return tensor;
     }
-} TensorSpec;
+};
 
 // ----------------------------------------------------------------------------
 // Copy, cast functions

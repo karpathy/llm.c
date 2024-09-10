@@ -195,10 +195,10 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
         for (int c = 0; c < iterations_C; c++) {
             int global_index = (warpThreadIdx * x128::size) + (c * C_per_iteration);
 
-            auto dout128 = new_tensor128(dout);
-            auto inp128 = new_tensor128(inp);
-            auto dinp128 = new_tensor128(dinp_old);
-            auto weight128 = new_tensor128(weight);
+            tensor128<floatX> dout128;
+            tensor128<floatX> inp128;
+            tensor128<floatX> weight128;
+            tensor128<floatX> dinp128;
 
             if(global_index < C) {
                 dout128 = load_tensor128(dout, bt * C + global_index, true);
@@ -316,6 +316,8 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
         // convert from float/FP32 to floatX/BF16 for the final write
         // this is separate because it cannot use as many warps as the above (f128 vs x128)
         // todo - if we split this code into another kernel, we could maybe do it at the same time?
+        auto dbias128_out = new_tensor128(dbias);
+        auto dweight128_out = new_tensor128(dweight);
         for (int c = warpId; c < iterations_C; c += warpsInBlock) {
             int global_index = (warpThreadIdx * x128::size) + (c * C_per_iteration);
             if (global_index >= C) {
@@ -329,13 +331,15 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
                 f128 s_dw = load128(dweight_shared + global_index + o * f128::size);
                 for(int i = 0; i < f128::size; ++i) {
                     int x = o * f128::size + i;
-                    dbias128.set(x, s_db[i] + dbias128.get(x));
-                    dweight128.set(x, s_dw[i] + dweight128.get(x));
+                    dbias128_out.set(x, s_db[i] + dbias128.get(x));
+                    dweight128_out.set(x, s_dw[i] + dweight128.get(x));
                 }
             }
-            dbias128.store_same_length<floatX>(global_index);
-            dweight128.store_same_length<floatX>(global_index);
+            dbias128_out.store_same_length<floatX>(global_index);
+            dweight128_out.store_same_length<floatX>(global_index);
         }
+        dbias128_out.update_absmax(threadIdx.x, BLOCK_SIZE, false);
+        dweight128_out.update_absmax(threadIdx.x, BLOCK_SIZE, false);
     }
 }
 

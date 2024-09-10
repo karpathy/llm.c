@@ -150,6 +150,9 @@ typedef struct {
     unsigned long long rng_state_last_update; // RNG before last gpt2_update() to re-round identically from master weights
 } GPT2;
 
+GPT2 model; // todo - move back
+bool backward = false; // todo - hack - REMOVE
+
 TensorSpec tensor_specs[MAX_TENSORS] = {0};
 TensorSpec* tensor_specs_gpu = NULL;
 
@@ -163,6 +166,74 @@ int current_absmax_index = 0;
 float* gpu_scale_memory = NULL;
 unsigned int* gpu_absmax_memory = NULL;
 
+// debug helper function
+void print_tensor_elements(int tensor_id) {
+    return;
+    if (backward == false) return;
+
+    printf("Printing tensor %d\n", tensor_id);
+    TensorSpec spec = tensor_specs[tensor_id];
+    size_t num_elements = spec.num_elements;
+    const char* tensor_name = spec.name;
+    TT tensor_type = spec.tensor_type;
+    DType dtype = spec.data_type;
+    size_t element_size = sizeof_dtype(dtype);
+
+    void* gpu_memory = (tensor_type == TT::ACTIVATIONS_MULTIUSE) ? model.multiuse_memory : model.params_memory[tensor_type];
+    void* gpu_tensor = (void*)((char*)gpu_memory + tensor_specs[tensor_id].offset);
+    void* cpu_tensor = malloc(num_elements * element_size);
+
+    printf("Printing tensor %s\n", tensor_name);
+    printf("GPU memory: %p\n", gpu_tensor);
+    printf("CPU memory: %p\n", cpu_tensor);
+    printf("Num elements: %zu\n", num_elements);
+    printf("Element size: %zu\n", element_size);
+    printf("Offset: %zu\n", tensor_specs[tensor_id].offset);
+
+    cudaCheck(cudaMemcpy(cpu_tensor, gpu_tensor, num_elements * element_size, cudaMemcpyDeviceToHost));
+
+    printf("Did memcpy\n");
+
+    printf("First 4 of %s: ", tensor_name);
+    for (int i = 0; i < num_elements && i < 4; i++) {
+        if (dtype == DType::FP32) {
+            printf("%.16f ", ((float*)cpu_tensor)[i]);
+        } else if (dtype == DType::FP16) {
+            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
+        } else if (dtype == DType::BF16) {
+            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
+        }
+    }
+    printf("\n");
+
+    printf("Middle 4 of %s: ", tensor_name);
+    for (int i = (num_elements/2) + 4; i < num_elements && i < (num_elements/2 + 8); i++) {
+        if (dtype == DType::FP32) {
+            printf("%.16f ", ((float*)cpu_tensor)[i]);
+        } else if (dtype == DType::FP16) {
+            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
+        } else if (dtype == DType::BF16) {
+            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
+        }
+    }
+    printf("\n");
+
+    printf("Last 4 of %s: ", tensor_name);
+    for (int i = num_elements - 4; i < num_elements; i++) {
+        if (dtype == DType::FP32) {
+            printf("%.16f ", ((float*)cpu_tensor)[i]);
+        } else if (dtype == DType::FP16) {
+            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
+        } else if (dtype == DType::BF16) {
+            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
+        }
+    }
+    printf("\n");
+    printf("\n");
+
+    free(cpu_tensor);
+}
+
 TensorSpec get_tensor(int spec_index, TT tensor_type, int layer) {
     TensorSpec spec = tensor_specs[spec_index];
     if (layer > 0 && spec.remaining_layers >= layer) {
@@ -172,6 +243,7 @@ TensorSpec get_tensor(int spec_index, TT tensor_type, int layer) {
         assert(false);
     }
     assert(spec.tensor_type == tensor_type || tensor_type == DEFAULT);
+    print_tensor_elements(spec_index);
     return spec;
 }
 
@@ -179,7 +251,8 @@ int add_tensor_spec(const char* name, size_t total_elements, size_t num_shards, 
     assert(num_tensor_specs < 16*1024);
     assert((total_elements % num_shards) == 0);
     TensorSpec* spec = &tensor_specs[num_tensor_specs];
-    strncpy(spec->name, name, 16);
+    strncpy(spec->name, name, 15);
+    spec->name[15] = 0;
 
     spec->id = num_tensor_specs;
     spec->num_elements = total_elements / num_shards;
@@ -426,7 +499,7 @@ void gpt2_allocate(GPT2 *model) {
     }
 
     // we are finished creating the tensors specs and can copy them to the GPU (effectively read-only)
-    cudaMalloc(&tensor_specs_gpu, sizeof(TensorSpec) * num_tensor_specs);
+    cudaMalloc((void**)&tensor_specs_gpu, sizeof(TensorSpec) * num_tensor_specs);
     cudaMemcpy(tensor_specs_gpu, tensor_specs, sizeof(TensorSpec) * num_tensor_specs, cudaMemcpyHostToDevice);
 
     //initialise helper variables
@@ -458,8 +531,9 @@ void gpt2_allocate(GPT2 *model) {
     free(h_scale_memory);
 
     // copy to constant buffers
-    cudaMemcpyToSymbol(gpu_scale_memory_ptr, gpu_scale_memory, sizeof(float*));
-    cudaMemcpyToSymbol(gpu_absmax_memory_ptr, gpu_absmax_memory, sizeof(unsigned int*));
+    cudaMemcpyToSymbol(tensor_specs_ptr, &tensor_specs_gpu, sizeof(TensorSpec*));
+    cudaMemcpyToSymbol(gpu_scale_memory_ptr, &gpu_scale_memory, sizeof(float*));
+    cudaMemcpyToSymbol(gpu_absmax_memory_ptr, &gpu_absmax_memory, sizeof(unsigned int*));
 
     cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
     cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
@@ -699,60 +773,6 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     free(params_memory_cpu);
 }
 
-// debug helper function
-void print_tensor_elements(GPT2 *model, int tensor_id) {
-    TensorSpec spec = tensor_specs[tensor_id];
-    size_t num_elements = spec.num_elements;
-    const char* tensor_name = spec.name;
-    TT tensor_type = spec.tensor_type;
-    DType dtype = spec.data_type;
-    size_t element_size = sizeof_dtype(dtype);
-
-    void* gpu_memory = (tensor_id == TT::ACTIVATIONS_MULTIUSE) ? model->multiuse_memory : model->params_memory[tensor_type];
-    void* gpu_tensor = (void*)((char*)gpu_memory + tensor_specs[tensor_id].offset);
-    void* cpu_tensor = malloc(num_elements * element_size);
-    cudaCheck(cudaMemcpy(cpu_tensor, gpu_tensor, num_elements * element_size, cudaMemcpyDeviceToHost));
-
-    printf("First 4 of %s: ", tensor_name);
-    for (int i = 0; i < num_elements && i < 4; i++) {
-        if (dtype == DType::FP32) {
-            printf("%.16f ", ((float*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP16) {
-            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
-        } else if (dtype == DType::BF16) {
-            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
-        }
-    }
-    printf("\n");
-
-    printf("Middle 4 of %s: ", tensor_name);
-    for (int i = (num_elements/2) + 4; i < num_elements && i < (num_elements/2 + 8); i++) {
-        if (dtype == DType::FP32) {
-            printf("%.16f ", ((float*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP16) {
-            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
-        } else if (dtype == DType::BF16) {
-            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
-        }
-    }
-    printf("\n");
-
-    printf("Last 4 of %s: ", tensor_name);
-    for (int i = num_elements - 4; i < num_elements; i++) {
-        if (dtype == DType::FP32) {
-            printf("%.16f ", ((float*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP16) {
-            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
-        } else if (dtype == DType::BF16) {
-            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
-        }
-    }
-    printf("\n");
-    printf("\n");
-
-    free(cpu_tensor);
-}
-
 // Helper macros for accessing tensors
 #define TENSOR(x,layer)  get_tensor(x, DEFAULT, layer)
 #define ACT_L(x,layer)   get_tensor(model->acts.x, ACTIVATIONS_MULTIUSE, layer)
@@ -856,6 +876,7 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
 
 void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
     NVTX_RANGE_FN();
+    backward = true; // todo - hack - REMOVE
 
     // convenience shortcuts (size_t instead of int so that pointer arithmetics don't overflow)
     const size_t B = model->batch_size;
@@ -1623,7 +1644,7 @@ int main(int argc, char *argv[]) {
     }
 
     // build the GPT-2 model
-    GPT2 model;
+    // todo - add model declaration back here
     gpt2_init_common(&model);
     model.use_master_weights = use_master_weights;
     model.gelu_fusion = gelu_fusion;
