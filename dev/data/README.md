@@ -6,3 +6,5 @@ The idea is that each dataset has a .py file here in the root of `dev/data`, and
 - running `python tinyshakespeare.py` will create a directory `tinyshakespeare` with its .bin files inside it
 
 And so on. This way we can nicely organize multiple datasets here, share common utilities between them, and then point the .py/.c code in the root of the project accordingly to these.
+
+Note: we support "gpt-2" and "llama" (llama 3 in particular) models and the above scripts will tokenize gpt-2 by default.

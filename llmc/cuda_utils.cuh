@@ -206,6 +206,29 @@ void global_sum_deterministic(float* result, const Float* values, int count, cud
 }
 
 // ----------------------------------------------------------------------------
+// memory management
+
+// allocate memory, preferrably on the device
+// returns a status code. 0 = OK, 1 = fell back to managed memory
+int cudaMallocConditionallyManaged(void** out, size_t bytes, const char *file, int line) {
+    // try to allocate
+    cudaError_t err = cudaMalloc(out, bytes);
+    if(err == cudaErrorMemoryAllocation) {
+        // if we OOM, fallback to a managed allocation. slower but at least won't crash.
+        cudaGetLastError(); // reset the error before the next API call
+        cudaCheck_(cudaMallocManaged(out, bytes), file, line);
+        cudaCheck_(cudaMemAdvise(*out, bytes, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId), file, line);
+        return 1;
+    } else {
+        cudaCheck_(err, file, line);
+        return 0;
+    }
+}
+
+#define cudaMallocConditionallyManaged(out, bytes)\
+(cudaMallocConditionallyManaged((void**)out, bytes, __FILE__, __LINE__))
+
+// ----------------------------------------------------------------------------
 // Random Number Generation used in Stochastic Rounding
 
 // SquirrelNoise5 - Squirrel's Raw Noise utilities (version 5)
