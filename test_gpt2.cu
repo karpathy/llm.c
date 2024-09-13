@@ -59,6 +59,8 @@ typedef struct {
     float*  ln2b; // (L, C)
     float*  fcw; // (L, 4*C, C)
     float*  fcb; // (L, 4*C)
+    float*  gatew; // (L, 4*C, C)
+    float*  gateb; // (L, 4*C)
     float*  fcprojw; // (L, C, 4*C)
     float*  fcprojb; // (L, C)
     float*  lnfw; // (C)
@@ -78,6 +80,7 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
     float** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
+        &params->gatew, &params->gateb,
         &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
     };
     float* params_memory_iterator = params_memory;
@@ -122,7 +125,7 @@ int main(int argc, char *argv[]) {
         if (argv[i][0] != '-') { exit(EXIT_FAILURE); } // must start with dash
         if (argv[i][1] == 'w') { model.use_master_weights = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { model.recompute = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'g' && argv[i][2] == 'e') { model.gelu_fusion = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'g' && argv[i][2] == 'e') { model.act_func_fusion = atoi(argv[i+1]); }
     }
 
     // load additional information that we will use for debugging and error checking
