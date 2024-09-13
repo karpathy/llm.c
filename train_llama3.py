@@ -875,28 +875,31 @@ def write_model(model, filename, dtype):
         "float32": 3, # 3: all tensors are fp32
         "bfloat16": 5, # 5: all tensors are bf16
     }[dtype]
-    header = torch.zeros(256, dtype=torch.int32)
-    header[0] = 20240803 # magic
-    header[1] = version # checkpoint version
-    header[2] = model.config.block_size
-    header[3] = model.config.vocab_size
-    header[4] = model.config.n_layer
-    header[5] = model.config.n_head
-    header[6] = model.config.n_kv_head
-    header[7] = model.config.n_embd
-    header[8] = model.config.ffn_dim_multiplier
-    header[9] = model.config.multiple_of
-    header[10] = model.config.norm_eps
-    header[11] = model.config.rope_theta
-    header[12] = model.config.use_scaled_rope
-    header[13] = model.config.max_gen_batch_size
-    header[14] = int(model.config.version.split('.')[0]) # major version
-    header[15] = int(model.config.version.split('.')[1]) # minor version
+    # integer section of the header
+    header_int = torch.zeros(256, dtype=torch.int32)
+    header_int[0] = 20240803 # magic
+    header_int[1] = version # checkpoint version
+    header_int[2] = model.config.block_size
+    header_int[3] = model.config.vocab_size
+    header_int[4] = model.config.n_layer
+    header_int[5] = model.config.n_head
+    header_int[6] = model.config.n_kv_head
+    header_int[7] = model.config.n_embd
+    header_int[8] = model.config.multiple_of
+    header_int[9] = int(model.config.use_scaled_rope)
+    header_int[10] = int(model.config.version.split('.')[0]) # major version
+    header_int[11] = int(model.config.version.split('.')[1]) # minor version
+    # float section of the header
+    header_float = torch.zeros(256, dtype=torch.float32)
+    header_float[0] = model.config.ffn_dim_multiplier
+    header_float[1] = model.config.norm_eps
+    header_float[2] = model.config.rope_theta
     # 2) the parameters follow the header
     params = {name: param.cpu() for name, param in model.named_parameters()}
     # now write to file
     with open(filename, "wb") as file:
-        file.write(header.numpy().tobytes()) # header
+        file.write(header_int.numpy().tobytes()) # int header
+        file.write(header_float.numpy().tobytes()) # float header
         write_tensors(params, model.config.n_layer, file, dtype) # params
     print(f"wrote {filename}")
 

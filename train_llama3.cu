@@ -89,8 +89,14 @@ typedef struct {
     int vocab_size; // vocab size, e.g. 50257
     int padded_vocab_size; // padded to e.g. %128==0, 50304
     int num_layers; // number of layers, e.g. 12
-    int num_heads; // number of heads in attention, e.g. 12
+    int num_heads; // number of query heads in attention, e.g. 12
+    int num_kv_heads; // number of key and value heads in attention, e.g. 4 (<-- new in Llama 3)
     int channels; // number of channels, e.g. 768
+    int multiple_of; // used in feedforward layer sizing, e.g. 1024 (<-- new in Llama 3)
+    int use_scaled_rope; // whether to use scaled rope
+    float ffn_dim_multiplier; // multiplier used in feedforward layer, e.g. 1.3 (<-- new in Llama 3)
+    float norm_eps; // epsilon used in layernorm, e.g. 1e-5
+    float rope_theta; // theta used in ROPE attention, e.g. 500000.0 (<-- new in Llama 3)
 } GPT2Config;
 
 // the parameters of the model
@@ -467,10 +473,14 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
 
     // read in model from a checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
-    int model_header[256];
-    freadCheck(model_header, sizeof(int), 256, model_file);
-    if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(EXIT_FAILURE); }
-    int version = model_header[1];
+    int header_int[256]; // int section of the header
+    freadCheck(header_int, sizeof(int), 256, model_file);
+    assert(sizeof(int) == 4); // i think the python export code currently assumes this is int32
+    float header_float[256]; // float section of the header
+    freadCheck(header_float, sizeof(float), 256, model_file);
+    assert(sizeof(float) == 4); // i think the python export code currently assumes this is float32
+    if (header_int[0] != 20240803) { printf("Bad magic model file\n"); exit(EXIT_FAILURE); }
+    int version = header_int[1];
     if (!(version == 3 || version == 5)) {
         // 3 = fp32, padded vocab
         // 5 = bf16, padded vocab, layernorms also in bf16
@@ -494,13 +504,44 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
         }
     }
 
-    // read in hyperparameters
-    model->config.max_seq_len = model_header[2];
-    model->config.vocab_size = model_header[3];
-    model->config.num_layers = model_header[4];
-    model->config.num_heads = model_header[5];
-    model->config.channels = model_header[6];
-    model->config.padded_vocab_size = model_header[7];
+    // read in hyperparameters from the header
+    // first the integer section
+    model->config.max_seq_len = header_int[2];
+    model->config.vocab_size = header_int[3];
+    model->config.padded_vocab_size = model->config.vocab_size; // in Llama 3 there is no need for padding
+    model->config.num_layers = header_int[4];
+    model->config.num_heads = header_int[5];
+    model->config.num_kv_heads = header_int[6];
+    model->config.channels = header_int[7];
+    model->config.multiple_of = header_int[8];
+    model->config.use_scaled_rope = header_int[9];
+    int major_version = header_int[10]; // currently unused, e.g. 3
+    int minor_version = header_int[11]; // currently unused, e.g. 1 (so Llama 3.1)
+    // now the float section
+    model->config.ffn_dim_multiplier = header_float[0];
+    model->config.norm_eps = header_float[1];
+    model->config.rope_theta = header_float[2];
+
+    // ------------------------------------------------------------------------
+    // TODO TAKE OUT ----------------------------------------------------------
+    // Debugging: print all of the values above to check visually and EXIT
+    printf("CHECK:\n");
+    printf("max_seq_len: %d\n", model->config.max_seq_len);
+    printf("vocab_size: %d\n", model->config.vocab_size);
+    printf("padded_vocab_size: %d\n", model->config.padded_vocab_size);
+    printf("num_layers: %d\n", model->config.num_layers);
+    printf("num_heads: %d\n", model->config.num_heads);
+    printf("num_kv_heads: %d\n", model->config.num_kv_heads);
+    printf("channels: %d\n", model->config.channels);
+    printf("multiple_of: %d\n", model->config.multiple_of);
+    printf("use_scaled_rope: %d\n", model->config.use_scaled_rope);
+    printf("major version: %d\n", major_version);
+    printf("minor version: %d\n", minor_version);
+    printf("ffn_dim_multiplier: %f\n", model->config.ffn_dim_multiplier);
+    printf("norm_eps: %f\n", model->config.norm_eps);
+    printf("rope_theta: %f\n", model->config.rope_theta);
+    exit(0);
+    // ------------------------------------------------------------------------
 
     // allocate memory for the model parameters
     gpt2_allocate_weights(model);
@@ -514,131 +555,6 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
 
     // only return from this function once we are certain the params are ready on the GPU
     cudaCheck(cudaDeviceSynchronize());
-}
-
-void gpt2_set_hyperparameters(GPT2Config* config, const char* depth_str) {
-    int depth = atoi(depth_str);
-    assert(depth > 0); // atoi returns 0 if not a number
-    int channels, num_heads;
-    if      (depth == 6)  { channels = 384; num_heads = 6; }   // (unofficial) gpt2-tiny (30M)
-    else if (depth == 12) { channels = 768; num_heads = 12; }  // gpt2 (124M)
-    else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
-    else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
-    else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
-    else if (depth == 60) { channels = 1920; num_heads = 30; } // (unofficial) 2.7B
-    else if (depth == 72) { channels = 2880; num_heads = 30; } // (unofficial) 7.3B
-    else if (depth == 84) { channels = 3456; num_heads = 36; } // (unofficial) 12.2B
-    else { fprintf(stderr, "Unsupported GPT-2 depth: %d\n", depth); exit(EXIT_FAILURE); }
-    config->num_layers = depth;
-    config->channels = channels;
-    config->num_heads = num_heads;
-    config->max_seq_len = 1024;
-}
-
-void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
-    // we use channels instead of depth for GPT-3 because GPT-3 model depths are not one-to-one
-    // note that our models are not necessarily identical to GPT-3 because
-    // we use dense attention, not the alternating dense/banded attention of GPT-3
-    int channels = atoi(channels_str);
-    assert(channels > 0); // atoi returns 0 if not a number
-    int depth, head_size;
-    if      (channels == 384)   { depth = 6;  head_size = 64; }  // (unofficial) gpt3-tiny (31M)
-    else if (channels == 768)   { depth = 12; head_size = 64; }  // gpt3-small (125M)
-    else if (channels == 1024)  { depth = 24; head_size = 64; }  // gpt3-medium (350M)
-    else if (channels == 1536)  { depth = 24; head_size = 96; }  // gpt3-large (760M)
-    else if (channels == 2048)  { depth = 24; head_size = 128; } // gpt3-xl (1.3B) [heads fixed]
-    else if (channels == 2560)  { depth = 32; head_size = 80; }  // gpt3-2.7B
-    else if (channels == 4096)  { depth = 32; head_size = 128; } // gpt3-6.7B
-    else if (channels == 5140)  { depth = 40; head_size = 128; } // gpt3-13B
-    else if (channels == 12288) { depth = 96; head_size = 128; } // gpt3 (175B)
-    else { fprintf(stderr, "Unsupported GPT-3 channels: %d\n", channels); exit(EXIT_FAILURE); }
-    assert(channels % head_size == 0);
-    config->num_layers = depth;
-    config->channels = channels;
-    config->num_heads = channels / head_size;
-    config->max_seq_len = 2048; // NOTE: GPT-3 uses context length of 2048 tokens, up from 1024 in GPT-2
-}
-
-void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
-    // The model descriptor can be:
-    // - legacy format "dX", where X is number, e.g. "d12". This creates GPT-2 model with 12 layers.
-    // - new explicit format "gpt2:dX", same as above, e.g. "gpt2:d48" for GPT-2 with 48 layers.
-    // - "gpt3:cX", where X is now the channel count, e.g. "gpt3:c768" is the smallest GPT-3 model.
-
-    // check the valid prexies and dispatch to the right setup function
-    assert(descriptor != NULL);
-    size_t len = strlen(descriptor);
-    if (len > 1 && descriptor[0] == 'd') {
-        gpt2_set_hyperparameters(&model->config, descriptor + 1); // pass along the depth str without the 'd'
-    } else if (len > 6 && strncmp(descriptor, "gpt2:d", 6) == 0) {
-        gpt2_set_hyperparameters(&model->config, descriptor + 6); // pass along the depth str without the 'gpt2:d'
-    } else if (len > 6 && strncmp(descriptor, "gpt3:c", 6) == 0) {
-        gpt3_set_hyperparameters(&model->config, descriptor + 6); // pass along the channels str without the 'gpt3:c'
-    } else {
-        fprintf(stderr, "Unsupported model descriptor: %s\n", descriptor); exit(EXIT_FAILURE);
-    }
-
-    // both GPT-2 and GPT-3 use the same tokenizer with 50257 tokens
-    model->config.vocab_size = 50257;
-    model->config.padded_vocab_size = 50304; // padded to 128 for CUDA kernel efficiency
-
-    gpt2_allocate_weights(model);
-
-    // allocate and random init the memory for all the parameters with GPT-2 schema
-    // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
-    // NOTE: assuming all parameters are of the type floatX, could be relaxed later
-    mt19937_state init_rng;
-    manual_seed(&init_rng, 42);
-    floatX* params_memory_cpu = (floatX*)mallocCheck(model->num_parameters_bytes);
-    memset(params_memory_cpu, 0, model->num_parameters_bytes);
-    // fill in all the weights with random values
-    float residual_scale = 1.0f / sqrtf(2.0f * model->config.num_layers);
-    // we have to init all these tensors exactly in the order that PyTorch initializes them
-    // so that we can match them up and get correctness and exactly the same initial conditions
-    size_t L = model->config.num_layers;
-    size_t offset = 0;
-    for (int l = 0; l < L; l++) {
-        offset = 0;
-        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-            // the layernorm parameters are all initialized to 1
-            if (l == 0 && (i == 2 || i == 8 || i == 14)) { // only at l = 0 to init these just once
-                for (size_t j = 0; j < model->param_elements[i]; j++) {
-                    params_memory_cpu[offset + j] = 1.0f;
-                }
-            }
-            // weights tensors are handled here
-            if ((l == 0 && (i == 0 || i == 1)) // only at l = 0, init the wte and wpe tensors
-              || i == 4 || i == 6 || i == 10 || i == 12) {
-                size_t n = model->param_elements[i];
-                size_t layer_offset = 0;
-                if (i == 0) {
-                    // for wte tensor (padded vocab) override to init V instead of Vp rows
-                    n = model->config.vocab_size * model->config.channels;
-                }
-                if (i == 4 || i == 6 || i == 10 || i == 12) {
-                    // weight tensors, we are only initializing layer l
-                    assert(n % L == 0);
-                    n = n / L;
-                    layer_offset = l * n;
-                }
-                // in GPT-2, the projections back into the residual stream are additionally
-                // scaled by 1/sqrt(2*L) for training stability
-                float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
-                // okay let's draw the random numbers and write them
-                float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
-                normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
-                for (size_t j = 0; j < n; j++) {
-                    params_memory_cpu[offset + layer_offset + j] = (floatX)fp32_buffer[j];
-                }
-                free(fp32_buffer);
-            }
-            offset += model->param_elements[i];
-        }
-    }
-
-    // copy them to GPU
-    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
-    free(params_memory_cpu);
 }
 
 // propagate inputs through the network to produce logits.
@@ -1420,7 +1336,7 @@ int main(int argc, char *argv[]) {
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
-    const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
+    const char* load_filename = "llama3.1_8B_bf16.bin"; // bf16 weights of the Llama 3.1 8B model
     const char* lr_scheduler_type = "cosine";
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write checkpoints every how many steps?
@@ -1428,9 +1344,9 @@ int main(int argc, char *argv[]) {
     int major_checkpoint_every = 0; // major checkpoints never get deleted when maintaining history
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
     int B = 4; // batch size
-    int T = 1024; // sequence length max
+    int T = 64; // sequence length max
     int total_batch_size = -1; // will be calculated down below later, if not provided
-    float learning_rate = 3e-4f;
+    float learning_rate = 1e-5f;
     int log_gpu_every = -1;
     int warmup_iterations = 0;
     float final_learning_rate_frac = 1.0f; // final fraction of learning rate, at end of training
@@ -1441,8 +1357,8 @@ int main(int argc, char *argv[]) {
     int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
-    int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
-    int max_steps = -1;
+    int overfit_single_batch = 1; // useful for debugging, 1 = only load a single data batch once
+    int max_steps = 10;
     int override_enable_tf32 = 1;
     int use_master_weights = 1;
     int gelu_fusion = -1; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
@@ -1580,9 +1496,10 @@ int main(int argc, char *argv[]) {
         // otherwise, if this is a .bin file, we assume it's a model, let's init from it
         gpt2_build_from_checkpoint(&model, load_filename);
     } else {
-        // if it's not .bin, it could be a "special descriptor". This descriptor is used to
-        // construct GPT-2 / GPT-3 models in a convenient format. See the function for docs.
-        gpt_build_from_descriptor(&model, load_filename);
+        // For Llama 3.1 we currently demand a .bin file to load the model from, and
+        // initializing from scratch is currently not supported (but can be added later)
+        printf0("Error: Llama 3 cannot be initialized from scratch right now\n");
+        exit(EXIT_FAILURE);
     }
 
     model.use_master_weights = use_master_weights;
