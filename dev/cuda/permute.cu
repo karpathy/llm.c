@@ -42,10 +42,10 @@ The linear index in a flattened 1D array is calculated as:
 linear_idx = i1 × ( dim2 × dim3 × dim4 ) + i2 × ( dim3 × dim4 ) + i3 × dim4 + i4
 This linear index uniquely identifies the position of the element in the 1D array.
 
-To permute the matrix, we need to rearrange the indices according to the new shape. 
+To permute the matrix, we need to rearrange the indices according to the new shape.
 In this case, we are permuting from (dim1, dim2, dim3, dim4) to (dim4, dim3, dim1, dim2).
 
-The new dimension post permutation will be as follow:
+The new dimension post permutation will be as follows:
 
 dim1 becomes the new 3rd dimension.
 dim2 becomes the new 4th dimension.
@@ -74,7 +74,9 @@ Similarly we can follow the above approach to permute matrices of any dimensions
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <cmath> 
+#include <cmath>
+
+#include "common.h"
 
 // CPU function to permute a 4D matrix
 void permute_cpu(const float* matrix, float* out_matrix, int dim1, int dim2, int dim3, int dim4) {
@@ -95,9 +97,9 @@ void permute_cpu(const float* matrix, float* out_matrix, int dim1, int dim2, int
 }
 
 // CUDA kernel to permute a 4D matrix
-__global__ void permute_cuda(const float* matrix, float* out_matrix, int dim1, int dim2, int dim3, int dim4) {
+__global__ void permute_kernel(const float* matrix, float* out_matrix, int dim1, int dim2, int dim3, int dim4) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
+
     // Ensure index is within bounds
     if (idx < dim1 * dim2 * dim3 * dim4) {
         // Calculate the 4D indices from the linear index
@@ -113,32 +115,6 @@ __global__ void permute_cuda(const float* matrix, float* out_matrix, int dim1, i
     }
 }
 
-// Function to check if the CUDA permutation result matches the CPU result
-bool verify_results(const float* permuted_matrix_cuda, const float* permuted_matrix_cpu, int totalElements) {
-    bool success = true;
-    for (int i = 0; i < totalElements; i++) {
-        // Allow a small tolerance for floating-point comparison
-        if (fabs(permuted_matrix_cuda[i] - permuted_matrix_cpu[i]) > 1e-5) {
-            success = false;
-            printf("Permute Operation Failed\n");
-            printf("CPU: %f\n", permuted_matrix_cpu[i]);
-            printf("CUDA: %f\n", permuted_matrix_cuda[i]);
-            break; // Exit early on the first failure
-        }
-    }
-    if (success) {
-        printf("Permute Operation Passed\n");
-    }
-    return success;
-}
-
-// Function to initialize the matrix with random values
-void initialize_matrix(float* mat, int dim_1, int dim_2, int dim_3, int dim_4) {
-    for (int i = 0; i < dim_1 * dim_2 * dim_3 * dim_4; ++i) {
-        mat[i] = static_cast<float>(rand()) / RAND_MAX;
-    }
-    printf("Matrix Initialized\n");
-}
 
 int main() {
     int dim_1 = 24;
@@ -154,12 +130,10 @@ int main() {
     printf("Device %d: %s\n", deviceIdx, deviceProp.name);
 
     // Allocate host memory
-    float* matrix = (float*)malloc(dim_1 * dim_2 * dim_3 * dim_4 * sizeof(float));
+    float* matrix = make_random_float(dim_1 * dim_2 * dim_3 * dim_4);
     float* permuted_matrix = (float*)malloc(dim_1 * dim_2 * dim_3 * dim_4 * sizeof(float));
-    float* permuted_matrix_cpu = (float*)malloc(dim_1 * dim_2 * dim_3 * dim_4 * sizeof(float));
 
     // Initialize the matrix with random values
-    initialize_matrix(matrix, dim_1, dim_2, dim_3, dim_4);
 
     // Allocate device memory
     float *d_matrix, *d_permuted_matrix;
@@ -170,30 +144,38 @@ int main() {
     cudaMemcpy(d_matrix, matrix, dim_1 * dim_2 * dim_3 * dim_4 * sizeof(float), cudaMemcpyHostToDevice);
 
     // Perform permutation on CPU
-    permute_cpu(matrix, permuted_matrix_cpu, dim_1, dim_2, dim_3, dim_4);
+    clock_t start = clock();
+    permute_cpu(matrix, permuted_matrix, dim_1, dim_2, dim_3, dim_4);
+    clock_t end = clock();
+    double elapsed_time_cpu = (double)(end - start) / CLOCKS_PER_SEC;
 
     // Define block and grid sizes
-    dim3 blockSize(256); 
+    dim3 blockSize(256);
     int totalThreads = dim_1 * dim_2 * dim_3 * dim_4;
     int gridSize = (totalThreads + blockSize.x - 1) / blockSize.x; // Compute grid size
 
     // Launch CUDA kernel to perform permutation
-    permute_cuda<<<gridSize, blockSize>>>(d_matrix, d_permuted_matrix, dim_1, dim_2, dim_3, dim_4);
+    permute_kernel<<<gridSize, blockSize>>>(d_matrix, d_permuted_matrix, dim_1, dim_2, dim_3, dim_4);
     cudaDeviceSynchronize(); // Ensure kernel execution is complete
 
-    // Copy the result from device to host
-    cudaMemcpy(permuted_matrix, d_permuted_matrix, dim_1 * dim_2 * dim_3 * dim_4 * sizeof(float), cudaMemcpyDeviceToHost);
-
     // Verify results
-    verify_results(permuted_matrix, permuted_matrix_cpu, dim_1 * dim_2 * dim_3 * dim_4);
+    printf("Checking correctness...\n");
+    validate_result(d_permuted_matrix, permuted_matrix, "permuted_matrix", dim_1 * dim_2 * dim_3 * dim_4, 1e-5f);
+
+    printf("All results match.\n\n");
+    // benchmark kernel
+    int repeat_times = 1000;
+    float elapsed_time = benchmark_kernel(repeat_times, permute_kernel,
+                                          d_matrix, d_permuted_matrix, dim_1, dim_2, dim_3, dim_4
+    );
+    printf("time gpu %.4f ms\n", elapsed_time);
+    printf("time cpu %.4f ms\n", elapsed_time_cpu);
 
     // Free allocated memory
     free(matrix);
     free(permuted_matrix);
-    free(permuted_matrix_cpu);
     cudaFree(d_matrix);
     cudaFree(d_permuted_matrix);
 
     return 0;
 }
-
