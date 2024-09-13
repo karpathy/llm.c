@@ -80,6 +80,36 @@ typedef Packed128<float> f128;
 typedef Packed128<floatX> x128;
 
 // ----------------------------------------------------------------------------
+// DType support
+
+// enumerator to indentify the datatype of a tensor.
+enum class DType : uint8_t {
+    FP32, FP16, BF16
+};
+
+// Given a datatype enum, returns the underlying number of bytes
+// for a scalar of that type
+size_t sizeof_dtype(DType type) {
+    switch (type) {
+        case DType::FP32:
+            return sizeof(float);
+        case DType::FP16:
+            return sizeof(half);
+        case DType::BF16:
+            return sizeof(nv_bfloat16);
+        default: // handle or get compiler warning
+            fprintf(stderr, "Unknown datatype\n");
+            exit(EXIT_FAILURE);
+    }
+}
+
+DType dtype_of(float* f) { return DType::FP32; }
+DType dtype_of(nv_bfloat16 * f) { return DType::BF16; }
+DType dtype_of(half * f) { return DType::FP16; }
+
+
+
+// ----------------------------------------------------------------------------
 // Copy, cast functions
 
 // device functions and the kernel to cast data between types
@@ -174,6 +204,29 @@ void global_sum_deterministic(float* result, const Float* values, int count, cud
     global_sum_single_block_kernel<<<1, 1024, 0, stream>>>(result, values, count);
     cudaCheck(cudaGetLastError());
 }
+
+// ----------------------------------------------------------------------------
+// memory management
+
+// allocate memory, preferrably on the device
+// returns a status code. 0 = OK, 1 = fell back to managed memory
+int cudaMallocConditionallyManaged(void** out, size_t bytes, const char *file, int line) {
+    // try to allocate
+    cudaError_t err = cudaMalloc(out, bytes);
+    if(err == cudaErrorMemoryAllocation) {
+        // if we OOM, fallback to a managed allocation. slower but at least won't crash.
+        cudaGetLastError(); // reset the error before the next API call
+        cudaCheck_(cudaMallocManaged(out, bytes), file, line);
+        cudaCheck_(cudaMemAdvise(*out, bytes, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId), file, line);
+        return 1;
+    } else {
+        cudaCheck_(err, file, line);
+        return 0;
+    }
+}
+
+#define cudaMallocConditionallyManaged(out, bytes)\
+(cudaMallocConditionallyManaged((void**)out, bytes, __FILE__, __LINE__))
 
 // ----------------------------------------------------------------------------
 // Random Number Generation used in Stochastic Rounding

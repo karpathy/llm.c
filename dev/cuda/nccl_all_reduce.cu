@@ -193,5 +193,6 @@ int main(int argc, char **argv) {
 
   free(all_reduce_buffer_host);
   cudaCheck(cudaFree(all_reduce_buffer));
+  cudaCheck(cudaFree(all_reduce_buffer_recv));
   multi_gpu_config_free(&multi_gpu_config);
 }

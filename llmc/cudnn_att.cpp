@@ -3,6 +3,7 @@
 // TODO this currently duplicates some of the utilities from the main file
 
 #define NOMINMAX
+#include <unistd.h>
 #include "cudnn_att.h"
 #include <cudnn_frontend.h>
 
