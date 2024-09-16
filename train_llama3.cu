@@ -46,6 +46,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines: encoder_forward, encoder_backward
 #include "llmc/encoder.cuh"
 // defines: layernorm_forward, residual_forward, fused_residual_forward5, layernorm_backward
+// defines: rmsnorm_forward
 #include "llmc/layernorm.cuh"
 // defines: matmul_cublaslt, matmul_forward, matmul_backward, gelu_forward, gelu_backward_inplace
 #include "llmc/matmul.cuh"
@@ -620,19 +621,20 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     ActivationTensors acts = model->acts;
     encoder_forward(acts.encoded, model->inputs, params.wte, NULL, B, T, C, main_stream); // encoding goes into residual[0]
 
+    // first layernorm isn't fused
+    rmsnorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_rstd, acts.encoded, params.ln1w, B, T, C, main_stream);
+
     // ------------------------------------------------------------------------
     // DEBUGGING: we only work until this point right now, so exit here
     // transfer the first 32 elements to CPU and print them
+    floatX* output = (model->recompute < 2) ? acts.ln1 : acts.lnf;
     floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
-    cudaCheck(cudaMemcpy(cpu, acts.encoded, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
     for (int i = 0; i < 32; i++) {
-        printf("cpu[%d] = %f\n", i, (float) cpu[i]);
+        printf("cpu[%d] = %.8f\n", i, (float) cpu[i]);
     }
     exit(0);
     // ------------------------------------------------------------------------
-
-    // first layernorm isn't fused
-    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);

@@ -166,6 +166,14 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, freqs_cis=None, start_pos=None, mask=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # ---------------------------------------------------------------------
+        # DEBUGGING: print first 32 elements of x
+        for i in range(32):
+            print("acts[{}]: {}".format(i, x.view(-1)[i].item()))
+        breakpoint()
+        # ---------------------------------------------------------------------
+
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
         q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
@@ -299,14 +307,6 @@ class LLaMA(nn.Module):
         # forward the LLaMA model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         freqs_cis = self.freqs_cis[start_pos:start_pos+t]
-
-        # ---------------------------------------------------------------------
-        # DEBUGGING: print first 32 elements of x
-        for i in range(32):
-            print("acts[{}]: {}".format(i, x.view(-1)[i].item()))
-        breakpoint()
-        # ---------------------------------------------------------------------
-
         mask = torch.triu(torch.ones((t, t), device=next(self.parameters()).device, dtype=torch.bool), diagonal=1)
 
         for i, block in enumerate(self.transformer.h):
