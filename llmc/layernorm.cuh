@@ -139,7 +139,7 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
     }
 }
 
-__global__ void rmsnorm_forward_kernel6(floatX* __restrict__ out, float* __restrict__ rstd,
+__global__ void rmsnorm_forward_kernel6(floatX* __restrict__ out, float* __restrict__ rms,
                                     const floatX*  __restrict__ inp, const floatX*  __restrict__ weight, int N, int C) {
     // this kernel is a simplified version of layernorm_forward_kernel6
     assert(blockDim.x == WARP_SIZE);
@@ -166,18 +166,18 @@ __global__ void rmsnorm_forward_kernel6(floatX* __restrict__ out, float* __restr
     out += idx * C;
 
     const float eps = 1e-5f;
-    float rms = 0.f;
+    float acc = 0.f;
 
     for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
         const x128 in_data = load128cs(inp + c);
         s_in[c / x128::size] = in_data;
         for(int k = 0; k < x128::size; ++k) {
-            rms += (float)in_data[k] * (float)in_data[k];
+            acc += (float)in_data[k] * (float)in_data[k];
         }
     }
 
-    rms = warpReduceSum(rms) / C;
-    float s = rsqrtf(rms + eps);
+    acc = warpReduceSum(acc) / C;
+    float s = rsqrtf(acc + eps);
 
     for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
         const x128 in_data = s_in[c / x128::size];
@@ -192,9 +192,9 @@ __global__ void rmsnorm_forward_kernel6(floatX* __restrict__ out, float* __restr
         store128cs(out + c, out_data);
     }
 
-    // store the rstd, no need to cache it
-    if(threadIdx.x == 0 && rstd != nullptr) {
-        __stcs(rstd + idx, s);
+    // store the rms, no need to cache it
+    if(threadIdx.x == 0 && rms != nullptr) {
+        __stcs(rms + idx, s);
     }
 }
 
@@ -514,7 +514,7 @@ void layernorm_forward(floatX* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
-void rmsnorm_forward(floatX* out, float* rstd,
+void rmsnorm_forward(floatX* out, float* rms,
                        floatX* inp, const floatX* weight,
                        int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
@@ -530,7 +530,7 @@ void rmsnorm_forward(floatX* out, float* rstd,
     auto status = cudaFuncSetAttribute(rmsnorm_forward_kernel6, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaCheck(cudaGetLastError());
     if (status == cudaSuccess) {
-        rmsnorm_forward_kernel6<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(out, rstd, inp, weight, N, C);
+        rmsnorm_forward_kernel6<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(out, rms, inp, weight, N, C);
     } else {
         // We should not allow for these perf regressions for now - just throw an error
         assert(false);
