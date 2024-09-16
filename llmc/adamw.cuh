@@ -21,6 +21,8 @@ __global__ void adamw_full_update(TensorSpec* specs, unsigned int seed,
                                   float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction,
                                   float eps, float weight_decay, float grad_scale, int t, bool init_from_master_only=false) {
     // ...
+    __shared__ int shared_spec_id;
+
     constexpr size_t block_size = 64; // 64 ==> 4KiB chunks with iteration_size=16 for FP32 opt/master
     size_t iteration_size = 16;
     assert(iteration_size <= 16);
@@ -39,17 +41,30 @@ __global__ void adamw_full_update(TensorSpec* specs, unsigned int seed,
     size_t current_start = opt_spec.offset / sizeof(float);
     size_t current_end = current_start + opt_spec.num_elements;
 
-    while (idx < num_opt_parameters) {
-        // todo - do this part on thread 0 only?
-        while (idx >= current_end) {
-            spec_id++;
-            if (spec_id >= num_params_tensors) {
-                return;
+    while (true) {
+        // todo - performance analysis/optimisation! (impact of using step 0?)
+        if (threadIdx.x == 0) {
+            while (idx >= current_end) {
+                spec_id++;
+                if (spec_id >= num_params_tensors) {
+                    shared_spec_id = -1;
+                    return;
+                }
+                opt_spec = opt_v_specs[spec_id];
+                current_start = opt_spec.offset / sizeof(float);
+                current_end = current_start + opt_spec.num_elements;
             }
-            opt_spec = opt_v_specs[spec_id];
-            current_start = opt_spec.offset / sizeof(float);
-            current_end = current_start + opt_spec.num_elements;
+            shared_spec_id = spec_id;
         }
+        __syncthreads();
+        spec_id = shared_spec_id;
+        if (spec_id == -1) {
+            return;
+        }
+
+        opt_spec = opt_v_specs[spec_id];
+        current_start = opt_spec.offset / sizeof(float);
+        current_end = current_start + opt_spec.num_elements;
 
         TensorGPU<floatX> grad_tensor = grad_specs[spec_id];
         TensorGPU<float> master_tensor = master_specs[spec_id];
@@ -63,7 +78,7 @@ __global__ void adamw_full_update(TensorSpec* specs, unsigned int seed,
         // todo - make it configurable whether weight decay applies to e.g. bias or not
         float wd = (opt_spec.flags & TENSOR_2D) ? weight_decay : 0.0f;
 
-        if (specs[spec_id].data_type == DType::BF16 || specs[spec_id].data_type == DType::FP16) {
+        if (specs[spec_id].data_type == DType::BF16) {
             // todo - this is actually "EQUAL FLOATX" right now, doesn't work for mix and match
             // !!!
             TensorGPU<__nv_bfloat16> param_tensor = specs[spec_id];
@@ -123,10 +138,10 @@ __global__ void adamw_full_update(TensorSpec* specs, unsigned int seed,
                     }
                     out_param128.store(offset);
                 }
-                out_param128.update_absmax(threadIdx.x, block_size, false);
                 idx_blk += stride;
                 idx += stride;
             }
+            out_param128.update_absmax(threadIdx.x, block_size, false);
         } else {
             assert(false); // TODO
         }

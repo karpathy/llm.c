@@ -47,7 +47,7 @@ extern cudaStream_t main_stream;
 
 // short-cuts for compile-time boolean values that can be used as function arguments
 constexpr std::bool_constant<true> True;
-constexpr std::bool_constant<true> False;
+constexpr std::bool_constant<false> False;
 
 // ----------------------------------------------------------------------------
 // Error checking

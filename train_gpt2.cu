@@ -2,7 +2,7 @@
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 #define UNIQUE_TENSOR_MEMORY false
-#define LAYERS_PER_ACTIVATION_CHECKPOINT 1 // 0 = disabled
+#define LAYERS_PER_ACTIVATION_CHECKPOINT 0 // 0 = disabled
 
 #include <unistd.h>
 #include <stdio.h>
@@ -87,6 +87,45 @@ TensorGPU<floatX> null_tensorX = {0};
 TensorGPU<float> null_tensorFP32 = {0};
 // buffer size to use for device <-> disk io
 constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
+
+// todo - move this
+__global__ void update_scale_descale_kernel(float* gpu_scale_memory, unsigned int* gpu_absmax_memory, int num_tensor_specs) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_tensor_specs) return;
+
+    // Get the absmax value for this tensor
+    unsigned int absmax_uint = gpu_absmax_memory[tid];
+    float absmax = __uint_as_float(absmax_uint);
+
+    // Calculate scale and descale
+    if (absmax == 0.0f) {
+        absmax = 1.0f;
+    }
+    float scale = 1.0f / absmax;
+    float descale = absmax;
+
+    if (!(tensor_specs_ptr[tid].flags & TFlags::RESIDUAL) && !(tensor_specs_ptr[tid].flags & TFlags::EMBEDDING) && absmax != 1.0f) {
+        if  ((tensor_specs_ptr[tid].flags & TFlags::GRADIENT) && (tensor_specs_ptr[tid].tensor_type == TT::ACTIVATIONS_MULTIUSE)) {
+            // e5
+            scale *= 32768.0f;
+            descale *= 1.0f/32768.0f;
+        } else {
+            // e4
+            scale *= 256.0f;
+            descale *= (1.0f/256.0f);
+        }
+    } else {
+        scale = 1.0f;
+        descale = 1.0f;
+    }
+
+    // todo: circular buffer
+    //gpu_absmax_memory[tid] = 0.0f;
+
+    // Update gpu_scale_memory
+    gpu_scale_memory[tid * 2] = scale;
+    gpu_scale_memory[tid * 2 + 1] = descale;
+}
 
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
@@ -388,89 +427,122 @@ void gpt2_allocate(GPT2 *model) {
     reuse_every_n = LAYERS_PER_ACTIVATION_CHECKPOINT;
     assert(!reuse_every_n  || (L % reuse_every_n) == 0);
 
-    TENSOR_SPECS     (encoded,    1, BTC,     0);
-    TENSOR_SPECS     (lnf,        1, BTC,     0);
-    TENSOR_SPECS_FP32(lnf_mean,   1, BT,      LAYERNORM | STATS);
-    TENSOR_SPECS_FP32(lnf_rstd,   1, BT,      LAYERNORM | STATS);
-    TENSOR_SPECS_FP32(losses,     1, BT,      0);
-
-    TENSOR_SPECS_FP32(ln1_mean,   L, BT,      LAYERNORM | STATS);
-    TENSOR_SPECS_FP32(ln1_rstd,   L, BT,      LAYERNORM | STATS);
-    TENSOR_SPECS     (atty,       L, BTC,     0);
-    TENSOR_SPECS     (residual2,  L, BTC,     RESIDUAL);
-    TENSOR_SPECS_FP32(ln2_mean,   L, BT,      LAYERNORM | STATS);
-    TENSOR_SPECS_FP32(ln2_rstd,   L, BT,      LAYERNORM | STATS);
-    TENSOR_SPECS_LOWP(fch,        L, 4 * BTC, 0);
-    TENSOR_SPECS     (qkvr,       L, 3 * BTC, 0);
+    TENSOR_SPECS     (encoded,    1, BTC,     EMBEDDING);
+    TENSOR_SPECS     (qkvr,       L, 3 * BTC, TENSOR_2D);
     #ifdef ENABLE_CUDNN
     TENSOR_SPECS_FP32(att,        L, NH * B * T, 0);
     #else
     TENSOR_SPECS     (att,        L, NH * B * T * T, 0);
     #endif
-
-    if (UNIQUE_TENSOR_MEMORY) {
-        TENSOR_SPECS     (output,   1, output_size, 0);
-        TENSOR_SPECS_LOWP(fcproj,   L, BTC, 0);
-        TENSOR_SPECS_LOWP(attproj,  L, BTC, 0);
-    } else {
-        spec->output = add_tensor_spec("output", output_size, shards, dtype, model->multiuse.output_scratch, REUSED_MEMORY);
-        spec->fcproj = add_layer_specs(L, "fcproj", BTC, shards, dtype_lowp, model->multiuse.btc, REUSED_MEMORY);
-        spec->attproj = add_layer_specs(L, "attproj", BTC, shards, dtype_lowp, model->multiuse.btc, REUSED_MEMORY);
-    }
+    TENSOR_SPECS     (atty,       L, BTC,     0);
+    TENSOR_SPECS     (residual2,  L, BTC,     RESIDUAL);
+    TENSOR_SPECS_LOWP(fch,        L, 4 * BTC, TENSOR_2D);
 
     // optionally reuse the same activation buffer at each layer and re-compute the gelu during backward
     // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
     if (model->recompute < 1 || UNIQUE_TENSOR_MEMORY) {
-        TENSOR_SPECS(ln1,           L, BTC, LAYERNORM);
-        TENSOR_SPECS(ln2,           L, BTC, LAYERNORM);
         TENSOR_SPECS(fch_gelu,      L, 4 * BTC, 0);
-    } else if (model->recompute < 2) {
         TENSOR_SPECS(ln1,           L, BTC, LAYERNORM);
         TENSOR_SPECS(ln2,           L, BTC, LAYERNORM);
-        spec->fch_gelu = add_layer_specs(L, "fch_gelu", 4 * BTC, shards, dtype_lowp, model->acts.output, REUSED_MEMORY);
+    } else if (model->recompute < 2) {
+        spec->fch_gelu = add_layer_specs(L, "fch_gelu", 4 * BTC, shards, dtype_lowp, model->multiuse.output_scratch, REUSED_MEMORY);
+        TENSOR_SPECS(ln1,           L, BTC, LAYERNORM);
+        TENSOR_SPECS(ln2,           L, BTC, LAYERNORM);
     } else {
+        spec->fch_gelu = add_layer_specs(L, "fch_gelu", 4 * BTC, shards, dtype_lowp, model->multiuse.output_scratch, REUSED_MEMORY);
         spec->ln1 = add_layer_specs(L, "ln1", BTC, shards, dtype, model->multiuse.btc, LAYERNORM | REUSED_MEMORY);
         spec->ln2 = add_layer_specs(L, "ln2", BTC, shards, dtype, model->multiuse.btc, LAYERNORM | REUSED_MEMORY);
-        spec->fch_gelu = add_layer_specs(L, "fch_gelu", 4 * BTC, shards, dtype_lowp, model->acts.output, REUSED_MEMORY);
+    }
+    TENSOR_SPECS_FP32(ln1_mean,   L, BT,      LAYERNORM | STATS);
+    TENSOR_SPECS_FP32(ln1_rstd,   L, BT,      LAYERNORM | STATS);
+    TENSOR_SPECS_FP32(ln2_mean,   L, BT,      LAYERNORM | STATS);
+    TENSOR_SPECS_FP32(ln2_rstd,   L, BT,      LAYERNORM | STATS);
+
+    if (UNIQUE_TENSOR_MEMORY) {
+        TENSOR_SPECS_LOWP(attproj,  L, BTC, TENSOR_2D);
+        TENSOR_SPECS_LOWP(fcproj,   L, BTC, TENSOR_2D);
+        TENSOR_SPECS     (output,   1, output_size, TENSOR_2D | EMBEDDING);
+    } else {
+        spec->attproj = add_layer_specs(L, "attproj", BTC, shards, dtype_lowp, model->multiuse.btc, REUSED_MEMORY | TENSOR_2D);
+        spec->fcproj = add_layer_specs(L, "fcproj", BTC, shards, dtype_lowp, model->multiuse.btc, REUSED_MEMORY | TENSOR_2D);
+        spec->output = add_tensor_spec("output", output_size, shards, dtype, model->multiuse.output_scratch, REUSED_MEMORY | EMBEDDING | TENSOR_2D);
     }
 
+    TENSOR_SPECS     (lnf,        1, BTC,     LAYERNORM);
+    TENSOR_SPECS_FP32(lnf_mean,   1, BT,      LAYERNORM | STATS);
+    TENSOR_SPECS_FP32(lnf_rstd,   1, BT,      LAYERNORM | STATS);
+    TENSOR_SPECS_FP32(losses,     1, BT,      0);
+
+
+
+        if(model->recompute >= 1) { // recompute >= 1 means we recompute gelu
+            gelu_forward(ACT(fch_gelu), ACT(fch));
+        }
+        matmul_backward<floatX>(AGRAD(fch), PGRAD(fcprojw), PGRAD(fcprojb), AGRAD(residual3), ACT(fch_gelu), PARAM(fcprojw), scratchF, B*T, 4*C, C, ACT(fch), model->gelu_fusion);
+
+        if(model->recompute >= 2) { // recompute >= 2 means we recompute layernorm
+            layernorm_forward(ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), ACT(residual2), PARAM(ln2w), PARAM(ln2b), B*T, C);
+        }
+        matmul_backward(AGRAD(ln2), PGRAD(fcw), PGRAD(fcb), AGRAD(fch), ACT(ln2), PARAM(fcw), scratchF, B*T, C, 4 * C);
+        layernorm_backward(AGRAD(residual2), AGRAD(residual3), PGRAD(ln2w), PGRAD(ln2b), scratchF, AGRAD(ln2), ACT(residual2), PARAM(ln2w), ACT(ln2_mean), ACT(ln2_rstd), B*T, C);
+        matmul_backward(AGRAD(atty), PGRAD(attprojw), PGRAD(attprojb), AGRAD(residual2), ACT(atty), PARAM(attprojw), scratchF, B*T, C, C);
+
+        #ifdef ENABLE_CUDNN
+        attention_backward_cudnn(AGRAD(qkvr), AGRAD(atty), ACT(qkvr), ACT(atty), ACT(att), B, T, NH, C);
+        #else
+        // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
+        floatX* buffer_a = ACT(atty);
+        floatX* buffer_b = ACT(fch);
+        attention_backward(AGRAD(qkvr), buffer_b, scratchX_HUGE, buffer_a, AGRAD(atty), ACT(qkvr), ACT(att), B, T, C, NH);
+        #endif
+
+        if(model->recompute >= 2) {
+            layernorm_forward(ACT(ln1), ACT(ln1_mean), ACT(ln1_rstd), residual, PARAM(ln1w), PARAM(ln1b), B*T, C);
+        }
+        matmul_backward(AGRAD(ln1), PGRAD(qkvw), PGRAD(qkvb), AGRAD(qkvr), ACT(ln1), PARAM(qkvw), scratchF, B*T, C, 3 * C);
+        layernorm_backward(dresidual, AGRAD(residual2), PGRAD(ln1w), PGRAD(ln1b), scratchF, AGRAD(ln1), residual, PARAM(ln1w), ACT(ln1_mean), ACT(ln1_rstd), B*T, C);
+
+
+
+
     // 4) activation gradients
-    // todo - specify subtype!
+    // note: TENSOR_2D are for the tensors written to by a matmul which are different here
+    // todo - is "LAYERNORM" applied logically here? do we care?
     reuse_every_n = 0;
     spec = &model->acts_grads;
     dtype_lowp = DTYPE_FLOATX; // todo FP8
     shards = 1;
 
     if (UNIQUE_TENSOR_MEMORY) {
-        TENSOR_SPECS(encoded,    1, BTC,            GRADIENT);
-        TENSOR_SPECS(output,     1, output_size,    GRADIENT);
-        TENSOR_SPECS(lnf,        1, BTC,            GRADIENT | LAYERNORM);
-        TENSOR_SPECS(ln1,        L, BTC,            GRADIENT | LAYERNORM);
-        TENSOR_SPECS(atty,       L, BTC,            GRADIENT);
+        TENSOR_SPECS(encoded,    1, BTC,            GRADIENT | EMBEDDING);
+        TENSOR_SPECS(output,     1, output_size,    GRADIENT | EMBEDDING);
+        TENSOR_SPECS(lnf,        1, BTC,            GRADIENT | LAYERNORM | TENSOR_2D);
+        TENSOR_SPECS(ln1,        L, BTC,            GRADIENT | LAYERNORM | TENSOR_2D);
+        TENSOR_SPECS(atty,       L, BTC,            GRADIENT | TENSOR_2D);
         TENSOR_SPECS(residual2,  L, BTC,            GRADIENT | RESIDUAL);
-        TENSOR_SPECS(ln2,        L, BTC,            GRADIENT | LAYERNORM);
-        TENSOR_SPECS(fch,        L, 4 * BTC,        GRADIENT);
-        TENSOR_SPECS(fch_gelu,   L, 4 * BTC,        GRADIENT);
+        TENSOR_SPECS(ln2,        L, BTC,            GRADIENT | LAYERNORM | TENSOR_2D);
+        TENSOR_SPECS(fch,        L, 4 * BTC,        GRADIENT | TENSOR_2D);
+        TENSOR_SPECS(fch_gelu,   L, 4 * BTC,        GRADIENT | TENSOR_2D);
         TENSOR_SPECS(residual3,  L, BTC,            GRADIENT | RESIDUAL);
         TENSOR_SPECS(qkvr,       L, 3 * BTC,        GRADIENT);
     } else {
-        spec->output = add_layer_specs(1, "output", output_size, 1, dtype, model->multiuse.output_scratch, GRADIENT);
+        spec->output = add_layer_specs(1, "output", output_size, 1, dtype, model->multiuse.output_scratch, GRADIENT | EMBEDDING);
 
         int reused_btc = model->acts.residual3 + (L-1); // todo - check if this works with activation checkpointing
-        spec->ln1 = add_layer_specs(L, "ln1", BTC, 1, dtype, reused_btc, GRADIENT | LAYERNORM);
-        spec->ln2 = add_layer_specs(L, "ln2", BTC, 1, dtype, reused_btc, GRADIENT | LAYERNORM);
-        spec->atty = add_layer_specs(L, "atty", BTC, 1, dtype, reused_btc, GRADIENT);
+        spec->ln1 = add_layer_specs(L, "ln1", BTC, 1, dtype, reused_btc, GRADIENT | LAYERNORM | TENSOR_2D);
+        spec->ln2 = add_layer_specs(L, "ln2", BTC, 1, dtype, reused_btc, GRADIENT | LAYERNORM | TENSOR_2D);
+        spec->atty = add_layer_specs(L, "atty", BTC, 1, dtype, reused_btc, GRADIENT | TENSOR_2D);
 
         int reused_btc2 = model->acts.lnf;
         spec->residual2 = add_layer_specs(L, "residual2", BTC, 1, dtype, reused_btc2, GRADIENT | RESIDUAL);
         spec->residual3 = add_layer_specs(L, "residual3", BTC, 1, dtype, reused_btc2, GRADIENT | RESIDUAL);
-        spec->encoded = add_layer_specs(1, "encoded", BTC, 1, dtype, reused_btc2, GRADIENT);
+        spec->encoded = add_layer_specs(1, "encoded", BTC, 1, dtype, reused_btc2, GRADIENT | EMBEDDING);
 
         // (lnf doesn't need bt4c but it's free at this point unlike the other buffers)
-        spec->lnf = add_layer_specs(1, "lnf", BTC, 1, dtype, model->multiuse.bt4c, GRADIENT | LAYERNORM);
-        spec->fch_gelu = add_layer_specs(L, "fch_gelu", 4 * BTC, 1, dtype, model->multiuse.bt4c, GRADIENT);
-        spec->fch = add_layer_specs(L, "fch", 4 * BTC, 1, dtype, model->multiuse.bt4c, GRADIENT);
-        spec->qkvr = add_layer_specs(L, "qkvr", 3 * BTC, 1, dtype, model->multiuse.bt4c, GRADIENT);
+        spec->lnf = add_layer_specs(1, "lnf", BTC, 1, dtype, model->multiuse.bt4c, GRADIENT | LAYERNORM | TENSOR_2D);
+        spec->fch_gelu = add_layer_specs(L, "fch_gelu", 4 * BTC, 1, dtype, model->multiuse.bt4c, GRADIENT | TENSOR_2D);
+        spec->fch = add_layer_specs(L, "fch", 4 * BTC, 1, dtype, model->multiuse.bt4c, GRADIENT | TENSOR_2D);
+        spec->qkvr = add_layer_specs(L, "qkvr", 3 * BTC, 1, dtype, model->multiuse.bt4c, GRADIENT | TENSOR_2D);
     }
 
     // allocate a single huge GPU buffer for all the tensors of a given type
@@ -818,7 +890,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         NvtxRange layer_range("Layer", l);
         tensorX residual = (l == 0) ? ACT(encoded) : ACT_L(residual3, l-1);
 
-        tensorX qkvr = MULTI(output_scratch); // non-cudnn reuses tensor with different memory pre/post-permute
+        tensorX qkvr = ACT(qkvr); // non-cudnn reuses tensor with different memory pre/post-permute
         qkvr.data_ptr = CUDNN_ENABLED ? ACT(qkvr) : MULTI(output_scratch);
         matmul_forward_cublaslt(qkvr, ACT(ln1), PARAM(qkvw), PARAM(qkvb), B*T, C, 3*C);
         #ifdef ENABLE_CUDNN
@@ -1195,6 +1267,11 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         }
     }
     */
+
+    // todo - hack - update scale/descale from absmax
+    int absmax_block_size = 256;
+    int num_blocks = (num_tensor_specs + absmax_block_size - 1) / block_size;
+    update_scale_descale_kernel<<<num_blocks, absmax_block_size>>>(gpu_scale_memory, gpu_absmax_memory, num_tensor_specs);
 
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -1779,6 +1856,9 @@ int main(int argc, char *argv[]) {
     // in any case, this must be true or we'd index beyond the model's wpe (position embedding table)
     assert(T <= model.config.max_seq_len);
 
+    // todo - hack - do this to update the absmax of all the weights
+    gpt2_update(&model, 0.0f, 0.9f, 0.95f, 1e-8f, 1.0f, 1.0f, 1, &multi_gpu_config);
+
     // train
     cudaEvent_t start, end;
     cudaCheck(cudaEventCreate(&start));
@@ -1926,6 +2006,14 @@ int main(int argc, char *argv[]) {
             // clip the gradient norm to a maximum value
             float grad_clip = 1.0f;
             float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
+
+            // todo - hack - because the 1st step is now kinda useless due to FP8 absmax scaling not being ready
+            // todo - ideally should rerun this step so we don't "waste" the data without training on it
+            if (step == 0) {
+                step_learning_rate = 0.0f;
+                weight_decay = 1.0f;
+            }
+
             gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
         }
         cudaCheck(cudaEventRecord(end));

@@ -3,6 +3,8 @@
 #ifndef CUDA_UTILS_CUH
 #define CUDA_UTILS_CUH
 
+#define FAKE_FP8
+
 #include "cuda_common.h"
 
 struct TensorSpec;  // Forward declaration
@@ -10,6 +12,24 @@ struct TensorSpec;  // Forward declaration
 __device__ __constant__ TensorSpec* tensor_specs_ptr;
 __device__ __constant__ float* gpu_scale_memory_ptr;
 __device__ __constant__ unsigned int* gpu_absmax_memory_ptr;
+
+enum TT : uint8_t {
+    PARAMETER=0, PARAMETER_GRAD, PARAMETER_OPT_M, PARAMETER_OPT_V, PARAMETER_MASTER, // 1 allocation each
+    ACTIVATIONS_MULTIUSE, // single buffer shared for activations, activation gradients, and scratch
+    DEFAULT, COUNT=DEFAULT, NUM_TYPES_PARAM=PARAMETER_MASTER+1
+};
+
+enum TFlags : uint8_t {
+    NONE=0,
+    REUSED_MEMORY=1,
+    GRADIENT=2,
+    TENSOR_2D=4, // used for matmul *outputs* only, not inputs (+weights)
+    BIAS=8,
+    LAYERNORM=16,
+    RESIDUAL=32,
+    EMBEDDING=64,
+    STATS=128
+};
 
 // ----------------------------------------------------------------------------
 // Packed128 data structure that forces the compiler to use 128-bit loads/stores
@@ -181,17 +201,16 @@ __device__ __host__ unsigned int get_random_noise(unsigned int seed, unsigned in
 // stochastic rounding (typicalling using Squirel Noise above to go from a seed to a random number)
 // new algorithm that calculates distance from rounded up/down values to correctly handle denorms
 // (didn't matter with BF16 because denorms are so tiny they're irrelevant, unlike in FP8/FP16)
-template<bool noise=true, typename highp=float, typename Ti=__nv_fp8_e4m3>
-__device__ __forceinline__ void stochastic_rounding(float in, Ti *out, unsigned int seed, float prob_offset=0.0f) {
+template<typename Ti=__nv_fp8_e4m3>
+__device__ void stochastic_rounding(float in, Ti &out, unsigned int random, float prob_offset=0.0f) {
     if constexpr (std::is_same<Ti, float>::value) {
-            *out = in;
-            return;
+        out = in;
+        return;
     }
 
-    unsigned int random = noise ? get_random_noise(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed) : seed;
     // prob_offset allows rounding towards gradient more of the time (one paper recommends that)
     // e.g. +0.3f ==> 65% chance up, 35% chance down
-    highp threshold_percentage = ((highp)random / (highp)0xFFFFFFFF) - prob_offset;
+    float threshold_percentage = ((float)random / (float)0xFFFFFFFF) - prob_offset;
 
     Ti rounded_down, rounded_up;
     if constexpr (std::is_same<Ti, half>::value) {
@@ -203,48 +222,64 @@ __device__ __forceinline__ void stochastic_rounding(float in, Ti *out, unsigned 
     } else if constexpr (std::is_same<Ti, __nv_fp8_e4m3>::value) {
         // CUDA doesn't have round down/up instructions for FP8 (in SW or HW) so we do it ourselves
         // ARM-Intel-NVIDIA style FP8 E4M3 (different for AMD-Graphcore-Qualcomm format!)
-        Ti rounded = __nv_fp8_e4m3(in);
-        unsigned char rounded_bits = rounded.__x;
-        unsigned char absolute_bits = rounded_bits & 127;
-        unsigned char rounded_up_bits = absolute_bits + 1;
-        unsigned char rounded_down_bits = absolute_bits - 1;
+        float low = in;
+        float high = in;
 
-        // compiler likes the following code atm, but small changes may increase instructions by a lot
-        // as it may suddenly decide to use branches rather than predication...
-        if (absolute_bits >= 126) { // maximum normal value (+NaN)
-            rounded_up_bits = absolute_bits;
-            if (absolute_bits == 127) { // NaN (not always preserving sign)
-                rounded_down_bits = 127;
-            }
-        } else if (absolute_bits == 0) { // zero
-            rounded_down_bits = 0;
+        if (fabsf(in) < 0.0156f) {
+            low -= 0.000975f;
+            high += 0.000975f;
         } else {
-            unsigned char mantissa_bits = absolute_bits & 7;
-            if (mantissa_bits == 7) { // maximum mantissa (already known non-NaN/non-max)
-                rounded_up_bits = (absolute_bits - mantissa_bits) + 8; // clear mantissa, add 1 to exponent
-            } else if (mantissa_bits == 0) { // minimum mantissa (already known non-zero)
-                rounded_down_bits = (absolute_bits + 7) - 8; // max mantissa, subtract 1 from exponent
+            if (in > 0.0f) {
+                low *= (15.5f / 16.0f);
+                high *= (8.5f / 8.0f);
+            } else {
+                low *= (8.5f / 8.0f);
+                high *= (15.5f / 16.0f);
             }
         }
-        if (in < 0) { // negative input: swap rounded up/down and add negative sign
-            unsigned char swap_tmp = rounded_down_bits | 128;
-            rounded_down_bits = rounded_up_bits | 128;
-            rounded_up_bits = swap_tmp;
-        }
-
-        // rounding to nearest even already gave us 1 of the 2 rounded values surrounding the input
-        // we only need the other one (but no point skipping anything above given SIMT divergence)
-        rounded_down.__x = ((float)rounded <= in) ? rounded.__x : rounded_down_bits;
-        rounded_up.__x = ((float)rounded >= in) ? rounded.__x : rounded_up_bits;
-    } else if constexpr (std::is_same<Ti, __nv_fp8_e5m2>::value) {
-        assert(false); // todo
-    } else {
-        assert(false);
+        rounded_up = (__nv_fp8_e4m3)high;
+        rounded_down = (__nv_fp8_e4m3)low;
     }
 
-    highp diff = (highp)rounded_up - (highp)rounded_down;
-    highp lerp = ((highp)in - (highp)rounded_down) / diff; // division by 0 is OK as it means (up == down) anyway
-    *out = (lerp > threshold_percentage) ? rounded_up : rounded_down;
+    float diff = (float)rounded_up - (float)rounded_down;
+    float lerp = (in - (float)rounded_down) / diff; // division by 0 is OK as it means (up == down) anyway
+    out = (lerp > threshold_percentage) ? rounded_up : rounded_down;
+}
+
+
+// ----------------------------------------------------------------------------
+
+// todo - stochastic is bugged, spent hours debugging, no idea why backwards is so broken with it
+__device__ float fake_fp8(bool faking, float input, float scale, float descale, bool mode_e5, bool stochastic=false) {
+#ifdef FAKE_FP8
+    unsigned int random_number;
+    if (false) {
+        unsigned int clock, laneid;
+        asm volatile("mov.u32 %0, %%clock;" : "=r"(clock));
+        asm volatile("mov.u32 %0, %%laneid;" : "=r"(laneid));
+        random_number = get_random_noise(clock, laneid, blockIdx.x * blockDim.x);
+    }
+
+    if (faking && scale != 1.0f) {
+        assert(scale == 1.0f/descale || scale == 1.0f);
+        if (mode_e5) {
+            __nv_fp8_e5m2 value_fp8 = __nv_fp8_e5m2(input * scale);
+            if (false) {
+                //stochastic_rounding(input * scale, value_fp8, random_number);
+            }
+            return ((float)value_fp8) * descale;
+
+        } else {
+            __nv_fp8_e4m3 value_fp8 = __nv_fp8_e4m3(input * scale);
+            if (stochastic) {
+                // BUGGED - spent 6+ hours debuggin this, and at this point, I genuinely suspect a compiler bug *sigh*
+                //stochastic_rounding(input * scale, value_fp8, random_number);
+            }
+            return ((float)value_fp8) * descale;
+        }
+    }
+#endif
+    return input;
 }
 
 // ----------------------------------------------------------------------------
@@ -286,6 +321,10 @@ struct TensorGPU {
     }
 
     __device__ __host__ float get_scalar(size_t index, bool disable_scaling=false) const {
+        #ifdef FAKE_FP8
+        disable_scaling = true;
+        #endif
+
         ElementType* __restrict__ data_ptr_restricted = data_ptr;
         float* __restrict__ scale_ptr_restricted = scale_descale_ptr;
 
@@ -295,6 +334,10 @@ struct TensorGPU {
     }
 
     __device__ __host__ ElementType set_scalar(size_t index, float value, bool disable_scaling=false) {
+        #ifdef FAKE_FP8
+        disable_scaling = true;
+        #endif
+
         ElementType* __restrict__ data_ptr_restricted = data_ptr;
         float* __restrict__ scale_ptr_restricted = scale_descale_ptr;
 
@@ -329,6 +372,9 @@ private:
     bool wrote_data = false;
     bool wrote_absmax = false;
     int id = -1;
+    // fake fp8 mode
+    bool faking_fp8 = false;
+    bool mode_e5 = false;
 
 public:
     bool scaling = true; // todo - fp8 only
@@ -339,18 +385,26 @@ public:
         data_ptr = tensor.data_ptr;
         id = tensor.id;
 
-        if (!disable_scaling) {
-            float2* __restrict__ ptr_restricted = (float2*)tensor.scale_descale_ptr;
-            if (tensor.scale_descale_ptr == nullptr) {
-                assert(false);
+#ifdef FAKE_FP8
+        if (!disable_scaling && id >= 0 && sizeof(ElementType) == 2 && tensor_specs_ptr[id].tensor_type != TT::PARAMETER_GRAD) {
+            if (!(tensor_specs_ptr[id].flags & TFlags::RESIDUAL) && !(tensor_specs_ptr[id].flags & TFlags::EMBEDDING)) {
+                faking_fp8 = true;
+                if  ((tensor_specs_ptr[id].flags & TFlags::GRADIENT) && (tensor_specs_ptr[id].tensor_type == TT::ACTIVATIONS_MULTIUSE)) {
+                    mode_e5 = true;
+                }
             }
-            float2 scale_descale = *ptr_restricted;
-            scale = scale_descale.x;
-            descale = scale_descale.y;
-            absmax_ptr = tensor.absmax_ptr;
+        }
+        scaling = false; // only do "fake" scaling
+#endif
+
+        if (!disable_scaling) {
+            const float* __restrict__ ptr_restricted = tensor.scale_descale_ptr;
+            scale = ptr_restricted[0];
+            descale = ptr_restricted[1];
         } else {
             scaling = false;
         }
+        absmax_ptr = tensor.absmax_ptr;
     }
 
     __device__ void load(size_t offset, bool cache_streaming=false) {
@@ -387,16 +441,20 @@ public:
 
     // call this manually if e.g. you use set_scalar() to update the tensor
     // todo - in the future, this could consider more than just absmax
-    __device__ void add_value_stats(float value, ElementType output) {
+    __device__ void add_value_stats(float value, ElementType output=(ElementType)0.0f) {
         new_absmax = max(new_absmax, fabsf(value));
     }
 
     __device__ float get(int index) {
-        return (float)data128[index] * (scaling ? descale : 1.0f);
+        float value = (float)data128[index] * (scaling ? descale : 1.0f);
+        value = fake_fp8(faking_fp8, value, scale, descale, mode_e5);
+        return value;
     }
 
     __device__ void set(int index, float value) {
-        data128[index] = (ElementType)(value * (scaling ? scale : 1.0f));
+        float output = value * (scaling ? scale : 1.0f);
+        output = fake_fp8(faking_fp8, output, scale, descale, mode_e5);
+        data128[index] = (ElementType)(output);
         add_value_stats(value, data128[index]);
     }
 
@@ -423,29 +481,47 @@ public:
             random_number = get_random_noise(clock, laneid, blockIdx.x * blockDim.x);
         }
 
-        stochastic_rounding<false>(scaled_value, &data128[index], random_number);
+        stochastic_rounding(scaled_value, data128[index], random_number);
         add_value_stats(value, data128[index]);
     }
 
     __device__ bool update_absmax(int thread_id, int num_threads, bool exit=false, bool forced=false) {
+        #ifdef FAKE_FP8
+        if (id < 0 || absmax_ptr == NULL) {
+            return false;
+        }
+        forced = true;
+        #endif
+
         if (!forced && !scaling) {
             return false; // if we return true, we can skip __syncthreads() in some kernels
         }
         wrote_absmax = true;
-        return false;
-
-        // use native integer reductions as much as possible (supported on all GPUs with FP8)
-        // this might treat NaN/INF slightly differently but that is the least of our problems
-        unsigned int absmax_uint = *(unsigned int*)&new_absmax;
-        asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
-        __shared__ unsigned int shared[32];
 
         // lane_id must be obtained directly from the special register
         // otherwise, the compiler does silly things related to the redux/atomicMax
         unsigned int lane_id ;
         asm volatile("mov.u32 %0, %laneid;" : "=r"(lane_id));
         unsigned int num_warps = num_threads >> 5;
-        unsigned int warp_id = thread_id & 31;
+        unsigned int warp_id = thread_id >> 5;
+
+        // use native integer reductions as much as possible (supported on all GPUs with FP8)
+        // this might treat NaN/INF slightly differently but that is the least of our problems
+        unsigned int absmax_uint = *(unsigned int*)&new_absmax;
+        __shared__ unsigned int shared[32];
+
+
+        // slow path in case redux causes issues
+        /*shared[lane_id] = absmax_uint;
+        __syncwarp();
+        for (int i = 0; i < 32; i++) {
+            absmax_uint = max(absmax_uint, shared[i]);
+        }
+        __syncwarp();*/
+        asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
+
+
+
 
         // with this condition instead of lane_id == 0, we have shared[lane_id] both here and below
         // this reduces the number of instructions for addressing
@@ -456,7 +532,7 @@ public:
         // sync can be after exit (dead threads don't count) but must be before return
         // if this is the end of the kernel, the compiler puts a conditional EXIT right after BAR
         // but this way the EXIT is right before the barrier which frees the warps slightly quicker
-        bool done = (warp_id != 0 || lane_id >= num_warps);
+        bool done = (warp_id != 0);
         if (done && exit) asm volatile("exit;");
         __syncthreads();
         if (done && !exit) return true;
@@ -464,47 +540,57 @@ public:
         // one more warp reduction then global memory atomic
         // we want as few global atomics as possible (i.e. 1 per threadblock)
         absmax_uint = shared[lane_id];
+        if (lane_id >= num_warps) {
+            absmax_uint = 0;
+        }
+
+
+        // slow path in case redux causes issues
+        /*shared[lane_id] = absmax_uint;
+        __syncwarp();
+        for (int i = 0; i < 32; i++) {
+            absmax_uint = max(absmax_uint, shared[i]);
+        }
+        __syncwarp();*/
         asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
+
+
+
         if (lane_id == 0) {
             atomicMax(absmax_ptr, absmax_uint);
         }
         return true;
     }
-    __device__ void update_absmax_1D(bool exit=false) {
-        update_absmax(threadIdx.x & 31, blockDim.x >> 5, exit);
+    __device__ void update_absmax_auto(int dimensions=1, bool exit=false) {
+        if (dimensions == 1) {
+            update_absmax(threadIdx.x, blockDim.x, exit);
+        } else if (dimensions == 2) {
+            update_absmax(threadIdx.x + threadIdx.y * blockDim.x, blockDim.x * blockDim.y, exit);
+        } else if (dimensions == 3) {
+            update_absmax(threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y,
+                          blockDim.x * blockDim.y * blockDim.z, exit);
+        }
     }
     __device__ void skip_absmax() {
         wrote_absmax = true;
     }
 
-    template <typename ForcedType>
-    __device__ void force_precision(bool stochastic=false, int microtensor_scale=false,
-                                    int zeroed_mantissa_bits=0, bool two_four_sparsity=false) {
-        for (int k = 0; k < elements; k++) {
-            // todo: fancy stuff
-            if (scaling || scale == 0.0f) { // already scaled
-                data128[k] = (ElementType)((ForcedType)(data128[k]));
-            } else { // need to scale & descale
-                float scaled_value = (float)data128[k] * scaling;
-                ForcedType converted_value = (ForcedType)scaled_value;
-                float descaled_value = (float)converted_value * descale;
-                data128[k] = (ElementType)descaled_value;
-            }
-        }
-    }
-
     __device__ ~tensor128() {
         // this should ~always be optimised away by the compiler
         if (!wrote_absmax && scaling && wrote_data) {
-            printf("id: %d\n", id);
+            //printf("id: %d\n", id);
             assert(false);
         }
     }
 };
 
-template <typename T>
+template <bool init=true, typename T>
 __device__ tensor128<T> new_tensor128(TensorGPU<T> tensor, bool disable_scaling=false) {
-    return tensor128<T>(tensor, disable_scaling);
+    if constexpr (init) {
+        return tensor128<T>(tensor, disable_scaling);
+    } else {
+        return tensor128<T>();
+    }
 }
 
 template <typename T>
@@ -525,23 +611,6 @@ extern int current_absmax_index;
 extern float* gpu_scale_memory;
 extern unsigned int* gpu_absmax_memory;
 
-enum TT : uint8_t {
-    PARAMETER=0, PARAMETER_GRAD, PARAMETER_OPT_M, PARAMETER_OPT_V, PARAMETER_MASTER, // 1 allocation each
-    ACTIVATIONS_MULTIUSE, // single buffer shared for activations, activation gradients, and scratch
-    DEFAULT, COUNT=DEFAULT, NUM_TYPES_PARAM=PARAMETER_MASTER+1
-};
-
-enum TFlags : uint8_t {
-    NONE=0,
-    REUSED_MEMORY=1,
-    GRADIENT=2,
-    TENSOR_2D=4,
-    BIAS=8,
-    LAYERNORM=16,
-    RESIDUAL=32,
-    EMBEDDING=64,
-    STATS=128
-};
 struct TensorSpec {
     char* ptr;
     size_t offset; // into base pointer
@@ -589,42 +658,6 @@ struct TensorSpec {
 
 // ----------------------------------------------------------------------------
 // Copy, cast functions
-
-using elementwise_func_t = float (*) (float);
-__device__ float nothing_elementwise(float x) {
-    return x;
-}
-template <int block_size=256, bool disable_scaling=false, bool reversed_order=false,
-          elementwise_func_t elementwise_func=nothing_elementwise,
-          typename T1=float, typename T2=float>
-__global__ void copy_advanced_kernel(TensorGPU<T1> in, TensorGPU<T2> out) {
-    constexpr size_t vec_size = 16 / ((sizeof(T1) < sizeof(T2)) ? sizeof(T2) : sizeof(T1));
-    size_t adjusted_blockidx = reversed_order ? (gridDim.x - blockIdx.x - 1) : blockIdx.x;
-    size_t idx = (adjusted_blockidx * blockDim.x + threadIdx.x) * vec_size;
-    if (idx >= in.num_elements) { return; }
-
-    auto inp128 = load_tensor128(in, idx, true, disable_scaling);
-    auto out128 = new_tensor128(out);
-    for (int k = 0; k < vec_size; k++) {
-        float out_fp32 = elementwise_func(inp128.get(k));
-        out128.set(k, out_fp32);
-    }
-    out128.store_same_length(idx);
-    out128.update_absmax(threadIdx.x, block_size, true);
-}
-
-// todo - move to GELU etc.
-__device__ float gelu_forward_elementwise(float x) {
-    float cube = 0.044715f * x * x * x;
-
-    float tanh_out;
-    float tanh_arg = sqrtf(2.0f / M_PI) * (x + cube);
-    asm ("tanh.approx.f32 %0,%1;" : "=f"(tanh_out) : "f"(tanh_arg));
-
-    // the following uses FMUL+FMA instead of FMUL+FADD+FMUL for "0.5f * x * (1.0f + tanh_out)"
-    float half_x = 0.5f * x;
-    return half_x * tanh_out + half_x;
-}
 
 // device functions and the kernel to cast data between types
 template<typename Td, typename Ts>

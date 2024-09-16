@@ -93,11 +93,11 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
 
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
-    auto dlogits128 = new_tensor128(dlogits);
+    tensor128<floatX> dlogits128 = new_tensor128<WriteDLogits>(dlogits, true);
     for (int i = threadIdx.x; i < V/elements; i += blockDim.x) {
         // this is the 2nd read of logits after the one in prepare_softmax2
         // it will be overwritten by the logits gradients which is when we reduce cache persistence
-        auto logits128 = load_tensor128(logits, idx * P + i * elements);
+        auto logits128 = load_tensor128(logits, idx * P + i * elements, false, true);
         x128 packed_probs; // todo - unused but might be read on CPU in the future so not scaling (???)
         for(int k = 0; k < elements; ++k) {
             int element = i*elements + k;
@@ -106,7 +106,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
             float indicator = (element == ix) ? 1.0f : 0.0f;
             dlogits128.set(k, (prob - indicator) * dloss);
         }
-        if (WriteDLogits){
+        if constexpr (WriteDLogits) {
             // reduce cache persistence for the overwritten logits
             // to maximise probability that logits remain in cache between prepare_softmax and here
             dlogits128.store(idx * P + i * elements, true);
@@ -131,7 +131,9 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
             probs[idx * P + i] = (floatX)prob;
         }
     }
-    dlogits128.update_absmax(threadIdx.x, blockDim.x, true);
+    if constexpr (WriteDLogits) {
+        dlogits128.update_absmax(threadIdx.x, blockDim.x, true);
+    }
 }
 
 // ----------------------------------------------------------------------------

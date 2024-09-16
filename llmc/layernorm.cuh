@@ -266,9 +266,8 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
 
     // if we did actually update the absmax (returns true), we already did __syncthreads() here
     if (!dinp_new128.update_absmax(threadIdx.x, BLOCK_SIZE, false)) {
-        //__syncthreads();
+        __syncthreads();
     }
-    __syncthreads();
 
     // Each block writes its partial sum to global memory
     // The last block to finish becomes responsible for summing up all the partial sums

@@ -55,7 +55,7 @@ __global__ void gelu_backward_kernel(tensorFP8e5 dinp, tensorFP8e5 dout, TensorG
 
         float sech_out = 1.0f - (tanh_in_out * tanh_in_out);
         float local_grad = 0.5f * ((1.0f + tanh_in_out) + x * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x));
-        float result = local_grad * (float)dout128.get(k);
+        float result = local_grad * dout128.get(k);
         dinp128.set(k, result);
     }
     dinp128.store_same_length<floatX>(idx, false);

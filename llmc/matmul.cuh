@@ -10,6 +10,9 @@ Matrix Multiplication, with help from cuBLASLt
 // GELU can be either fused (cublasLt) or non-fused (gelu.h)
 #include "gelu.cuh"
 
+// todo - does this need to be included globally?
+#include "copy_and_fp8.h"
+
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
@@ -181,7 +184,7 @@ void matmul_cublaslt(tensorX d, const tensorX a, const tensorX b, const tensorX 
             assert(!has_bias); // we shouldn't have any backward matmuls that use both GELU and bias
             epilogue = CUBLASLT_EPILOGUE_DGELU;
             if (pre_gelu.scale_descale_ptr) { // descale input
-                float* gelu_descale_ptr = pre_gelu.scale_descale_ptr + 1;
+                //float* gelu_descale_ptr = pre_gelu.scale_descale_ptr + 1;
                 //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_SCALE_POINTER, &gelu_descale_ptr, sizeof(float*)));
             }
         } else {
@@ -242,6 +245,8 @@ void matmul_cublaslt(tensorX d, const tensorX a, const tensorX b, const tensorX 
     cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
                                &alpha, a, ALayout, b, BLayout, &beta, d, CLayout, d, DLayout,
                                &heuristic.algo, cublaslt_workspace, cublaslt_workspace_size, stream));
+
+    update_absmax(d, false, stream);
 
     // cleanups
     cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
