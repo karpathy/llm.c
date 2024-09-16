@@ -530,12 +530,12 @@ void rmsnorm_forward(floatX* out, float* rstd,
     // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
     // this may fail, in which case we fall back to the smem free implementation.
     cudaCheck(cudaGetLastError());
-    auto status = cudaFuncSetAttribute(layernorm_forward_kernel6, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    auto status = cudaFuncSetAttribute(rmsnorm_forward_kernel6, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaCheck(cudaGetLastError());
     if (status == cudaSuccess) {
         rmsnorm_forward_kernel6<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(out, rstd, inp, weight, N, C);
     } else {
-        // should not happen - throw an error
+        // We should not allow for these perf regressions for now - just throw an error
         assert(false);
     }
     cudaCheck(cudaGetLastError());
