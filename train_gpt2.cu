@@ -473,38 +473,6 @@ void gpt2_allocate(GPT2 *model) {
     TENSOR_SPECS_FP32(lnf_rstd,   1, BT,      LAYERNORM | STATS);
     TENSOR_SPECS_FP32(losses,     1, BT,      0);
 
-
-
-        if(model->recompute >= 1) { // recompute >= 1 means we recompute gelu
-            gelu_forward(ACT(fch_gelu), ACT(fch));
-        }
-        matmul_backward<floatX>(AGRAD(fch), PGRAD(fcprojw), PGRAD(fcprojb), AGRAD(residual3), ACT(fch_gelu), PARAM(fcprojw), scratchF, B*T, 4*C, C, ACT(fch), model->gelu_fusion);
-
-        if(model->recompute >= 2) { // recompute >= 2 means we recompute layernorm
-            layernorm_forward(ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), ACT(residual2), PARAM(ln2w), PARAM(ln2b), B*T, C);
-        }
-        matmul_backward(AGRAD(ln2), PGRAD(fcw), PGRAD(fcb), AGRAD(fch), ACT(ln2), PARAM(fcw), scratchF, B*T, C, 4 * C);
-        layernorm_backward(AGRAD(residual2), AGRAD(residual3), PGRAD(ln2w), PGRAD(ln2b), scratchF, AGRAD(ln2), ACT(residual2), PARAM(ln2w), ACT(ln2_mean), ACT(ln2_rstd), B*T, C);
-        matmul_backward(AGRAD(atty), PGRAD(attprojw), PGRAD(attprojb), AGRAD(residual2), ACT(atty), PARAM(attprojw), scratchF, B*T, C, C);
-
-        #ifdef ENABLE_CUDNN
-        attention_backward_cudnn(AGRAD(qkvr), AGRAD(atty), ACT(qkvr), ACT(atty), ACT(att), B, T, NH, C);
-        #else
-        // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
-        floatX* buffer_a = ACT(atty);
-        floatX* buffer_b = ACT(fch);
-        attention_backward(AGRAD(qkvr), buffer_b, scratchX_HUGE, buffer_a, AGRAD(atty), ACT(qkvr), ACT(att), B, T, C, NH);
-        #endif
-
-        if(model->recompute >= 2) {
-            layernorm_forward(ACT(ln1), ACT(ln1_mean), ACT(ln1_rstd), residual, PARAM(ln1w), PARAM(ln1b), B*T, C);
-        }
-        matmul_backward(AGRAD(ln1), PGRAD(qkvw), PGRAD(qkvb), AGRAD(qkvr), ACT(ln1), PARAM(qkvw), scratchF, B*T, C, 3 * C);
-        layernorm_backward(dresidual, AGRAD(residual2), PGRAD(ln1w), PGRAD(ln1b), scratchF, AGRAD(ln1), residual, PARAM(ln1w), ACT(ln1_mean), ACT(ln1_rstd), B*T, C);
-
-
-
-
     // 4) activation gradients
     // note: TENSOR_2D are for the tensors written to by a matmul which are different here
     // todo - is "LAYERNORM" applied logically here? do we care?
