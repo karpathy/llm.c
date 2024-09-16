@@ -618,7 +618,18 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    encoder_forward(acts.encoded, model->inputs, params.wte, NULL, B, T, C, main_stream); // encoding goes into residual[0]
+
+    // ------------------------------------------------------------------------
+    // DEBUGGING: we only work until this point right now, so exit here
+    // transfer the first 32 elements to CPU and print them
+    floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
+    cudaCheck(cudaMemcpy(cpu, acts.encoded, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < 32; i++) {
+        printf("cpu[%d] = %f\n", i, (float) cpu[i]);
+    }
+    exit(0);
+    // ------------------------------------------------------------------------
 
     // first layernorm isn't fused
     layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
@@ -1565,9 +1576,6 @@ int main(int argc, char *argv[]) {
     printf0("| train_num_batches     | %-50d |\n", train_num_batches);
     printf0("| val_num_batches       | %-50d |\n", val_num_batches);
     printf0("+-----------------------+----------------------------------------------------+\n");
-
-    // DEBUGGING: we only work until this point right now, so exit here
-    exit(0);
 
     // build an EvalLoader for HellaSwag
     EvalLoader eval_loader;

@@ -300,6 +300,13 @@ class LLaMA(nn.Module):
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         freqs_cis = self.freqs_cis[start_pos:start_pos+t]
 
+        # ---------------------------------------------------------------------
+        # DEBUGGING: print first 32 elements of x
+        for i in range(32):
+            print("acts[{}]: {}".format(i, x.view(-1)[i].item()))
+        breakpoint()
+        # ---------------------------------------------------------------------
+
         mask = torch.triu(torch.ones((t, t), device=next(self.parameters()).device, dtype=torch.bool), diagonal=1)
 
         for i, block in enumerate(self.transformer.h):
