@@ -141,6 +141,7 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
 
 __global__ void rmsnorm_forward_kernel6(floatX* __restrict__ out, float* __restrict__ rstd,
                                     const floatX*  __restrict__ inp, const floatX*  __restrict__ weight, int N, int C) {
+    // this kernel is a simplified version of layernorm_forward_kernel6
     assert(blockDim.x == WARP_SIZE);
 
     // load weights into shared memory
@@ -165,15 +166,11 @@ __global__ void rmsnorm_forward_kernel6(floatX* __restrict__ out, float* __restr
     out += idx * C;
 
     const float eps = 1e-5f;
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 in_data = load128cs(inp + c);
-        s_in[c / x128::size] = in_data;
-    }
-
     float rms = 0.f;
 
     for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 in_data = s_in[c / x128::size];
+        const x128 in_data = load128cs(inp + c);
+        s_in[c / x128::size] = in_data;
         for(int k = 0; k < x128::size; ++k) {
             rms += (float)in_data[k] * (float)in_data[k];
         }
