@@ -1539,9 +1539,7 @@ int main(int argc, char *argv[]) {
     printf0("| channels C            | %-50d |\n", model.config.channels);
     printf0("| num_parameters        | %-50zu |\n", model.num_parameters);
     printf0("+-----------------------+----------------------------------------------------+\n");
-
-    // DEBUGGING: we only work until this point right now, so exit here
-    exit(0);
+    assert(T <= model.config.max_seq_len);
 
     // build DataLoaders for both train and val
     int permute_train_loader = (overfit_single_batch == 1) ? 0 : 1;
@@ -1567,6 +1565,9 @@ int main(int argc, char *argv[]) {
     printf0("| train_num_batches     | %-50d |\n", train_num_batches);
     printf0("| val_num_batches       | %-50d |\n", val_num_batches);
     printf0("+-----------------------+----------------------------------------------------+\n");
+
+    // DEBUGGING: we only work until this point right now, so exit here
+    exit(0);
 
     // build an EvalLoader for HellaSwag
     EvalLoader eval_loader;
@@ -1605,7 +1606,7 @@ int main(int argc, char *argv[]) {
 
     // set up the Tokenizer
     Tokenizer tokenizer;
-    tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+    // tokenizer_init(&tokenizer, "gpt2_tokenizer.bin"); // TODO: port tokenizer later from GPT2 -> Llama 3
 
     // set up learning rate scheduler
     LearningRateScheduler lr_scheduler;
@@ -1630,23 +1631,6 @@ int main(int argc, char *argv[]) {
     init_detector(&loss_outlier_detector);
     init_detector(&grad_norm_outlier_detector);
 
-    // do some checks here before we kick off training
-    // cross-check the desired sequence length T with the model's max sequence length
-    if (T < model.config.max_seq_len) {
-        printf0("!!!!!!!!\n");
-        printf0("WARNING:\n");
-        printf0("- The training sequence length is: T=%d (set with -t)\n", T);
-        printf0("- The model's max sequence length is: max_seq_len=%d\n", model.config.max_seq_len);
-        printf0("You are attempting to train with a sequence length shorter than the model's max.\n");
-        printf0("This will lead to unused parameters in the wpe position embedding weights.\n");
-        printf0("If you know what you're doing you can ignore this warning.\n");
-        printf0("If you're like ???, you are most likely misconfiguring your training run.\n");
-        printf0("---> HINT: If you're training GPT-2 use -t 1024. If GPT-3, use -t 2048.\n");
-        printf0("!!!!!!!!\n");
-    }
-    // in any case, this must be true or we'd index beyond the model's wpe (position embedding table)
-    assert(T <= model.config.max_seq_len);
-
     // train
     cudaEvent_t start, end;
     cudaCheck(cudaEventCreate(&start));
@@ -1658,6 +1642,8 @@ int main(int argc, char *argv[]) {
         NvtxRange step_range("Train step", step);
 
         int last_step = step == train_num_batches;
+
+        if(0) { // TODO DELETE; START: IGNORE ALL THIS BLOCK WHILE GETTING STUFF TO WORK
 
         // once in a while estimate the validation loss (all processes collaborate)
         if (step % val_loss_every == 0 || last_step) {
@@ -1756,6 +1742,7 @@ int main(int argc, char *argv[]) {
             }
         }
         resuming = 0;
+        } // TODO DELETE; END: IGNORE ALL THIS BLOCK WHILE GETTING STUFF TO WORK
 
         // bit confusing: we want to make sure to eval and sample on 0th iteration
         // but also after the very last iteration. so we loop for step <= train_num_batches
