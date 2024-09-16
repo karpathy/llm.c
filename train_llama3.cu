@@ -122,27 +122,43 @@ typedef struct {
 static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
 void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
+    // see train_llama3.py write_tensors() function for detailed docs of some of the trickery here
+    // trick 1: all biases are still present but set to zero
+    // trick 2: the SwiGLU weights are "packed" into one, concatenated
+    // trick 3: the positional embedding is replaced with the final classifier layer weights
     size_t Vp = config.padded_vocab_size;
     size_t C = config.channels;
-    size_t maxT = config.max_seq_len;
     size_t L = config.num_layers;
+    // calculation following the .py code inside CausalSelfAttention
+    // we have to calculate the number of channels in the QKV projection
+    size_t n_head = config.num_heads;
+    size_t n_kn_head = config.num_kv_heads;
+    size_t hd = C / n_head; // head dimension
+    size_t qkv_channels = (n_head + 2*n_kn_head) * hd; // Q, K, V channels
+    // calculation following the .py code inside MLP
+    // we have to calculate the number of channels in the SwiGLU projections c_fc + c_fc2
+    size_t hidden_dim = 4 * C;
+    hidden_dim = (2 * hidden_dim) / 3;
+    hidden_dim = config.ffn_dim_multiplier * hidden_dim;
+    hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) / config.multiple_of);
+    size_t ffn_channels = hidden_dim * 2; // c_fc + c_fc2 concatenated
+    // now populate the parameter sizes
     param_sizes[0] = Vp * C; // wte
-    param_sizes[1] = maxT * C; // wpe
+    param_sizes[1] = Vp * C; // (3) lm_head (final classifier layer weights)
     param_sizes[2] = L * C; // ln1w
-    param_sizes[3] = L * C; // ln1b
-    param_sizes[4] = L * (3 * C) * C; // qkvw
-    param_sizes[5] = L * (3 * C); // qkvb
+    param_sizes[3] = L * C; // ln1b; (1) all biases are zero it's ok
+    param_sizes[4] = L * (qkv_channels) * C; // qkvw
+    param_sizes[5] = L * (qkv_channels); // qkvb
     param_sizes[6] = L * C * C; // attprojw
     param_sizes[7] = L * C; // attprojb
     param_sizes[8] = L * C; // ln2w
     param_sizes[9] = L * C; // ln2b
-    param_sizes[10] = L * (4 * C) * C; // fcw
-    param_sizes[11] = L * (4 * C); // fcb
-    param_sizes[12] = L * C * (4 * C); // fcprojw
+    param_sizes[10] = L * ffn_channels * C; // fcw; (2) this is twice the size
+    param_sizes[11] = L * ffn_channels; // fcb
+    param_sizes[12] = L * C * hidden_dim; // fcprojw
     param_sizes[13] = L * C; // fcprojb
     param_sizes[14] = C; // lnfw
     param_sizes[15] = C; // lnfb
-
     // populate the parameter sizes in bytes (all the same for now, keeping for future use)
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         param_sizeof[i] = sizeof(floatX);
@@ -365,6 +381,16 @@ void gpt2_allocate_weights(GPT2 *model) {
         model->num_parameters += model->param_elements[i];
         model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
     }
+
+    // TODO TAKE OUT ----------------------------------------------------------
+    // DEBUGGING: print out the sizes of the parameters
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        printf("param_elements[%d] = %zu\n", i, model->param_elements[i]);
+    }
+    printf("num_parameters = %zu\n", model->num_parameters);
+    printf("num_parameters_bytes = %zu\n", model->num_parameters_bytes);
+    // ------------------------------------------------------------------------
+
     // create memory for model parameters on the device
     assert(model->params_memory == nullptr);
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
@@ -540,7 +566,6 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     printf("ffn_dim_multiplier: %f\n", model->config.ffn_dim_multiplier);
     printf("norm_eps: %f\n", model->config.norm_eps);
     printf("rope_theta: %f\n", model->config.rope_theta);
-    exit(0);
     // ------------------------------------------------------------------------
 
     // allocate memory for the model parameters
@@ -1514,6 +1539,9 @@ int main(int argc, char *argv[]) {
     printf0("| channels C            | %-50d |\n", model.config.channels);
     printf0("| num_parameters        | %-50zu |\n", model.num_parameters);
     printf0("+-----------------------+----------------------------------------------------+\n");
+
+    // DEBUGGING: we only work until this point right now, so exit here
+    exit(0);
 
     // build DataLoaders for both train and val
     int permute_train_loader = (overfit_single_batch == 1) ? 0 : 1;
