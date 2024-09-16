@@ -2,34 +2,7 @@
 
 #ifndef CUDA_UTILS_CUH
 #define CUDA_UTILS_CUH
-
-#define FAKE_FP8
-
 #include "cuda_common.h"
-
-struct TensorSpec;  // Forward declaration
-
-__device__ __constant__ TensorSpec* tensor_specs_ptr;
-__device__ __constant__ float* gpu_scale_memory_ptr;
-__device__ __constant__ unsigned int* gpu_absmax_memory_ptr;
-
-enum TT : uint8_t {
-    PARAMETER=0, PARAMETER_GRAD, PARAMETER_OPT_M, PARAMETER_OPT_V, PARAMETER_MASTER, // 1 allocation each
-    ACTIVATIONS_MULTIUSE, // single buffer shared for activations, activation gradients, and scratch
-    DEFAULT, COUNT=DEFAULT, NUM_TYPES_PARAM=PARAMETER_MASTER+1
-};
-
-enum TFlags : uint8_t {
-    NONE=0,
-    REUSED_MEMORY=1,
-    GRADIENT=2,
-    TENSOR_2D=4, // used for matmul *outputs* only, not inputs (+weights)
-    BIAS=8,
-    LAYERNORM=16,
-    RESIDUAL=32,
-    EMBEDDING=64,
-    STATS=128
-};
 
 // ----------------------------------------------------------------------------
 // Packed128 data structure that forces the compiler to use 128-bit loads/stores
@@ -138,7 +111,7 @@ typedef Packed128<floatX> x128;
 
 // enumerator to indentify the datatype of a tensor.
 enum class DType : uint8_t {
-    FP32, FP16, BF16
+    FP32, FP16, BF16, FP8E4M3, FP8E5M2
 };
 
 // Given a datatype enum, returns the underlying number of bytes
@@ -151,6 +124,10 @@ size_t sizeof_dtype(DType type) {
             return sizeof(half);
         case DType::BF16:
             return sizeof(nv_bfloat16);
+        case DType::FP8E4M3:
+            return sizeof(__nv_fp8_e4m3);
+        case DType::FP8E5M2:
+            return sizeof(__nv_fp8_e5m2);
         default: // handle or get compiler warning
             fprintf(stderr, "Unknown datatype\n");
             exit(EXIT_FAILURE);
@@ -160,6 +137,8 @@ size_t sizeof_dtype(DType type) {
 DType dtype_of(float* f) { return DType::FP32; }
 DType dtype_of(nv_bfloat16 * f) { return DType::BF16; }
 DType dtype_of(half * f) { return DType::FP16; }
+DType dtype_of(__nv_fp8_e4m3 * f) { return DType::FP8E4M3; }
+DType dtype_of(__nv_fp8_e5m2 * f) { return DType::FP8E5M2; }
 
 // ----------------------------------------------------------------------------
 // Random Number Generation used in Stochastic Rounding (defined here as used by TensorGPU)
@@ -246,22 +225,20 @@ __device__ void stochastic_rounding(float in, Ti &out, unsigned int random, floa
     out = (lerp > threshold_percentage) ? rounded_up : rounded_down;
 }
 
-
 // ----------------------------------------------------------------------------
-
 // todo - stochastic is bugged, spent hours debugging, no idea why backwards is so broken with it
 __device__ float fake_fp8(bool faking, float input, float scale, float descale, bool mode_e5, bool stochastic=false) {
-#ifdef FAKE_FP8
     unsigned int random_number;
-    if (false) {
-        unsigned int clock, laneid;
-        asm volatile("mov.u32 %0, %%clock;" : "=r"(clock));
-        asm volatile("mov.u32 %0, %%laneid;" : "=r"(laneid));
-        random_number = get_random_noise(clock, laneid, blockIdx.x * blockDim.x);
-    }
-
     if (faking && scale != 1.0f) {
         assert(scale == 1.0f/descale || scale == 1.0f);
+
+        if (stochastic) {
+            unsigned int clock, laneid;
+            asm volatile("mov.u32 %0, %%clock;" : "=r"(clock));
+            asm volatile("mov.u32 %0, %%laneid;" : "=r"(laneid));
+            random_number = get_random_noise(clock, laneid, blockIdx.x * blockDim.x);
+        }
+
         if (mode_e5) {
             __nv_fp8_e5m2 value_fp8 = __nv_fp8_e5m2(input * scale);
             if (false) {
@@ -273,388 +250,13 @@ __device__ float fake_fp8(bool faking, float input, float scale, float descale, 
             __nv_fp8_e4m3 value_fp8 = __nv_fp8_e4m3(input * scale);
             if (stochastic) {
                 // BUGGED - spent 6+ hours debuggin this, and at this point, I genuinely suspect a compiler bug *sigh*
-                //stochastic_rounding(input * scale, value_fp8, random_number);
+                stochastic_rounding(input * scale, value_fp8, random_number);
             }
             return ((float)value_fp8) * descale;
         }
     }
-#endif
     return input;
 }
-
-// ----------------------------------------------------------------------------
-// ...
-template<typename ElementType=float>
-struct TensorGPU {
-    ElementType* data_ptr;
-    int id;
-    float* scale_descale_ptr;
-    unsigned int* absmax_ptr;
-    size_t num_elements;
-
-    static __device__ __host__ TensorGPU from(ElementType* ptr=nullptr) {
-        TensorGPU tmp = {0};
-        tmp.data_ptr = ptr;
-        tmp.id = -1;
-        return tmp;
-    }
-
-    template<typename T>
-    __device__ __host__ T* as() {
-        return reinterpret_cast<T*>(data_ptr);
-    }
-
-    __device__ __host__  operator ElementType*() const {
-        return data_ptr;
-    }
-
-    __device__ __host__ ElementType& operator[](size_t index) {
-        return data_ptr[index];
-    }
-
-    __device__ __host__ const ElementType& operator[](size_t index) const {
-        return data_ptr[index];
-    }
-
-    __device__ __host__ int num_per_128() const {
-        return sizeof(int4) / sizeof(ElementType);
-    }
-
-    __device__ __host__ float get_scalar(size_t index, bool disable_scaling=false) const {
-        #ifdef FAKE_FP8
-        disable_scaling = true;
-        #endif
-
-        ElementType* __restrict__ data_ptr_restricted = data_ptr;
-        float* __restrict__ scale_ptr_restricted = scale_descale_ptr;
-
-        float value = (float)data_ptr_restricted[index];
-        float descale = (scale_descale_ptr && !disable_scaling) ? scale_ptr_restricted[1] : 1.0f;
-        return value * descale; // [1] = descale
-    }
-
-    __device__ __host__ ElementType set_scalar(size_t index, float value, bool disable_scaling=false) {
-        #ifdef FAKE_FP8
-        disable_scaling = true;
-        #endif
-
-        ElementType* __restrict__ data_ptr_restricted = data_ptr;
-        float* __restrict__ scale_ptr_restricted = scale_descale_ptr;
-
-        float scale = (scale_descale_ptr && !disable_scaling) ? scale_ptr_restricted[0] : 1.0f;
-        ElementType output = (ElementType)(value * scale);
-        data_ptr_restricted[index] = output;
-        return output;
-    }
-};
-
-// short-form typedefs
-typedef TensorGPU<floatX> tensorX;
-typedef TensorGPU<float> tensorFP32;
-typedef TensorGPU<half> tensorFP16;
-typedef TensorGPU<nv_bfloat16> tensorBF16;
-
-typedef TensorGPU<floatX> tensorFP8e4;
-typedef TensorGPU<floatX> tensorFP8e5;
-
-extern TensorGPU<floatX> null_tensorX;
-extern TensorGPU<float> null_tensorFP32;
-
-template<typename ElementType=float>
-struct tensor128 {
-private:
-    Packed128<ElementType> data128;
-    ElementType* data_ptr;
-    unsigned int *absmax_ptr = nullptr;
-    float scale = 1.0f;
-    float descale = 1.0f;
-    float new_absmax = 0.0f;
-    bool wrote_data = false;
-    bool wrote_absmax = false;
-    int id = -1;
-    // fake fp8 mode
-    bool faking_fp8 = false;
-    bool mode_e5 = false;
-
-public:
-    bool scaling = true; // todo - fp8 only
-    static constexpr const size_t elements = sizeof(int4) / sizeof(ElementType);
-    __device__ tensor128() { scaling = false; }
-
-    __device__ tensor128(TensorGPU<ElementType> tensor, bool disable_scaling=false) {
-        data_ptr = tensor.data_ptr;
-        id = tensor.id;
-
-#ifdef FAKE_FP8
-        if (!disable_scaling && id >= 0 && sizeof(ElementType) == 2 && tensor_specs_ptr[id].tensor_type != TT::PARAMETER_GRAD) {
-            if (!(tensor_specs_ptr[id].flags & TFlags::RESIDUAL) && !(tensor_specs_ptr[id].flags & TFlags::EMBEDDING)) {
-                faking_fp8 = true;
-                if  ((tensor_specs_ptr[id].flags & TFlags::GRADIENT) && (tensor_specs_ptr[id].tensor_type == TT::ACTIVATIONS_MULTIUSE)) {
-                    mode_e5 = true;
-                }
-            }
-        }
-        scaling = false; // only do "fake" scaling
-#endif
-
-        if (!disable_scaling) {
-            const float* __restrict__ ptr_restricted = tensor.scale_descale_ptr;
-            scale = ptr_restricted[0];
-            descale = ptr_restricted[1];
-        } else {
-            scaling = false;
-        }
-        absmax_ptr = tensor.absmax_ptr;
-    }
-
-    __device__ void load(size_t offset, bool cache_streaming=false) {
-        ElementType* addr = data_ptr + offset;
-        data128 = cache_streaming ? load128cs(addr) : load128(addr);
-    }
-
-    __device__ void store(size_t offset, bool cache_streaming=false) {
-        if (cache_streaming) {
-            store128cs(data_ptr + offset, data128);
-        } else {
-            store128(data_ptr + offset, data128);
-        }
-        wrote_data = true;
-    }
-
-    template <typename OriginalType>
-    __device__ void store_same_length(size_t offset, bool cache_streaming=false) {
-        if (cache_streaming) {
-            store128_same_length_cs<OriginalType, ElementType>(data_ptr + offset, data128);
-        } else {
-            store128_same_length<OriginalType, ElementType>(data_ptr + offset, data128);
-        }
-        wrote_data = true;
-    }
-
-    __device__ const Packed128<ElementType>& get128() const {
-        return data128;
-    }
-
-    __device__ Packed128<ElementType>& get128() {
-        return data128;
-    }
-
-    // call this manually if e.g. you use set_scalar() to update the tensor
-    // todo - in the future, this could consider more than just absmax
-    __device__ void add_value_stats(float value, ElementType output=(ElementType)0.0f) {
-        new_absmax = max(new_absmax, fabsf(value));
-    }
-
-    __device__ float get(int index) {
-        float value = (float)data128[index] * (scaling ? descale : 1.0f);
-        value = fake_fp8(faking_fp8, value, scale, descale, mode_e5);
-        return value;
-    }
-
-    __device__ void set(int index, float value) {
-        float output = value * (scaling ? scale : 1.0f);
-        output = fake_fp8(faking_fp8, output, scale, descale, mode_e5);
-        data128[index] = (ElementType)(output);
-        add_value_stats(value, data128[index]);
-    }
-
-    __device__ void set_stochastic(int index, float value, unsigned int random_number,
-                                   bool rotate_by_index=true, bool non_deterministic_rng=false) {
-        float scaled_value = value * (scaling ? scale : 1.0f);
-
-        // rotate the random number by the index so we can cheaply reuse the same RNG
-        // obviously less good than having true per-index RNG, but should be good enough
-        // when rounding FP32 to FP8, most of the bits make extremely little difference anyway...
-        // x10 is used so that it never repeats for indices [0;15] with a minimum difference of 2 etc.
-        if (rotate_by_index) {
-            assert(index < 16); // >=16 would repeat and be extremely bad RNG
-            random_number = __funnelshift_l(random_number, random_number, index * 10);
-        }
-        // RNG without a seed from the host for quick testing, but obviously not deterministic!
-        #ifdef FORCE_NON_DETERMINISM
-        non_deterministic_rng = true;
-        #endif
-        if (non_deterministic_rng) {
-            unsigned int clock, laneid;
-            asm volatile("mov.u32 %0, %%clock;" : "=r"(clock));
-            asm volatile("mov.u32 %0, %%laneid;" : "=r"(laneid));
-            random_number = get_random_noise(clock, laneid, blockIdx.x * blockDim.x);
-        }
-
-        stochastic_rounding(scaled_value, data128[index], random_number);
-        add_value_stats(value, data128[index]);
-    }
-
-    __device__ bool update_absmax(int thread_id, int num_threads, bool exit=false, bool forced=false) {
-        #ifdef FAKE_FP8
-        if (id < 0 || absmax_ptr == NULL) {
-            return false;
-        }
-        forced = true;
-        #endif
-
-        if (!forced && !scaling) {
-            return false; // if we return true, we can skip __syncthreads() in some kernels
-        }
-        wrote_absmax = true;
-
-        // lane_id must be obtained directly from the special register
-        // otherwise, the compiler does silly things related to the redux/atomicMax
-        unsigned int lane_id ;
-        asm volatile("mov.u32 %0, %laneid;" : "=r"(lane_id));
-        unsigned int num_warps = num_threads >> 5;
-        unsigned int warp_id = thread_id >> 5;
-
-        // use native integer reductions as much as possible (supported on all GPUs with FP8)
-        // this might treat NaN/INF slightly differently but that is the least of our problems
-        unsigned int absmax_uint = *(unsigned int*)&new_absmax;
-        __shared__ unsigned int shared[32];
-
-
-        // slow path in case redux causes issues
-        /*shared[lane_id] = absmax_uint;
-        __syncwarp();
-        for (int i = 0; i < 32; i++) {
-            absmax_uint = max(absmax_uint, shared[i]);
-        }
-        __syncwarp();*/
-        asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
-
-
-
-
-        // with this condition instead of lane_id == 0, we have shared[lane_id] both here and below
-        // this reduces the number of instructions for addressing
-        if (lane_id == warp_id) {
-            shared[lane_id] = absmax_uint;
-        }
-
-        // sync can be after exit (dead threads don't count) but must be before return
-        // if this is the end of the kernel, the compiler puts a conditional EXIT right after BAR
-        // but this way the EXIT is right before the barrier which frees the warps slightly quicker
-        bool done = (warp_id != 0);
-        if (done && exit) asm volatile("exit;");
-        __syncthreads();
-        if (done && !exit) return true;
-
-        // one more warp reduction then global memory atomic
-        // we want as few global atomics as possible (i.e. 1 per threadblock)
-        absmax_uint = shared[lane_id];
-        if (lane_id >= num_warps) {
-            absmax_uint = 0;
-        }
-
-
-        // slow path in case redux causes issues
-        /*shared[lane_id] = absmax_uint;
-        __syncwarp();
-        for (int i = 0; i < 32; i++) {
-            absmax_uint = max(absmax_uint, shared[i]);
-        }
-        __syncwarp();*/
-        asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
-
-
-
-        if (lane_id == 0) {
-            atomicMax(absmax_ptr, absmax_uint);
-        }
-        return true;
-    }
-    __device__ void update_absmax_auto(int dimensions=1, bool exit=false) {
-        if (dimensions == 1) {
-            update_absmax(threadIdx.x, blockDim.x, exit);
-        } else if (dimensions == 2) {
-            update_absmax(threadIdx.x + threadIdx.y * blockDim.x, blockDim.x * blockDim.y, exit);
-        } else if (dimensions == 3) {
-            update_absmax(threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y,
-                          blockDim.x * blockDim.y * blockDim.z, exit);
-        }
-    }
-    __device__ void skip_absmax() {
-        wrote_absmax = true;
-    }
-
-    __device__ ~tensor128() {
-        // this should ~always be optimised away by the compiler
-        if (!wrote_absmax && scaling && wrote_data) {
-            //printf("id: %d\n", id);
-            assert(false);
-        }
-    }
-};
-
-template <bool init=true, typename T>
-__device__ tensor128<T> new_tensor128(TensorGPU<T> tensor, bool disable_scaling=false) {
-    if constexpr (init) {
-        return tensor128<T>(tensor, disable_scaling);
-    } else {
-        return tensor128<T>();
-    }
-}
-
-template <typename T>
-__device__ tensor128<T> load_tensor128(TensorGPU<T> tensor, size_t offset,
-                                       bool cache_streaming = false, bool disable_scaling=false) {
-    tensor128<T> t128(tensor, disable_scaling);
-    t128.load(offset, cache_streaming);
-    return t128;
-}
-
-// ----------------------------------------------------------------------------
-// ...
-
-constexpr size_t MAX_TENSORS = 16*1024;
-constexpr size_t MAX_ABSMAX_HISTORY = 32; // todo - should make this a command line option
-extern int num_tensor_specs;
-extern int current_absmax_index;
-extern float* gpu_scale_memory;
-extern unsigned int* gpu_absmax_memory;
-
-struct TensorSpec {
-    char* ptr;
-    size_t offset; // into base pointer
-    size_t num_elements; // per shard
-    int id;
-    short num_shards;
-    short remaining_layers;
-    DType data_type;
-    TT tensor_type;
-    int flags;
-    char name[16];
-
-    template <typename T>
-    __host__ __device__ operator T*() const {
-        // TODO !!! make it work device side!
-        /*
-        if (std::is_same<T, float>::value && data_type != DType::FP32 ||
-            std::is_same<T, __half>::value && data_type != DType::FP16 ||
-            std::is_same<T, nv_bfloat16>::value && data_type != DType::BF16) {
-            printf("ERROR: Unexpected data type (%d) for tensor %s\n", (int)data_type, name);
-            exit(EXIT_FAILURE);
-        }
-        */
-        return reinterpret_cast<T*>(ptr);
-    }
-
-    template <typename T>
-    __device__ __host__ operator TensorGPU<T>() const {
-        TensorGPU<T> tensor;
-        tensor.num_elements = num_elements;
-        tensor.data_ptr = this->operator T*();
-        tensor.id = id;
-
-        #ifdef __CUDA_ARCH__
-        tensor.scale_descale_ptr = gpu_scale_memory_ptr + 2*id;
-        tensor.absmax_ptr = gpu_absmax_memory_ptr + id;
-        #else
-        tensor.scale_descale_ptr = gpu_scale_memory + 2*id;
-        tensor.absmax_ptr = gpu_absmax_memory + id;
-        #endif
-
-        return tensor;
-    }
-};
 
 // ----------------------------------------------------------------------------
 // Copy, cast functions

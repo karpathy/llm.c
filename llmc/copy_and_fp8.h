@@ -58,376 +58,48 @@ __global__ void copy_advanced_kernel(TensorGPU<T1> in, TensorGPU<T2> out) {
     out128.update_absmax(threadIdx.x, block_size, true);
 }
 
-/*
 // transpose + copy + format conversion (+ elementwise + absmax) kernel
-template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=TRANSPOSE_TILE_SIZE, bool reciprocal_scale=true, bool enable_copy=false, bool scaling=true,
-         uint absmax_factor=0, elementwise_func_t elementwise_func=nothing_elementwise, typename T1, typename T2>
-__global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ copy, const T2* __restrict__ input,
-                                 const float* __restrict__ descale_pointer=(float*)NULL, const float* __restrict__ scale_pointer=(float*)NULL,
-                                 unsigned int* absmax_output=(unsigned int*)NULL, const void** meta=NULL)
+template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=TRANSPOSE_TILE_SIZE, typename T1>
+__global__ void transpose_simple_kernel(T1* __restrict__ transposed, const T1* __restrict__ input, int height)
 {
-    constexpr size_t TILE_DIM_PADDED = TILE_DIM + 4/sizeof(T1);
-    __shared__ T1 tile[TILE_DIM][TILE_DIM_PADDED];
-    int width  = gridDim.x * TILE_DIM;
-    int height = gridDim.y * TILE_DIM;
-
-    constexpr size_t T1_elements = 16 / sizeof(T1);
-    constexpr size_t T2_elements = 16 / sizeof(T2);
-    constexpr size_t copy_vectors = (sizeof(T1) >= sizeof(T2)) ? (sizeof(T1) / sizeof(T2)) : 1;
-
-    float descale_factor = (scaling && descale_pointer) ? *descale_pointer : 1.0f; // never reciprocal
-    float scale_factor = (scaling && scale_pointer) ? *scale_pointer : 1.0f;
-    scale_factor = (reciprocal_scale && scale_factor != 0.0f) ? (1.0f / scale_factor) : scale_factor;
-    int x = blockIdx.x * TILE_DIM + (threadIdx.x * T2_elements);
-    int y = blockIdx.y * TILE_DIM + threadIdx.y;
-    uint absmax_uint = 0;
-
-    #pragma unroll
-    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-        Packed128<T2> in128 = load128cs<T2>(input + x + (y+j)*width);
-        Packed128<T1> copy128[copy_vectors];
-        for (int k = 0; k < in128.size; k++) {
-            T2 in = in128[k];
-            float out_float = elementwise_func((float)in * descale_factor);
-            update_local_absmax(absmax_uint, out_float, absmax_factor); // optional absmax
-
-            T1 out = (T1)(out_float * scale_factor);
-            copy128[k/T1_elements][k%T1_elements] = out; // optimised away by compiler if unused
-        }
-
-        for (int o = 0; o < copy_vectors; o++) {
-            if constexpr (enable_copy) {
-                store_same_length<T2,T1>(copy + x + (y+j)*width + o*T1_elements, copy128[o]);
-            }
-
-            size_t tile_offset = (threadIdx.x * T2_elements) + (threadIdx.y+j)*TILE_DIM_PADDED + o*T1_elements;
-            int* one_bank = reinterpret_cast<int*>(&tile[0][0] + tile_offset);
-            for (int k = 0; k < 4; k++) {
-                one_bank[k] = *(int*)(&copy128[o][k*4/sizeof(T1)]);
-            }
-            //store_same_length<T2,T1>(&tile[0][0] + tile_offset, copy128[o]);
-        }
-    }
-
-    if constexpr (absmax_factor != 0) {
-        update_global_absmax<true>(absmax_output, absmax_uint);
-    } else {
-        __syncthreads();
-    }
-
-    // reduce the number of threads for the write if T1_elements > T2_elements
-    // we want to keep all 32 threads in a warp active, so we try to eliminate in y dimension first
-    // so we create fake/adjusted tid.x/tid.y where "extra" threadIdx.x adds to the effective tid.y
-    constexpr size_t block_size_x = (TILE_DIM * sizeof(T2)) / 16;
-    constexpr size_t block_size_y = BLOCK_ROWS;
-
-    constexpr size_t desired_ratio = (sizeof(T2) >= sizeof(T1)) ? (sizeof(T2) / sizeof(T1)) : 1;
-    constexpr size_t ratio = (desired_ratio <= block_size_y) ? desired_ratio : block_size_y;
-    constexpr size_t block_size_x_div_r = block_size_x / ratio;
-    constexpr size_t block_size_y_div_r = block_size_y / ratio;
-
-    int adjusted_tid_x = threadIdx.x % block_size_x_div_r;
-    int adjusted_tid_y = (threadIdx.y * ratio) + (threadIdx.x / block_size_x_div_r);
-    if (threadIdx.y >= block_size_y_div_r) { return; }
-
-    // if we cannot reduce block_size.y enough, also reduce x (hurting perf with partial warps)
-    if (ratio != desired_ratio && adjusted_tid_x >= TILE_DIM / T1_elements) { return; }
-
-    // x/y for final write to global memory
-    x = blockIdx.y * TILE_DIM + adjusted_tid_x * T1_elements;
-    y = blockIdx.x * TILE_DIM + adjusted_tid_y;
-
-    constexpr int in_parallel = 4/sizeof(T1);
-
-    #pragma unroll
-    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS * in_parallel) {
-        if ((j+adjusted_tid_y) * in_parallel >= TILE_DIM) { return; }
-
-        // we need more instructions for the write than the read if T2_elements > T1_elements
-        #pragma unroll
-        for (int o = 0; o < copy_vectors; o++) {
-            Packed128<T1> out128[in_parallel];
-            #pragma unroll
-            for (int k = 0; k < Packed128<T1>::size; k++) {
-                int in32 = *(int*)(&tile[k + (adjusted_tid_x + o * blockDim.x) * Packed128<T1>::size][(adjusted_tid_y + j) * in_parallel]);
-                for (int p = 0; p < in_parallel; p++) {
-                    out128[p][k] = ((T1*)&in32)[p];
-                }
-            }
-            for (int p = 0; p < in_parallel; p++) {
-                store128<T1>(transposed + x + (o * blockDim.x * Packed128<T1>::size) + (y+p + j * in_parallel)*height, out128[p]);
-            }
-        }
-    }
-}
-*/
-
-/*
-template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=TRANSPOSE_TILE_SIZE, bool enable_copy=false,
-         elementwise_func_t elementwise_func=nothing_elementwise, typename T1, typename T2>
-__global__ void transpose_kernel_tensor(TensorGPU<T1> transposed, TensorGPU<T1> copy, TensorGPU<T2> input, int height) {
     __shared__ T1 tile[TILE_DIM][TILE_DIM];
     int width  = gridDim.x * TILE_DIM;
     height = gridDim.y * TILE_DIM;
 
-    constexpr bool disable_scaling = (sizeof(T1) == sizeof(T2)); // TODO - THIS IS WRONG - need to check types are identical, not just same size!
-    constexpr size_t T1_elements = 16 / sizeof(T1);
-    constexpr size_t T2_elements = 16 / sizeof(T2);
-    constexpr size_t copy_vectors = (sizeof(T1) >= sizeof(T2)) ? (sizeof(T1) / sizeof(T2)) : 1;
-
-    int x = blockIdx.x * TILE_DIM + (threadIdx.x * T2_elements);
+    constexpr size_t elements = 16 / sizeof(T1);
+    int x = blockIdx.x * TILE_DIM + (threadIdx.x * elements);
     int y = blockIdx.y * TILE_DIM + threadIdx.y;
-
-    tensor128<T1> copy128 = new_tensor128<enable_copy>(copy, disable_scaling);
 
     #pragma unroll
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-        auto in128 = load_tensor128(input, x + (y+j)*width, true, disable_scaling);
-        Packed128<T2> in128 = load128cs<T2>(input + x + (y+j)*width);
-        Packed128<T1> copy128[copy_vectors];
-        for (int k = 0; k < in128.size; k++) {
-            float out_float = elementwise_func(in128.get(k));
-            copy128.set(k % T1_elements, out_float * scale_factor); // optimised away by compiler if unused
-
-            if (k+1 == out128.size) {
-                // ...
-
-            }
-        }
-
-        for (int o = 0; o < copy_vectors; o++) {
-            if constexpr (enable_copy) {
-                store_same_length<T2,T1>(copy + x + (y+j)*width + o*T1_elements, copy128[o]);
-            }
-            size_t tile_offset = (threadIdx.x * T2_elements) + (threadIdx.y+j)*TILE_DIM + o*T1_elements;
-            store_same_length<T2,T1>(&tile[0][0] + tile_offset, copy128[o]);
-        }
+        Packed128<T1> in128 = load128cs<T1>(input + x + (y+j)*width);
+        size_t tile_offset = (threadIdx.x * elements) + (threadIdx.y+j)*TILE_DIM;
+        store128(&tile[0][0] + tile_offset, in128);
     }
+    __syncthreads();
 
-
-}
-*/
-
-
-
-
-
-// transpose + copy + format conversion (+ elementwise + absmax) kernel
-template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=TRANSPOSE_TILE_SIZE, bool reciprocal_scale=true, bool enable_copy=false, bool scaling=true,
-         uint absmax_factor=0, elementwise_func_t elementwise_func=nothing_elementwise, typename T1, typename T2>
-__global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ copy, const T2* __restrict__ input, int height,
-                                 const float* __restrict__ descale_pointer=(float*)NULL, const float* __restrict__ scale_pointer=(float*)NULL,
-                                 unsigned int* absmax_output=(unsigned int*)NULL, const void** meta=NULL)
-{
-    /*
-    __shared__ T1 tile[TILE_DIM][TILE_DIM];
-    int width  = gridDim.x * TILE_DIM;
-    height = gridDim.y * TILE_DIM;
-
-    constexpr size_t T1_elements = 16 / sizeof(T1);
-    constexpr size_t T2_elements = 16 / sizeof(T2);
-    constexpr size_t copy_vectors = (sizeof(T1) >= sizeof(T2)) ? (sizeof(T1) / sizeof(T2)) : 1;
-
-    float descale_factor = (scaling && descale_pointer) ? *descale_pointer : 1.0f; // never reciprocal
-    float scale_factor = (scaling && scale_pointer) ? *scale_pointer : 1.0f;
-    scale_factor = (reciprocal_scale && scale_factor != 0.0f) ? (1.0f / scale_factor) : scale_factor;
-    int x = blockIdx.x * TILE_DIM + (threadIdx.x * T2_elements);
-    int y = blockIdx.y * TILE_DIM + threadIdx.y;
-    uint absmax_uint = 0;
-
-    #pragma unroll
-    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-        Packed128<T2> in128 = load128cs<T2>(input + x + (y+j)*width);
-        Packed128<T1> copy128[copy_vectors];
-        for (int k = 0; k < in128.size; k++) {
-            T2 in = in128[k];
-            float out_float = elementwise_func((float)in * descale_factor);
-            update_local_absmax(absmax_uint, out_float, absmax_factor); // optional absmax
-
-            T1 out = (T1)(out_float * scale_factor);
-            copy128[k/T1_elements][k%T1_elements] = out; // optimised away by compiler if unused
-        }
-
-        for (int o = 0; o < copy_vectors; o++) {
-            if constexpr (enable_copy) {
-                store_same_length<T2,T1>(copy + x + (y+j)*width + o*T1_elements, copy128[o]);
-            }
-            size_t tile_offset = (threadIdx.x * T2_elements) + (threadIdx.y+j)*TILE_DIM + o*T1_elements;
-            store_same_length<T2,T1>(&tile[0][0] + tile_offset, copy128[o]);
-        }
-    }
-
-    if constexpr (absmax_factor != 0) {
-        update_global_absmax<true>(absmax_output, absmax_uint);
-    } else {
-        __syncthreads();
-    }
-
-    // reduce the number of threads for the write if T1_elements > T2_elements
-    // we want to keep all 32 threads in a warp active, so we try to eliminate in y dimension first
-    // so we create fake/adjusted tid.x/tid.y where "extra" threadIdx.x adds to the effective tid.y
-    constexpr size_t block_size_x = (TILE_DIM * sizeof(T2)) / 16;
+    constexpr size_t block_size_x = (TILE_DIM * sizeof(T1)) / 16;
     constexpr size_t block_size_y = BLOCK_ROWS;
 
-    constexpr size_t desired_ratio = (sizeof(T2) >= sizeof(T1)) ? (sizeof(T2) / sizeof(T1)) : 1;
-    constexpr size_t ratio = (desired_ratio <= block_size_y) ? desired_ratio : block_size_y;
-    constexpr size_t block_size_x_div_r = block_size_x / ratio;
-    constexpr size_t block_size_y_div_r = block_size_y / ratio;
-
-    int adjusted_tid_x = threadIdx.x % block_size_x_div_r;
-    int adjusted_tid_y = (threadIdx.y * ratio) + (threadIdx.x / block_size_x_div_r);
-    if (threadIdx.y >= block_size_y_div_r) { return; }
-
-    // if we cannot reduce block_size.y enough, also reduce x (hurting perf with partial warps)
-    if (ratio != desired_ratio && adjusted_tid_x >= TILE_DIM / T1_elements) { return; }
+    int adjusted_tid_x = threadIdx.x % block_size_x;
+    int adjusted_tid_y = (threadIdx.y) + (threadIdx.x / block_size_y);
 
     // x/y for final write to global memory
-    x = blockIdx.y * TILE_DIM + adjusted_tid_x * T1_elements;
+    x = blockIdx.y * TILE_DIM + adjusted_tid_x * elements;
     y = blockIdx.x * TILE_DIM + adjusted_tid_y;
 
     #pragma unroll
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-        // we need more instructions for the write than the read if T2_elements > T1_elements
+        Packed128<T1> out128;
         #pragma unroll
-        for (int o = 0; o < copy_vectors; o++) {
-            Packed128<T1> out128;
-            #pragma unroll
-            for (int k = 0; k < out128.size; k++) {
-                // these are tiny 8-bit loads with loads of bank conflicts for FP8
-                // extremely hard to avoid and not a bottleneck when everything else is well optimised
-                out128[k] = tile[k + (adjusted_tid_x + o * blockDim.x) * out128.size][adjusted_tid_y + j];
-            }
-            store128<T1>(transposed + x + (o * blockDim.x * out128.size) + (y+j)*height, out128);
+        for (int k = 0; k < elements; k++) {
+            // these are tiny 8-bit loads with loads of bank conflicts for FP8
+            // extremely hard to avoid and not a bottleneck when everything else is well optimised
+            out128[k] = tile[k + (adjusted_tid_x) * out128.size][adjusted_tid_y + j];
         }
-    }
-    */
-}
-
-
-/*
-// best I could come up with (without using TMA) - no bank conflicts, but 64B reads/writes not ideal
-// Z_DIM=2 improves perf by ~2% partly by improving L2 hit rates for the writes as far as I can tell
-template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=TRANSPOSE_TILE_SIZE, bool reciprocal_scale=true, bool enable_copy=false, bool scaling=true,
-         uint absmax_factor=0, elementwise_func_t elementwise_func=nothing_elementwise, int Z_DIM=1, typename T1, typename T2>
-__global__ void transpose_kernel(T1* __restrict__ transposed, T1* __restrict__ copy, const T2* __restrict__ input, int height,
-                                 const float* __restrict__ descale_pointer=(float*)NULL, const float* __restrict__ scale_pointer=(float*)NULL,
-                                 unsigned int* absmax_output=(unsigned int*)NULL, const void** meta=NULL)
-{
-    constexpr int in_parallel = 4/sizeof(T1);
-
-    constexpr size_t TILE_DIM_PADDED = (TILE_DIM * 33) / 32;
-    __shared__ T1 tile[Z_DIM][TILE_DIM][TILE_DIM_PADDED];
-    int w  = gridDim.x * TILE_DIM;
-
-    constexpr size_t T1_elements = 16 / sizeof(T1);
-    constexpr size_t T2_elements = 16 / sizeof(T2);
-    constexpr size_t copy_vectors = (sizeof(T1) >= sizeof(T2)) ? (sizeof(T1) / sizeof(T2)) : 1;
-
-    float descale_factor = (scaling && descale_pointer) ? *descale_pointer : 1.0f; // never reciprocal
-    float scale_factor = (scaling && scale_pointer) ? *scale_pointer : 1.0f;
-    scale_factor = (reciprocal_scale && scale_factor != 0.0f) ? (1.0f / scale_factor) : scale_factor;
-
-    int x = blockIdx.x * TILE_DIM + (threadIdx.x * T2_elements);
-    int y = blockIdx.y * TILE_DIM * Z_DIM + threadIdx.z * TILE_DIM + threadIdx.y;
-
-    uint absmax_uint = 0;
-    if (y < height) {
-        #pragma unroll
-        for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-            Packed128<T1> copy128[copy_vectors];
-
-            int4 payload;
-            const int4* address = reinterpret_cast<const int4*>(input + x + (y+j)*w);
-            asm volatile("ld.global.L2::128B.v4.s32 {%0, %1, %2, %3}, [%4];"
-                        : "=r"(payload.x), "=r"(payload.y), "=r"(payload.z), "=r"(payload.w)
-                        : "l"(address));
-            Packed128<T2> in128(payload);
-
-            #pragma unroll
-            for (int k = 0; k < in128.size; k++) {
-                T2 in = in128[k];
-                float out_float = elementwise_func((float)in * descale_factor);
-
-                T1 out = (T1)(out_float * scale_factor);
-                copy128[k/T1_elements][k%T1_elements] = out; // optimised away by compiler if unused
-                update_local_absmax(absmax_uint, out_float, absmax_factor); // optional absmax
-            }
-
-            #pragma unroll
-            for (int o = 0; o < copy_vectors; o++) {
-                if constexpr (enable_copy) {
-                    store_same_length<T2,T1>(copy + x + (y+j)*w + o*T1_elements, copy128[o]);
-                }
-
-                size_t offset_x = (threadIdx.x * T2_elements) + (o * T1_elements);
-                size_t offset_y = (threadIdx.y + j) * TILE_DIM;
-                offset_y += (offset_y / (128/sizeof(T1))) * in_parallel;
-
-                int* one_bank = reinterpret_cast<int*>(&tile[threadIdx.z][0][0] + offset_x + offset_y);
-                #pragma unroll
-                for (int k = 0; k < 4; k++) {
-                    one_bank[k] = *(int*)(&copy128[o][k*4/sizeof(T1)]);
-                }
-            }
-        }
-    }
-
-    if constexpr (absmax_factor != 0) {
-        update_global_absmax<true, true>(absmax_output, absmax_uint);
-    } else {
-        __syncthreads();
-    }
-
-    // reduce the number of threads for the write if T1_elements > T2_elements
-    // we want to keep all 32 threads in a warp active, so we try to eliminate in y dimension first
-    // so we create fake/adjusted tid.x/tid.y where "extra" threadIdx.x adds to the effective tid.y
-    constexpr size_t block_size_x = (TILE_DIM * sizeof(T2)) / 16;
-    constexpr size_t block_size_y = BLOCK_ROWS;
-    constexpr size_t desired_ratio = (sizeof(T2) >= sizeof(T1)) ? (sizeof(T2) / sizeof(T1)) : 1;
-    constexpr size_t ratio = (desired_ratio <= block_size_y) ? desired_ratio : block_size_y;
-    constexpr size_t block_size_x_div_r = block_size_x / ratio;
-    constexpr size_t block_size_y_div_r = block_size_y / ratio;
-
-    int adjusted_tid_x = threadIdx.x % block_size_x_div_r;
-    int adjusted_tid_y = (threadIdx.y * ratio) + (threadIdx.x / block_size_x_div_r);
-    if (threadIdx.y >= block_size_y_div_r) { return; }
-
-    // if we cannot reduce block_size.y enough, also reduce x (hurting perf with partial warps)
-    if (ratio != desired_ratio && adjusted_tid_x >= TILE_DIM / T1_elements) { return; }
-
-    // x/y for final write to global memory
-    x = blockIdx.y * TILE_DIM * Z_DIM + threadIdx.z * TILE_DIM + adjusted_tid_x * T1_elements;
-    y = blockIdx.x * TILE_DIM + (adjusted_tid_y*in_parallel);
-
-    if (x >= height) { return; }
-
-    #pragma unroll
-    for (int j = 0; j < TILE_DIM / in_parallel; j += BLOCK_ROWS) {
-        if ((j+adjusted_tid_y) * in_parallel * ratio >= TILE_DIM) { return; }
-
-        // we need more instructions for the write than the read if T2_elements > T1_elements
-        #pragma unroll
-        for (int o = 0; o < copy_vectors; o++) {
-            Packed128<T1> out128[in_parallel];
-            #pragma unroll
-            for (int k = 0; k < Packed128<T1>::size; k++) {
-                int offset_x = (adjusted_tid_y + j) * in_parallel;
-                int offset_y = ((adjusted_tid_x + o * blockDim.x) * Packed128<T1>::size + k) * TILE_DIM;
-                offset_y += (offset_y / (128/sizeof(T1))) * in_parallel;
-
-                int in32 = *(int*)(&tile[threadIdx.z][0][0] + offset_x + offset_y);
-                for (int p = 0; p < in_parallel; p++) {
-                    out128[p][k] = ((T1*)&in32)[p];
-                }
-            }
-            #pragma unroll
-            for (int p = 0; p < in_parallel; p++) {
-                store128<T1>(transposed + x + (o * blockDim.x * Packed128<T1>::size) + (y+p + j * in_parallel) * height, out128[p]);
-            }
-        }
+        store128<T1>(transposed + x + out128.size + (y+j)*height, out128);
     }
 }
-*/
 
 // only calculate absmax of the input tensor (non-fused)
 template <bool disable_scaling=true, typename T>
@@ -449,30 +121,18 @@ __global__ void update_absmax_kernel(TensorGPU<T> inp) {
 }
 
 // ----------------------------------------------------------------------------
-// kernel launchers
-/*
-template <bool reciprocal=true, typename T1, typename T2>
-void copy_simple(T1 *copy, const T2 *input, size_t N, float* scale_pointer=NULL, const size_t block_size=512) {
-    size_t fewest_elements = min(Packed128<T1>::size, Packed128<T2>::size);
-    const dim3 grid_size(CEIL_DIV(N, block_size * fewest_elements));
-
-    if (scale_pointer) {
-        copy_simple_kernel<reciprocal, true><<<grid_size, dim3(block_size)>>>(copy, input, N, scale_pointer);
-    } else {
-        copy_simple_kernel<reciprocal, false><<<grid_size, dim3(block_size)>>>(copy, input, N);
-    }
-    cudaCheck(cudaGetLastError());
-}
-*/
 
 template <bool reversed_order=false, elementwise_func_t elementwise_func=nothing_elementwise, bool reciprocal=true, typename T1, typename T2>
-void copy_advanced(T1 *copy, const T2 *input, size_t N, float* descale_pointer=NULL, float* scale_pointer=NULL, void* absmax_output=NULL, /*bool memset_absmax=true,*/ cudaStream_t stream=0, const size_t block_size=512) {
+void copy_advanced(TensorGPU<T1> *copy, TensorGPU<T2> *input, size_t N, float* descale_pointer=NULL, float* scale_pointer=NULL, void* absmax_output=NULL, /*bool memset_absmax=true,*/ cudaStream_t stream=0, const size_t block_size=512) {
     size_t fewest_elements = min(Packed128<T1>::size, Packed128<T2>::size);
     const dim3 grid_size(CEIL_DIV(N, block_size * fewest_elements));
     assert((N % fewest_elements) == 0);
 
     constexpr uint absmax_factor = 1;
     unsigned int* absmax_uint = (unsigned int*)absmax_output;
+
+    // todo - fix this function
+    assert(false);
 
     if (absmax_output) {
         /*if (memset_absmax) {
@@ -493,54 +153,21 @@ void copy_advanced(T1 *copy, const T2 *input, size_t N, float* descale_pointer=N
     cudaCheck(cudaGetLastError());
 }
 
-// only 2 important template parameters: write_absmax and elementwise_func
-// (use copy_and_transpose() rather than enable_copy=true for clarity)
-// slight inefficiency in that we don't optimise away scaling for kernels that don't need it (kernel checks for NULL)
-template <bool write_absmax=false, elementwise_func_t elementwise_func=nothing_elementwise, bool reciprocal=true,
-          bool enable_copy=false, typename T1, typename T2> // advanced template options, usually don't need to be changed
-void transpose(T1 *transposed, const T2 *input, size_t w, size_t h, float* descale_pointer=NULL, float* scale_pointer=NULL, void* absmax_output=NULL,
-               /*bool memset_absmax=true,*/ cudaStream_t stream=0, size_t block_size=128, T1 *copy=NULL) { // advanced parameters
+template<typename T1>
+void transpose_simple(TensorGPU<T1> transposed, TensorGPU<T1> input, size_t w, size_t h, cudaStream_t stream=0, size_t block_size=128) {
     assert((w % TRANSPOSE_TILE_SIZE) == 0 && (h % TRANSPOSE_TILE_SIZE) == 0);
     cudaCheck(cudaGetLastError());
-    constexpr int DIM_Z = 1;
-    block_size /= DIM_Z;
 
-    size_t block_size_x = (TRANSPOSE_TILE_SIZE * sizeof(T2)) / 16;
+    size_t block_size_x = (TRANSPOSE_TILE_SIZE * sizeof(T1)) / 16;
     size_t block_size_y = min(TRANSPOSE_TILE_SIZE, block_size / block_size_x);
-    dim3 grid_size(w / TRANSPOSE_TILE_SIZE, h / (TRANSPOSE_TILE_SIZE * DIM_Z));
-    dim3 block_size_dim(block_size_x, block_size_y, DIM_Z);
-
-    constexpr uint absmax_factor = write_absmax ? 1 : 0;
-    unsigned int* absmax_uint = (unsigned int*)absmax_output;
-    /*if (write_absmax && memset_absmax) {
-        cudaMemset(absmax_output, 0, sizeof(unsigned int));
-    }*/
+    dim3 grid_size(w / TRANSPOSE_TILE_SIZE, h / (TRANSPOSE_TILE_SIZE));
+    dim3 block_size_dim(block_size_x, block_size_y, 1);
 
     switch (block_size_y) {
-        case 64: transpose_kernel<64, TRANSPOSE_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, h, descale_pointer, scale_pointer, absmax_uint); break;
-        case 32: transpose_kernel<32, TRANSPOSE_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, h, descale_pointer, scale_pointer, absmax_uint); break;
-        case 16: transpose_kernel<16, TRANSPOSE_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, h, descale_pointer, scale_pointer, absmax_uint); break;
-        /*case 8: transpose_kernel<8, TRANSPOSE_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, h, descale_pointer, scale_pointer, absmax_uint,); break;
-        case 4: transpose_kernel<4, TRANSPOSE_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, h, descale_pointer, scale_pointer, absmax_uint); break;
-        case 2: transpose_kernel<2, TRANSPOSE_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, h, descale_pointer, scale_pointer, absmax_uint); break;
-        case 1: transpose_kernel<1, TRANSPOSE_TILE_SIZE, reciprocal, enable_copy, true, absmax_factor, elementwise_func><<<grid_size, block_size_dim, 0, stream>>>(transposed, copy, input, h, descale_pointer, scale_pointer, absmax_uint); break;*/
+        case 64: transpose_simple_kernel<64, TRANSPOSE_TILE_SIZE><<<grid_size, block_size_dim, 0, stream>>>(transposed, input, h); break;
+        case 32: transpose_simple_kernel<32, TRANSPOSE_TILE_SIZE><<<grid_size, block_size_dim, 0, stream>>>(transposed, input, h); break;
+        case 16: transpose_simple_kernel<16, TRANSPOSE_TILE_SIZE><<<grid_size, block_size_dim, 0, stream>>>(transposed, input, h); break;
         default: printf("Invalid block size (might be easy to add): %lu\n", block_size_y); exit(1);
-    }
-    cudaCheck(cudaGetLastError());
-}
-
-// wrapper so the parameters of the standard transpose function are less messy
-template <bool write_absmax=false, elementwise_func_t elementwise_func=nothing_elementwise, bool reciprocal=true, typename T1, typename T2>
-void copy_and_transpose(T1 *transposed, T1 *copy, const T2 *input, size_t w, size_t h, float* descale_pointer=NULL, float* scale_pointer=NULL, unsigned int* absmax_output=NULL, /*bool memset_absmax=true,*/ cudaStream_t stream=0, const size_t block_size=256) {
-    transpose<write_absmax, elementwise_func, reciprocal, true, T1, T2>(transposed, input, w, h, descale_pointer, scale_pointer, absmax_output, /*memset_absmax,*/ stream, block_size, copy);
-}
-
-template <bool write_absmax=false, elementwise_func_t elementwise_func=nothing_elementwise, bool reciprocal=true, typename T1, typename T2>
-void copy_or_transpose(bool transposing, T1 *output, const T2 *input, size_t w, size_t h, float* descale_pointer=NULL, float* scale_pointer=NULL, unsigned int* absmax_output=NULL, /*bool memset_absmax=true,*/ cudaStream_t stream=0, const size_t block_size=0) {
-    if (transposing) {
-        transpose<write_absmax, elementwise_func, reciprocal, false, T1, T2>(output, input, w, h, descale_pointer, scale_pointer, absmax_output, /*memset_absmax,*/ stream, block_size ? block_size : 256);
-    } else {
-        copy_advanced<false, elementwise_func, reciprocal>(output, input, w*h, descale_pointer, scale_pointer, absmax_output, /*memset_absmax,*/ stream, block_size ? block_size : 512);
     }
     cudaCheck(cudaGetLastError());
 }
@@ -675,7 +302,8 @@ public:
 
         Tout* transposed = CudaScratchAllocator::getMemory<Tout>(m * k, true);
         if (compute) {
-            copy_or_transpose<false>(true, transposed, original, m, k, nullptr, nullptr, nullptr, stream);
+            // todo
+            //copy_or_transpose<false>(true, transposed, original, m, k, nullptr, nullptr, nullptr, stream);
         }
 
         cache[key] = {transposed, size};
