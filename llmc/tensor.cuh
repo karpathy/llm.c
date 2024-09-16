@@ -2,8 +2,8 @@
 #define TENSOR_CUH
 
 // ...
-#define FAKE_FP8
-#define UNIQUE_TENSOR_MEMORY false
+//#define FAKE_FP8
+#define UNIQUE_TENSOR_MEMORY true
 #define LAYERS_PER_ACTIVATION_CHECKPOINT 0 // 0 = disabled
 // ...
 
@@ -71,16 +71,22 @@ __device__ __constant__ unsigned int* gpu_absmax_memory_ptr;
 
 template<typename ElementType=float>
 struct TensorGPU {
-    ElementType* data_ptr;
-    int id;
-    float* scale_descale_ptr;
-    unsigned int* absmax_ptr;
-    size_t num_elements;
+    ElementType* data_ptr = NULL;
+    float* scale_descale_ptr = NULL;
+    unsigned int* absmax_ptr = NULL;
+    size_t num_elements = 0;
+    int id = -1;
+
+    bool is_null() const {
+        return (data_ptr == NULL);
+    }
+    bool enabled() const {
+        return (absmax_ptr != NULL);
+    }
 
     static __device__ __host__ TensorGPU from(ElementType* ptr=nullptr) {
-        TensorGPU tmp = {0};
+        TensorGPU tmp;
         tmp.data_ptr = ptr;
-        tmp.id = -1;
         return tmp;
     }
 
@@ -146,8 +152,10 @@ typedef TensorGPU<floatX> tensorFP8e4;
 typedef TensorGPU<floatX> tensorFP8e5;
 #endif
 
-extern TensorGPU<floatX> null_tensorX;
 extern TensorGPU<float> null_tensorFP32;
+extern TensorGPU<floatX> null_tensorX;
+extern TensorGPU<float8e4> null_tensorFP8E4;
+extern TensorGPU<float8e5> null_tensorFP8E5;
 
 // ----------------------------------------------------------------------------
 

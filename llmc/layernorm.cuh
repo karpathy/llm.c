@@ -13,13 +13,15 @@ E.g., the layernorms are connected to the residuals so we += in layernorm backwa
 // llmc internal imports
 #include "cuda_common.h"
 #include "cuda_utils.cuh"
+#include "tensor.cuh"
 
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
-__global__ void layernorm_forward_kernel6(tensorFP8e4 out, tensorFP32 mean, tensorFP32 rstd,
-                                    tensorFP8e4 inp, tensorFP8e4 weight,
-                                    const tensorX bias, int N, int C) {
+template <typename T=floatX>
+__global__ void layernorm_forward_kernel6(TensorGPU<T> out, tensorFP32 mean, tensorFP32 rstd,
+                                          tensorX inp, tensorX weight,
+                                          tensorX bias, int N, int C) {
     // Note that blockDim.x must be WARP_SIZE=32 but we don't want to pay the cost of assert() here
     int idx = blockIdx.x * blockDim.y + threadIdx.y; // non-standard: threadIdx.x is used for c
     if(idx >= N) { return; }
@@ -62,7 +64,7 @@ __global__ void layernorm_forward_kernel6(tensorFP8e4 out, tensorFP32 mean, tens
             float o = n * w128.get(k) + b128.get(k); // scale and shift it
             out128.set(k, o);
         }
-        out128.store_same_length<floatX>(idx * C + c);
+        out128.template store_same_length<floatX>(idx * C + c);
     }
     // cache the mean and rstd for the backward pass later
     if(threadIdx.x == 0) { // todo - add a way to pass equivalent of null for mean/rstd to avoid store
@@ -73,8 +75,9 @@ __global__ void layernorm_forward_kernel6(tensorFP8e4 out, tensorFP32 mean, tens
     out128.update_absmax(threadIdx.x + threadIdx.y * blockDim.x, blockDim.x * blockDim.y, true);
 }
 
-__global__ void fused_residual_forward_kernel5(tensorX residual_, tensorFP8e4 normed_, tensorFP32 mean, tensorFP32 rstd,
-                                               const tensorX inp1_, const tensorFP8e4 inp2_,
+template <typename T=float8e4, typename T2 = T>
+__global__ void fused_residual_forward_kernel5(tensorX residual, TensorGPU<T> normed, tensorFP32 mean, tensorFP32 rstd,
+                                               const tensorX inp1, const TensorGPU<T2> inp2,
                                                const tensorX weight, const tensorX bias,
                                                int N, int C) {
     // Note that blockDim.x must be WARP_SIZE=32 but we don't want to pay the cost of assert() here
@@ -85,20 +88,20 @@ __global__ void fused_residual_forward_kernel5(tensorX residual_, tensorFP8e4 no
     extern __shared__ char* params[];
     x128* s_res = reinterpret_cast<x128*>(params) + (threadIdx.y * C / x128::size);
 
-    auto residual128 = new_tensor128(residual_);
-    auto normed128 = new_tensor128(normed_);
+    auto residual128 = new_tensor128(residual);
+    auto normed128 = new_tensor128(normed);
 
     const float eps = 1e-5f;
     float sum = 0.0f;
     for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        auto inp1_128 = load_tensor128(inp1_, idx * C + c, true);
-        auto inp2_128 = load_tensor128(inp2_, idx * C + c, true);
+        auto inp1_128 = load_tensor128(inp1, idx * C + c, true);
+        auto inp2_128 = load_tensor128(inp2, idx * C + c, true);
         for(int k = 0; k < x128::size; ++k) {
             float out = inp1_128.get(k) + inp2_128.get(k);
             residual128.set(k, out);
             sum += residual128.get(k);
         }
-        residual128.store_same_length<floatX>(idx * C + c, false);
+        residual128.store(idx * C + c, false);
         s_res[c / x128::size] = residual128.get128();
     }
 
@@ -125,7 +128,7 @@ __global__ void fused_residual_forward_kernel5(tensorX residual_, tensorFP8e4 no
             float o = n * w128.get(k) + b128.get(k); // scale and shift it
             normed128.set(k, o);
         }
-        normed128.store_same_length<floatX>(idx * C + c, false);
+        normed128.template store_same_length<floatX>(idx * C + c, false);
     }
     // cache the mean and rstd for the backward pass later
     if(threadIdx.x == 0) {
@@ -133,15 +136,15 @@ __global__ void fused_residual_forward_kernel5(tensorX residual_, tensorFP8e4 no
         __stcs(rstd + idx, s);
     }
 
-    // Update absmax for both residual and normed tensors
+    // Update absmax for residual and normed tensors (typically it will skip residual as it is not FP8)
     residual128.update_absmax(threadIdx.x + threadIdx.y * blockDim.x, blockDim.x * blockDim.y, false);
     normed128.update_absmax(threadIdx.x + threadIdx.y * blockDim.x, blockDim.x * blockDim.y, true);
 }
 
-template <bool zero_dinp_old=false>
+template <bool zero_dinp_old=false, typename T=float8e5>
 __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with only 1024 threads?
     layernorm_backward_kernel10(tensorX dinp_new, tensorX dinp_old, tensorX dweight, tensorX dbias, tensorFP32 scratch_,
-                                tensorFP8e5 dout, tensorX inp, tensorX weight, tensorFP32 mean, tensorFP32 rstd,
+                                TensorGPU<T> dout, tensorX inp, tensorX weight, tensorFP32 mean, tensorFP32 rstd,
                                 int BT, int C) {
     int BLOCK_SIZE = blockDim.x; // todo - does it make any difference if this is hardcoded here?
     int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
@@ -195,7 +198,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
         for (int c = 0; c < iterations_C; c++) {
             int global_index = (warpThreadIdx * x128::size) + (c * C_per_iteration);
 
-            tensor128<floatX> dout128;
+            tensor128<T> dout128;
             tensor128<floatX> inp128;
             tensor128<floatX> weight128;
             tensor128<floatX> dinp128;
@@ -370,22 +373,25 @@ void launch_layernorm_kernel(KernelFunc kernel, int N, int C, cudaStream_t strea
     cudaCheck(cudaGetLastError());
 }
 
-void layernorm_forward(tensorX out, tensorFP32 mean, tensorFP32 rstd,
+template <typename T=floatX>
+void layernorm_forward(TensorGPU<T> out, tensorFP32 mean, tensorFP32 rstd,
                        tensorX inp, const tensorX weight, const tensorX bias,
                        int N, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
-    launch_layernorm_kernel(layernorm_forward_kernel6, N, C, stream, out, mean, rstd, inp, weight, bias);
+    launch_layernorm_kernel(layernorm_forward_kernel6<T>, N, C, stream, out, mean, rstd, inp, weight, bias);
 }
 
-void fused_residual_forward5(tensorX residual, tensorX normed, tensorFP32 mean, tensorFP32 rstd,
-                             tensorX inp1, tensorX inp2, tensorX weight, tensorX bias,
+template <typename T=float8e4, typename T2 = T>
+void fused_residual_forward5(tensorX residual, TensorGPU<T> normed, tensorFP32 mean, tensorFP32 rstd,
+                             tensorX inp1, TensorGPU<T2> inp2, tensorX weight, tensorX bias,
                              int N, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
-    launch_layernorm_kernel(fused_residual_forward_kernel5, N, C, stream, residual, normed, mean, rstd, inp1, inp2, weight, bias);
+    launch_layernorm_kernel(fused_residual_forward_kernel5<T, T2>, N, C, stream, residual, normed, mean, rstd, inp1, inp2, weight, bias);
 }
 
+template <typename T=float8e5>
 void layernorm_backward(tensorX dinp_new, tensorX dinp_old, tensorX dweight, tensorX dbias, tensorFP32 scratch,
-                        const tensorX dout, const tensorX inp, const tensorX weight, tensorFP32 mean, tensorFP32 rstd,
+                        const TensorGPU<T> dout, const tensorX inp, const tensorX weight, tensorFP32 mean, tensorFP32 rstd,
                         int BT, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 512;

@@ -1,4 +1,4 @@
-//#define ENABLE_FP8
+#define ENABLE_FP8
 
 /*
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
@@ -98,8 +98,10 @@ int current_absmax_index = 0;
 float* gpu_scale_memory = NULL;
 unsigned int* gpu_absmax_memory = NULL;
 
-TensorGPU<floatX> null_tensorX = {0};
 TensorGPU<float> null_tensorFP32 = {0};
+TensorGPU<floatX> null_tensorX = {0};
+TensorGPU<float8e4> null_tensorFP8E4 = {0};
+TensorGPU<float8e5> null_tensorFP8E5 = {0};
 
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
@@ -187,7 +189,7 @@ void gpt2_allocate(GPT2 *model) {
     // 1) parameters & optimizer state
     for (int t = PARAMETER; t <= PARAMETER_MASTER; t++) {
         DType dtype = (t <= PARAMETER_GRAD) ? DTYPE_FLOATX : DType::FP32;
-        DType dtype_lowp = (t <= PARAMETER_GRAD) ? DTYPE_FLOATX : DType::FP32; // FP8 in the future
+        DType dtype_lowp = (t == PARAMETER) ? DTYPE_FP8E4 : ((t == PARAMETER_GRAD) ? DTYPE_FLOATX : DType::FP32);
 
         current_tensor_type = (TT)t;
         ParameterTensors* spec = &model->params[t];
@@ -207,7 +209,7 @@ void gpt2_allocate(GPT2 *model) {
         TENSOR_SPECS     (ln2w,       L, C,         LAYERNORM);
         TENSOR_SPECS     (ln2b,       L, C,         LAYERNORM | BIAS);
         TENSOR_SPECS_LOWP(fcw,        L, 4 * C * C, TENSOR_2D);
-        TENSOR_SPECS_LOWP(fcb,        L, 4 * C,     BIAS);
+        TENSOR_SPECS     (fcb,        L, 4 * C,     BIAS);
         TENSOR_SPECS_LOWP(fcprojw,    L, 4 * C * C, TENSOR_2D);
         TENSOR_SPECS     (fcprojb,    L, C,         BIAS);
         TENSOR_SPECS     (lnfw,       1, C,         LAYERNORM);
@@ -229,7 +231,7 @@ void gpt2_allocate(GPT2 *model) {
 
     // 3) activations
     ActivationTensors* spec = &model->acts;
-    DType dtype_lowp = DTYPE_FLOATX; // todo FP8
+    DType dtype_lowp = DTYPE_FP8E4; // todo FP8
     DType dtype = DTYPE_FLOATX;
     shards = 1;
 
@@ -254,17 +256,17 @@ void gpt2_allocate(GPT2 *model) {
     // optionally reuse the same activation buffer at each layer and re-compute the gelu during backward
     // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
     if (model->recompute < 1 || UNIQUE_TENSOR_MEMORY) {
-        TENSOR_SPECS(fch_gelu,      L, 4 * BTC, 0);
-        TENSOR_SPECS(ln1,           L, BTC, LAYERNORM);
-        TENSOR_SPECS(ln2,           L, BTC, LAYERNORM);
+        TENSOR_SPECS_LOWP(fch_gelu,      L, 4 * BTC, 0);
+        TENSOR_SPECS_LOWP(ln1,           L, BTC, LAYERNORM);
+        TENSOR_SPECS_LOWP(ln2,           L, BTC, LAYERNORM);
     } else if (model->recompute < 2) {
         spec->fch_gelu = add_layer_specs(L, "fch_gelu", 4 * BTC, shards, dtype_lowp, model->multiuse.output_scratch, REUSED_MEMORY);
-        TENSOR_SPECS(ln1,           L, BTC, LAYERNORM);
-        TENSOR_SPECS(ln2,           L, BTC, LAYERNORM);
+        TENSOR_SPECS_LOWP(ln1,           L, BTC, LAYERNORM);
+        TENSOR_SPECS_LOWP(ln2,           L, BTC, LAYERNORM);
     } else {
         spec->fch_gelu = add_layer_specs(L, "fch_gelu", 4 * BTC, shards, dtype_lowp, model->multiuse.output_scratch, REUSED_MEMORY);
-        spec->ln1 = add_layer_specs(L, "ln1", BTC, shards, dtype, model->multiuse.btc, LAYERNORM | REUSED_MEMORY);
-        spec->ln2 = add_layer_specs(L, "ln2", BTC, shards, dtype, model->multiuse.btc, LAYERNORM | REUSED_MEMORY);
+        spec->ln1 = add_layer_specs(L, "ln1", BTC, shards, dtype_lowp, model->multiuse.btc, LAYERNORM | REUSED_MEMORY);
+        spec->ln2 = add_layer_specs(L, "ln2", BTC, shards, dtype_lowp, model->multiuse.btc, LAYERNORM | REUSED_MEMORY);
     }
     TENSOR_SPECS_FP32(ln1_mean,   L, BT,      LAYERNORM | STATS);
     TENSOR_SPECS_FP32(ln1_rstd,   L, BT,      LAYERNORM | STATS);
@@ -291,27 +293,27 @@ void gpt2_allocate(GPT2 *model) {
     // todo - is "LAYERNORM" applied logically here? do we care?
     reuse_every_n = 0;
     spec = &model->acts_grads;
-    dtype_lowp = DTYPE_FLOATX; // todo FP8
+    dtype_lowp = DTYPE_FP8E5;
     shards = 1;
 
     if (UNIQUE_TENSOR_MEMORY) {
-        TENSOR_SPECS(encoded,    1, BTC,            GRADIENT | EMBEDDING);
-        TENSOR_SPECS(output,     1, output_size,    GRADIENT | EMBEDDING);
-        TENSOR_SPECS(lnf,        1, BTC,            GRADIENT | LAYERNORM | TENSOR_2D);
-        TENSOR_SPECS(ln1,        L, BTC,            GRADIENT | LAYERNORM | TENSOR_2D);
-        TENSOR_SPECS(atty,       L, BTC,            GRADIENT | TENSOR_2D);
-        TENSOR_SPECS(residual2,  L, BTC,            GRADIENT | RESIDUAL);
-        TENSOR_SPECS(ln2,        L, BTC,            GRADIENT | LAYERNORM | TENSOR_2D);
-        TENSOR_SPECS(fch,        L, 4 * BTC,        GRADIENT | TENSOR_2D);
-        TENSOR_SPECS(fch_gelu,   L, 4 * BTC,        GRADIENT | TENSOR_2D);
-        TENSOR_SPECS(residual3,  L, BTC,            GRADIENT | RESIDUAL);
-        TENSOR_SPECS(qkvr,       L, 3 * BTC,        GRADIENT);
+        TENSOR_SPECS     (encoded,    1, BTC,            GRADIENT | EMBEDDING);
+        TENSOR_SPECS     (output,     1, output_size,    GRADIENT | EMBEDDING);
+        TENSOR_SPECS_LOWP(lnf,        1, BTC,            GRADIENT | LAYERNORM | TENSOR_2D);
+        TENSOR_SPECS_LOWP(ln1,        L, BTC,            GRADIENT | LAYERNORM | TENSOR_2D);
+        TENSOR_SPECS     (atty,       L, BTC,            GRADIENT | TENSOR_2D);
+        TENSOR_SPECS     (residual2,  L, BTC,            GRADIENT | RESIDUAL);
+        TENSOR_SPECS_LOWP(ln2,        L, BTC,            GRADIENT | LAYERNORM | TENSOR_2D);
+        TENSOR_SPECS_LOWP(fch,        L, 4 * BTC,        GRADIENT | TENSOR_2D);
+        TENSOR_SPECS_LOWP(fch_gelu,   L, 4 * BTC,        GRADIENT | TENSOR_2D);
+        TENSOR_SPECS     (residual3,  L, BTC,            GRADIENT | RESIDUAL);
+        TENSOR_SPECS     (qkvr,       L, 3 * BTC,        GRADIENT);
     } else {
         spec->output = add_layer_specs(1, "output", output_size, 1, dtype, model->multiuse.output_scratch, GRADIENT | EMBEDDING);
 
         int reused_btc = model->acts.residual3 + (L-1); // todo - check if this works with activation checkpointing
-        spec->ln1 = add_layer_specs(L, "ln1", BTC, 1, dtype, reused_btc, GRADIENT | LAYERNORM | TENSOR_2D);
-        spec->ln2 = add_layer_specs(L, "ln2", BTC, 1, dtype, reused_btc, GRADIENT | LAYERNORM | TENSOR_2D);
+        spec->ln1 = add_layer_specs(L, "ln1", BTC, 1, dtype_lowp, reused_btc, GRADIENT | LAYERNORM | TENSOR_2D);
+        spec->ln2 = add_layer_specs(L, "ln2", BTC, 1, dtype_lowp, reused_btc, GRADIENT | LAYERNORM | TENSOR_2D);
         spec->atty = add_layer_specs(L, "atty", BTC, 1, dtype, reused_btc, GRADIENT | TENSOR_2D);
 
         int reused_btc2 = model->acts.lnf;
@@ -320,9 +322,9 @@ void gpt2_allocate(GPT2 *model) {
         spec->encoded = add_layer_specs(1, "encoded", BTC, 1, dtype, reused_btc2, GRADIENT | EMBEDDING);
 
         // (lnf doesn't need bt4c but it's free at this point unlike the other buffers)
-        spec->lnf = add_layer_specs(1, "lnf", BTC, 1, dtype, model->multiuse.bt4c, GRADIENT | LAYERNORM | TENSOR_2D);
-        spec->fch_gelu = add_layer_specs(L, "fch_gelu", 4 * BTC, 1, dtype, model->multiuse.bt4c, GRADIENT | TENSOR_2D);
-        spec->fch = add_layer_specs(L, "fch", 4 * BTC, 1, dtype, model->multiuse.bt4c, GRADIENT | TENSOR_2D);
+        spec->lnf = add_layer_specs(1, "lnf", BTC, 1, dtype_lowp, model->multiuse.bt4c, GRADIENT | LAYERNORM | TENSOR_2D);
+        spec->fch_gelu = add_layer_specs(L, "fch_gelu", 4 * BTC, 1, dtype_lowp, model->multiuse.bt4c, GRADIENT | TENSOR_2D);
+        spec->fch = add_layer_specs(L, "fch", 4 * BTC, 1, dtype_lowp, model->multiuse.bt4c, GRADIENT | TENSOR_2D);
         spec->qkvr = add_layer_specs(L, "qkvr", 3 * BTC, 1, dtype, model->multiuse.bt4c, GRADIENT | TENSOR_2D);
     }
 
@@ -652,7 +654,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // start of forward pass with encoder (layer 0)
     int l = 0;
     encoder_forward(ACT(encoded), model->inputs, PARAM(wte), PARAM(wpe), B, T, C);
-    layernorm_forward(ACT(ln1), ACT(ln1_mean), ACT(ln1_rstd), ACT(encoded), PARAM(ln1w), PARAM(ln1b), B*T, C);
+    layernorm_forward<float8e4>(ACT(ln1), ACT(ln1_mean), ACT(ln1_rstd), ACT(encoded), PARAM(ln1w), PARAM(ln1b), B*T, C);
 
     for (; l < L; l++) {
         NvtxRange layer_range("Layer", l);
@@ -660,28 +662,28 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
         tensorX qkvr = ACT(qkvr); // non-cudnn reuses tensor with different memory pre/post-permute
         qkvr.data_ptr = CUDNN_ENABLED ? ACT(qkvr) : MULTI(output_scratch);
-        matmul_forward_cublaslt(qkvr, ACT(ln1), PARAM(qkvw), PARAM(qkvb), B*T, C, 3*C);
+        matmul_forward_cublaslt<float8e4, floatX>(qkvr, ACT(ln1), PARAM(qkvw), PARAM(qkvb), B*T, C, 3*C);
         #ifdef ENABLE_CUDNN
         attention_forward_cudnn(ACT(atty), ACT(att), ACT(qkvr), B, T, NH, C);
         #else
         attention_forward(ACT(atty), ACT(qkvr), ACT(att), qkvr, B, T, C, NH);
         #endif
 
-        matmul_forward_cublaslt(ACT(attproj), ACT(atty), PARAM(attprojw), PARAM(attprojb), B*T, C, C);
-        fused_residual_forward5(ACT(residual2), ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), residual, ACT(attproj), PARAM(ln2w), PARAM(ln2b), B*T, C);
-        matmul_forward_cublaslt<floatX>(ACT(fch_gelu), ACT(ln2), PARAM(fcw), PARAM(fcb), B*T, C, 4*C, ACT(fch), model->gelu_fusion);
-        matmul_forward_cublaslt(ACT(fcproj), ACT(fch_gelu), PARAM(fcprojw), PARAM(fcprojb), B*T, 4*C, C);
+        matmul_forward_cublaslt<float8e4, float8e4>(ACT(attproj), ACT(atty), PARAM(attprojw), PARAM(attprojb), B*T, C, C);
+        fused_residual_forward5<float8e4, float8e4>(ACT(residual2), ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), residual, ACT(attproj), PARAM(ln2w), PARAM(ln2b), B*T, C);
+        matmul_forward_cublaslt<float8e4, float8e4>(ACT(fch_gelu), ACT(ln2), PARAM(fcw), PARAM(fcb), B*T, C, 4*C, ACT(fch), model->gelu_fusion);
+        matmul_forward_cublaslt<float8e4, float8e4>(ACT(fcproj), ACT(fch_gelu), PARAM(fcprojw), PARAM(fcprojb), B*T, 4*C, C);
 
         if(l+1 != L) {
-            fused_residual_forward5(ACT(residual3), ACT_L(ln1, l+1), ACT_L(ln1_mean, l+1), ACT_L(ln1_rstd, l+1), ACT(residual2), ACT(fcproj),
-                                    PARAM_L(ln1w, l+1), PARAM_L(ln1b, l+1), B*T, C);
+            fused_residual_forward5<float8e4, float8e4>(ACT(residual3), ACT_L(ln1, l+1), ACT_L(ln1_mean, l+1), ACT_L(ln1_rstd, l+1), ACT(residual2), ACT(fcproj),
+                                              PARAM_L(ln1w, l+1), PARAM_L(ln1b, l+1), B*T, C);
         } else {
-            fused_residual_forward5(ACT(residual3), ACT(lnf), ACT(lnf_mean), ACT(lnf_rstd), ACT(residual2), ACT(fcproj),
-                                    PARAM(lnfw), PARAM(lnfb), B*T, C);
+            fused_residual_forward5<floatX, float8e4>(ACT(residual3), ACT(lnf), ACT(lnf_mean), ACT(lnf_rstd), ACT(residual2), ACT(fcproj),
+                                            PARAM(lnfw), PARAM(lnfb), B*T, C);
         }
     }
 
-    matmul_forward_cublaslt(ACT(output), ACT(lnf), PARAM(wte), null_tensorX, B*T, C, Vp);
+    matmul_forward_cublaslt<floatX, floatX>(ACT(output), ACT(lnf), PARAM(wte), null_tensorX, B*T, C, Vp);
 }
 
 
@@ -716,6 +718,8 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
 
 void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
     NVTX_RANGE_FN();
+    exit(0);
+#if 0
 
     // convenience shortcuts (size_t instead of int so that pointer arithmetics don't overflow)
     const size_t B = model->batch_size;
@@ -757,8 +761,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     // next: backward the classifier matmul
     matmul_backward<floatX>(AGRAD(lnf), PGRAD(wte), null_tensorX, AGRAD(output), ACT(lnf), PARAM(wte), scratchF, B*T, C, Vp);
     // backward the final layernorm
-    layernorm_backward(AGRAD_L(residual3, L-1), null_tensorX, PGRAD(lnfw), PGRAD(lnfb), scratchF, AGRAD(lnf), ACT_L(residual3, L-1),
-                       PARAM(lnfw), ACT(lnf_mean), ACT(lnf_rstd), B*T, C);
+    layernorm_backward<floatX>(AGRAD_L(residual3, L-1), null_tensorX, PGRAD(lnfw), PGRAD(lnfb), scratchF, AGRAD(lnf), ACT_L(residual3, L-1),
+                               PARAM(lnfw), ACT(lnf_mean), ACT(lnf_rstd), B*T, C);
 
     // now backward all the layers
     for (; l >= 0; l--) {
@@ -868,6 +872,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     } else {
         model->mean_loss = -1.f; // no loss available yet
     }
+#endif
 }
 
 float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {

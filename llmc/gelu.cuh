@@ -65,7 +65,7 @@ __global__ void gelu_backward_kernel(tensorFP8e5 dinp, tensorFP8e5 dout, TensorG
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-void gelu_forward(tensorX out, tensorX inp, cudaStream_t stream=main_stream) {
+void gelu_forward(tensorFP8e4 out, tensorFP8e4 inp, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     assert(inp.num_elements % (block_size * inp.num_per_128()) == 0);
@@ -75,7 +75,7 @@ void gelu_forward(tensorX out, tensorX inp, cudaStream_t stream=main_stream) {
     cudaCheck(cudaGetLastError());
 }
 
-void gelu_backward(tensorX dinp, tensorX dout, tensorX inp, cudaStream_t stream=main_stream) {
+void gelu_backward(tensorFP8e5 dinp, tensorFP8e5 dout, tensorFP8e4 inp, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int grid_size = CEIL_DIV(inp.num_elements, block_size * inp.num_per_128());

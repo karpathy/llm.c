@@ -142,6 +142,11 @@ __global__ void adamw_full_update(TensorSpec* specs, unsigned int seed,
                 idx += stride;
             }
             out_param128.update_absmax(threadIdx.x, block_size, false);
+        } else if (specs[spec_id].data_type == DType::FP8E4M3) {
+            TensorGPU<float8e4> param_tensor = specs[spec_id];
+            auto out_param128 = new_tensor128(param_tensor);
+            return;
+            // todo
         } else {
             assert(false); // TODO
         }

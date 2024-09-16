@@ -98,6 +98,18 @@ typedef __nv_bfloat16 floatX;
 #define DTYPE_FLOATX DType::BF16
 #endif
 
+#if defined(ENABLE_FP8)
+typedef __nv_fp8_e4m3 float8e4;
+typedef __nv_fp8_e5m2 float8e5;
+#define DTYPE_FP8E4 DType::FP8E4M3
+#define DTYPE_FP8E5 DType::FP8E5M2
+#else
+typedef floatX float8e4;
+typedef floatX float8e5;
+#define DTYPE_FP8E4 DTYPE_FLOATX
+#define DTYPE_FP8E5 DTYPE_FLOATX
+#endif
+
 // ----------------------------------------------------------------------------
 // Load and store with streaming cache hints
 // Older nvcc does not provide __ldcs and __stcs for bfloat16, despite these
