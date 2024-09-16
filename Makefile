@@ -119,7 +119,8 @@ ifeq ($(USE_CUDNN), 1)
       $(info ✓ cuDNN found, will run with flash-attention)
       CUDNN_FRONTEND_PATH ?= cudnn-frontend/include
     else
-      $(error ✗ cuDNN not found. See the README for install instructions and the Makefile for hard-coded paths)
+      CUDNN_FRONTEND_PATH ?= /workspace/Projects/Github/NLP/cudnn-frontend/include
+      #$(error ✗ cuDNN not found. See the README for install instructions and the Makefile for hard-coded paths)
     endif
     NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
     NVCC_LDFLAGS += -lcudnn
