@@ -17,7 +17,7 @@ In the backward pass, the gradients flow to both, handled by different kernels
 // CUDA kernels
 
 __global__ void encoder_forward_kernel3(floatX* out,
-                               const int* inp, const floatX* wte, const floatX* wpe,
+                               const int* inp, const floatX* wte, const floatX* wpe, int use_rope,
                                int B, int T, int C) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     int N = B * T * C;
@@ -36,9 +36,16 @@ __global__ void encoder_forward_kernel3(floatX* out,
 
     x128 packed_out;
     x128 wte128 = load128cs(wte_ix);
-    x128 wpe128 = load128cs(wpe_tc);
+    x128 wpe128;
+    if (!use_rope) {
+        wpe128 = load128cs(wpe_tc);
+    }
     for (int k = 0; k < x128::size; k++) {
-        packed_out[k] = (floatX)((float)wte128[k] + (float)wpe128[k]);
+        if (!use_rope) {
+            packed_out[k] = (floatX)((float)wte128[k] + (float)wpe128[k]);
+        } else {
+            packed_out[k] = wte128[k];
+        }
     }
     store128(out_btc, packed_out);
 }
@@ -151,17 +158,33 @@ __global__ void wpe_backward_kernel(floatX* dwpe,
     store128(dwpe_tc, packed_dwpe);
 }
 
+__global__ void init_rope_freqs_kernel(float* rope_freqs, float rope_base_freq) {
+    int m = blockIdx.x;
+    int d_half = blockDim.x;
+    int i = threadIdx.x + 1;
+    int out_idx = m * d_half + i - 1;
+
+    float theta_i = __powf(rope_base_freq, -2.0f * (float)(i - 1) / (2.f * (float)d_half));
+    rope_freqs[out_idx] = (float)m * theta_i;
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
+void init_rope_freqs(float* rope_freqs, int max_seq_len, int HS, float rope_base_freq, cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    init_rope_freqs_kernel<<<max_seq_len, HS, 0, stream>>>(rope_freqs, rope_base_freq);
+    cudaCheck(cudaGetLastError());
+}
+
 void encoder_forward(floatX* out,
-                     const int* inp, const floatX* wte, const floatX* wpe,
+                     const int* inp, const floatX* wte, const floatX* wpe, int use_rope,
                      int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int N = B * T * C;
     const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
-    encoder_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, inp, wte, wpe, B, T, C);
+    encoder_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, inp, wte, wpe, use_rope, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -169,15 +192,17 @@ void encoder_forward(floatX* out,
 void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu outputs & scratch
                       int* workload_indices, int4* bucket_info,    // cpu scratch buffers
                       const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
-                      int B, int T, int C, unsigned int seed, cudaStream_t stream) {
+                      int use_rope, int B, int T, int C, unsigned int seed, cudaStream_t stream) {
     NVTX_RANGE_FN();
 
-    // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
-    const int block_size = 256;
-    const int N = T * C / x128::size;
-    const int grid_size = CEIL_DIV(N, block_size);
-    wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
-    cudaCheck(cudaGetLastError());
+    if (!use_rope) {
+        // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
+        const int block_size = 256;
+        const int N = T * C / x128::size;
+        const int grid_size = CEIL_DIV(N, block_size);
+        wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
+        cudaCheck(cudaGetLastError());
+    }
 
     // check the GPU scratch buffer is large enough to hold the bucket info and workload indices
     // todo - this is trivially true given hardcoded scratch buffer size here, is this useful?

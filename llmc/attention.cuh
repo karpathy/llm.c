@@ -189,11 +189,55 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
     }
 }
 
+__global__ void rope_rotate_kernel(floatX* q, floatX* k, float* rope_freqs, int B, int NH, int T, int HS, int is_backward) {
+    // thanks to the nice mathematical properties of RoPE this is both our fwd & bwd pass kernel!
+    // the only difference is that we have to toggle the sign of the sin term in the rotation
+    // q, k are of shape (B, NH, T, HS)
+    // rope_freqs is of shape (T, HS/2)
+    int n = HS / x128::size;
+    int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread_idx >= B * NH * T * n) { return; }
+
+    int b = thread_idx / (NH * T * n);
+    int rest = thread_idx % (NH * T * n);
+    int nh = rest / (T * n);
+    rest = rest % (T * n);
+    int t = rest / n;
+    int i = rest % n;
+
+    float* rope_freqs_t = rope_freqs + t * (HS / 2) + i * (x128::size / 2);
+    f128 freqs_reg = load128(rope_freqs_t);  // caching the frequencies
+
+    int idx = b * NH * T * HS + nh * T * HS + t * HS + i * x128::size;
+    x128 q_reg = load128cs(&q[idx]);
+    x128 k_reg = load128cs(&k[idx]);
+    x128 qout_reg, kout_reg;
+    for (int k = 0; k < x128::size / 2; k++) {  // div by 2 because we're processing tuples of 2
+        // rotate q
+        floatX x1 = q_reg[2*k];
+        floatX x2 = q_reg[2*k + 1];
+        floatX q_out1 = (floatX)((float)x1 * cosf(freqs_reg[k]) + (is_backward ? 1 : -1) * (float)x2 * sinf(freqs_reg[k]));
+        floatX q_out2 = (floatX)((float)x2 * cosf(freqs_reg[k]) + (is_backward ? -1 : 1) * (float)x1 * sinf(freqs_reg[k]));
+        qout_reg[2*k] = q_out1;
+        qout_reg[2*k + 1] = q_out2;
+        // rotate k
+        x1 = k_reg[2*k];
+        x2 = k_reg[2*k + 1];
+        floatX k_out1 = (floatX)((float)x1 * cosf(freqs_reg[k]) + (is_backward ? 1 : -1) * (float)x2 * sinf(freqs_reg[k]));
+        floatX k_out2 = (floatX)((float)x2 * cosf(freqs_reg[k]) + (is_backward ? -1 : 1) * (float)x1 * sinf(freqs_reg[k]));
+        kout_reg[2*k] = k_out1;
+        kout_reg[2*k + 1] = k_out2;
+    }
+
+    store128cs(&q[idx], qout_reg);
+    store128cs(&k[idx], kout_reg);
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
 void attention_forward(floatX* out, floatX* qkvr, floatX* att,
-                       floatX* inp,
+                       floatX* inp, int use_rope, float* rope_freqs,
                        int B, int T, int C, int NH, cudaStream_t stream) {
     NVTX_RANGE_FN();
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
@@ -213,6 +257,13 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, B, T, NH, HS);
+
+    if (use_rope) {
+        assert(HS % x128::size == 0);
+        total_threads = B * NH * T * (HS / x128::size);
+        num_blocks = CEIL_DIV(total_threads, block_size);
+        rope_rotate_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, rope_freqs, B, NH, T, HS, 0);
+    }
 
     floatX* preatt = inp; // reuse inp as scratch buffer
     matmul_cublaslt(preatt, k, q, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
@@ -239,6 +290,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
                         const floatX* dout,
                         const floatX* qkvr, const floatX* att,
+                        int use_rope, float* rope_freqs,
                         int B, int T, int C, int NH, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
@@ -269,6 +321,14 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     matmul_cublaslt(dq, k, dpreatt, nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
     // backward into k
     matmul_cublaslt(dk, q, dpreatt, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
+
+    if (use_rope) {
+        assert(HS % x128::size == 0);
+        int total_threads = B * NH * T * (HS / x128::size);
+        num_blocks = CEIL_DIV(total_threads, block_size);
+        rope_rotate_kernel<<<num_blocks, block_size, 0, stream>>>(dq, dk, rope_freqs, B, NH, T, HS, 1);
+    }
+
     // backward into inp
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
     permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dinp, dq, dk, dv, B, T, NH, HS);
