@@ -1101,6 +1101,10 @@ if __name__ == "__main__":
         assert args.tokenizer_path is not None and os.path.exists(args.tokenizer_path), f"llama3 tokenizer path {args.tokenizer_path} does not exist"
         model = LLaMA.from_pretrained_llama3_meta(args.ckpt_dir, args.tokenizer_path)
 
+    # convert the model to the desired precision
+    if args.dtype == "float32":
+        model = model.to(torch.float32)
+
     model.train()
     if args.compile:
         if hasattr(config, "coordinate_descent_tuning"):
