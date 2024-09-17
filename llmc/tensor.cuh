@@ -3,7 +3,7 @@
 
 // ...
 //#define FAKE_FP8
-#define UNIQUE_TENSOR_MEMORY true
+#define UNIQUE_TENSOR_MEMORY false
 #define LAYERS_PER_ACTIVATION_CHECKPOINT 0 // 0 = disabled
 // ...
 
@@ -21,8 +21,8 @@ enum TT : uint8_t {
 
 enum TFlags : uint8_t {
     NONE=0,
-    REUSED_MEMORY=1,
-    GRADIENT=2,
+    GRADIENT=1,
+    REUSED_MEMORY=2,
     TENSOR_2D=4, // used for matmul *outputs* only, not inputs (+weights)
     BIAS=8,
     LAYERNORM=16,
@@ -77,13 +77,12 @@ struct TensorGPU {
     size_t num_elements = 0;
     int id = -1;
 
-    static constexpr bool no_scaling = (sizeof(ElementType) == 1);
-
+    static constexpr bool no_scaling = (sizeof(ElementType) != 1);
     bool is_null() const {
         return (data_ptr == NULL);
     }
     bool enabled() const {
-        return (absmax_ptr != NULL);
+        return (data_ptr != NULL);
     }
 
     static __device__ __host__ TensorGPU from(ElementType* ptr=nullptr) {
@@ -202,8 +201,6 @@ struct TensorSpec {
 
 // debug helper function
 void print_tensor_elements(int tensor_id) {
-    return;
-
     printf("Printing tensor %d\n", tensor_id);
     TensorSpec spec = tensor_specs[tensor_id];
     size_t num_elements = spec.num_elements;
@@ -215,65 +212,35 @@ void print_tensor_elements(int tensor_id) {
     void* gpu_tensor = spec.ptr;
     void* cpu_tensor = malloc(num_elements * element_size);
 
-    printf("Printing tensor %s (tensor_type: %d, data_type: %d)\n", tensor_name, (int)tensor_type, (int)dtype);
+    // Get scale from GPU
+    float scale, descale, absmax;
+    cudaMemcpy(&scale, &gpu_scale_memory[spec.id * 2], sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&descale, &gpu_scale_memory[spec.id * 2 + 1], sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&absmax, &gpu_absmax_memory[spec.id], sizeof(float), cudaMemcpyDeviceToHost);
+
+    printf("Printing tensor %s (tensor_type: %d, data_type: %d, flags: %d)\n", tensor_name, (int)tensor_type, (int)dtype, spec.flags);
     printf("GPU memory: %p\n", gpu_tensor);
     printf("CPU memory: %p\n", cpu_tensor);
     printf("Num elements: %zu\n", num_elements);
     printf("Element size: %zu\n", element_size);
     printf("Offset: %zu\n", spec.offset);
+    printf("Scale: %f, Descale: %f, Absmax: %f\n", scale, descale, absmax);
 
     cudaCheck(cudaMemcpy(cpu_tensor, gpu_tensor, num_elements * element_size, cudaMemcpyDeviceToHost));
 
-    printf("Did memcpy\n");
-
-    printf("First 4 of %s: ", tensor_name);
-    for (int i = 0; i < num_elements && i < 4; i++) {
-        if (dtype == DType::FP32) {
-            printf("%.16f ", ((float*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP16) {
-            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
-        } else if (dtype == DType::BF16) {
-            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP8E4M3) {
-            printf("%.16f ", (float)((__nv_fp8_e4m3*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP8E5M2) {
-            printf("%.16f ", (float)((__nv_fp8_e5m2*)cpu_tensor)[i]);
+    printf("First 4 & Last 4 of %s:\n", tensor_name);
+    for (int i = 0; i < 8; i++) {
+        int idx = (i < 4) ? i : num_elements - 8 + i;
+        switch (dtype) {
+            case DType::FP32: printf("%.16f ", ((float*)cpu_tensor)[idx]); break;
+            case DType::FP16: printf("%.16f ", (float)((__nv_half*)cpu_tensor)[idx]); break;
+            case DType::BF16: printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[idx]); break;
+            case DType::FP8E4M3: printf("%.16f ", (float)((__nv_fp8_e4m3*)cpu_tensor)[idx]); break;
+            case DType::FP8E5M2: printf("%.16f ", (float)((__nv_fp8_e5m2*)cpu_tensor)[idx]); break;
         }
+        if (i == 3) printf("\n");
     }
-    printf("\n");
-
-    printf("Middle 4 of %s: ", tensor_name);
-    for (int i = (num_elements/2) + 4; i < num_elements && i < (num_elements/2 + 8); i++) {
-        if (dtype == DType::FP32) {
-            printf("%.16f ", ((float*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP16) {
-            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
-        } else if (dtype == DType::BF16) {
-            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP8E4M3) {
-            printf("%.16f ", (float)((__nv_fp8_e4m3*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP8E5M2) {
-            printf("%.16f ", (float)((__nv_fp8_e5m2*)cpu_tensor)[i]);
-        }
-    }
-    printf("\n");
-
-    printf("Last 4 of %s: ", tensor_name);
-    for (int i = num_elements - 4; i < num_elements; i++) {
-        if (dtype == DType::FP32) {
-            printf("%.16f ", ((float*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP16) {
-            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
-        } else if (dtype == DType::BF16) {
-            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP8E4M3) {
-            printf("%.16f ", (float)((__nv_fp8_e4m3*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP8E5M2) {
-            printf("%.16f ", (float)((__nv_fp8_e5m2*)cpu_tensor)[i]);
-        }
-    }
-    printf("\n");
-    printf("\n");
+    printf("\n\n");
 
     free(cpu_tensor);
 }
@@ -289,7 +256,7 @@ TensorSpec get_tensor(int spec_index, TT tensor_type, int layer) {
         assert(false);
     }
     assert(spec.tensor_type == tensor_type || tensor_type == DEFAULT);
-    print_tensor_elements(spec_index);
+    //print_tensor_elements(spec.id); // enable for extreme debugging
     return spec;
 }
 
@@ -315,13 +282,10 @@ int add_tensor_spec(const char* name, size_t total_elements, size_t num_shards, 
         size_t original_tensor_bytes = base_spec.num_elements * sizeof_dtype(base_spec.data_type);
         size_t new_tensor_bytes = spec->num_elements * sizeof_dtype(data_type);
         if (base_spec.tensor_type != spec->tensor_type) {
-            printf("ERROR: tensor_type mismatch for %s: %d vs %d\n",
-                   spec->name, (int)base_spec.tensor_type, (int)spec->tensor_type);
+            printf("ERROR: tensor_type for %s: %d vs %d\n", spec->name, (int)base_spec.tensor_type, (int)spec->tensor_type);
             assert(false);
         }
-        if (flags & REUSED_MEMORY) {
-            base_spec.flags |= REUSED_MEMORY;
-        }
+        base_spec.flags |= (flags & REUSED_MEMORY);
         assert(base_spec.tensor_type == spec->tensor_type);
         assert(new_tensor_bytes <= original_tensor_bytes);
     } else {
@@ -367,39 +331,57 @@ __global__ void update_scale_descale_kernel(int num_tensor_specs) {
     float absmax = __uint_as_float(absmax_uint);
 
     // Calculate scale and descale
-    if (absmax == 0.0f) {
-        absmax = 1.0f;
+    float scale = 1.0f;
+    float descale = 1.0f;
+    if (absmax != 0.0f) {
+        scale = 1.0f / absmax;
+        descale = absmax;
     }
-    float scale = 1.0f / absmax;
-    float descale = absmax;
 
-    if (!(tensor_specs_ptr[tid].flags & TFlags::RESIDUAL) && !(tensor_specs_ptr[tid].flags & TFlags::EMBEDDING) && absmax != 1.0f) {
-        if  ((tensor_specs_ptr[tid].flags & TFlags::GRADIENT) && (tensor_specs_ptr[tid].tensor_type == TT::MULTIUSE)) {
-            // e5
+    if  ((tensor_specs_ptr[tid].flags & TFlags::GRADIENT) && (tensor_specs_ptr[tid].tensor_type == TT::MULTIUSE)) {
+        // e5
+        if (absmax != 0.0f) {
             scale *= 32768.0f;
             descale *= 1.0f/32768.0f;
         } else {
-            // e4
-            //if (tensor_specs_ptr[tid].tensor_type != TT::PARAMETER || absmax >= 4.0f) {
-                scale *= 256.0f;
-                descale *= (1.0f/256.0f);
-            //}
+            // default so that things are not as bad for gradients on the first step
+            scale = 4096.0f;
+            descale = 1.0f/4096.0f;
         }
     } else {
+        // e4
+        // todo - power benefit of making sure top bit of exponent is (nearly always) zero?
+        // this can be done simply by *not* multiplying here, so that the "maximum" is 1.0f
+        //if (tensor_specs_ptr[tid].tensor_type != TT::PARAMETER || absmax >= 4.0f) {
+        if (absmax != 0.0f) {
+            scale *= 256.0f;
+            descale *= (1.0f/256.0f);
+        }
+    }
+
+    #ifdef FAKE_FP8
+    // with real FP8, we rely on tensor128 not scaling when sizeof(T)>1, but that doesn't work with fake FP8
+    // so we prevent scaling for the things we know we don't want to scale
+    // this might not match what we have in the real FP8 implementation, but allows for quick experimentation
+    if ((tensor_specs_ptr[tid].flags & TFlags::RESIDUAL) || (tensor_specs_ptr[tid].flags & TFlags::EMBEDDING)) {
         scale = 1.0f;
         descale = 1.0f;
     }
-
-    if (scale != 1.0f) {
-        //printf("%s: absmax: %f, scale: %f, descale: %f\n", tensor_specs_ptr[tid].name, absmax, scale, descale);
-    }
-
-    // todo: circular buffer
-    //gpu_absmax_memory[tid] = 0.0f;
+    #endif
 
     // Update gpu_scale_memory
+    // todo: descale should be delayed by one step for parameters (see comment in gpt2_update).
     gpu_scale_memory_ptr[tid * 2] = scale;
     gpu_scale_memory_ptr[tid * 2 + 1] = descale;
+
+    // todo: circular buffer !!!
+    //gpu_absmax_memory[tid] = 0.0f;
+}
+
+void update_scales_from_absmax() {
+    int block_size = 256;
+    int num_blocks = CEIL_DIV(num_tensor_specs, block_size);
+    update_scale_descale_kernel<<<num_blocks, block_size>>>(num_tensor_specs);
 }
 
 // ----------------------------------------------------------------------------

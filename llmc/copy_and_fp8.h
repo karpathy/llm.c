@@ -42,7 +42,7 @@ template <bool reversed_order=false, bool disable_scaling=false,
           elementwise_func_t elementwise_func=nothing_elementwise,
           typename Tin=float, typename Tout=float>
 __global__ void copy_advanced_kernel(TensorGPU<Tout> out, TensorGPU<Tin> in) {
-    constexpr size_t vec_size = 16 / ((sizeof(Tin) < sizeof(Tout)) ? sizeof(Tout) : sizeof(Tin));
+    constexpr size_t vec_size = 16 / ((sizeof(Tin) >= sizeof(Tout)) ? sizeof(Tin) : sizeof(Tout));
     size_t adjusted_blockidx = reversed_order ? (gridDim.x - blockIdx.x - 1) : blockIdx.x;
     size_t idx = (adjusted_blockidx * blockDim.x + threadIdx.x) * vec_size;
     if (idx >= out.num_elements) { return; }
@@ -57,16 +57,15 @@ __global__ void copy_advanced_kernel(TensorGPU<Tout> out, TensorGPU<Tin> in) {
     out128.update_absmax(threadIdx.x, blockDim.x, true);
 }
 
-// transpose + copy + format conversion (+ elementwise + absmax) kernel
 template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=TRANSPOSE_TILE_SIZE, typename T1>
-__global__ void transpose_simple_kernel(T1* __restrict__ transposed, const T1* __restrict__ input, int height)
+__global__ void transpose_simple_kernel(T1* __restrict__ transposed, const T1* __restrict__ input)
 {
+    constexpr size_t elements = 16 / sizeof(T1);
     __shared__ T1 tile[TILE_DIM][TILE_DIM];
     int width  = gridDim.x * TILE_DIM;
-    height = gridDim.y * TILE_DIM;
+    int height = gridDim.y * TILE_DIM;
 
-    constexpr size_t elements = 16 / sizeof(T1);
-    int x = blockIdx.x * TILE_DIM + (threadIdx.x * elements);
+    int x = blockIdx.x * TILE_DIM + threadIdx.x * elements;
     int y = blockIdx.y * TILE_DIM + threadIdx.y;
 
     #pragma unroll
@@ -77,15 +76,9 @@ __global__ void transpose_simple_kernel(T1* __restrict__ transposed, const T1* _
     }
     __syncthreads();
 
-    constexpr size_t block_size_x = (TILE_DIM * sizeof(T1)) / 16;
-    constexpr size_t block_size_y = BLOCK_ROWS;
-
-    int adjusted_tid_x = threadIdx.x % block_size_x;
-    int adjusted_tid_y = (threadIdx.y) + (threadIdx.x / block_size_y);
-
     // x/y for final write to global memory
-    x = blockIdx.y * TILE_DIM + adjusted_tid_x * elements;
-    y = blockIdx.x * TILE_DIM + adjusted_tid_y;
+    x = blockIdx.y * TILE_DIM + threadIdx.x * elements;
+    y = blockIdx.x * TILE_DIM + threadIdx.y;
 
     #pragma unroll
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
@@ -94,9 +87,9 @@ __global__ void transpose_simple_kernel(T1* __restrict__ transposed, const T1* _
         for (int k = 0; k < elements; k++) {
             // these are tiny 8-bit loads with loads of bank conflicts for FP8
             // extremely hard to avoid and not a bottleneck when everything else is well optimised
-            out128[k] = tile[k + (adjusted_tid_x) * out128.size][adjusted_tid_y + j];
+            out128[k] = tile[k + threadIdx.x * elements][threadIdx.y + j];
         }
-        store128<T1>(transposed + x + out128.size + (y+j)*height, out128);
+        store128<T1>(transposed + x + (y+j)*height, out128);
     }
 }
 
@@ -139,9 +132,9 @@ void transpose_simple(TensorGPU<T1> transposed, TensorGPU<T1> input, size_t w, s
     dim3 block_size_dim(block_size_x, block_size_y, 1);
 
     switch (block_size_y) {
-        case 64: transpose_simple_kernel<64, TRANSPOSE_TILE_SIZE><<<grid_size, block_size_dim, 0, stream>>>(transposed, input, h); break;
-        case 32: transpose_simple_kernel<32, TRANSPOSE_TILE_SIZE><<<grid_size, block_size_dim, 0, stream>>>(transposed, input, h); break;
-        case 16: transpose_simple_kernel<16, TRANSPOSE_TILE_SIZE><<<grid_size, block_size_dim, 0, stream>>>(transposed, input, h); break;
+        case 64: transpose_simple_kernel<64, TRANSPOSE_TILE_SIZE><<<grid_size, block_size_dim, 0, stream>>>((T1*)transposed, (T1*)input); break;
+        case 32: transpose_simple_kernel<32, TRANSPOSE_TILE_SIZE><<<grid_size, block_size_dim, 0, stream>>>((T1*)transposed, (T1*)input); break;
+        case 16: transpose_simple_kernel<16, TRANSPOSE_TILE_SIZE><<<grid_size, block_size_dim, 0, stream>>>((T1*)transposed, (T1*)input); break;
         default: printf("Invalid block size (might be easy to add): %lu\n", block_size_y); exit(1);
     }
     cudaCheck(cudaGetLastError());
@@ -161,132 +154,5 @@ void update_absmax(TensorGPU<T> inp, bool memset_absmax=true, cudaStream_t strea
     update_absmax_kernel<<<grid_size, block_size, 0, stream>>>(inp);
     cudaCheck(cudaGetLastError());
 }
-
-// ----------------------------------------------------------------------------
-// Scratch allocation for FP8 conversions etc.
-// todo - consider alternatives (or at least move it somewhere else)
-
-#include <vector>
-#include <algorithm>
-#include <cuda_runtime.h>
-
-class CudaScratchAllocator {
-private:
-    struct Allocation {
-        void* ptr;
-        size_t size;
-        bool in_use;
-
-        Allocation(void* p, size_t s) : ptr(p), size(s), in_use(false) {}
-    };
-
-    static std::vector<Allocation> allocations;
-    static size_t total_allocated;
-
-public:
-    template<typename T>
-    static T* getMemory(size_t count, bool exact=false) {
-        size_t size = count * sizeof(T);
-
-        // Find the smallest free allocation that fits the requested size
-        auto it = std::min_element(allocations.begin(), allocations.end(),
-            [size](const Allocation& a, const Allocation& b) {
-                return !a.in_use && a.size >= size && (b.in_use || b.size < size || a.size < b.size);
-            });
-
-        if (it != allocations.end() && !it->in_use && it->size >= size && (!exact || it->size == size)) {
-            it->in_use = true;
-            return reinterpret_cast<T*>(it->ptr);
-        }
-
-        // If no suitable allocation found, create a new one
-        void* new_ptr;
-        cudaMalloc(&new_ptr, size);
-        allocations.emplace_back(new_ptr, size);
-        allocations.back().in_use = true;
-        total_allocated += size;
-        printf("Allocated CUDA scratch memory: %lu bytes (%p) ==> total allocated: %.1fGiB\n", size, new_ptr, total_allocated / (1024.0 * 1024.0 * 1024.0));
-        return reinterpret_cast<T*>(new_ptr);
-    }
-
-    template<typename T>
-    static void releaseMemory(T* ptr) {
-        if (ptr == nullptr) { return; }
-        auto it = std::find_if(allocations.begin(), allocations.end(),
-            [ptr](const Allocation& a) { return a.ptr == (void*)ptr; });
-
-        if (it != allocations.end()) {
-            it->in_use = false;
-        }
-    }
-
-    static void cleanup() {
-        for (const auto& alloc : allocations) {
-            cudaFree(alloc.ptr);
-        }
-        allocations.clear();
-    }
-};
-std::vector<CudaScratchAllocator::Allocation> CudaScratchAllocator::allocations;
-size_t CudaScratchAllocator::total_allocated = 0;
-
-// ----------------------------------------------------------------------------
-// Transposed Cache (for FP8 weights)
-
-#include <functional>
-
-// Custom hash function for std::pair<uint64_t, uint64_t>
-// todo - why did we need this? complained about default constructor issue?
-struct PairHash {
-    std::size_t operator()(const std::pair<uint64_t, uint64_t>& p) const {
-        return std::hash<uint64_t>{}(p.first) ^ (std::hash<uint64_t>{}(p.second) << 1);
-    }
-};
-
-class TransposedCache {
-private:
-    struct CacheEntry {
-        void* ptr;
-        size_t size;
-    };
-
-    std::unordered_map<std::pair<uint64_t, uint64_t>, CacheEntry, PairHash> cache;
-
-public:
-    TransposedCache() = default;
-
-    template<typename T, typename Tout=T>
-    Tout* getTransposed(const T* original, const void* associatedTensor, size_t m, size_t k, bool compute=true, bool find_only=false, cudaStream_t stream=0) {
-        uint64_t key1 = reinterpret_cast<uint64_t>(original);
-        uint64_t key2 = reinterpret_cast<uint64_t>(associatedTensor);
-        auto key = std::make_pair(key1, key2);
-        size_t size = m * k * sizeof(T);
-
-        auto it = cache.find(key);
-        if (it != cache.end() && it->second.size == size) {
-            return reinterpret_cast<Tout*>(it->second.ptr);
-        }
-        if (find_only) {
-            return nullptr;
-        }
-
-        Tout* transposed = CudaScratchAllocator::getMemory<Tout>(m * k, true);
-        if (compute) {
-            // todo
-            //copy_or_transpose<false>(true, transposed, original, m, k, nullptr, nullptr, nullptr, stream);
-        }
-
-        cache[key] = {transposed, size};
-        return transposed;
-    }
-
-    void clearCache() {
-        for (const auto& entry : cache) {
-            CudaScratchAllocator::releaseMemory(entry.second.ptr);
-        }
-        cache.clear();
-    }
-};
-TransposedCache g_transposed_cache;
 
 #endif

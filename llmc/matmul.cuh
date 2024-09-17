@@ -16,9 +16,11 @@ Matrix Multiplication, with help from cuBLASLt
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
-template<typename OutFloat=floatX, bool UseAuxBuffer>
-__global__ void matmul_backward_bias_kernel9(TensorGPU<OutFloat> dbias, tensorX dout, int BT, int OC,
+template<typename Tdout, typename OutFloat, bool UseAuxBuffer>
+__global__ void matmul_backward_bias_kernel9(TensorGPU<OutFloat> dbias, TensorGPU<Tdout> dout, int BT, int OC,
                                              std::bool_constant<UseAuxBuffer>) {
+    // todo - this kernel is way more complicated than it needs to be
+    // (should look at my old PR to simplify it again after this)
     constexpr const int bdx = 4;
     constexpr const int bdy = WARP_SIZE / bdx;
     assert(blockDim.x == bdx);
@@ -28,33 +30,33 @@ __global__ void matmul_backward_bias_kernel9(TensorGPU<OutFloat> dbias, tensorX 
     int warp_c = (int)threadIdx.y;
     int block_d = (int)threadIdx.z;
 
-    const int OC_per_warp = bdy * x128::size;  // 64 at BF16
+    const int OC_per_warp = bdy * Packed128<Tdout>::size;  // 64 at BF16
 
-    int local_oc = warp_c * x128::size;
+    int local_oc = warp_c * Packed128<Tdout>::size;
     int global_oc = blockIdx.x * OC_per_warp + local_oc;
 
     int local_bt = warp_d + bdx * block_d;
     int bt_per_block = bdx * blockDim.z;
 
-    float accumulators[x128::size];
-    for (int k = 0; k < x128::size; k++) {
+    float accumulators[Packed128<Tdout>::size];
+    for (int k = 0; k < Packed128<Tdout>::size; k++) {
         accumulators[k] = 0.0f;
     }
 
     if(global_oc < OC) {
         // sum up over all bt within registers
         for (int idx = blockIdx.y * bt_per_block + local_bt; idx < BT; idx += gridDim.y * bt_per_block) {
-            x128 packed_dout = load128(dout + global_oc + idx*OC);
-            for (int k = 0; k < x128::size; k++) {
-                accumulators[k] += (float)packed_dout[k];
+            auto dout128 = load_tensor128(dout, global_oc + idx*OC);
+            for (int k = 0; k < Packed128<Tdout>::size; k++) {
+                accumulators[k] += dout128.get(k);
             }
         }
     }
 
-    __shared__ float sub_results[x128::size][WARP_SIZE][bdy];
+    __shared__ float sub_results[Packed128<Tdout>::size][WARP_SIZE][bdy];
 
     // reduce within-warp results
-    for (int k = 0; k < x128::size; k++) {
+    for (int k = 0; k < Packed128<Tdout>::size; k++) {
         float v = accumulators[k];
         v += __shfl_down_sync(0xffffffff, v, 1, 4);
         v += __shfl_down_sync(0xffffffff, v, 2, 4);
@@ -65,7 +67,7 @@ __global__ void matmul_backward_bias_kernel9(TensorGPU<OutFloat> dbias, tensorX 
     __syncthreads();
 
     // block-wide reductions
-    for (int k = block_d; k < x128::size; k += blockDim.z) {
+    for (int k = block_d; k < Packed128<Tdout>::size; k += blockDim.z) {
         float a = 0.f;
         for (int r = warp_d; r < blockDim.z; r += bdx) {
             float v = sub_results[k][r][warp_c];
@@ -152,8 +154,7 @@ void matmul_cublaslt(tensorX d, const tensorX a, const tensorX b, const tensorX 
     } else {
         cublasCheck(cublasLtMatrixLayoutCreate(&BLayout, CUBLAS_LOWP, k, n, k));
     }
-    // cuBLASLt requires C in FP8 mode to be BF16 or FP32... (sigh)
-    cublasCheck(cublasLtMatrixLayoutCreate(&CLayout, (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP, m, n, m));
+    cublasCheck(cublasLtMatrixLayoutCreate(&CLayout, CUBLAS_LOWP, m, n, m));
     cublasCheck(cublasLtMatrixLayoutCreate(&DLayout, CUBLAS_LOWP, m, n, m));
 
     // Strided Batched GEMM (used for non-flash attention, equivalent to cublasGemmStridedBatchedEx)
@@ -183,18 +184,8 @@ void matmul_cublaslt(tensorX d, const tensorX a, const tensorX b, const tensorX 
         if (backward) {
             assert(!has_bias); // we shouldn't have any backward matmuls that use both GELU and bias
             epilogue = CUBLASLT_EPILOGUE_DGELU;
-            if (pre_gelu.scale_descale_ptr) { // descale input
-                //float* gelu_descale_ptr = pre_gelu.scale_descale_ptr + 1;
-                //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_SCALE_POINTER, &gelu_descale_ptr, sizeof(float*)));
-            }
         } else {
             epilogue = has_bias ? CUBLASLT_EPILOGUE_GELU_AUX_BIAS : CUBLASLT_EPILOGUE_GELU_AUX;
-            if (pre_gelu.absmax_ptr) {
-                //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_AMAX_POINTER, &pre_gelu.absmax_ptr, sizeof(pre_gelu.absmax_ptr)));
-            }
-            if (pre_gelu.scale_descale_ptr) { // scale output
-                //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_SCALE_POINTER, &pre_gelu.scale_descale_ptr, sizeof(float*)));
-            }
         }
     } else if(has_bias){
         epilogue = backward ? CUBLASLT_EPILOGUE_BGRADB : CUBLASLT_EPILOGUE_BIAS;
@@ -210,21 +201,6 @@ void matmul_cublaslt(tensorX d, const tensorX a, const tensorX b, const tensorX 
         cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias.data_ptr, sizeof(bias.data_ptr)));
     }
 
-    // scale factors
-    if (a.scale_descale_ptr) {
-        //float* a_descale_ptr = a.scale_descale_ptr + 1;
-        //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_descale_ptr, sizeof(float*)));
-    }
-    if (b.scale_descale_ptr) {
-        //float* b_descale_ptr = b.scale_descale_ptr + 1;
-        //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_descale_ptr, sizeof(float*)));
-    }
-    if (d.scale_descale_ptr) {
-        //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, &d.scale_descale_ptr, sizeof(float*)));
-    }
-    if (d.absmax_ptr) {
-        //cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_AMAX_D_POINTER, &d.absmax_ptr, sizeof(float*)));
-    }
 
     // set scale type to FP32 (needs to be FP16 if and only if using CUBLAS_COMPUTE_16F, so it's FP32 even for FP8!)
     cublasDataType_t scale_type = CUDA_R_32F;
@@ -245,8 +221,6 @@ void matmul_cublaslt(tensorX d, const tensorX a, const tensorX b, const tensorX 
     cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
                                &alpha, a, ALayout, b, BLayout, &beta, d, CLayout, d, DLayout,
                                &heuristic.algo, cublaslt_workspace, cublaslt_workspace_size, stream));
-
-    update_absmax(d, false, stream);
 
     // cleanups
     cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
@@ -311,7 +285,6 @@ void matmul_cublaslt_fp8(TensorGPU<Td> d, const TensorGPU<Ta> a, const TensorGPU
         cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_AMAX_D_POINTER, &d.absmax_ptr, sizeof(float*)));
     }
 
-    // set scale type to FP32 (needs to be FP16 if and only if using CUBLAS_COMPUTE_16F, so it's FP32 even for FP8!)
     cublasDataType_t scale_type = CUDA_R_32F;
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &scale_type, sizeof(scale_type)));
 
@@ -324,7 +297,6 @@ void matmul_cublaslt_fp8(TensorGPU<Td> d, const TensorGPU<Ta> a, const TensorGPU
     // find a suitable algorithm (cached internally so shouldn't take much CPU time in practice)
     int returnedResults = 0;
     cublasLtMatmulHeuristicResult_t heuristic;
-
     cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc, ALayout, BLayout, CLayout, DLayout,
                                    preference, 1, &heuristic, &returnedResults);
 
@@ -380,12 +352,8 @@ void matmul_forward_cublaslt(TensorGPU<Tout> out,
     }
 }
 
-template<typename T=floatX>
-void matmul_backward(tensorX dinp, tensorX dweight, tensorX dbias,
-                     tensorX dout, tensorX inp, tensorX weight,
-                     tensorFP32 dbias_buffer,
-                     int BT, int C, int OC,
-                     TensorGPU<T> pre_gelu=null_tensorX, int gelu_fusion=1, cudaStream_t stream=main_stream) {
+template<typename Tdout=floatX>
+void matmul_backward_bias(tensorX dbias, TensorGPU<Tdout> dout, tensorFP32 scratch, int BT, int OC, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
 
     // backward to bias, if given, does a +=
@@ -407,20 +375,83 @@ void matmul_backward(tensorX dinp, tensorX dweight, tensorX dbias,
             cudaCheck(cudaGetLastError());
         } else {
             // kernel 9 overwrites temp buffer, so no need to memset
-            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim, 0, stream>>>(dbias_buffer, dout, BT, OC, True);
+            matmul_backward_bias_kernel9<<<dim3(grid_size_x, grid_size_y), block_dim, 0, stream>>>(scratch, dout, BT, OC, True);
             cudaCheck(cudaGetLastError());
-            reduce_add_sum_kernel<<<CEIL_DIV(OC, 256 * f128::size), 256, 0, stream>>>(dbias, dbias_buffer, OC, grid_size_y);
+            reduce_add_sum_kernel<<<CEIL_DIV(OC, 256 * f128::size), 256, 0, stream>>>(dbias, scratch, OC, grid_size_y);
             cudaCheck(cudaGetLastError());
         }
     }
+}
+
+template<typename Tdout=float8e5>
+void matmul_backward_fp8(tensorFP8e5 dinp, tensorX dweight, tensorX dbias,
+                     TensorGPU<Tdout> dout, tensorFP8e4 inp, tensorFP8e4 weight,
+                     tensorFP32 scratch1_big, tensorFP32 scratch2_huge,
+                     int BT, int C, int OC,
+                     tensorFP8e4 pre_gelu_activation=null_tensorFP8E4, cudaStream_t stream=main_stream) {
+#ifndef ENABLE_FP8
+    // FP8 is not enabled so we use the regular floatX matmul path
+    matmul_backward(dinp, dweight, dbias, dout, inp, weight, scratch1_big, BT, C, OC, pre_gelu_activation, 1, stream);
+#else
+    NVTX_RANGE_FN();
+    matmul_backward_bias(dbias, dout, scratch1_big, BT, OC, stream);
+
+    // N.B.: Both scratch1 and scratch2 are guaranteed to be big enough for 4BTC and 4CC in FP8
+    // IMPORTANT: inp is allowed to be the same buffer as scratch2_huge (e.g. for fch_gelu)
+    // ==> this MUST be done first and write to scratch1_big!
+    // transpose input
+    TensorGPU<float8e4> inp_fp8_transposed = inp;
+    inp_fp8_transposed.data_ptr = (float8e4*)scratch1_big.data_ptr;
+    transpose_simple<float8e4>(inp_fp8_transposed, inp, C, BT, stream);
+
+    // convert dout to FP8e5 if it is not already, and transpose it
+    // the buffer is guaranteed to be at least twice as big as 4BTC, so we can split it in 2
+    // todo - merge conversion and tranposition like we did before?
+    TensorGPU<float8e5> dout_fp8;
+    if constexpr (std::is_same<Tdout, float8e5>::value) {
+        dout_fp8 = dout;
+    } else {
+        dout_fp8 = *(TensorGPU<float8e5>*)&dout;
+        dout_fp8.data_ptr = (float8e5*)(scratch2_huge.data_ptr);
+        copy_advanced(dout_fp8, dout, stream);
+    }
+    TensorGPU<float8e5> dout_fp8_transposed = dout_fp8;
+    dout_fp8_transposed.data_ptr = (float8e5*)(scratch2_huge.data_ptr + (scratch2_huge.num_elements / 2));
+    transpose_simple(dout_fp8_transposed, dout_fp8, OC, BT, stream);
+
+    // GEMM 1: dweight, inp_fp8_transposed, dout_fp8_transposed
+    matmul_cublaslt_fp8(dweight, inp_fp8_transposed, dout_fp8_transposed, null_tensorX, C, OC, BT, stream, false, true);
+
+    // transpose weight (todo: option to cache this / do it at optimizer time)
+    TensorGPU<float8e4> weight_fp8_transposed = weight;
+    weight_fp8_transposed.data_ptr = (float8e4*)scratch1_big.data_ptr;
+    transpose_simple(weight_fp8_transposed, weight, C, OC, stream);
+
+    matmul_cublaslt_fp8(dinp, weight_fp8_transposed, dout_fp8, null_tensorX, C, BT, OC, stream, false, true);
+
+    if (pre_gelu_activation.data_ptr) {
+        gelu_backward(dinp, dinp, pre_gelu_activation, stream);
+    }
+#endif
+}
+
+
+template<typename T=floatX>
+void matmul_backward(tensorX dinp, tensorX dweight, tensorX dbias,
+                     tensorX dout, tensorX inp, tensorX weight,
+                     tensorFP32 dbias_scratch,
+                     int BT, int C, int OC,
+                     TensorGPU<T> pre_gelu_activation=null_tensorX, int gelu_fusion=1, cudaStream_t stream=main_stream) {
+    NVTX_RANGE_FN();
+    matmul_backward_bias(dbias, dout, dbias_scratch, BT, OC, stream);
 
     // backward to input, uses = in the backward pass (set the gradient)
     matmul_cublaslt(dinp, weight, dout, null_tensorX, C, BT, OC, stream, false, false, 0, 0, 0, 0, false,
-                    gelu_fusion >= 2 ? pre_gelu : null_tensorX, true);
+                    gelu_fusion >= 2 ? pre_gelu_activation : null_tensorX, true);
 
     // backward GELU (if it wasn't fused into the matmul above)
-    if (gelu_fusion < 2 && pre_gelu != null_tensorX) {
-        gelu_backward(dinp, dinp, pre_gelu, stream);
+    if (gelu_fusion < 2 && pre_gelu_activation.enabled()) {
+        gelu_backward(dinp, dinp, pre_gelu_activation, stream);
     }
 
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one

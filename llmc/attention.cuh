@@ -270,12 +270,15 @@ void attention_forward(tensorX out, floatX* qkvr, floatX* att,
 
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
-void attention_backward(tensorX dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
+void attention_backward(tensorX dinp, floatX* dqkvr, floatX* datt,
                         tensorX dout, tensorX qkvr, floatX* att,
                         int B, int T, int C, int NH, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int HS = C / NH; // head size
+
+    // now reusing dinp as scratch buffer (free before the final output and it's the right size)
+    floatX* scratch = dinp.data_ptr;
 
     // unpack convenience pointers into q, k, v
     floatX *q, *k, *v;

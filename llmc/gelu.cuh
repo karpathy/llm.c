@@ -10,7 +10,8 @@
 // CUDA kernels
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-__global__ void gelu_forward_kernel2(tensorFP8e4 out, tensorFP8e4 inp) {
+template<typename Tout=tensorFP8e4, typename Tinp=tensorFP8e4>
+__global__ void gelu_forward_kernel2(TensorGPU<Tout> out, TensorGPU<Tinp> inp) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * inp.num_per_128();
 
     auto out128 = new_tensor128(out);
@@ -35,8 +36,8 @@ __global__ void gelu_forward_kernel2(tensorFP8e4 out, tensorFP8e4 inp) {
 }
 
 //template<typename Tinp=floatX>
-template<typename Tinp=floatX>
-__global__ void gelu_backward_kernel(tensorFP8e5 dinp, tensorFP8e5 dout, TensorGPU<Tinp> inp) {
+template<typename Tinp=tensorFP8e4, typename Td=tensorFP8e5>
+__global__ void gelu_backward_kernel(TensorGPU<Td> dinp, TensorGPU<Td> dout, TensorGPU<Tinp> inp) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * dout.num_per_128();
 
     auto dinp128 = new_tensor128(dinp);
@@ -64,8 +65,8 @@ __global__ void gelu_backward_kernel(tensorFP8e5 dinp, tensorFP8e5 dout, TensorG
 
 // ----------------------------------------------------------------------------
 // kernel launchers
-
-void gelu_forward(tensorFP8e4 out, tensorFP8e4 inp, cudaStream_t stream=main_stream) {
+template<typename Tout=tensorFP8e4, typename Tinp=tensorFP8e4>
+void gelu_forward(TensorGPU<Tout> out, TensorGPU<Tinp> inp, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     assert(inp.num_elements % (block_size * inp.num_per_128()) == 0);
@@ -75,7 +76,8 @@ void gelu_forward(tensorFP8e4 out, tensorFP8e4 inp, cudaStream_t stream=main_str
     cudaCheck(cudaGetLastError());
 }
 
-void gelu_backward(tensorFP8e5 dinp, tensorFP8e5 dout, tensorFP8e4 inp, cudaStream_t stream=main_stream) {
+template<typename Tinp=tensorFP8e4, typename Td=tensorFP8e5>
+void gelu_backward(TensorGPU<Td> dinp, TensorGPU<Td> dout, TensorGPU<Tinp> inp, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int grid_size = CEIL_DIV(inp.num_elements, block_size * inp.num_per_128());
