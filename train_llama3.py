@@ -170,7 +170,7 @@ class CausalSelfAttention(nn.Module):
         # ---------------------------------------------------------------------
         # DEBUGGING: print first 32 elements of x
         for i in range(32):
-            print("acts[{}]: {}".format(i, x.view(-1)[i].item()))
+            print("acts[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
         breakpoint()
         # ---------------------------------------------------------------------
 
@@ -178,9 +178,7 @@ class CausalSelfAttention(nn.Module):
         qkv = self.c_attn(x)
         q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
         q, k, v = map(lambda t: t.view(B, T, -1, self.hd), (q, k, v))  # (B, T, NH, HD)
-
         q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)  <-- 1. difference compared to GPT-2
-
         if self.use_kv and not self.training and start_pos >= 0:  # use kv-caching during inference
             self.cache_k[:B, start_pos : start_pos + T] = k
             self.cache_v[:B, start_pos : start_pos + T] = v
@@ -1131,6 +1129,7 @@ if __name__ == "__main__":
         # save model params, in bfloat16
         model_to_size = {"meta-llama/Meta-Llama-3.1-8B": "8B"}
         model_size_str = model_to_size[args.model] # e.g. "8B"
+        write_model(model, os.path.join(args.output_dir, f"llama3.1_{model_size_str}.bin"), dtype="float32")
         write_model(model, os.path.join(args.output_dir, f"llama3.1_{model_size_str}_bf16.bin"), dtype="bfloat16")
         # save x, y, logits, loss, and parameter gradients, for debugging C
         # always store these in fp32 to have an accurate reference (?)

@@ -240,14 +240,19 @@ struct TensorSpec {
 #define TENSOR_SPEC(pointer, size) TensorSpec{(void**)(&pointer), (size), dtype_of(pointer)};
 
 void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS], size_t B, size_t T, GPT2Config config, int recompute) {
-    size_t Vp = config.padded_vocab_size;
-    size_t L = config.num_layers;
-    size_t NH = config.num_heads;
-    size_t C = config.channels;
+    const size_t Vp = config.padded_vocab_size;
+    const size_t L = config.num_layers;
+    const size_t NH = config.num_heads;
+    const size_t C = config.channels;
+    const size_t n_head = config.num_heads;
+    const size_t n_kn_head = config.num_kv_heads;
+    const size_t hd = C / n_head; // head dimension
+    const size_t qkv_channels = (n_head + 2*n_kn_head) * hd; // Q, K, V channels
+
     tensors[0] = TENSOR_SPEC(data->encoded, B * T * C);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
     tensors[1] = TENSOR_SPEC(data->ln1,  (recompute < 2) ? L * B * T * C : 0);
-    tensors[2] = TENSOR_SPEC(data->ln1_mean, L * B * T);
+    tensors[2] = TENSOR_SPEC(data->ln1_mean, 0); // Llama 3 does not use this activation
     tensors[3] = TENSOR_SPEC(data->ln1_rstd, L * B * T);
     tensors[4] = TENSOR_SPEC(data->atty, L * B * T * C);
     #ifdef ENABLE_CUDNN
@@ -269,9 +274,8 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[14] = TENSOR_SPEC(data->lnf_mean, B * T);
     tensors[15] = TENSOR_SPEC(data->lnf_rstd, B * T);
     tensors[16] = TENSOR_SPEC(data->losses, B * T);
-    tensors[17] = TENSOR_SPEC(data->qkvr, L * B * T * 3*C);
-    tensors[18] = TENSOR_SPEC(data->output, B * T * max(3*C, max(NH*T, Vp)));
-
+    tensors[17] = TENSOR_SPEC(data->qkvr, L * B * T * qkv_channels);
+    tensors[18] = TENSOR_SPEC(data->output, B * T * max(qkv_channels, max(NH*T, Vp)));
     tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * 4 * C);
     tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
 }
@@ -281,17 +285,13 @@ void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         bytes += tensors[i].size * sizeof_dtype(tensors[i].type);
     }
-
     printf0("allocating %d MiB for activations\n", (int)round(bytes / (1024 * 1024)));
-
     void* acts_memory;
     cudaCheck(cudaMalloc((void**)&acts_memory, bytes));
-
     // cudaMalloc does not guarantee initial memory values so we memset the allocation here
     // this matters because e.g. non-cuDNN attention assumes the attention buffer is zeroed
     // todo - up to ~100ms on slow GPUs, could theoretically be more selective, but this is safer
     cudaCheck(cudaMemset(acts_memory, 0, bytes));
-
     char* acts_memory_iterator = (char*)acts_memory;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         // extra protection so we don't accidentally use an empty buffer
@@ -602,6 +602,10 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     const size_t L = model->config.num_layers;
     const size_t NH = model->config.num_heads;
     const size_t C = model->config.channels;
+    const size_t n_head = model->config.num_heads;
+    const size_t n_kn_head = model->config.num_kv_heads;
+    const size_t hd = C / n_head; // head dimension
+    const size_t qkv_channels = (n_head + 2*n_kn_head) * hd; // Q, K, V channels
 
     // validate B,T are not larger than the values used at initialisation
     // (smaller B,T are okay for inference only)
@@ -620,7 +624,6 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
     encoder_forward(acts.encoded, model->inputs, params.wte, NULL, B, T, C, main_stream); // encoding goes into residual[0]
-
     // first layernorm isn't fused
     rmsnorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_rstd, acts.encoded, params.ln1w, B, T, C, main_stream);
 
@@ -642,8 +645,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
-        floatX* l_qkvw = params.qkvw + l * 3*C * C;
-        floatX* l_qkvb = params.qkvb + l * 3*C;
+        floatX* l_qkvw = params.qkvw + l * qkv_channels * C;
+        floatX* l_qkvb = params.qkvb + l * qkv_channels;
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_attprojb = params.attprojb + l * C;
         floatX* l_ln2w = params.ln2w + l * C;
@@ -655,7 +658,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
         // get the pointers of the activations for this layer
         floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
-        floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
+        floatX* l_qkvr = acts.qkvr + l * B * T * qkv_channels;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
@@ -668,10 +671,10 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
         floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
 
-        // now do the forward pass
+        // now start the block forward pass
         #ifdef ENABLE_CUDNN
+        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, qkv_channels, main_stream);
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
@@ -680,7 +683,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         }
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, qkv_channels, main_stream);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
         #endif
 
@@ -1374,7 +1377,7 @@ int main(int argc, char *argv[]) {
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
-    const char* load_filename = "llama3.1_8B_bf16.bin"; // bf16 weights of the Llama 3.1 8B model
+    const char* load_filename = "llama3.1_8B.bin"; // bf16 weights of the Llama 3.1 8B model
     const char* lr_scheduler_type = "cosine";
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write checkpoints every how many steps?
