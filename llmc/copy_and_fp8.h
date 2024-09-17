@@ -11,7 +11,6 @@ See /dev/cuda/advanced_copy_transpose.cu for more information and options
 #include "cuda_utils.cuh"
 
 // todo - tune these for performance (but should be close to optimal already)
-#define ABSMAX_ITERATIONS_PER_THREAD 4
 #define TRANSPOSE_TILE_SIZE 64UL
 
 // ----------------------------------------------------------------------------
@@ -39,23 +38,23 @@ __device__ float gelu_forward_elementwise(float x) {
 
 // Same as copy_simple_kernel but with optional absmax and elementwise function options
 // absmax is calculated before scaling but after the elementwise function
-template <int block_size=256, bool disable_scaling=false, bool reversed_order=false,
+template <bool reversed_order=false, bool disable_scaling=false,
           elementwise_func_t elementwise_func=nothing_elementwise,
-          typename T1=float, typename T2=float>
-__global__ void copy_advanced_kernel(TensorGPU<T1> in, TensorGPU<T2> out) {
-    constexpr size_t vec_size = 16 / ((sizeof(T1) < sizeof(T2)) ? sizeof(T2) : sizeof(T1));
+          typename Tin=float, typename Tout=float>
+__global__ void copy_advanced_kernel(TensorGPU<Tout> out, TensorGPU<Tin> in) {
+    constexpr size_t vec_size = 16 / ((sizeof(Tin) < sizeof(Tout)) ? sizeof(Tout) : sizeof(Tin));
     size_t adjusted_blockidx = reversed_order ? (gridDim.x - blockIdx.x - 1) : blockIdx.x;
     size_t idx = (adjusted_blockidx * blockDim.x + threadIdx.x) * vec_size;
-    if (idx >= in.num_elements) { return; }
+    if (idx >= out.num_elements) { return; }
 
     auto inp128 = load_tensor128(in, idx, true, disable_scaling);
-    auto out128 = new_tensor128(out);
+    auto out128 = new_tensor128(out, disable_scaling);
     for (int k = 0; k < vec_size; k++) {
         float out_fp32 = elementwise_func(inp128.get(k));
         out128.set(k, out_fp32);
     }
-    out128.store_same_length(idx);
-    out128.update_absmax(threadIdx.x, block_size, true);
+    out128.template store_same_length<Tin>(idx);
+    out128.update_absmax(threadIdx.x, blockDim.x, true);
 }
 
 // transpose + copy + format conversion (+ elementwise + absmax) kernel
@@ -104,17 +103,13 @@ __global__ void transpose_simple_kernel(T1* __restrict__ transposed, const T1* _
 // only calculate absmax of the input tensor (non-fused)
 template <bool disable_scaling=true, typename T>
 __global__ void update_absmax_kernel(TensorGPU<T> inp) {
-    size_t idx = ((blockIdx.x * blockDim.x * ABSMAX_ITERATIONS_PER_THREAD) + threadIdx.x) * inp.num_per_128();
-    auto max128 = new_tensor128(inp, disable_scaling);
+    size_t idx = ((blockIdx.x * blockDim.x) + threadIdx.x) * inp.num_per_128();
+    auto max128 = new_tensor128(inp);
     if (idx < inp.num_elements) {
-        #pragma unroll
-        for (int i = 0; i < ABSMAX_ITERATIONS_PER_THREAD; i++) {
-            auto inp128 = load_tensor128(inp, idx, disable_scaling);
-            for(int k = 0; k < inp.num_per_128(); ++k) {
-                float value = inp128.get(k);
-                max128.add_value_stats(value);
-            }
-            idx += blockDim.x * inp.num_per_128();
+        auto inp128 = load_tensor128(inp, idx, disable_scaling);
+        for(int k = 0; k < inp.num_per_128(); ++k) {
+            float value = inp128.get(k);
+            max128.add_value_stats(value);
         }
     }
     max128.update_absmax(threadIdx.x, blockDim.x, true, true);
@@ -122,34 +117,14 @@ __global__ void update_absmax_kernel(TensorGPU<T> inp) {
 
 // ----------------------------------------------------------------------------
 
-template <bool reversed_order=false, elementwise_func_t elementwise_func=nothing_elementwise, bool reciprocal=true, typename T1, typename T2>
-void copy_advanced(TensorGPU<T1> *copy, TensorGPU<T2> *input, size_t N, float* descale_pointer=NULL, float* scale_pointer=NULL, void* absmax_output=NULL, /*bool memset_absmax=true,*/ cudaStream_t stream=0, const size_t block_size=512) {
+template <bool reversed_order=false, bool disable_scaling=false, elementwise_func_t elementwise_func=nothing_elementwise, typename T1, typename T2>
+void copy_advanced(TensorGPU<T1> out, TensorGPU<T2> in, cudaStream_t stream=0, const size_t block_size=512) {
+    size_t N = out.num_elements;
     size_t fewest_elements = min(Packed128<T1>::size, Packed128<T2>::size);
-    const dim3 grid_size(CEIL_DIV(N, block_size * fewest_elements));
     assert((N % fewest_elements) == 0);
 
-    constexpr uint absmax_factor = 1;
-    unsigned int* absmax_uint = (unsigned int*)absmax_output;
-
-    // todo - fix this function
-    assert(false);
-
-    if (absmax_output) {
-        /*if (memset_absmax) {
-            cudaMemset(absmax_output, 0, sizeof(unsigned int));
-        }*/
-        if (scale_pointer || descale_pointer) {
-            copy_advanced_kernel<reciprocal, true, reversed_order, elementwise_func, absmax_factor><<<grid_size, dim3(block_size), 0, stream>>>(copy, input, N, descale_pointer, scale_pointer, absmax_uint);
-        } else {
-            copy_advanced_kernel<reciprocal, false, reversed_order, elementwise_func, absmax_factor><<<grid_size, dim3(block_size), 0, stream>>>(copy, input, N, NULL, NULL, absmax_uint);
-        }
-    } else {
-        if (scale_pointer || descale_pointer) {
-            copy_advanced_kernel<reciprocal, true, reversed_order, elementwise_func><<<grid_size, dim3(block_size), 0, stream>>>(copy, input, N, descale_pointer, scale_pointer);
-        } else {
-            copy_advanced_kernel<reciprocal, false, reversed_order, elementwise_func><<<grid_size, dim3(block_size), 0, stream>>>(copy, input, N);
-        }
-    }
+    const dim3 grid_size(CEIL_DIV(N, block_size * fewest_elements));
+    copy_advanced_kernel<reversed_order, disable_scaling, elementwise_func><<<grid_size, dim3(block_size), 0, stream>>>(out, in);
     cudaCheck(cudaGetLastError());
 }
 
@@ -173,18 +148,13 @@ void transpose_simple(TensorGPU<T1> transposed, TensorGPU<T1> input, size_t w, s
 }
 
 template <typename T>
-void update_absmax(TensorGPU<T> inp, bool memset_absmax=false, cudaStream_t stream=main_stream, size_t max_block_size=512) {
+void update_absmax(TensorGPU<T> inp, bool memset_absmax=true, cudaStream_t stream=main_stream) {
     size_t N = inp.num_elements;
     if (N == 0 || inp.absmax_ptr == NULL) { return; }
+    assert(N % inp.num_per_128() == 0);
 
-    // find the largest block size that divides N
-    size_t block_size = max_block_size;
-    while ((N % (block_size * Packed128<T>::size * ABSMAX_ITERATIONS_PER_THREAD)) != 0) {
-        block_size /= 2;
-        assert(block_size >= 32); // block size of 1 would be OK, but so inefficient we'd rather fail and debug I think
-    }
-
-    const dim3 grid_size(CEIL_DIV(N, block_size * ABSMAX_ITERATIONS_PER_THREAD * Packed128<T>::size));
+    size_t block_size = 512;
+    const dim3 grid_size(CEIL_DIV(N, block_size * Packed128<T>::size));
     if (memset_absmax) {
         cudaMemset(inp.absmax_ptr, 0, sizeof(unsigned int));
     }

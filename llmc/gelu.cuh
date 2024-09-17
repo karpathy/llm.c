@@ -30,7 +30,7 @@ __global__ void gelu_forward_kernel2(tensorFP8e4 out, tensorFP8e4 inp) {
         float half_xi = 0.5f * xi;
         out128.set(k, half_xi * tanh_in_out + half_xi);
     }
-    out128.store_same_length<floatX>(idx, false);
+    out128.store(idx, false);
     out128.update_absmax(threadIdx.x, blockDim.x, true);
 }
 
@@ -58,7 +58,7 @@ __global__ void gelu_backward_kernel(tensorFP8e5 dinp, tensorFP8e5 dout, TensorG
         float result = local_grad * dout128.get(k);
         dinp128.set(k, result);
     }
-    dinp128.store_same_length<floatX>(idx, false);
+    dinp128.store(idx, false);
     dinp128.update_absmax(threadIdx.x, blockDim.x, true);
 }
 

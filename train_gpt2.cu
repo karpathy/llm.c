@@ -204,7 +204,7 @@ void gpt2_allocate(GPT2 *model) {
         TENSOR_SPECS     (ln1b,       L, C,         LAYERNORM | BIAS);
         TENSOR_SPECS_LOWP(qkvw,       L, 3 * C * C, TENSOR_2D);
         TENSOR_SPECS     (qkvb,       L, 3 * C,     BIAS);
-        TENSOR_SPECS_LOWP(attprojw,   L, C * C,     TENSOR_2D);
+        TENSOR_SPECS     (attprojw,   L, C * C,     TENSOR_2D);
         TENSOR_SPECS     (attprojb,   L, C,         BIAS);
         TENSOR_SPECS     (ln2w,       L, C,         LAYERNORM);
         TENSOR_SPECS     (ln2b,       L, C,         LAYERNORM | BIAS);
@@ -274,11 +274,11 @@ void gpt2_allocate(GPT2 *model) {
     TENSOR_SPECS_FP32(ln2_rstd,   L, BT,      LAYERNORM | STATS);
 
     if (UNIQUE_TENSOR_MEMORY) {
-        TENSOR_SPECS_LOWP(attproj,  L, BTC, TENSOR_2D);
+        TENSOR_SPECS     (attproj,  L, BTC, TENSOR_2D);
         TENSOR_SPECS_LOWP(fcproj,   L, BTC, TENSOR_2D);
         TENSOR_SPECS     (output,   1, output_size, TENSOR_2D | EMBEDDING);
     } else {
-        spec->attproj = add_layer_specs(L, "attproj", BTC, shards, dtype_lowp, model->multiuse.btc, REUSED_MEMORY | TENSOR_2D);
+        spec->attproj = add_layer_specs(L, "attproj", BTC, shards, dtype, model->multiuse.btc, REUSED_MEMORY | TENSOR_2D);
         spec->fcproj = add_layer_specs(L, "fcproj", BTC, shards, dtype_lowp, model->multiuse.btc, REUSED_MEMORY | TENSOR_2D);
         spec->output = add_tensor_spec("output", output_size, shards, dtype, model->multiuse.output_scratch, REUSED_MEMORY | EMBEDDING | TENSOR_2D);
     }
@@ -493,10 +493,48 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
 
     gpt2_allocate(model);
 
-    // read in the parameters if weight_init is true
     if (weight_init) {
-        file_to_device(model->tensor_memory[PARAMETER], model_file, model->num_parameters_bytes, IO_BUF_SIZE);
+        fseek(model_file, 0, SEEK_END);
+        size_t checkpoint_bytes = ftell(model_file) - sizeof(model_header);
+        fseek(model_file, sizeof(model_header), SEEK_SET);
+
+        if (checkpoint_bytes != model->num_parameters_bytes) {
+            assert(checkpoint_bytes <= tensors_bytes[MULTIUSE]); // hack - won't work if params size > activations size
+            file_to_device(model->tensor_memory[MULTIUSE], model_file, checkpoint_bytes, IO_BUF_SIZE);
+
+            size_t offset = 0;
+            int num_param_tensors = tensors_start[PARAMETER_GRAD];
+            for (int i = 0; i < num_param_tensors; i++) {
+                TensorGPU<floatX> tensor = tensor_specs[i];
+                tensor.data_ptr = (floatX*)(model->tensor_memory[MULTIUSE] + offset);
+                offset += tensor.num_elements * sizeof(floatX);
+                update_absmax(tensor);
+            }
+
+            int absmax_block_size = 256;
+            int num_blocks = (num_param_tensors + absmax_block_size - 1) / absmax_block_size;
+            update_scale_descale_kernel<<<num_blocks, absmax_block_size>>>(num_param_tensors);
+
+            offset = 0;
+            for (int i = 0; i < num_param_tensors; i++) {
+                TensorGPU<floatX> tensor_in = tensor_specs[i];
+                tensor_in.data_ptr = (floatX*)(model->tensor_memory[MULTIUSE] + offset);
+                offset += tensor_in.num_elements * sizeof(floatX);
+
+                switch (tensor_specs[i].data_type) {
+                    case DType::FP32: copy_advanced((TensorGPU<float>)tensor_specs[i], tensor_in); break;
+                    case DType::BF16: copy_advanced((TensorGPU<__nv_bfloat16>)tensor_specs[i], tensor_in); break;
+                    case DType::FP16: copy_advanced((TensorGPU<half>)tensor_specs[i], tensor_in); break;
+                    case DType::FP8E4M3: copy_advanced((TensorGPU<__nv_fp8_e4m3>)tensor_specs[i], tensor_in); break;
+                    case DType::FP8E5M2: copy_advanced((TensorGPU<__nv_fp8_e5m2>)tensor_specs[i], tensor_in); break;
+                }
+            }
+            cudaMemset(model->tensor_memory[MULTIUSE], 0, checkpoint_bytes);
+        } else {
+            file_to_device(model->tensor_memory[PARAMETER], model_file, model->num_parameters_bytes, IO_BUF_SIZE);
+        }
     }
+
     fcloseCheck(model_file);
 
     // only return from this function once we are certain the params are ready on the GPU
@@ -669,8 +707,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         attention_forward(ACT(atty), ACT(qkvr), ACT(att), qkvr, B, T, C, NH);
         #endif
 
-        matmul_forward_cublaslt<float8e4, float8e4>(ACT(attproj), ACT(atty), PARAM(attprojw), PARAM(attprojb), B*T, C, C);
-        fused_residual_forward5<float8e4, float8e4>(ACT(residual2), ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), residual, ACT(attproj), PARAM(ln2w), PARAM(ln2b), B*T, C);
+        matmul_forward_cublaslt<floatX, floatX>(ACT(attproj), ACT(atty), PARAM(attprojw), PARAM(attprojb), B*T, C, C);
+        fused_residual_forward5<float8e4, floatX>(ACT(residual2), ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), residual, ACT(attproj), PARAM(ln2w), PARAM(ln2b), B*T, C);
         matmul_forward_cublaslt<float8e4, float8e4>(ACT(fch_gelu), ACT(ln2), PARAM(fcw), PARAM(fcb), B*T, C, 4*C, ACT(fch), model->gelu_fusion);
         matmul_forward_cublaslt<float8e4, float8e4>(ACT(fcproj), ACT(fch_gelu), PARAM(fcprojw), PARAM(fcprojb), B*T, 4*C, C);
 
@@ -718,8 +756,14 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
 
 void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
     NVTX_RANGE_FN();
-    exit(0);
-#if 0
+
+
+
+    cudaCheck(cudaMemsetAsync(model->tensor_memory[PARAMETER_GRAD], 0, tensors_bytes[PARAMETER_GRAD], main_stream));
+
+
+
+    #if 0
 
     // convenience shortcuts (size_t instead of int so that pointer arithmetics don't overflow)
     const size_t B = model->batch_size;
@@ -776,10 +820,10 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         matmul_backward<floatX>(AGRAD(fch), PGRAD(fcprojw), PGRAD(fcprojb), AGRAD(residual3), ACT(fch_gelu), PARAM(fcprojw), scratchF, B*T, 4*C, C, ACT(fch), model->gelu_fusion);
 
         if(model->recompute >= 2) { // recompute >= 2 means we recompute layernorm
-            layernorm_forward(ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), ACT(residual2), PARAM(ln2w), PARAM(ln2b), B*T, C);
+            layernorm_forward<float8e4>(ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), ACT(residual2), PARAM(ln2w), PARAM(ln2b), B*T, C);
         }
         matmul_backward(AGRAD(ln2), PGRAD(fcw), PGRAD(fcb), AGRAD(fch), ACT(ln2), PARAM(fcw), scratchF, B*T, C, 4 * C);
-        layernorm_backward(AGRAD(residual2), AGRAD(residual3), PGRAD(ln2w), PGRAD(ln2b), scratchF, AGRAD(ln2), ACT(residual2), PARAM(ln2w), ACT(ln2_mean), ACT(ln2_rstd), B*T, C);
+        layernorm_backward<float8e5>(AGRAD(residual2), AGRAD(residual3), PGRAD(ln2w), PGRAD(ln2b), scratchF, AGRAD(ln2), ACT(residual2), PARAM(ln2w), ACT(ln2_mean), ACT(ln2_rstd), B*T, C);
         matmul_backward(AGRAD(atty), PGRAD(attprojw), PGRAD(attprojb), AGRAD(residual2), ACT(atty), PARAM(attprojw), scratchF, B*T, C, C);
 
         #ifdef ENABLE_CUDNN
@@ -792,10 +836,10 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         #endif
 
         if(model->recompute >= 2) {
-            layernorm_forward(ACT(ln1), ACT(ln1_mean), ACT(ln1_rstd), residual, PARAM(ln1w), PARAM(ln1b), B*T, C);
+            layernorm_forward<float8e4>(ACT(ln1), ACT(ln1_mean), ACT(ln1_rstd), residual, PARAM(ln1w), PARAM(ln1b), B*T, C);
         }
         matmul_backward(AGRAD(ln1), PGRAD(qkvw), PGRAD(qkvb), AGRAD(qkvr), ACT(ln1), PARAM(qkvw), scratchF, B*T, C, 3 * C);
-        layernorm_backward(dresidual, AGRAD(residual2), PGRAD(ln1w), PGRAD(ln1b), scratchF, AGRAD(ln1), residual, PARAM(ln1w), ACT(ln1_mean), ACT(ln1_rstd), B*T, C);
+        layernorm_backward<float8e5>(dresidual, AGRAD(residual2), PGRAD(ln1w), PGRAD(ln1b), scratchF, AGRAD(ln1), residual, PARAM(ln1w), ACT(ln1_mean), ACT(ln1_rstd), B*T, C);
 
         // Accumulate gradients from this layer in a background stream.
         if(last_step) {
@@ -819,6 +863,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         }
 
         // Is it time to redo the forward pass from our activation checkpoints?
+        /*
         if (LAYERS_PER_ACTIVATION_CHECKPOINT && (l % max(1, LAYERS_PER_ACTIVATION_CHECKPOINT)) == 0 && l > 0) {
             int old_l = l;
             // forward pass time!
@@ -845,7 +890,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             }
             l = old_l;
         }
-
+        */
     }
 
     encoder_backward(PGRAD(wte), PGRAD(wpe), scratchX_HUGE, model->workload_indices, model->bucket_info,
@@ -920,7 +965,7 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
 }
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_scale, int t,
-                 MultiGpuConfig* multi_gpu_config, bool init_from_master_only=false) {
+                 MultiGpuConfig* multi_gpu_config) {
     // update the model parameters using the AdamW optimizer
     // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
     // so we may not be responsible for the entire parameter tensor
@@ -941,6 +986,27 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         cudaCheck(cudaMemset(model->tensor_memory[PARAMETER_OPT_V], 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
     }
 
+    int absmax_block_size = 256;
+    int absmax_num_blocks = (num_tensor_specs + absmax_block_size - 1) / absmax_block_size;
+
+/*
+    printf("--------------\n");
+    update_scale_descale_kernel<<<absmax_num_blocks, absmax_block_size>>>(num_tensor_specs);
+
+    // copy all absmax to CPU and printf if != 1.0f
+    float* absmax_cpu = (float*)malloc(num_tensor_specs * sizeof(float));
+    float* scale_cpu = (float*)malloc(num_tensor_specs * 2 * sizeof(float));
+    cudaCheck(cudaMemcpy(absmax_cpu, gpu_absmax_memory, num_tensor_specs * sizeof(float), cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpy(scale_cpu, gpu_scale_memory, num_tensor_specs * 2 * sizeof(float), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < num_tensor_specs; i++) {
+        if (scale_cpu[i*2] != 1.0f || absmax_cpu[i] != 0.0f) {
+            printf("scale[%d/%s] ==> %.10f ==> %.10f / %.10f\n", i, tensor_specs[i].name, absmax_cpu[i], scale_cpu[i*2], scale_cpu[i*2+1]);
+        }
+    }
+
+    printf("==============\n");
+*/
+
     // save RNG state at this point so we can round from master weights identically when restoring from a checkpoint
     model->rng_state_last_update = model->rng_state;
 
@@ -952,14 +1018,12 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     const int block_size = 64;
     const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
     if (model->use_master_weights) {
-        if (init_state || init_from_master_only) {
+        if (init_state) {
             // reads regular weights & writes to master+regular weights
-            // or init_from_master_only: reads master & write to regular weights as-is
             adamw_full_update<true, true><<<grid_size, block_size, 0, main_stream>>>(
                                     tensor_specs_gpu, seed, tensors_start[PARAMETER_GRAD],
                                     model->num_parameters, model->num_parameters / num_shards,
-                                    learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, grad_scale, t,
-                                    init_from_master_only);
+                                    learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, grad_scale, t);
         } else {
             // reads master weights & writes to master+regular weights
             adamw_full_update<true, false><<<grid_size, block_size, 0, main_stream>>>(
@@ -1041,9 +1105,23 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     */
 
     // todo - hack - update scale/descale from absmax
-    int absmax_block_size = 256;
-    int num_blocks = (num_tensor_specs + absmax_block_size - 1) / block_size;
-    update_scale_descale_kernel<<<num_blocks, absmax_block_size>>>(gpu_scale_memory, gpu_absmax_memory, num_tensor_specs);
+    update_scale_descale_kernel<<<absmax_num_blocks, absmax_block_size>>>(num_tensor_specs);
+
+/*
+    float* absmax_cpu2 = (float*)malloc(num_tensor_specs * sizeof(float));
+    float* scale_cpu2 = (float*)malloc(num_tensor_specs * 2 * sizeof(float));
+    cudaCheck(cudaMemcpy(absmax_cpu2, gpu_absmax_memory, num_tensor_specs * sizeof(float), cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpy(scale_cpu2, gpu_scale_memory, num_tensor_specs * 2 * sizeof(float), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < num_tensor_specs; i++) {
+        if (scale_cpu[i*2] != scale_cpu2[i*2] || absmax_cpu[i] != absmax_cpu2[i]) {
+            printf("scale[%d/%s] ==> absmax: %f -> %f, scale: %f -> %f, descale: %f -> %f\n", i, tensor_specs[i].name, absmax_cpu[i], absmax_cpu2[i], scale_cpu[i*2], scale_cpu2[i*2], scale_cpu[i*2+1], scale_cpu2[i*2+1]);
+        }
+    }
+    free(scale_cpu);
+    free(absmax_cpu);
+    free(scale_cpu2);
+    free(absmax_cpu2);
+*/
 
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -1203,10 +1281,6 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     if(model->use_master_weights) {
         assert(model->tensor_memory[PARAMETER_MASTER] != nullptr);
         file_to_device(model->tensor_memory[PARAMETER_MASTER], state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-        // restore weights from the master weights using the RNG state before last weight update
-        model->rng_state = model->rng_state_last_update;
-        gpt2_update(model, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, &multi_gpu_config, /* init_from_master_only*/ true);
-        model->rng_state = *((unsigned long long*)&state_header[20]); // use final RNG state from checkpoint after this
     }
 
     // revive the DataLoader object and its state
@@ -1626,9 +1700,6 @@ int main(int argc, char *argv[]) {
     // in any case, this must be true or we'd index beyond the model's wpe (position embedding table)
     assert(T <= model.config.max_seq_len);
 
-    // todo - hack - do this to update the absmax of all the weights
-    gpt2_update(&model, 0.0f, 0.9f, 0.95f, 1e-8f, 1.0f, 1.0f, 1, &multi_gpu_config);
-
     // train
     cudaEvent_t start, end;
     cudaCheck(cudaEventCreate(&start));
@@ -1781,7 +1852,7 @@ int main(int argc, char *argv[]) {
             // todo - ideally should rerun this step so we don't "waste" the data without training on it
             if (step == 0) {
                 step_learning_rate = 0.0f;
-                weight_decay = 1.0f;
+                weight_decay = 0.0f;
             }
 
             gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);

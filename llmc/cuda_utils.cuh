@@ -191,7 +191,7 @@ __device__ void stochastic_rounding(float in, Ti &out, unsigned int random, floa
     // e.g. +0.3f ==> 65% chance up, 35% chance down
     float threshold_percentage = ((float)random / (float)0xFFFFFFFF) - prob_offset;
 
-    Ti rounded_down, rounded_up;
+    Ti rounded_down = (Ti)0.0f, rounded_up = (Ti)0.0f;
     if constexpr (std::is_same<Ti, half>::value) {
         rounded_down = __float2half_rd(in);
         rounded_up = __float2half_ru(in);
@@ -218,6 +218,8 @@ __device__ void stochastic_rounding(float in, Ti &out, unsigned int random, floa
         }
         rounded_up = (__nv_fp8_e4m3)high;
         rounded_down = (__nv_fp8_e4m3)low;
+    } else {
+        assert(false);
     }
 
     float diff = (float)rounded_up - (float)rounded_down;

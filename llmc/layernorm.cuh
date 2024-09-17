@@ -75,9 +75,9 @@ __global__ void layernorm_forward_kernel6(TensorGPU<T> out, tensorFP32 mean, ten
     out128.update_absmax(threadIdx.x + threadIdx.y * blockDim.x, blockDim.x * blockDim.y, true);
 }
 
-template <typename T=float8e4, typename T2 = T>
-__global__ void fused_residual_forward_kernel5(tensorX residual, TensorGPU<T> normed, tensorFP32 mean, tensorFP32 rstd,
-                                               const tensorX inp1, const TensorGPU<T2> inp2,
+template <typename Tout=float8e4, typename Tin = Tout>
+__global__ void fused_residual_forward_kernel5(tensorX residual, TensorGPU<Tout> normed, tensorFP32 mean, tensorFP32 rstd,
+                                               const tensorX inp1, const TensorGPU<Tin> inp2,
                                                const tensorX weight, const tensorX bias,
                                                int N, int C) {
     // Note that blockDim.x must be WARP_SIZE=32 but we don't want to pay the cost of assert() here
@@ -381,17 +381,17 @@ void layernorm_forward(TensorGPU<T> out, tensorFP32 mean, tensorFP32 rstd,
     launch_layernorm_kernel(layernorm_forward_kernel6<T>, N, C, stream, out, mean, rstd, inp, weight, bias);
 }
 
-template <typename T=float8e4, typename T2 = T>
-void fused_residual_forward5(tensorX residual, TensorGPU<T> normed, tensorFP32 mean, tensorFP32 rstd,
-                             tensorX inp1, TensorGPU<T2> inp2, tensorX weight, tensorX bias,
+template <typename Tout=float8e4, typename Tin = Tout>
+void fused_residual_forward5(tensorX residual, TensorGPU<Tout> normed, tensorFP32 mean, tensorFP32 rstd,
+                             tensorX inp1, TensorGPU<Tin> inp2, tensorX weight, tensorX bias,
                              int N, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
-    launch_layernorm_kernel(fused_residual_forward_kernel5<T, T2>, N, C, stream, residual, normed, mean, rstd, inp1, inp2, weight, bias);
+    launch_layernorm_kernel(fused_residual_forward_kernel5<Tout, Tin>, N, C, stream, residual, normed, mean, rstd, inp1, inp2, weight, bias);
 }
 
-template <typename T=float8e5>
+template <typename Tdout=float8e5>
 void layernorm_backward(tensorX dinp_new, tensorX dinp_old, tensorX dweight, tensorX dbias, tensorFP32 scratch,
-                        const TensorGPU<T> dout, const tensorX inp, const tensorX weight, tensorFP32 mean, tensorFP32 rstd,
+                        const TensorGPU<Tdout> dout, const tensorX inp, const tensorX weight, tensorFP32 mean, tensorFP32 rstd,
                         int BT, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 512;

@@ -77,6 +77,8 @@ struct TensorGPU {
     size_t num_elements = 0;
     int id = -1;
 
+    static constexpr bool no_scaling = (sizeof(ElementType) == 1);
+
     bool is_null() const {
         return (data_ptr == NULL);
     }
@@ -111,7 +113,7 @@ struct TensorGPU {
         return sizeof(int4) / sizeof(ElementType);
     }
 
-    __device__ __host__ float get_scalar(size_t index, bool disable_scaling=false) const {
+    __device__ __host__ float get_scalar(size_t index, bool disable_scaling=no_scaling) const {
         #ifdef FAKE_FP8
         disable_scaling = true;
         #endif
@@ -124,7 +126,7 @@ struct TensorGPU {
         return value * descale; // [1] = descale
     }
 
-    __device__ __host__ ElementType set_scalar(size_t index, float value, bool disable_scaling=false) {
+    __device__ __host__ ElementType set_scalar(size_t index, float value, bool disable_scaling=no_scaling) {
         #ifdef FAKE_FP8
         disable_scaling = true;
         #endif
@@ -198,6 +200,86 @@ struct TensorSpec {
 
 // ----------------------------------------------------------------------------
 
+// debug helper function
+void print_tensor_elements(int tensor_id) {
+    return;
+
+    printf("Printing tensor %d\n", tensor_id);
+    TensorSpec spec = tensor_specs[tensor_id];
+    size_t num_elements = spec.num_elements;
+    const char* tensor_name = spec.name;
+    TT tensor_type = spec.tensor_type;
+    DType dtype = spec.data_type;
+    size_t element_size = sizeof_dtype(dtype);
+
+    void* gpu_tensor = spec.ptr;
+    void* cpu_tensor = malloc(num_elements * element_size);
+
+    printf("Printing tensor %s (tensor_type: %d, data_type: %d)\n", tensor_name, (int)tensor_type, (int)dtype);
+    printf("GPU memory: %p\n", gpu_tensor);
+    printf("CPU memory: %p\n", cpu_tensor);
+    printf("Num elements: %zu\n", num_elements);
+    printf("Element size: %zu\n", element_size);
+    printf("Offset: %zu\n", spec.offset);
+
+    cudaCheck(cudaMemcpy(cpu_tensor, gpu_tensor, num_elements * element_size, cudaMemcpyDeviceToHost));
+
+    printf("Did memcpy\n");
+
+    printf("First 4 of %s: ", tensor_name);
+    for (int i = 0; i < num_elements && i < 4; i++) {
+        if (dtype == DType::FP32) {
+            printf("%.16f ", ((float*)cpu_tensor)[i]);
+        } else if (dtype == DType::FP16) {
+            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
+        } else if (dtype == DType::BF16) {
+            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
+        } else if (dtype == DType::FP8E4M3) {
+            printf("%.16f ", (float)((__nv_fp8_e4m3*)cpu_tensor)[i]);
+        } else if (dtype == DType::FP8E5M2) {
+            printf("%.16f ", (float)((__nv_fp8_e5m2*)cpu_tensor)[i]);
+        }
+    }
+    printf("\n");
+
+    printf("Middle 4 of %s: ", tensor_name);
+    for (int i = (num_elements/2) + 4; i < num_elements && i < (num_elements/2 + 8); i++) {
+        if (dtype == DType::FP32) {
+            printf("%.16f ", ((float*)cpu_tensor)[i]);
+        } else if (dtype == DType::FP16) {
+            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
+        } else if (dtype == DType::BF16) {
+            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
+        } else if (dtype == DType::FP8E4M3) {
+            printf("%.16f ", (float)((__nv_fp8_e4m3*)cpu_tensor)[i]);
+        } else if (dtype == DType::FP8E5M2) {
+            printf("%.16f ", (float)((__nv_fp8_e5m2*)cpu_tensor)[i]);
+        }
+    }
+    printf("\n");
+
+    printf("Last 4 of %s: ", tensor_name);
+    for (int i = num_elements - 4; i < num_elements; i++) {
+        if (dtype == DType::FP32) {
+            printf("%.16f ", ((float*)cpu_tensor)[i]);
+        } else if (dtype == DType::FP16) {
+            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
+        } else if (dtype == DType::BF16) {
+            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
+        } else if (dtype == DType::FP8E4M3) {
+            printf("%.16f ", (float)((__nv_fp8_e4m3*)cpu_tensor)[i]);
+        } else if (dtype == DType::FP8E5M2) {
+            printf("%.16f ", (float)((__nv_fp8_e5m2*)cpu_tensor)[i]);
+        }
+    }
+    printf("\n");
+    printf("\n");
+
+    free(cpu_tensor);
+}
+
+// ----------------------------------------------------------------------------
+
 TensorSpec get_tensor(int spec_index, TT tensor_type, int layer) {
     TensorSpec spec = tensor_specs[spec_index];
     if (layer > 0 && spec.remaining_layers >= layer) {
@@ -207,7 +289,7 @@ TensorSpec get_tensor(int spec_index, TT tensor_type, int layer) {
         assert(false);
     }
     assert(spec.tensor_type == tensor_type || tensor_type == DEFAULT);
-    //print_tensor_elements(spec_index);
+    print_tensor_elements(spec_index);
     return spec;
 }
 
@@ -274,81 +356,14 @@ int add_layer_specs(int num_layers, const char* name, size_t total_elements, siz
     return first_tensor_id;
 }
 
-// debug helper function
-void print_tensor_elements(int tensor_id) {
-    return;
-
-    printf("Printing tensor %d\n", tensor_id);
-    TensorSpec spec = tensor_specs[tensor_id];
-    size_t num_elements = spec.num_elements;
-    const char* tensor_name = spec.name;
-    TT tensor_type = spec.tensor_type;
-    DType dtype = spec.data_type;
-    size_t element_size = sizeof_dtype(dtype);
-
-    void* gpu_memory = spec.ptr;
-    void* gpu_tensor = (void*)((char*)gpu_memory + tensor_specs[tensor_id].offset);
-    void* cpu_tensor = malloc(num_elements * element_size);
-
-    printf("Printing tensor %s (tensor_type: %d, data_type: %d)\n", tensor_name, (int)tensor_type, (int)dtype);
-    printf("GPU memory: %p\n", gpu_tensor);
-    printf("CPU memory: %p\n", cpu_tensor);
-    printf("Num elements: %zu\n", num_elements);
-    printf("Element size: %zu\n", element_size);
-    printf("Offset: %zu\n", tensor_specs[tensor_id].offset);
-
-    cudaCheck(cudaMemcpy(cpu_tensor, gpu_tensor, num_elements * element_size, cudaMemcpyDeviceToHost));
-
-    printf("Did memcpy\n");
-
-    printf("First 4 of %s: ", tensor_name);
-    for (int i = 0; i < num_elements && i < 4; i++) {
-        if (dtype == DType::FP32) {
-            printf("%.16f ", ((float*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP16) {
-            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
-        } else if (dtype == DType::BF16) {
-            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
-        }
-    }
-    printf("\n");
-
-    printf("Middle 4 of %s: ", tensor_name);
-    for (int i = (num_elements/2) + 4; i < num_elements && i < (num_elements/2 + 8); i++) {
-        if (dtype == DType::FP32) {
-            printf("%.16f ", ((float*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP16) {
-            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
-        } else if (dtype == DType::BF16) {
-            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
-        }
-    }
-    printf("\n");
-
-    printf("Last 4 of %s: ", tensor_name);
-    for (int i = num_elements - 4; i < num_elements; i++) {
-        if (dtype == DType::FP32) {
-            printf("%.16f ", ((float*)cpu_tensor)[i]);
-        } else if (dtype == DType::FP16) {
-            printf("%.16f ", (float)((__nv_half*)cpu_tensor)[i]);
-        } else if (dtype == DType::BF16) {
-            printf("%.16f ", (float)((__nv_bfloat16*)cpu_tensor)[i]);
-        }
-    }
-    printf("\n");
-    printf("\n");
-
-    free(cpu_tensor);
-}
-
 // ----------------------------------------------------------------------------
 
-__global__ void update_scale_descale_kernel(float* gpu_scale_memory, unsigned int* gpu_absmax_memory, int num_tensor_specs) {
+__global__ void update_scale_descale_kernel(int num_tensor_specs) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_tensor_specs) return;
 
     // Get the absmax value for this tensor
-    unsigned int absmax_uint = gpu_absmax_memory[tid];
+    unsigned int absmax_uint = gpu_absmax_memory_ptr[tid];
     float absmax = __uint_as_float(absmax_uint);
 
     // Calculate scale and descale
@@ -365,7 +380,7 @@ __global__ void update_scale_descale_kernel(float* gpu_scale_memory, unsigned in
             descale *= 1.0f/32768.0f;
         } else {
             // e4
-            //if (tensor_specs_ptr[tid].tensor_type != TT::PARAMETER) {
+            //if (tensor_specs_ptr[tid].tensor_type != TT::PARAMETER || absmax >= 4.0f) {
                 scale *= 256.0f;
                 descale *= (1.0f/256.0f);
             //}
@@ -375,12 +390,16 @@ __global__ void update_scale_descale_kernel(float* gpu_scale_memory, unsigned in
         descale = 1.0f;
     }
 
+    if (scale != 1.0f) {
+        //printf("%s: absmax: %f, scale: %f, descale: %f\n", tensor_specs_ptr[tid].name, absmax, scale, descale);
+    }
+
     // todo: circular buffer
     //gpu_absmax_memory[tid] = 0.0f;
 
     // Update gpu_scale_memory
-    gpu_scale_memory[tid * 2] = scale;
-    gpu_scale_memory[tid * 2 + 1] = descale;
+    gpu_scale_memory_ptr[tid * 2] = scale;
+    gpu_scale_memory_ptr[tid * 2 + 1] = descale;
 }
 
 // ----------------------------------------------------------------------------
@@ -422,12 +441,11 @@ public:
         scaling = false; // only do "fake" scaling
 #endif
 
-        if (!disable_scaling) {
+        scaling = scaling && !disable_scaling;
+        if (scaling) {
             const float* __restrict__ ptr_restricted = tensor.scale_descale_ptr;
             scale = ptr_restricted[0];
             descale = ptr_restricted[1];
-        } else {
-            scaling = false;
         }
         absmax_ptr = tensor.absmax_ptr;
     }
@@ -528,8 +546,8 @@ public:
         // otherwise, the compiler does silly things related to the redux/atomicMax
         unsigned int lane_id ;
         asm volatile("mov.u32 %0, %laneid;" : "=r"(lane_id));
-        unsigned int num_warps = num_threads >> 5;
-        unsigned int warp_id = thread_id >> 5;
+        unsigned int num_warps = num_threads / WARP_SIZE;
+        unsigned int warp_id = thread_id / WARP_SIZE;
 
         // use native integer reductions as much as possible (supported on all GPUs with FP8)
         // this might treat NaN/INF slightly differently but that is the least of our problems
