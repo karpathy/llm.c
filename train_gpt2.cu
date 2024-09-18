@@ -344,9 +344,12 @@ void gpt2_allocate(GPT2 *model) {
     }
 
     // Set the GPU pointer for each tensor spec (so we don't need to know the base and the offset)
+    // also specify 1st and end elements explicitly to optimise kernels iterating over the tensors
     for (size_t i = 0; i < num_tensor_specs; i++) {
         TensorSpec* spec = &tensor_specs[i];
         spec->ptr = model->tensor_memory[spec->tensor_type] + spec->offset;
+        spec->element_start_end.x = spec->offset / sizeof_dtype(spec->data_type);
+        spec->element_start_end.y = spec->element_start_end.x + spec->num_elements;
     }
 
     // we are finished creating the tensors specs and copy them to the GPU (they are effectively read-only)
@@ -959,44 +962,21 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
 float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
     NVTX_RANGE_FN();
-    floatX* grads_memory = (floatX*)model->tensor_memory[PARAMETER_GRAD];
-
     // repurposing this buffer (which isn't needed now) to write grad norm into it
     float* grad_norm_squared = MULTI_0(output_scratch_fp32);
     float grad_norm_squared_cpu = 0.0f;
 
-    int num_slices[2] = {1, model->config.num_layers};
-    int max_num_block_sums = get_max_num_block_sums(num_slices, 2);
-    /*if (multi_gpu_config->zero_stage == 1) {
-        // because of the ncclReduceScatter() in backward,
-        // grads_memory only contains the averaged gradients at the local shards,
-        // so we only calculate the grad norm at the grads_memory belonging to the local shards
-        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-            ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
-            ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
-            ptrdiff_t offset = tensor.offset + shard.offset;
-            bool is_first_pass = (i == 0);
-            if((i < 2 || i > 13)) {
-                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, 0, 1,
-                                    max_num_block_sums, is_first_pass, main_stream);
-            } else {
-                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, tensor.size, model->config.num_layers,
-                                    max_num_block_sums, is_first_pass, main_stream);
-            }
-        }
-        global_sum_deterministic(grad_norm_squared, grad_norm_squared, max_num_block_sums, main_stream);
+    // automagically handles everything including sharding for ZeRO 1/2/3
+    global_norm_tensors(grad_norm_squared, multi_gpu_config->process_rank, main_stream);
+
 #if MULTI_GPU
+    if (multi_gpu_config->zero_stage >= 1) {
         // further sum the (partial) squared norm across all GPUs
         ncclCheck(ncclAllReduce(grad_norm_squared, grad_norm_squared, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, main_stream));
-#endif
-    } else*/ {
-        // in regular DDP, backward has averaged the gradients across all GPUs
-        // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
-        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, 0, 1, max_num_block_sums, true, main_stream);
-        global_sum_deterministic(grad_norm_squared, grad_norm_squared, max_num_block_sums, main_stream);
     }
-    cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
+#endif
 
+    cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
     float grad_norm_cpu = sqrtf(grad_norm_squared_cpu);
     return grad_norm_cpu;
 }
@@ -1022,19 +1002,16 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     float beta2_correction = 1.0f - powf(beta2, t);
     unsigned int seed = random_u32(&model->rng_state);
     int num_shards = tensor_specs[tensors_start[PARAMETER_OPT_M]].num_shards;
+    int shard_idx = multi_gpu_config->process_rank % num_shards; // todo - currently assuming ZeRO 1 or DPP
 
     const int block_size = 64;
     const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
     if (model->use_master_weights) {
-        adamw_full_update<true><<<grid_size, block_size, 0, main_stream>>>(
-                                tensor_specs_gpu, seed, tensors_start[PARAMETER+1],
-                                model->num_parameters, model->num_parameters / num_shards,
-                                learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, grad_scale, t);
+        adamw_update_everything<true><<<grid_size, block_size, 0, main_stream>>>(tensors_start[PARAMETER+1], seed, shard_idx,
+                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, grad_scale, t);
     } else {
-        adamw_full_update<false><<<grid_size, block_size, 0, main_stream>>>(
-                                tensor_specs_gpu, seed, tensors_start[PARAMETER+1],
-                                model->num_parameters, model->num_parameters / num_shards,
-                                learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, grad_scale, t);
+        adamw_update_everything<false><<<grid_size, block_size, 0, main_stream>>>(tensors_start[PARAMETER+1], seed, shard_idx,
+                               learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, grad_scale, t);
     }
 
     // AdamW update

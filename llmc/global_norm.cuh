@@ -1,5 +1,7 @@
+// TODO - BUGGED - just committing my WIP, not sure why grad norm is zero, probably something silly!
+
 /*
-Global norm, used in gradient clipping
+Global norm, used in gralldient clipping
 */
 #include <assert.h>
 #include <stddef.h>
@@ -11,79 +13,71 @@ Global norm, used in gradient clipping
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
-template<class T>
-__device__ float global_norm_squared_for_range(const T* data, size_t count) {
-    size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t grid_width = blockDim.x * gridDim.x;
-    float accumulator = 0.f;
-    for(size_t i = index; i < count; i += grid_width) {
-        accumulator += (float)data[i] * (float)data[i];
-    }
-    // block-level reduce
-    return blockReduce<warpReduceSum>(accumulator);
-}
+// currently assumes all gradients are the same type (simplified adamw_update_everything)
+// ZeRO 1 should use shard_idx, while DPP and ZeRO 2/3 should simply set it to 0
+template <typename Tgrad=floatX>
+__global__ void __launch_bounds__(256, MAX_WARPS/8) global_norm_tensors_kernel(float* out, int num_params_tensors, unsigned int shard_idx) {
+    float grad_norm_accumulator = 0.f;
 
-template<class T>
-__global__ void global_norm_squared_kernel(float* out, const T* data, size_t count, ptrdiff_t stride) {
-    float block_sum = global_norm_squared_for_range(data + blockIdx.y * stride, count);
-    // each block accumulates its partial sum to out[out_index]
-    // we want to avoid using atomic add here so we combine this kernel with another kernel call
-    // that sums up the partial block sums
-    if(threadIdx.x == 0) {
-        size_t out_index = blockIdx.y * gridDim.x + blockIdx.x;
-        out[out_index] = out[out_index] + block_sum;
-    }
-}
+    constexpr size_t block_size = 256;
+    constexpr size_t iteration_size = Packed128<Tgrad>::size;
+    size_t idx = (blockIdx.x * block_size * iteration_size) + (threadIdx.x * iteration_size);
+    unsigned int stride = gridDim.x * blockDim.x * iteration_size;
 
-__global__ void global_norm_aggregate_kernel(float* out, size_t grid_size) {
-    size_t index = threadIdx.x;
-    // grab block sums from the previous kernel, use 0. as the neutral sum element
-    float block_sum = (index < grid_size) ? out[index] : 0.f;
-    float sum = blockReduce<warpReduceSum>(block_sum);
-    if(threadIdx.x == 0) {
-        out[0] = sum;  // out[0] ends up with the final norm squared
+    int spec_id = 0;
+    TensorSpec* grad_specs   = tensor_specs_ptr + num_params_tensors;
+    TensorSpec* opt_v_specs  = tensor_specs_ptr + 3 * num_params_tensors;
+
+    TensorSpec opt_v_spec = opt_v_specs[spec_id];
+    size_t current_start = opt_v_spec.element_start_end.x;
+    size_t current_end = opt_v_spec.element_start_end.y;
+
+    while (true) {
+        while (idx >= current_end) {
+            // todo - check performance, misses probably okay if they reduce the tail effect
+            // (fastest block/SM "prefetches" for the slower ones)
+            // but tiny tensors back-to-back might be inefficient
+            spec_id++;
+            if (spec_id >= num_params_tensors) {
+                return;
+            }
+            opt_v_spec = opt_v_specs[spec_id];
+            current_start = opt_v_spec.element_start_end.x;
+            current_end = opt_v_spec.element_start_end.y;
+        }
+
+        // offset is 32-bit (checked <=4B elements in add_tensor_spec)
+        unsigned int offset = (idx - current_start) + (shard_idx * opt_v_spec.num_elements);
+        TensorGPU<floatX> grad_tensor  = grad_specs[spec_id];
+
+        __syncthreads(); // todo - hopefully improves memory locality
+        while (idx < current_end) {
+            auto grad128 = load_tensor128(grad_tensor, offset, false, true);
+            for (int k = 0; k < grad_tensor.num_per_128(); k++) {
+                float grad = grad128.get(k);
+                grad_norm_accumulator += grad * grad;
+            }
+            idx += stride;
+            offset += stride;
+        }
     }
+    out[blockIdx.x] = blockReduce<warpReduceSum>(grad_norm_accumulator);;
 }
 
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-// Helper function determines the maximum number of block sums
-int get_max_num_block_sums(int* num_slices_all, int numel) {
-    // NOTE: this needs to be kept in sync with `global_norm_squared` below.
-    const int block_size = 512;
+template<typename Tgrad=floatX>
+void global_norm_tensors(float* out, int gpu_process_rank, cudaStream_t stream=main_stream) {
+    const int block_size = 256;
     const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
-    assert(grid_size > 0);
-    int max_num_block_sums = 0;
-    for (int i = 0; i < numel; i++) {
-        int num_slices = num_slices_all[i];
-        const int gx = CEIL_DIV(grid_size, num_slices);
-        const int gy = num_slices;
-        max_num_block_sums = max(max_num_block_sums, gx * gy);
-    }
 
-    return max_num_block_sums;
-}
+    int num_params_tensors = tensors_start[PARAMETER+1];
+    int num_shards_opt = tensor_specs[tensors_start[PARAMETER_OPT_M]].num_shards;
+    int num_shards_grad = tensor_specs[tensors_start[PARAMETER_GRAD]].num_shards;
+    int num_shards = num_shards_opt / num_shards_grad; // should work for both DPP and ZeRO 1/2/3
+    int shard_idx = gpu_process_rank % num_shards;
 
-template<typename T>
-void global_norm_squared(float* out, const T* values, size_t count, ptrdiff_t stride, int num_slices, int max_num_block_sums, bool reset, cudaStream_t stream=main_stream) {
-    const int block_size = 512;
-    // launch just enough blocks to fill the grid. deliberately no DIV_CEIL.
-    // having one block less than possible is a tiny performance hit, having
-    // one block too many is catastrophic, since it only can start once all the other
-    // blocks finish. anyway, I think cuda_threads_per_SM should be a multiple of 512
-    // on all gpus, so the division really is going to be exact.
-    const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
-    assert(grid_size > 0);      // gives a better error than letting the call below fail
-
-    const int gx = CEIL_DIV(grid_size, num_slices);
-    const int gy = num_slices;
-
-    assert(gx * gy < 1024);  // we want to later accumulate the block sums in a single block
-
-    if (reset) {
-        cudaCheck(cudaMemsetAsync(out, 0, max_num_block_sums * sizeof(float), stream));
-    }
-    global_norm_squared_kernel<<<dim3(gx, gy), block_size, 0, stream>>>(out, values, count, stride);
-    cudaCheck(cudaGetLastError());
+    global_norm_tensors_kernel<Tgrad><<<grid_size, block_size, 0, stream>>>(out, num_params_tensors, shard_idx);
+    global_sum_deterministic(out, out, grid_size, stream);
 }

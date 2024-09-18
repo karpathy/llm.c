@@ -38,8 +38,10 @@ extern cudaStream_t main_stream;
 // this needs to be defines rather than queried to be used for __launch_bounds__
 #if __CUDA_ARCH__ == 800 || __CUDA_ARCH__ >= 900
 #define MAX_1024_THREADS_BLOCKS 2
+#define MAX_WARPS 64
 #else
 #define MAX_1024_THREADS_BLOCKS 1
+#define MAX_WARPS 48
 #endif
 
 // convenience macro for calculating grid/block dimensions for kernels

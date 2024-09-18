@@ -79,36 +79,35 @@ struct TensorGPU {
     unsigned int* absmax_ptr = NULL;
     size_t num_elements = 0;
 
-    static constexpr bool no_scaling = (sizeof(ElementType) != 1); // todo - this prevents scaling FP16
-    bool is_null() const { return (data_ptr == NULL); }
-    bool enabled() const { return (data_ptr != NULL); }
-
     static __device__ __host__ TensorGPU from(ElementType* ptr=nullptr) {
         TensorGPU tmp;
         tmp.data_ptr = ptr;
         return tmp;
     }
-
     template<typename T>
     __device__ __host__ T* as() {
         return reinterpret_cast<T*>(data_ptr);
     }
-
     __device__ __host__  operator ElementType*() const {
         return data_ptr;
     }
-
     __device__ __host__ ElementType& operator[](size_t index) {
         return data_ptr[index];
     }
-
     __device__ __host__ const ElementType& operator[](size_t index) const {
         return data_ptr[index];
     }
-
     __device__ __host__ int num_per_128() const {
         return sizeof(int4) / sizeof(ElementType);
     }
+    __device__ __host__ bool is_null() const {
+        return (data_ptr == NULL);
+    }
+    __device__ __host__ bool enabled() const {
+        return (data_ptr != NULL);
+    }
+
+    static constexpr bool no_scaling = (sizeof(ElementType) != 1); // todo - this prevents scaling FP16
 
     __device__ __host__ float get_scalar(size_t index, bool disable_scaling=no_scaling) const {
         #ifdef FAKE_FP8
@@ -155,8 +154,8 @@ extern TensorGPU<floatX> null_tensorX;
 // they all implicitly refer to this (in tensor_specs[] and tensor_specs_gpu[] for now) with the id
 // and these other classes are created by converting from this one (sometimes implicitly)
 struct TensorSpec {
-    int id;
     char* ptr;
+    int id;
 
     char name[16];
     TT tensor_type;
@@ -167,6 +166,9 @@ struct TensorSpec {
     size_t num_elements; // per shard
     short num_shards;
     short remaining_layers;
+
+    // explicit as performance optimization for optimizer critical path
+    ulonglong2 element_start_end;
 
     template <typename T>
     __host__ __device__ operator T*() const {
@@ -257,7 +259,7 @@ TensorSpec get_tensor(int spec_index, TT tensor_type, int layer) {
 
 // this can only be called at initialisation time, once tensor_specs has been uploaded to the GPU, it is fixed in stone
 int add_tensor_spec(const char* name, size_t total_elements, size_t num_shards, DType data_type, int copy_offset_from=-1, int flags=TFlags::NONE, TT tensor_type=TT::DEFAULT) {
-    assert(num_tensor_specs < 16*1024);
+    assert(num_tensor_specs < MAX_TENSORS);
     assert((total_elements % num_shards) == 0);
     TensorSpec* spec = &tensor_specs[num_tensor_specs];
 
@@ -267,6 +269,10 @@ int add_tensor_spec(const char* name, size_t total_elements, size_t num_shards, 
     spec->tensor_type = (tensor_type == TT::DEFAULT) ? current_tensor_type : tensor_type;
     spec->data_type = data_type;
     spec->flags = flags;
+
+    // parameter tensors must fit in a 32-bit unsigned integer (used as a performance optimisation in some kernels)
+    // todo - either 1) 32-bit everywhere (with a DEFINE?), 2) 64-bit everywhere despite the small performance impact
+    assert(total_elements < 4UL*1024*1024*1024 || spec->tensor_type == TT::MULTIUSE);
 
     spec->num_elements = total_elements / num_shards;
     spec->num_shards = num_shards;
@@ -411,6 +417,7 @@ public:
 
         scaling = scaling && !disable_scaling;
         if (scaling) {
+            // using __restrict__ here should allow the compiler to cache/reuse this in loops etc.
             const float* __restrict__ ptr_restricted = tensor.scale_descale_ptr;
             scale = ptr_restricted[0];
             descale = ptr_restricted[1];
@@ -525,7 +532,7 @@ public:
         // if this is the end of the kernel, the compiler puts a conditional EXIT right after BAR
         // but this way the EXIT is right before the barrier which frees the warps slightly quicker
         bool done = (warp_id != 0);
-        if (done && exit) asm volatile("exit;");
+        if (done && exit) asm volatile("exit;"); // todo - does this help enough to be worth it?
         __syncthreads();
         if (done && !exit) return true;
 
