@@ -174,8 +174,8 @@ def main_smac(args):
                     objectives=["val_loss", "train_time"],
                     walltime_limit=60*60*23,  
                     n_trials=args.n_trials, #500,  # Evaluate max 500 different trials
-                    min_budget=10**3,  # Train the MLP using a hyperparameter configuration for at least 5 epochs
-                    max_budget=2*10**4,  # Train the MLP using a hyperparameter configuration for at most 25 epochs
+                    min_budget=0.75*60*60,  # Train the MLP using a hyperparameter configuration for at least 5 epochs
+                    max_budget=24*60*60,  # Train the MLP using a hyperparameter configuration for at most 25 epochs
                     n_workers=1,
                     deterministic=True
         )
@@ -185,8 +185,8 @@ def main_smac(args):
             # objectives=["val_loss", "train_time"],
             walltime_limit=60*60*23,  
             n_trials=args.n_trials, #500,  # Evaluate max 500 different trials
-            min_budget=10**3,  # Train the MLP using a hyperparameter configuration for at least 5 epochs
-            max_budget=2*10**4,  # Train the MLP using a hyperparameter configuration for at most 25 epochs
+            min_budget=0.75*60*60,  # Train the MLP using a hyperparameter configuration for at least 5 epochs
+            max_budget=24*60*60,  # Train the MLP using a hyperparameter configuration for at most 25 epochs
             n_workers=1,
             deterministic=True
         )
@@ -207,7 +207,10 @@ def main_smac(args):
     # Use Expected Improvement (EI) as the acquisition function
     # acquisition_function = EI(model=gp_model)
     initial_design = MultiFidelityFacade.get_initial_design(scenario, n_configs=args.n_initial)
-    intensifier = Hyperband(scenario, eta=args.eta, incumbent_selection="highest_budget")
+    if args.multiobjective:
+        intensifier = Hyperband(scenario, eta=args.eta, incumbent_selection="highest_budget")
+    else:
+        intensifier = Hyperband(scenario, eta=args.eta)
     
     logger.info("\t== Creating SMAC MultiFidelityFacade ==")
 
@@ -218,7 +221,7 @@ def main_smac(args):
             initial_design=initial_design,
             intensifier=intensifier,
             multi_objective_algorithm=multi_objective_algorithm,
-            overwrite=True,            
+            overwrite=False,            
             model=model,
             # acquisition_function=acquisition_function,
         )
@@ -228,7 +231,7 @@ def main_smac(args):
             target_function=partial_function,
             initial_design=initial_design,
             intensifier=intensifier,
-            overwrite=True,            
+            overwrite=False,            
             model=model,
             # acquisition_function=acquisition_function,
         )

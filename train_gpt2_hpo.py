@@ -6,7 +6,7 @@ import torch
 import os 
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
-from train_gpt2 import GPT, GPTConfig, DistributedDataLoader
+from train_gpt2 import GPT, GPTConfig, DistributedDataLoader, write_model
 from contextlib import nullcontext
 import torch._inductor.config as config
 import math
@@ -34,10 +34,27 @@ def train_eval_hpo(
     zero_stage: int = 0,
     logger = None,
     multi_objective: bool = False,
+    hp_details: list = None
 ):
     
     section_tab = 3*"\t"
     print(f"Running train_eval_hpo with budget: {budget}, config_space: {config_space.get_dictionary()}")
+    
+    step = None
+    time_elapsed = None
+    learning_rate = config_space["learning_rate"]
+    weight_decay = config_space["weight_decay"]
+    sequence_length = config_space["sequence_length"]
+    
+    save_name = f"{model}_bs_{batch_size}_lr_{learning_rate}_wd_{weight_decay}_seq_{sequence_length}_budget_{budget}"
+    
+    if os.path.exists(f"dev/models/{save_name}.pth"):
+        print(f'loading previous training states from: {save_name}')
+        ckpt = torch.load(f"dev/models/{save_name}.pth", map_location=device)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        step = ckpt['step']
+        time_elapsed = ckpt['time_elapsed']
     
     logger.info(f"{section_tab}== Running train_eval_hpo ==")
     # log all the arguments
@@ -55,13 +72,7 @@ def train_eval_hpo(
                 + section_tab + f"\tval_max_steps: {val_max_steps} \n"
                 + section_tab + f"\tdtype: {dtype} \n"
                 + section_tab + f"\tzero_stage: {zero_stage} \n")
-    
-    
-    num_iterations = budget
-    learning_rate = config_space["learning_rate"]
-    weight_decay = config_space["weight_decay"]
-    sequence_length = config_space["sequence_length"]    
-    
+        
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)  
@@ -109,6 +120,7 @@ def train_eval_hpo(
     tokens_per_fwdbwd = B * T * ddp_world_size
     total_batch_size = total_batch_size if total_batch_size > 0 else tokens_per_fwdbwd
 
+    num_iterations = train_loader.ntok_total // total_batch_size    
     assert total_batch_size % tokens_per_fwdbwd == 0
     grad_accum_steps = total_batch_size // tokens_per_fwdbwd
     
@@ -136,6 +148,7 @@ def train_eval_hpo(
     # init (and write) the tokenizer
     enc = tiktoken.get_encoding("gpt2")
 
+    model_name = model.copy()
     # init the model, either from scratch or from OpenAI pretrained checkpoint
     if model[0] == "d":
         # from scratch (random weights)
@@ -203,9 +216,6 @@ def train_eval_hpo(
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
         return min_lr + coeff * (learning_rate - min_lr)
 
-
-    start_time = time.time()
-
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
         
@@ -213,15 +223,17 @@ def train_eval_hpo(
     logger.info(f"{section_tab}== Training loop ==\n")
     print(f"== Training loop ==")
     
+    model_to_size = {"gpt2-tiny": "30M", "gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
+    model_to_size.update({f"d{d}": f"d{d}" for d in [6, 12, 24, 36, 48]})
+    
     timings = []
     norm = -1.0   # dummy value to print in inference-only mode
-    for step in range(num_iterations + 1):
+    start_time = time.time()
+    training_losses = []
+    step = step if step is not None else 0
+    time_elapsed = time_elapsed if time_elapsed is not None else 0.0    
+    while time.time() + time_elapsed - start_time < budget:
         t0 = time.time()
-        last_step = (step == num_iterations)
-
-        if last_step:
-            break
-
         # --------------- TRAINING SECTION BEGIN -----------------
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -252,6 +264,10 @@ def train_eval_hpo(
             dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
     
+        training_losses.append(lossf)
+        if len(training_losses) > val_max_steps:
+            training_losses.pop(0)
+        
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
@@ -260,13 +276,10 @@ def train_eval_hpo(
         # step the optimizer
         optimizer.step()
         
-        if step % 100 == 0:
+        if step % 200 == 0:
             logger.info(f"{section_tab} \tStep: {step}/{num_iterations} | Loss: {lossf} | LR: {get_lr(step)} | Norm: {norm}")
             print(f"Step: {step}/{num_iterations} | Loss: {lossf} | LR: {get_lr(step)} | Norm: {norm}")
         
-        # --------------- TRAINING SECTION END -------------------
-        # everything that follows now is just diagnostics, prints, logging, etc.
-
         # wait on the CPU for all device work to end so we get accurate per-iteration timings below
         if device == "mps":
             torch.mps.synchronize()
@@ -275,12 +288,23 @@ def train_eval_hpo(
         # time and print
         t1 = time.time()           
         # keep track of smooth timings, last 20 iterations
-        if step > 0 and step > num_iterations - 20:
-            timings.append(t1-t0)
-
+        timings.append(t1-t0)
+        step += 1
+        
+        if step % 1000:
+            # store scheduler and optimizer state and model weights
+            ckpt = {
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'time_elapsed': time.time() - start_time,
+                'step': step,
+            }
+            torch.save(ckpt, f"/dev/models/{save_name}.pth")
+                    
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
     
+    print(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
     train_time = time.time() - start_time
     
     logger.info(f"{section_tab}== Training complete ==\n")
@@ -308,8 +332,16 @@ def train_eval_hpo(
                 + section_tab + f"\tval_loss: {val_loss} \n"
                 + section_tab + f"\ttrain_time: {train_time} \n")
     print(f"val_loss: {val_loss} \n train_time: {train_time}")
+    train_loss = np.mean(training_losses)
+    
+    hp_details.append({"val_loss": val_loss, "train_loss": train_loss, "train_time": train_time, "model_size": model_to_size[model_name],
+                        "batch_size": B, "learning_rate": learning_rate, "weight_decay": weight_decay, "sequence_length": T,
+                       })    
+    
     if multi_objective:
         return {"val_loss": val_loss, "train_time": train_time}
     else:
         return val_loss
     # return val_loss
+
+
