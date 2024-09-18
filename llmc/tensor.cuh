@@ -23,7 +23,7 @@ enum TFlags : uint8_t {
     NONE=0,
     GRADIENT=1,
     REUSED_MEMORY=2,
-    TENSOR_2D=4, // used for matmul *outputs* only, not inputs (+weights)
+    TENSOR_2D=4, // used for matmul weights and activation outputs only (not inputs or gradients)
     BIAS=8,
     LAYERNORM=16,
     RESIDUAL=32,
@@ -34,7 +34,7 @@ enum TFlags : uint8_t {
 // ----------------------------------------------------------------------------
 // forward declarations & extern variables defined in the training file
 struct TensorSpec;
-constexpr size_t MAX_TENSORS = 16*1024;
+constexpr size_t MAX_TENSORS = 32768; // only increases CPU memory usage if unused
 constexpr size_t MAX_ABSMAX_HISTORY = 32; // todo - command line option
 
 extern TensorSpec tensor_specs[MAX_TENSORS];
@@ -44,8 +44,8 @@ extern size_t tensors_bytes[TT::COUNT];
 extern size_t tensors_elements[TT::COUNT];
 extern int num_tensor_specs;
 
-extern TT current_tensor_type;
-extern int current_absmax_index;
+extern TT current_tensor_type; // todo - avoid having this somehow?
+extern int current_absmax_index; // todo - move into model struct?
 extern float* gpu_scale_memory;
 extern unsigned int* gpu_absmax_memory;
 
@@ -61,11 +61,13 @@ __device__ __constant__ unsigned int* gpu_absmax_memory_ptr;
 #define AGRAD_L(x,layer) get_tensor(model->acts_grads.x, MULTIUSE, layer)
 #define PARAM_L(x,layer) get_tensor(model->params[PARAMETER].x, PARAMETER, layer)
 #define PGRAD_L(x,layer) get_tensor(model->params[PARAMETER_GRAD].x, PARAMETER_GRAD, layer)
-#define ACT(x)   ACT_L(x,l)
-#define MULTI(x) MULTI_L(x,l)
-#define AGRAD(x) AGRAD_L(x,l)
-#define PARAM(x) PARAM_L(x,l)
-#define PGRAD(x) PGRAD_L(x,l)
+#define ACT(x)     ACT_L(x,l)
+#define MULTI(x)   MULTI_L(x,l)
+#define AGRAD(x)   AGRAD_L(x,l)
+#define PARAM(x)   PARAM_L(x,l)
+#define PGRAD(x)   PGRAD_L(x,l)
+#define ACT_0(x)   ACT_L(x,0)
+#define MULTI_0(x) MULTI_L(x,0)
 
 // ----------------------------------------------------------------------------
 
@@ -78,12 +80,8 @@ struct TensorGPU {
     int id = -1;
 
     static constexpr bool no_scaling = (sizeof(ElementType) != 1);
-    bool is_null() const {
-        return (data_ptr == NULL);
-    }
-    bool enabled() const {
-        return (data_ptr != NULL);
-    }
+    bool is_null() const { return (data_ptr == NULL); }
+    bool enabled() const { return (data_ptr != NULL); }
 
     static __device__ __host__ TensorGPU from(ElementType* ptr=nullptr) {
         TensorGPU tmp;
@@ -116,7 +114,6 @@ struct TensorGPU {
         #ifdef FAKE_FP8
         disable_scaling = true;
         #endif
-
         ElementType* __restrict__ data_ptr_restricted = data_ptr;
         float* __restrict__ scale_ptr_restricted = scale_descale_ptr;
 
@@ -129,7 +126,6 @@ struct TensorGPU {
         #ifdef FAKE_FP8
         disable_scaling = true;
         #endif
-
         ElementType* __restrict__ data_ptr_restricted = data_ptr;
         float* __restrict__ scale_ptr_restricted = scale_descale_ptr;
 
@@ -144,7 +140,6 @@ typedef TensorGPU<floatX> tensorX;
 typedef TensorGPU<float> tensorFP32;
 typedef TensorGPU<half> tensorFP16;
 typedef TensorGPU<nv_bfloat16> tensorBF16;
-
 #ifdef ENABLE_FP8
 typedef TensorGPU<__nv_fp8_e4m3> tensorFP8e4;
 typedef TensorGPU<__nv_fp8_e5m2> tensorFP8e5;
@@ -152,25 +147,23 @@ typedef TensorGPU<__nv_fp8_e5m2> tensorFP8e5;
 typedef TensorGPU<floatX> tensorFP8e4;
 typedef TensorGPU<floatX> tensorFP8e5;
 #endif
-
-extern TensorGPU<float> null_tensorFP32;
 extern TensorGPU<floatX> null_tensorX;
-extern TensorGPU<float8e4> null_tensorFP8E4;
-extern TensorGPU<float8e5> null_tensorFP8E5;
 
 // ----------------------------------------------------------------------------
 
 struct TensorSpec {
+    int id;
     char* ptr;
+
+    char name[16];
+    TT tensor_type;
+    DType data_type;
+    int flags;
+
     size_t offset; // into base pointer
     size_t num_elements; // per shard
-    int id;
     short num_shards;
     short remaining_layers;
-    DType data_type;
-    TT tensor_type;
-    int flags;
-    char name[16];
 
     template <typename T>
     __host__ __device__ operator T*() const {
@@ -199,9 +192,8 @@ struct TensorSpec {
 
 // ----------------------------------------------------------------------------
 
-// debug helper function
+// debug helper function (enable in get_tensor() for extreme logging)
 void print_tensor_elements(int tensor_id) {
-    printf("Printing tensor %d\n", tensor_id);
     TensorSpec spec = tensor_specs[tensor_id];
     size_t num_elements = spec.num_elements;
     const char* tensor_name = spec.name;
@@ -264,30 +256,27 @@ int add_tensor_spec(const char* name, size_t total_elements, size_t num_shards, 
     assert(num_tensor_specs < 16*1024);
     assert((total_elements % num_shards) == 0);
     TensorSpec* spec = &tensor_specs[num_tensor_specs];
-    strncpy(spec->name, name, 15);
-    spec->name[15] = 0;
 
     spec->id = num_tensor_specs;
+    strncpy(spec->name, name, 15);
+    spec->name[15] = 0;
+    spec->tensor_type = (tensor_type == TT::DEFAULT) ? current_tensor_type : tensor_type;
+    spec->data_type = data_type;
+    spec->flags = flags;
+
     spec->num_elements = total_elements / num_shards;
     spec->num_shards = num_shards;
     spec->remaining_layers = 0;
-    spec->data_type = data_type;
-    spec->tensor_type = (tensor_type == TT::DEFAULT) ? current_tensor_type : tensor_type;
-    spec->flags = flags;
-    tensors_elements[spec->tensor_type] += spec->num_elements;
 
     if (copy_offset_from >= 0) {
         TensorSpec base_spec = tensor_specs[copy_offset_from];
+        base_spec.flags |= (flags & REUSED_MEMORY);
         spec->offset = base_spec.offset;
+
         size_t original_tensor_bytes = base_spec.num_elements * sizeof_dtype(base_spec.data_type);
         size_t new_tensor_bytes = spec->num_elements * sizeof_dtype(data_type);
-        if (base_spec.tensor_type != spec->tensor_type) {
-            printf("ERROR: tensor_type for %s: %d vs %d\n", spec->name, (int)base_spec.tensor_type, (int)spec->tensor_type);
-            assert(false);
-        }
-        base_spec.flags |= (flags & REUSED_MEMORY);
-        assert(base_spec.tensor_type == spec->tensor_type);
         assert(new_tensor_bytes <= original_tensor_bytes);
+        assert(spec->tensor_type == base_spec.tensor_type);
     } else {
         spec->offset = tensors_bytes[spec->tensor_type];
         tensors_bytes[spec->tensor_type] += spec->num_elements * sizeof_dtype(data_type);
@@ -295,26 +284,26 @@ int add_tensor_spec(const char* name, size_t total_elements, size_t num_shards, 
             tensors_start[spec->tensor_type] = num_tensor_specs;
         }
     }
+
+    tensors_elements[spec->tensor_type] += spec->num_elements;
     return num_tensor_specs++;
 }
 
 int add_layer_specs(int num_layers, const char* name, size_t total_elements, size_t num_shards, DType data_type,
-                    int copy_offset_from=-1, int flags=TFlags::NONE, bool copy_per_layer=false,
-                    int reuse_every_n_layers=0, TT tensor_type=TT::DEFAULT) {
+                    int copy_offset_from=-1, int flags=TFlags::NONE, int reuse_every_n_layers=0,
+                    TT tensor_type=TT::DEFAULT) {
     int first_tensor_id = num_tensor_specs;
     if (reuse_every_n_layers > 0 && num_layers > 1) {
         flags |= REUSED_MEMORY;
     }
     for (int l = 0; l < num_layers; l++) {
         char layer_name[16];
-        assert(snprintf(layer_name, 16, "%s_%d", name, l) >= 0);
+        assert(snprintf(layer_name, 15, "%s_%d", name, l) >= 0);
         if (reuse_every_n_layers > 0 && l >= reuse_every_n_layers) {
             copy_offset_from = first_tensor_id + (l % reuse_every_n_layers);
         }
+
         int spec = add_tensor_spec(num_layers > 1 ? layer_name : name, total_elements, num_shards, data_type, copy_offset_from, flags, tensor_type);
-        if (copy_per_layer) {
-            copy_offset_from++;
-        }
         tensor_specs[spec].remaining_layers = num_layers - (l + 1);
     }
     return first_tensor_id;
@@ -322,6 +311,7 @@ int add_layer_specs(int num_layers, const char* name, size_t total_elements, siz
 
 // ----------------------------------------------------------------------------
 
+// todo - should this be moved elsewhere? maybe to copy_and_fp8.h?
 __global__ void update_scale_descale_kernel(int num_tensor_specs) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_tensor_specs) return;
@@ -359,16 +349,6 @@ __global__ void update_scale_descale_kernel(int num_tensor_specs) {
         }
     }
 
-    #ifdef FAKE_FP8
-    // with real FP8, we rely on tensor128 not scaling when sizeof(T)>1, but that doesn't work with fake FP8
-    // so we prevent scaling for the things we know we don't want to scale
-    // this might not match what we have in the real FP8 implementation, but allows for quick experimentation
-    if ((tensor_specs_ptr[tid].flags & TFlags::RESIDUAL) || (tensor_specs_ptr[tid].flags & TFlags::EMBEDDING)) {
-        scale = 1.0f;
-        descale = 1.0f;
-    }
-    #endif
-
     // Update gpu_scale_memory
     // todo: descale should be delayed by one step for parameters (see comment in gpt2_update).
     gpu_scale_memory_ptr[tid * 2] = scale;
@@ -398,7 +378,8 @@ private:
     bool wrote_data = false;
     bool wrote_absmax = false;
     int id = -1;
-    // fake fp8 mode
+
+    // fake fp8 mode (ignored without FAKE_FP8 define)
     bool faking_fp8 = false;
     bool mode_e5 = false;
 
@@ -438,31 +419,20 @@ public:
     }
 
     __device__ void store(size_t offset, bool cache_streaming=false) {
-        if (cache_streaming) {
-            store128cs(data_ptr + offset, data128);
-        } else {
-            store128(data_ptr + offset, data128);
-        }
+        if (cache_streaming) store128cs(data_ptr + offset, data128);
+        else store128(data_ptr + offset, data128);
         wrote_data = true;
     }
 
     template <typename OriginalType>
     __device__ void store_same_length(size_t offset, bool cache_streaming=false) {
-        if (cache_streaming) {
-            store128_same_length_cs<OriginalType, ElementType>(data_ptr + offset, data128);
-        } else {
-            store128_same_length<OriginalType, ElementType>(data_ptr + offset, data128);
-        }
+        if (cache_streaming) store128_same_length_cs<OriginalType, ElementType>(data_ptr + offset, data128);
+        else store128_same_length<OriginalType, ElementType>(data_ptr + offset, data128);
         wrote_data = true;
     }
 
-    __device__ const Packed128<ElementType>& get128() const {
-        return data128;
-    }
-
-    __device__ Packed128<ElementType>& get128() {
-        return data128;
-    }
+    __device__ const Packed128<ElementType>& get128() const { return data128; }
+    __device__ Packed128<ElementType>& get128() { return data128; }
 
     // call this manually if e.g. you use set_scalar() to update the tensor
     // todo - in the future, this could support more than just absmax
@@ -484,7 +454,7 @@ public:
     }
 
     __device__ void set_stochastic(int index, float value, unsigned int random_number,
-                                   bool rotate_by_index=true, bool non_deterministic_rng=false) {
+                                   int rotate_by_index=10, bool non_deterministic_rng=false) {
         float scaled_value = value * (scaling ? scale : 1.0f);
 
         // rotate the random number by the index so we can cheaply reuse the same RNG
@@ -493,9 +463,11 @@ public:
         // x10 is used so that it never repeats for indices [0;15] with a minimum difference of 2 etc.
         if (rotate_by_index) {
             assert(index < 16); // >=16 would repeat and be extremely bad RNG
-            random_number = __funnelshift_l(random_number, random_number, index * 10);
+            random_number = __funnelshift_l(random_number, random_number, index * rotate_by_index);
         }
-        // RNG without a seed from the host for quick testing, but obviously not deterministic!
+
+        // RNG without a seed from the host for quick testing, but obviously not deterministic
+        // can be forced to get slightly different runs from which you can calculate an average
         #ifdef FORCE_NON_DETERMINISM
         non_deterministic_rng = true;
         #endif
@@ -510,10 +482,10 @@ public:
         add_value_stats(value, data128[index]);
     }
 
-    // if update_absmax returns true, we can skip __syncthreads() in some kernels
+    // return value: if true, we can skip __syncthreads() in the calling function as we have just done one
     __device__ bool update_absmax(int thread_id, int num_threads, bool exit=false, bool forced=false) {
         #ifdef FAKE_FP8
-        if (id < 0 || absmax_ptr == NULL || !faking_fp8) {
+        if (absmax_ptr == NULL || !faking_fp8) {
             return false;
         }
         forced = true;
@@ -564,7 +536,8 @@ public:
         }
         return true;
     }
-    __device__ void update_absmax_auto(int dimensions=1, bool exit=false) {
+
+    __device__ void update_absmax(int dimensions=1, bool exit=false) {
         if (dimensions == 1) {
             update_absmax(threadIdx.x, blockDim.x, exit);
         } else if (dimensions == 2) {
@@ -574,6 +547,7 @@ public:
                           blockDim.x * blockDim.y * blockDim.z, exit);
         }
     }
+
     __device__ void skip_absmax() {
         wrote_absmax = true;
     }

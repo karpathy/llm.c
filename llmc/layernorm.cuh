@@ -75,7 +75,7 @@ __global__ void layernorm_forward_kernel6(TensorGPU<T> out, tensorFP32 mean, ten
     out128.update_absmax(threadIdx.x + threadIdx.y * blockDim.x, blockDim.x * blockDim.y, true);
 }
 
-template <typename Tout=float8e4, typename Tin = Tout>
+template <typename Tout=float8, typename Tin = Tout>
 __global__ void fused_residual_forward_kernel5(tensorX residual, TensorGPU<Tout> normed, tensorFP32 mean, tensorFP32 rstd,
                                                const tensorX inp1, const TensorGPU<Tin> inp2,
                                                const tensorX weight, const tensorX bias,
@@ -141,7 +141,7 @@ __global__ void fused_residual_forward_kernel5(tensorX residual, TensorGPU<Tout>
     normed128.update_absmax(threadIdx.x + threadIdx.y * blockDim.x, blockDim.x * blockDim.y, true);
 }
 
-template <bool zero_dinp_old=false, typename T=float8e5>
+template <bool zero_dinp_old=false, typename T=grads8>
 __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with only 1024 threads?
     layernorm_backward_kernel10(tensorX dinp_new, tensorX dinp_old, tensorX dweight, tensorX dbias, tensorFP32 scratch_,
                                 TensorGPU<T> dout, tensorX inp, tensorX weight, tensorFP32 mean, tensorFP32 rstd,
@@ -381,7 +381,7 @@ void layernorm_forward(TensorGPU<T> out, tensorFP32 mean, tensorFP32 rstd,
     launch_layernorm_kernel(layernorm_forward_kernel6<T>, N, C, stream, out, mean, rstd, inp, weight, bias);
 }
 
-template <typename Tout=float8e4, typename Tin = Tout>
+template <typename Tout=float8, typename Tin = Tout>
 void fused_residual_forward5(tensorX residual, TensorGPU<Tout> normed, tensorFP32 mean, tensorFP32 rstd,
                              tensorX inp1, TensorGPU<Tin> inp2, tensorX weight, tensorX bias,
                              int N, int C, cudaStream_t stream=main_stream) {
@@ -389,7 +389,7 @@ void fused_residual_forward5(tensorX residual, TensorGPU<Tout> normed, tensorFP3
     launch_layernorm_kernel(fused_residual_forward_kernel5<Tout, Tin>, N, C, stream, residual, normed, mean, rstd, inp1, inp2, weight, bias);
 }
 
-template <typename Tdout=float8e5>
+template <typename Tdout=grads8>
 void layernorm_backward(tensorX dinp_new, tensorX dinp_old, tensorX dweight, tensorX dbias, tensorFP32 scratch,
                         const TensorGPU<Tdout> dout, const tensorX inp, const tensorX weight, tensorFP32 mean, tensorFP32 rstd,
                         int BT, int C, cudaStream_t stream=main_stream) {
@@ -401,7 +401,7 @@ void layernorm_backward(tensorX dinp_new, tensorX dinp_old, tensorX dweight, ten
     size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - 32) * f128::size) * sizeof(float);
 
     cudaCheck(cudaMemsetAsync(scratch, 0, 1 * sizeof(float), stream)); // only need to reset the flag to 0
-    if (dinp_old == null_tensorX) {
+    if (dinp_old.is_null()) {
         layernorm_backward_kernel10<true><<<grid_size, block_size, shared_mem_size, stream>>>(dinp_new, dinp_old, dweight, dbias, scratch, dout, inp, weight, mean, rstd, BT, C);
     } else {
         layernorm_backward_kernel10<false><<<grid_size, block_size, shared_mem_size, stream>>>(dinp_new, dinp_old, dweight, dbias, scratch, dout, inp, weight, mean, rstd, BT, C);

@@ -201,6 +201,8 @@ __device__ void stochastic_rounding(float in, Ti &out, unsigned int random, floa
     } else if constexpr (std::is_same<Ti, __nv_fp8_e4m3>::value) {
         // CUDA doesn't have round down/up instructions for FP8 (in SW or HW) so we do it ourselves
         // ARM-Intel-NVIDIA style FP8 E4M3 (different for AMD-Graphcore-Qualcomm format!)
+        // tried this approach to avoid fake_fp8 bug (didn't help), keeping it for now...
+        // todo: compare perf & accuracy to bit shifting method (do exhaustive testing)
         float low = in;
         float high = in;
 
@@ -228,12 +230,11 @@ __device__ void stochastic_rounding(float in, Ti &out, unsigned int random, floa
 }
 
 // ----------------------------------------------------------------------------
-// todo - stochastic is bugged, spent hours debugging, no idea why backwards is so broken with it
 __device__ float fake_fp8(bool faking, float input, float scale, float descale, bool mode_e5, bool stochastic=false) {
+#ifdef FAKE_FP8
     unsigned int random_number;
     if (faking && scale != 1.0f) {
-        assert(scale == 1.0f/descale || scale == 1.0f);
-
+        assert(scale == 1.0f/descale || descale == 1.0f/scale || scale == 1.0f);
         if (stochastic) {
             unsigned int clock, laneid;
             asm volatile("mov.u32 %0, %%clock;" : "=r"(clock));
@@ -243,52 +244,18 @@ __device__ float fake_fp8(bool faking, float input, float scale, float descale, 
 
         if (mode_e5) {
             __nv_fp8_e5m2 value_fp8 = __nv_fp8_e5m2(input * scale);
-            if (false) {
-                //stochastic_rounding(input * scale, value_fp8, random_number);
-            }
             return ((float)value_fp8) * descale;
-
         } else {
             __nv_fp8_e4m3 value_fp8 = __nv_fp8_e4m3(input * scale);
             if (stochastic) {
-                // BUGGED - spent 6+ hours debuggin this, and at this point, I genuinely suspect a compiler bug *sigh*
+                // BUGGED(?) - spent 6+ hours debugging and I genuinely suspect a compiler bug *sigh*
                 stochastic_rounding(input * scale, value_fp8, random_number);
             }
             return ((float)value_fp8) * descale;
         }
     }
+#endif
     return input;
-}
-
-// ----------------------------------------------------------------------------
-// Copy, cast functions
-
-// device functions and the kernel to cast data between types
-template<typename Td, typename Ts>
-__device__ Td cast_value(Ts val);
-
-template<>
-__device__ float cast_value<float, float>(float val) {
-    return val;
-}
-
-template<>
-__device__ float cast_value<float, half>(half val) {
-    return __half2float(val);
-}
-
-template<>
-__device__ float cast_value<float, __nv_bfloat16>(__nv_bfloat16 val) {
-    return __bfloat162float(val);
-}
-
-template<typename Td, typename Ts>
-__global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n, ptrdiff_t stride_dst, ptrdiff_t stride_src) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // need to try grid stride looping for more perf later
-    if (idx < n) {
-        dst[idx + stride_dst * blockIdx.y] = cast_value<Td, Ts>(src[idx + stride_src * blockIdx.y]);
-    }
 }
 
 // ----------------------------------------------------------------------------

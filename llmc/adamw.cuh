@@ -16,7 +16,7 @@ __device__ float lerp(float start, float end, float weight) {
 }
 
 // always sizeof(param) <= sizeof(grad) <= sizeof(opt/master) <= sizeof(float)
-template <bool use_master_weights=true, bool master_init_modes=false, typename Tparam=floatX, typename Tgrad=floatX, typename Tm=float, typename Tv=float, typename Tmaster=float>
+template <bool use_master_weights=true, typename Tparam=floatX, typename Tgrad=floatX, typename Tm=float, typename Tv=float, typename Tmaster=float>
 __device__ size_t adamw_update_part(TensorGPU<Tparam> param_tensor, size_t idx, int spec_id, size_t current_start, size_t current_end, size_t stride,
                                     TensorGPU<Tgrad> grad_tensor, TensorGPU<Tmaster> master_tensor, TensorGPU<Tm> opt_m_tensor, TensorGPU<Tv> opt_v_tensor,
                                     unsigned int seed, int num_params_tensors, size_t num_parameters, size_t num_opt_parameters,
@@ -42,19 +42,20 @@ __device__ size_t adamw_update_part(TensorGPU<Tparam> param_tensor, size_t idx, 
         int next_idx[TT::NUM_TYPES_PARAM] = {0};
         int current_idx[TT::NUM_TYPES_PARAM] = {0};
 
+        // this implementation has a stride causing sparse reads/writes and bank conflicts for non-FP8
+        // todo - compare performance with a version that uses 128-bit for FP32, 64-bit for BF16, 32-bit for FP8
         #pragma unroll
         for (int i = 0; i < 16; i += 4, offset += 4) {
             if (current_idx[PARAMETER] == 0) param128 = load_tensor128(param_tensor, offset);
             if (current_idx[PARAMETER_GRAD] == 0) grad128 = load_tensor128(grad_tensor, offset, false, true);
             if (current_idx[PARAMETER_OPT_M] == 0) opt_m128 = load_tensor128(opt_m_tensor, offset, false,true);
             if (current_idx[PARAMETER_OPT_V] == 0) opt_v128 = load_tensor128(opt_v_tensor, offset, false, true);
-            if (current_idx[PARAMETER_MASTER] == 0) master128 = load_tensor128(master_tensor, offset, false, true);
+            if (current_idx[PARAMETER_MASTER] == 0 && use_master_weights) master128 = load_tensor128(master_tensor, offset, false, true);
 
             for (int k = 0; k < 4; k++) {
                 float grad = grad128.get(current_idx[PARAMETER_GRAD] + k);
                 float m = opt_m128.get(current_idx[PARAMETER_OPT_M] + k);
                 float v = opt_v128.get(current_idx[PARAMETER_OPT_V] + k);
-                float master = master128.get(current_idx[PARAMETER_MASTER] + k);
 
                 m = lerp(grad, m, beta1);
                 v = lerp(grad * grad, v, beta2);
@@ -64,15 +65,18 @@ __device__ size_t adamw_update_part(TensorGPU<Tparam> param_tensor, size_t idx, 
                 v /= beta2_correction;
 
                 float old_param;
-                if (use_master_weights && !master_init_modes) {
-                    old_param = master;
+                if constexpr (use_master_weights) {
+                    old_param = master128.get(current_idx[PARAMETER_MASTER] + k);
                 } else {
                     old_param = param128.get(current_idx[PARAMETER] + k);
                 }
+
                 float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + wd * old_param));
                 out_param128.set_stochastic(current_idx[PARAMETER] + k, param, random);
                 float new_param = out_param128.get(current_idx[PARAMETER] + k);
-                out_master128.set(current_idx[PARAMETER_MASTER] + k, param);
+                if constexpr (use_master_weights) {
+                    out_master128.set(current_idx[PARAMETER_MASTER] + k, param);
+                }
             }
             next_idx[PARAMETER] = (i + 4) % (16 / sizeof(Tparam));
             next_idx[PARAMETER_GRAD] = (i + 4) % (16 / sizeof(Tgrad));
@@ -97,7 +101,7 @@ __device__ size_t adamw_update_part(TensorGPU<Tparam> param_tensor, size_t idx, 
     return idx;
 }
 
-template <bool use_master_weights=true, bool master_init_modes=false>
+template <bool use_master_weights=true>
 __global__ void adamw_full_update(TensorSpec* specs, unsigned int seed,
                                   int num_params_tensors, size_t num_parameters, size_t num_opt_parameters,
                                   float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction,
@@ -146,7 +150,7 @@ __global__ void adamw_full_update(TensorSpec* specs, unsigned int seed,
 
         if (specs[spec_id].data_type == DType::FP32) {
             TensorGPU<float> param_tensor = specs[spec_id];
-            idx = adamw_update_part<use_master_weights, master_init_modes, float>(
+            idx = adamw_update_part<use_master_weights, float>(
                                     param_tensor, idx, spec_id, current_start, current_end, stride,
                                     grad_tensor, master_tensor, opt_m_tensor, opt_v_tensor,
                                     seed, num_params_tensors, num_parameters, num_opt_parameters,
@@ -154,7 +158,7 @@ __global__ void adamw_full_update(TensorSpec* specs, unsigned int seed,
                                     eps, wd, grad_scale, t);
         } else if (specs[spec_id].data_type == DType::BF16) {
             TensorGPU<__nv_bfloat16> param_tensor = specs[spec_id];
-            idx = adamw_update_part<use_master_weights, master_init_modes, __nv_bfloat16>(
+            idx = adamw_update_part<use_master_weights, __nv_bfloat16>(
                                     param_tensor, idx, spec_id, current_start, current_end, stride,
                                     grad_tensor, master_tensor, opt_m_tensor, opt_v_tensor,
                                     seed, num_params_tensors, num_parameters, num_opt_parameters,
@@ -162,14 +166,14 @@ __global__ void adamw_full_update(TensorSpec* specs, unsigned int seed,
                                     eps, wd, grad_scale, t);
         } else if (specs[spec_id].data_type == DType::FP8E4M3) {
             TensorGPU<__nv_fp8_e4m3> param_tensor = specs[spec_id];
-            idx = adamw_update_part<use_master_weights, master_init_modes, __nv_fp8_e4m3>(
+            idx = adamw_update_part<use_master_weights, __nv_fp8_e4m3>(
                                     param_tensor, idx, spec_id, current_start, current_end, stride,
                                     grad_tensor, master_tensor, opt_m_tensor, opt_v_tensor,
                                     seed, num_params_tensors, num_parameters, num_opt_parameters,
                                     learning_rate, beta1, beta2, beta1_correction, beta2_correction,
                                     eps, wd, grad_scale, t);
         } else {
-            assert(false); // TODO
+            assert(false); // TODO (no FP16 to avoid compile time increase but it'd be trivial to add)
         }
     }
 }
