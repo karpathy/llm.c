@@ -97,7 +97,7 @@ TT current_tensor_type = TT::PARAMETER;
 int current_absmax_index = 0;
 float* gpu_scale_memory = NULL;
 unsigned int* gpu_absmax_memory = NULL;
-TensorGPU<floatX> null_tensorX = {0};
+tensorX null_tensorX = {0};
 
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
@@ -441,7 +441,7 @@ void convert_fixed_parameters(GPT2* model, char* gpu_buffer, size_t fixed_size_b
 
 // to convert from variable precision parameters to a single precision (e.g. before checkpointing)
 template<typename Tout=floatX>
-void convert_from_fixed_parameters(GPT2* model, char* gpu_buffer) {
+void convert_to_fixed_parameters(GPT2* model, char* gpu_buffer) {
     size_t offset = 0;
     for (int i = 0; i < tensors_start[PARAMETER+1]; i++) {
         TensorGPU<Tout> tensor_out = tensor_specs[i];
@@ -505,7 +505,7 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     if (write_as_floatX && model->num_parameters_bytes != model->num_parameters * sizeof(floatX)) {
         // convert the parameters to floatX before writing them
         assert(tensors_bytes[MULTIUSE] >= model->num_parameters * sizeof(floatX)); // todo - make this always work
-        convert_from_fixed_parameters(model, model->tensor_memory[MULTIUSE]);
+        convert_to_fixed_parameters(model, model->tensor_memory[MULTIUSE]);
         device_to_file(model_file, model->tensor_memory[MULTIUSE], model->num_parameters * sizeof(floatX), IO_BUF_SIZE);
     } else {
         // just write the parameters as they are
@@ -833,9 +833,9 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     fused_classifier(AGRAD(output), ACT(output), ACT(losses), dloss, model->targets, B*T, V, Vp, True); // todo - split output & doutput
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass + dedicated buffer
-    tensorFP32 scratchF_HUGE = MULTI_0(output_scratch_fp32); // Largest buffer imaginable (max of output & everything else)
+    tensor32 scratchF_HUGE = MULTI_0(output_scratch_fp32); // Largest buffer imaginable (max of output & everything else)
     tensorX scratchX_HUGE = MULTI_0(output_scratch);
-    tensorFP32 scratchF = MULTI_0(local_scratch_fp32); // FP32 BTC with cuDNN, FP32 2*BTC without cuDNN (i.e. 4xBTC BF16)
+    tensor32 scratchF = MULTI_0(local_scratch_fp32); // FP32 BTC with cuDNN, FP32 2*BTC without cuDNN (i.e. 4xBTC BF16)
     tensorX scratchX = MULTI_0(local_scratch);
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
@@ -846,7 +846,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     // next: backward the classifier matmul
     matmul_backward(AGRAD(lnf), PGRAD(wte), null_tensorX, AGRAD(output), ACT(lnf), PARAM(wte), scratchF, B*T, C, Vp);
     // backward the final layernorm
-    layernorm_backward<floatX>(AGRAD_L(residual3, L-1), null_tensorX, PGRAD(lnfw), PGRAD(lnfb), scratchF, AGRAD(lnf), ACT_L(residual3, L-1),
+    layernorm_backward(AGRAD_L(residual3, L-1), null_tensorX, PGRAD(lnfw), PGRAD(lnfb), scratchF, (tensorX)AGRAD(lnf), ACT_L(residual3, L-1),
                                PARAM(lnfw), ACT(lnf_mean), ACT(lnf_rstd), B*T, C);
 
     // now backward all the layers
@@ -856,15 +856,15 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         tensorX dresidual = (l == 0) ? AGRAD(encoded) : AGRAD_L(residual3, l-1);
 
         if(model->recompute >= 1) { // recompute >= 1 means we recompute gelu
-            gelu_forward<float8, float8>(ACT(fch_gelu), ACT(fch));
+            gelu_forward_fp8(ACT(fch_gelu), ACT(fch));
         }
-        matmul_backward_fp8<floatX>(AGRAD(fch), PGRAD(fcprojw), PGRAD(fcprojb), AGRAD(residual3), ACT(fch_gelu), PARAM(fcprojw), scratchF, scratchF_HUGE, B*T, 4*C, C, ACT(fch));
+        matmul_backward_fp8(AGRAD(fch), PGRAD(fcprojw), PGRAD(fcprojb), (tensorX)AGRAD(residual3), ACT(fch_gelu), PARAM(fcprojw), scratchF, scratchF_HUGE, B*T, 4*C, C, ACT(fch));
 
         if(model->recompute >= 2) { // recompute >= 2 means we recompute layernorm
-            layernorm_forward<float8>(ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), ACT(residual2), PARAM(ln2w), PARAM(ln2b), B*T, C);
+            layernorm_forward((tensor8)ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), ACT(residual2), PARAM(ln2w), PARAM(ln2b), B*T, C);
         }
-        matmul_backward_fp8<grads8>(AGRAD(ln2), PGRAD(fcw), PGRAD(fcb), AGRAD(fch), ACT(ln2), PARAM(fcw), scratchF, scratchF_HUGE, B*T, C, 4 * C);
-        layernorm_backward<grads8>(AGRAD(residual2), AGRAD(residual3), PGRAD(ln2w), PGRAD(ln2b), scratchF, AGRAD(ln2), ACT(residual2), PARAM(ln2w), ACT(ln2_mean), ACT(ln2_rstd), B*T, C);
+        matmul_backward_fp8(AGRAD(ln2), PGRAD(fcw), PGRAD(fcb), (tensor8e5)AGRAD(fch), ACT(ln2), PARAM(fcw), scratchF, scratchF_HUGE, B*T, C, 4 * C);
+        layernorm_backward(AGRAD(residual2), AGRAD(residual3), PGRAD(ln2w), PGRAD(ln2b), scratchF, (tensor8e5)AGRAD(ln2), ACT(residual2), PARAM(ln2w), ACT(ln2_mean), ACT(ln2_rstd), B*T, C);
 
         // AGRAD(atty) is BF16, AGRAD(residual2) is BF16, ACT(atty) is BF16, PARAM(attprojw) is BF16... ==> 100% BF16 ==> keep BF16 for now!
         matmul_backward(AGRAD(atty), PGRAD(attprojw), PGRAD(attprojb), AGRAD(residual2), ACT(atty), PARAM(attprojw), scratchF, B*T, C, C);
@@ -875,10 +875,10 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         #endif
 
         if(model->recompute >= 2) {
-            layernorm_forward<float8>(ACT(ln1), ACT(ln1_mean), ACT(ln1_rstd), residual, PARAM(ln1w), PARAM(ln1b), B*T, C);
+            layernorm_forward((tensor8)ACT(ln1), ACT(ln1_mean), ACT(ln1_rstd), residual, PARAM(ln1w), PARAM(ln1b), B*T, C);
         }
-        matmul_backward_fp8<floatX>(AGRAD(ln1), PGRAD(qkvw), PGRAD(qkvb), AGRAD(qkvr), ACT(ln1), PARAM(qkvw), scratchF, scratchF_HUGE, B*T, C, 3 * C);
-        layernorm_backward<grads8>(dresidual, AGRAD(residual2), PGRAD(ln1w), PGRAD(ln1b), scratchF, AGRAD(ln1), residual, PARAM(ln1w), ACT(ln1_mean), ACT(ln1_rstd), B*T, C);
+        matmul_backward_fp8(AGRAD(ln1), PGRAD(qkvw), PGRAD(qkvb), (tensorX)AGRAD(qkvr), ACT(ln1), PARAM(qkvw), scratchF, scratchF_HUGE, B*T, C, 3 * C);
+        layernorm_backward(dresidual, AGRAD(residual2), PGRAD(ln1w), PGRAD(ln1b), scratchF, (tensor8e5)AGRAD(ln1), residual, PARAM(ln1w), ACT(ln1_mean), ACT(ln1_rstd), B*T, C);
 
         // Accumulate gradients from this layer in a background stream.
         if(last_step) {
@@ -901,35 +901,34 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
         }
 
+        // todo - this used to be bit-for-bit identical to not recomputing forward, why is it now different?!
         // Is it time to redo the forward pass from our activation checkpoints?
-        /*
         if (LAYERS_PER_ACTIVATION_CHECKPOINT && (l % max(1, LAYERS_PER_ACTIVATION_CHECKPOINT)) == 0 && l > 0) {
-            int old_l = l;
-            // forward pass time!
+            int backward_l = l;
             l -= LAYERS_PER_ACTIVATION_CHECKPOINT;
             for (int i = 0; i < LAYERS_PER_ACTIVATION_CHECKPOINT; i++, l++) {
                 // non-fused layernorm as we already (only!) have the residual
                 // (for the original forward pass, residual of l-1 is fused with layernorm of l)
                 tensorX residual = (l == 0) ? ACT(encoded) : ACT_L(residual3, l-1);
-                layernorm_forward(ACT(ln1), ACT(ln1_mean), ACT(ln1_rstd), residual, PARAM(ln1w), PARAM(ln1b), B*T, C);
+                layernorm_forward<float8>(ACT(ln1), ACT(ln1_mean), ACT(ln1_rstd), residual, PARAM(ln1w), PARAM(ln1b), B*T, C);
 
-                tensorX qkvr = ACT(qkvr);
+                tensorX qkvr = ACT(qkvr); // non-cudnn reuses tensor with different memory pre/post-permute
                 qkvr.data_ptr = CUDNN_ENABLED ? ACT(qkvr) : MULTI(output_scratch);
-                matmul_forward(qkvr, ACT(ln1), PARAM(qkvw), PARAM(qkvb), B*T, C, 3*C);
+                matmul_forward<floatX,float8>(qkvr, ACT(ln1), PARAM(qkvw), PARAM(qkvb), B*T, C, 3*C);
+
                 #ifdef ENABLE_CUDNN
-                attention_forward_cudnn(ACT(atty), ACT(att), ACT(qkvr), B, T, NH, C);
+                attention_forward_cudnn(ACT(atty), ACT(att), ACT(qkvr), B, T, NH, C, main_stream);
                 #else
                 attention_forward(ACT(atty), ACT(qkvr), ACT(att), qkvr, B, T, C, NH);
                 #endif
 
-                matmul_forward(ACT(attproj), ACT(atty), PARAM(attprojw), PARAM(attprojb), B*T, C, C);
-                fused_residual_forward5(ACT(residual2), ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), residual, ACT(attproj), PARAM(ln2w), PARAM(ln2b), B*T, C);
-                matmul_forward<floatX>(ACT(fch_gelu), ACT(ln2), PARAM(fcw), PARAM(fcb), B*T, C, 4*C, ACT(fch), model->gelu_fusion);
-                matmul_forward(ACT(fcproj), ACT(fch_gelu), PARAM(fcprojw), PARAM(fcprojb), B*T, 4*C, C);
+                matmul_forward<floatX, floatX>(ACT(attproj), ACT(atty), PARAM(attprojw), PARAM(attprojb), B*T, C, C);
+                fused_residual_forward5<float8, floatX>(ACT(residual2), ACT(ln2), ACT(ln2_mean), ACT(ln2_rstd), residual, ACT(attproj), PARAM(ln2w), PARAM(ln2b), B*T, C);
+                matmul_forward<float8, float8>(ACT(fch_gelu), ACT(ln2), PARAM(fcw), PARAM(fcb), B*T, C, 4*C, ACT(fch), model->gelu_fusion);
+                matmul_forward<float8, float8>(ACT(fcproj), ACT(fch_gelu), PARAM(fcprojw), PARAM(fcprojb), B*T, 4*C, C);
             }
-            l = old_l;
+            l = backward_l;
         }
-        */
     }
 
     encoder_backward(PGRAD(wte), PGRAD(wpe), scratchX_HUGE, model->workload_indices, model->bucket_info,

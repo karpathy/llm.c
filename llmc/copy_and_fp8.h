@@ -54,7 +54,7 @@ __global__ void copy_advanced_kernel(TensorGPU<Tout> out, TensorGPU<Tin> in) {
         out128.set(k, out_fp32);
     }
     out128.template store_same_length<Tin>(idx);
-    out128.update_absmax(threadIdx.x, blockDim.x, true);
+    out128.update_absmax(1);
 }
 
 template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=TRANSPOSE_TILE_SIZE, typename T1>

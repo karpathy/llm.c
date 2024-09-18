@@ -54,7 +54,7 @@ __device__ __constant__ float* gpu_scale_memory_ptr;
 __device__ __constant__ unsigned int* gpu_absmax_memory_ptr;
 
 // ----------------------------------------------------------------------------
-// Helper macros for accessing tensors in the training file
+// Helper macros for accessing tensors in the training loop
 #define TENSOR(x,layer)  get_tensor(x, DEFAULT, layer)
 #define ACT_L(x,layer)   get_tensor(model->acts.x, MULTIUSE, layer)
 #define MULTI_L(x,layer) get_tensor(model->multiuse.x, MULTIUSE, layer)
@@ -73,13 +73,13 @@ __device__ __constant__ unsigned int* gpu_absmax_memory_ptr;
 
 template<typename ElementType=float>
 struct TensorGPU {
+    int id = -1; // TensorSpec index in tensor_specs[] array
     ElementType* data_ptr = NULL;
     float* scale_descale_ptr = NULL;
     unsigned int* absmax_ptr = NULL;
     size_t num_elements = 0;
-    int id = -1;
 
-    static constexpr bool no_scaling = (sizeof(ElementType) != 1);
+    static constexpr bool no_scaling = (sizeof(ElementType) != 1); // todo - this prevents scaling FP16
     bool is_null() const { return (data_ptr == NULL); }
     bool enabled() const { return (data_ptr != NULL); }
 
@@ -137,20 +137,23 @@ struct TensorGPU {
 };
 
 typedef TensorGPU<floatX> tensorX;
-typedef TensorGPU<float> tensorFP32;
+typedef TensorGPU<float> tensor32;
 typedef TensorGPU<half> tensorFP16;
 typedef TensorGPU<nv_bfloat16> tensorBF16;
 #ifdef ENABLE_FP8
-typedef TensorGPU<__nv_fp8_e4m3> tensorFP8e4;
-typedef TensorGPU<__nv_fp8_e5m2> tensorFP8e5;
+typedef TensorGPU<__nv_fp8_e4m3> tensor8;
+typedef TensorGPU<__nv_fp8_e5m2> tensor8e5;
 #else
-typedef TensorGPU<floatX> tensorFP8e4;
-typedef TensorGPU<floatX> tensorFP8e5;
+typedef TensorGPU<floatX> tensor8;
+typedef TensorGPU<floatX> tensor8e5;
 #endif
 extern TensorGPU<floatX> null_tensorX;
 
 // ----------------------------------------------------------------------------
 
+// this is the "foundation" of the other tensor classes (TensorGPU and tensor128)
+// they all implicitly refer to this (in tensor_specs[] and tensor_specs_gpu[] for now) with the id
+// and these other classes are created by converting from this one (sometimes implicitly)
 struct TensorSpec {
     int id;
     char* ptr;
@@ -252,6 +255,7 @@ TensorSpec get_tensor(int spec_index, TT tensor_type, int layer) {
     return spec;
 }
 
+// this can only be called at initialisation time, once tensor_specs has been uploaded to the GPU, it is fixed in stone
 int add_tensor_spec(const char* name, size_t total_elements, size_t num_shards, DType data_type, int copy_offset_from=-1, int flags=TFlags::NONE, TT tensor_type=TT::DEFAULT) {
     assert(num_tensor_specs < 16*1024);
     assert((total_elements % num_shards) == 0);
@@ -302,7 +306,6 @@ int add_layer_specs(int num_layers, const char* name, size_t total_elements, siz
         if (reuse_every_n_layers > 0 && l >= reuse_every_n_layers) {
             copy_offset_from = first_tensor_id + (l % reuse_every_n_layers);
         }
-
         int spec = add_tensor_spec(num_layers > 1 ? layer_name : name, total_elements, num_shards, data_type, copy_offset_from, flags, tensor_type);
         tensor_specs[spec].remaining_layers = num_layers - (l + 1);
     }
@@ -393,6 +396,8 @@ public:
         id = tensor.id;
 
 #ifdef FAKE_FP8
+        // fake FP8 only applies to specific tensors to test expected training performance
+        // todo - expand this to support more unusual formats and test things like blockwise scaling(?)
         if (!disable_scaling && id >= 0 && sizeof(ElementType) == 2 && tensor_specs_ptr[id].tensor_type != TT::PARAMETER_GRAD) {
             if ((tensor_specs_ptr[id].flags & (TFlags::RESIDUAL | TFlags::EMBEDDING | TFlags::BIAS)) == 0) {
                 faking_fp8 = true;
@@ -440,9 +445,10 @@ public:
         new_absmax = max(new_absmax, fabsf(value));
     }
 
+    // get and set automatically apply scaling/descaling for FP8 values
     __device__ float get(int index) {
         float value = (float)data128[index] * (scaling ? descale : 1.0f);
-        value = fake_fp8(faking_fp8, value, scale, descale, mode_e5);
+        value = fake_fp8(faking_fp8, value, scale, descale, mode_e5); // ignored without FAKE_FP8
         return value;
     }
 
@@ -537,15 +543,18 @@ public:
         return true;
     }
 
-    __device__ void update_absmax(int dimensions=1, bool exit=false) {
-        if (dimensions == 1) {
-            update_absmax(threadIdx.x, blockDim.x, exit);
-        } else if (dimensions == 2) {
-            update_absmax(threadIdx.x + threadIdx.y * blockDim.x, blockDim.x * blockDim.y, exit);
-        } else if (dimensions == 3) {
-            update_absmax(threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y,
-                          blockDim.x * blockDim.y * blockDim.z, exit);
+    // helper function to avoid having to specify threadIdx/blockDim manually
+    __device__ bool update_absmax(int block_dimensions, bool exit=false) {
+        if (block_dimensions == 1) {
+            return update_absmax(threadIdx.x, blockDim.x, exit);
+        } else if (block_dimensions == 2) {
+            return update_absmax(threadIdx.x + threadIdx.y * blockDim.x, blockDim.x * blockDim.y, exit);
+        } else if (block_dimensions == 3) {
+            return update_absmax(threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y,
+                                 blockDim.x * blockDim.y * blockDim.z, exit);
         }
+        assert(false);
+        return false;
     }
 
     __device__ void skip_absmax() {

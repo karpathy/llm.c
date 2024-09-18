@@ -19,7 +19,7 @@ E.g., the layernorms are connected to the residuals so we += in layernorm backwa
 // CUDA kernels
 
 template <typename T=floatX>
-__global__ void layernorm_forward_kernel6(TensorGPU<T> out, tensorFP32 mean, tensorFP32 rstd,
+__global__ void layernorm_forward_kernel6(TensorGPU<T> out, tensor32 mean, tensor32 rstd,
                                           tensorX inp, tensorX weight,
                                           tensorX bias, int N, int C) {
     // Note that blockDim.x must be WARP_SIZE=32 but we don't want to pay the cost of assert() here
@@ -72,11 +72,11 @@ __global__ void layernorm_forward_kernel6(TensorGPU<T> out, tensorFP32 mean, ten
         __stcs(rstd + idx, s);
     }
     // update absmax
-    out128.update_absmax(threadIdx.x + threadIdx.y * blockDim.x, blockDim.x * blockDim.y, true);
+    out128.update_absmax(2);
 }
 
 template <typename Tout=float8, typename Tin = Tout>
-__global__ void fused_residual_forward_kernel5(tensorX residual, TensorGPU<Tout> normed, tensorFP32 mean, tensorFP32 rstd,
+__global__ void fused_residual_forward_kernel5(tensorX residual, TensorGPU<Tout> normed, tensor32 mean, tensor32 rstd,
                                                const tensorX inp1, const TensorGPU<Tin> inp2,
                                                const tensorX weight, const tensorX bias,
                                                int N, int C) {
@@ -137,14 +137,14 @@ __global__ void fused_residual_forward_kernel5(tensorX residual, TensorGPU<Tout>
     }
 
     // Update absmax for residual and normed tensors (typically it will skip residual as it is not FP8)
-    residual128.update_absmax(threadIdx.x + threadIdx.y * blockDim.x, blockDim.x * blockDim.y, false);
-    normed128.update_absmax(threadIdx.x + threadIdx.y * blockDim.x, blockDim.x * blockDim.y, true);
+    residual128.update_absmax(2);
+    normed128.update_absmax(2);
 }
 
-template <bool zero_dinp_old=false, typename T=grads8>
+template <bool zero_dinp_old=false, typename T=float8e5>
 __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with only 1024 threads?
-    layernorm_backward_kernel10(tensorX dinp_new, tensorX dinp_old, tensorX dweight, tensorX dbias, tensorFP32 scratch_,
-                                TensorGPU<T> dout, tensorX inp, tensorX weight, tensorFP32 mean, tensorFP32 rstd,
+    layernorm_backward_kernel10(tensorX dinp_new, tensorX dinp_old, tensorX dweight, tensorX dbias, tensor32 scratch_,
+                                TensorGPU<T> dout, tensorX inp, tensorX weight, tensor32 mean, tensor32 rstd,
                                 int BT, int C) {
     int BLOCK_SIZE = blockDim.x; // todo - does it make any difference if this is hardcoded here?
     int warpsInBlock = BLOCK_SIZE / WARP_SIZE; //number of warps in block
@@ -268,7 +268,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
     }
 
     // if we did actually update the absmax (returns true), we already did __syncthreads() here
-    if (!dinp_new128.update_absmax(threadIdx.x, BLOCK_SIZE, false)) {
+    if (!dinp_new128.update_absmax(1)) {
         __syncthreads();
     }
 
@@ -340,8 +340,8 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
             dbias128_out.store_same_length<floatX>(global_index);
             dweight128_out.store_same_length<floatX>(global_index);
         }
-        dbias128_out.update_absmax(threadIdx.x, BLOCK_SIZE, false);
-        dweight128_out.update_absmax(threadIdx.x, BLOCK_SIZE, false);
+        dbias128_out.update_absmax(1);
+        dweight128_out.update_absmax(1);
     }
 }
 
@@ -374,7 +374,7 @@ void launch_layernorm_kernel(KernelFunc kernel, int N, int C, cudaStream_t strea
 }
 
 template <typename T=floatX>
-void layernorm_forward(TensorGPU<T> out, tensorFP32 mean, tensorFP32 rstd,
+void layernorm_forward(TensorGPU<T> out, tensor32 mean, tensor32 rstd,
                        tensorX inp, const tensorX weight, const tensorX bias,
                        int N, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
@@ -382,16 +382,16 @@ void layernorm_forward(TensorGPU<T> out, tensorFP32 mean, tensorFP32 rstd,
 }
 
 template <typename Tout=float8, typename Tin = Tout>
-void fused_residual_forward5(tensorX residual, TensorGPU<Tout> normed, tensorFP32 mean, tensorFP32 rstd,
+void fused_residual_forward5(tensorX residual, TensorGPU<Tout> normed, tensor32 mean, tensor32 rstd,
                              tensorX inp1, TensorGPU<Tin> inp2, tensorX weight, tensorX bias,
                              int N, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     launch_layernorm_kernel(fused_residual_forward_kernel5<Tout, Tin>, N, C, stream, residual, normed, mean, rstd, inp1, inp2, weight, bias);
 }
 
-template <typename Tdout=grads8>
-void layernorm_backward(tensorX dinp_new, tensorX dinp_old, tensorX dweight, tensorX dbias, tensorFP32 scratch,
-                        const TensorGPU<Tdout> dout, const tensorX inp, const tensorX weight, tensorFP32 mean, tensorFP32 rstd,
+template <typename Tdout=float8e5>
+void layernorm_backward(tensorX dinp_new, tensorX dinp_old, tensorX dweight, tensorX dbias, tensor32 scratch,
+                        const TensorGPU<Tdout> dout, const tensorX inp, const tensorX weight, tensor32 mean, tensor32 rstd,
                         int BT, int C, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 512;

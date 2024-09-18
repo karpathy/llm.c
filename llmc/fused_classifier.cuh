@@ -132,7 +132,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
         }
     }
     if constexpr (WriteDLogits) {
-        dlogits128.update_absmax(threadIdx.x, blockDim.x, true);
+        dlogits128.update_absmax(1);
     }
 }
 
@@ -141,7 +141,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
 
 // replaces logits with logit gradients
 template <bool WriteDLogits>
-void fused_classifier(tensorX dlogits, tensorX logits, tensorFP32 losses,
+void fused_classifier(tensorX dlogits, tensorX logits, tensor32 losses,
                       const float dloss, const int* targets,
                       int BT, int V, int P, std::bool_constant<WriteDLogits> write_dlogits, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();

@@ -335,12 +335,12 @@ void matmul_forward(TensorGPU<Tout> out,
     if constexpr (sizeof(Tin) == 1) {
         matmul_cublaslt_fp8(pre_gelu.enabled() ? pre_gelu : out, weight, inp, bias, OC, BT, C, stream, false, false);
         if (pre_gelu.enabled()) {
-            gelu_forward(out, pre_gelu, stream);
+            gelu_forward<Tout>(out, pre_gelu, stream);
         }
     } else {
         if (pre_gelu.enabled() && gelu_fusion < 1) {
             matmul_cublaslt(pre_gelu, weight, inp, bias, OC, BT, C, stream, true, false, 0, 0, 0, 0, false, null_tensorX, false);
-            gelu_forward(out, pre_gelu, stream);
+            gelu_forward<Tout>(out, pre_gelu, stream);
         } else {
             matmul_cublaslt(out, weight, inp, bias, OC, BT, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
         }
@@ -348,7 +348,7 @@ void matmul_forward(TensorGPU<Tout> out,
 }
 
 template<typename Tdout=floatX>
-void matmul_backward_bias(tensorX dbias, TensorGPU<Tdout> dout, tensorFP32 scratch, int BT, int OC, cudaStream_t stream=main_stream) {
+void matmul_backward_bias(tensorX dbias, TensorGPU<Tdout> dout, tensor32 scratch, int BT, int OC, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
 
     // backward to bias, if given, does a +=
@@ -378,12 +378,12 @@ void matmul_backward_bias(tensorX dbias, TensorGPU<Tdout> dout, tensorFP32 scrat
     }
 }
 
-template<typename Tdout=grads8>
-void matmul_backward_fp8(tensorFP8e5 dinp, tensorX dweight, tensorX dbias,
-                     TensorGPU<Tdout> dout, tensorFP8e4 inp, tensorFP8e4 weight,
-                     tensorFP32 scratch1_big, tensorFP32 scratch2_huge,
+template<typename Tdout=float8e5>
+void matmul_backward_fp8(tensor8e5 dinp, tensorX dweight, tensorX dbias,
+                     TensorGPU<Tdout> dout, tensor8 inp, tensor8 weight,
+                     tensor32 scratch1_big, tensor32 scratch2_huge,
                      int BT, int C, int OC,
-                     tensorFP8e4 pre_gelu_activation=tensorFP8e4(), cudaStream_t stream=main_stream) {
+                     tensor8 pre_gelu_activation=tensor8(), cudaStream_t stream=main_stream) {
 #ifndef ENABLE_FP8
     // FP8 is not enabled so we use the regular floatX matmul path
     matmul_backward(dinp, dweight, dbias, dout, inp, weight, scratch1_big, BT, C, OC, pre_gelu_activation, 1, stream);
@@ -395,34 +395,37 @@ void matmul_backward_fp8(tensorFP8e5 dinp, tensorX dweight, tensorX dbias,
     // IMPORTANT: inp is allowed to be the same buffer as scratch2_huge (e.g. for fch_gelu)
     // ==> this MUST be done first and write to scratch1_big!
     // transpose input
-    TensorGPU<float8> inp_fp8_transposed = inp;
+    tensor8 inp_fp8_transposed = inp;
     inp_fp8_transposed.data_ptr = (float8*)scratch1_big.data_ptr;
     transpose_simple<float8>(inp_fp8_transposed, inp, C, BT, stream);
 
     // convert dout to FP8e5 if it is not already, and transpose it
     // the buffer is guaranteed to be at least twice as big as 4BTC, so we can split it in 2
     // todo - merge conversion and tranposition like we did before?
-    TensorGPU<grads8> dout_fp8 = *(TensorGPU<grads8>*)&dout;
-    if constexpr (std::is_same<Tdout, grads8>::value == false) {
-        dout_fp8.data_ptr = (grads8*)(scratch2_huge.data_ptr);
+    tensor8e5 dout_fp8 = *(tensor8e5*)&dout;
+    if constexpr (std::is_same<Tdout, float8e5>::value == false) {
+        dout_fp8.data_ptr = (float8e5*)(scratch2_huge.data_ptr);
         copy_advanced(dout_fp8, dout, stream);
     }
-    TensorGPU<grads8> dout_fp8_transposed = dout_fp8;
-    dout_fp8_transposed.data_ptr = (grads8*)(scratch2_huge.data_ptr + (scratch2_huge.num_elements / 2));
+    tensor8e5 dout_fp8_transposed = dout_fp8;
+    dout_fp8_transposed.data_ptr = (float8e5*)(scratch2_huge.data_ptr + (scratch2_huge.num_elements / 2));
     transpose_simple(dout_fp8_transposed, dout_fp8, OC, BT, stream);
 
     // GEMM 1: dweight, inp_fp8_transposed, dout_fp8_transposed
     matmul_cublaslt_fp8(dweight, inp_fp8_transposed, dout_fp8_transposed, null_tensorX, C, OC, BT, stream, false, true);
 
     // transpose weight (todo: option to cache this / do it at optimizer time)
-    TensorGPU<float8> weight_fp8_transposed = weight;
+    tensor8 weight_fp8_transposed = weight;
     weight_fp8_transposed.data_ptr = (float8*)scratch1_big.data_ptr;
     transpose_simple(weight_fp8_transposed, weight, C, OC, stream);
 
+    // GEMM 2: dinp, weight_fp8_transposed, dout_fp8
     matmul_cublaslt_fp8(dinp, weight_fp8_transposed, dout_fp8, null_tensorX, C, BT, OC, stream, false, true);
 
+    // todo - need dinp and dinp_pre_gelu passed separately here, important for UNIQUE_TENSOR_MEMORY!
+    // todo - need to support BF16 for dinp into gelu_backwasrd() with FP8 out of gelu_backward()!
     if (pre_gelu_activation.enabled()) {
-        gelu_backward(dinp, dinp, pre_gelu_activation, stream);
+        gelu_backward_fp8(dinp, dinp, pre_gelu_activation, stream);
     }
 #endif
 }
@@ -430,7 +433,7 @@ void matmul_backward_fp8(tensorFP8e5 dinp, tensorX dweight, tensorX dbias,
 
 void matmul_backward(tensorX dinp, tensorX dweight, tensorX dbias,
                      tensorX dout, tensorX inp, tensorX weight,
-                     tensorFP32 dbias_scratch,
+                     tensor32 dbias_scratch,
                      int BT, int C, int OC,
                      tensorX pre_gelu_activation=null_tensorX, int gelu_fusion=1, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
@@ -442,7 +445,7 @@ void matmul_backward(tensorX dinp, tensorX dweight, tensorX dbias,
 
     // backward GELU (if it wasn't fused into the matmul above)
     if ( pre_gelu_activation.enabled() && gelu_fusion < 2) {
-        gelu_backward(dinp, dinp, pre_gelu_activation, stream);
+        gelu_backward<floatX, floatX, floatX>(dinp, dinp, pre_gelu_activation, stream);
     }
 
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one

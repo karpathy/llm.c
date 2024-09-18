@@ -100,12 +100,12 @@ typedef __nv_bfloat16 floatX;
 
 #if defined(ENABLE_FP8)
 typedef __nv_fp8_e4m3 float8;
-typedef __nv_fp8_e5m2 grads8;
+typedef __nv_fp8_e5m2 float8e5;
 #define DTYPE_FP8E4 DType::FP8E4M3
 #define DTYPE_FP8E5 DType::FP8E5M2
 #else
 typedef floatX float8;
-typedef floatX grads8;
+typedef floatX float8e5;
 #define DTYPE_FP8E4 DTYPE_FLOATX
 #define DTYPE_FP8E5 DTYPE_FLOATX
 #endif

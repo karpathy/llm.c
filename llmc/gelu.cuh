@@ -10,7 +10,7 @@
 // CUDA kernels
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-template<typename Tout=tensorFP8e4, typename Tinp=tensorFP8e4>
+template<typename Tout=float8, typename Tinp=float8>
 __global__ void gelu_forward_kernel2(TensorGPU<Tout> out, TensorGPU<Tinp> inp) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * inp.num_per_128();
 
@@ -32,12 +32,12 @@ __global__ void gelu_forward_kernel2(TensorGPU<Tout> out, TensorGPU<Tinp> inp) {
         out128.set(k, half_xi * tanh_in_out + half_xi);
     }
     out128.store(idx, false);
-    out128.update_absmax(threadIdx.x, blockDim.x, true);
+    out128.update_absmax(1);
 }
 
 //template<typename Tinp=floatX>
-template<typename Tinp=tensorFP8e4, typename Td=tensorFP8e5>
-__global__ void gelu_backward_kernel(TensorGPU<Td> dinp, TensorGPU<Td> dout, TensorGPU<Tinp> inp) {
+template<typename Tdinp=float8e5, typename Tdout=float8e5, typename Tinp=float8>
+__global__ void gelu_backward_kernel(TensorGPU<Tdinp> dinp, TensorGPU<Tdout> dout, TensorGPU<Tinp> inp) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * dout.num_per_128();
 
     auto dinp128 = new_tensor128(dinp);
@@ -60,12 +60,12 @@ __global__ void gelu_backward_kernel(TensorGPU<Td> dinp, TensorGPU<Td> dout, Ten
         dinp128.set(k, result);
     }
     dinp128.store(idx, false);
-    dinp128.update_absmax(threadIdx.x, blockDim.x, true);
+    dinp128.update_absmax(1);
 }
 
 // ----------------------------------------------------------------------------
 // kernel launchers
-template<typename Tout=tensorFP8e4, typename Tinp=tensorFP8e4>
+template<typename Tout=float8, typename Tinp=Tout>
 void gelu_forward(TensorGPU<Tout> out, TensorGPU<Tinp> inp, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
@@ -76,11 +76,19 @@ void gelu_forward(TensorGPU<Tout> out, TensorGPU<Tinp> inp, cudaStream_t stream=
     cudaCheck(cudaGetLastError());
 }
 
-template<typename Tinp=tensorFP8e4, typename Td=tensorFP8e5>
-void gelu_backward(TensorGPU<Td> dinp, TensorGPU<Td> dout, TensorGPU<Tinp> inp, cudaStream_t stream=main_stream) {
+template<typename Tdinp=float8e5, typename Tdout=float8e5, typename Tinp=float8>
+void gelu_backward(TensorGPU<Tdinp> dinp, TensorGPU<Tdout> dout, TensorGPU<Tinp> inp, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int grid_size = CEIL_DIV(inp.num_elements, block_size * inp.num_per_128());
     gelu_backward_kernel<<<grid_size, block_size, 0, stream>>>(dinp, dout, inp);
     cudaCheck(cudaGetLastError());
+}
+
+void gelu_forward_fp8(tensor8 out, tensor8 inp, cudaStream_t stream=main_stream) {
+    gelu_forward(out, inp, stream);
+}
+
+void gelu_backward_fp8(tensor8e5 dinp, tensor8e5 dout, tensor8 inp, cudaStream_t stream=main_stream) {
+    gelu_backward(dinp, dout, inp, stream);
 }

@@ -37,7 +37,7 @@ __global__ void encoder_forward_kernel3(tensorX out,
         out128.set(k, wte128.get(k) + wpe128.get(k));
     }
     out128.store(b * T * C + t * C + c);
-    out128.update_absmax(threadIdx.x, blockDim.x, true);
+    out128.update_absmax(1);
 }
 
 template <int BLOCK_SIZE=256>
@@ -107,7 +107,7 @@ __global__ void wte_backward_kernel(tensorX dwte,
         dwte128.set_stochastic(k, accum[k] + dwte128.get(k), random);
     }
     dwte128.store(bucket_ix * C + c);
-    dwte128.update_absmax(threadIdx.x, blockDim.x, true);
+    dwte128.update_absmax(1);
 }
 
 __global__ void wpe_backward_kernel(tensorX dwpe,
@@ -143,7 +143,7 @@ __global__ void wpe_backward_kernel(tensorX dwpe,
         dwpe128.set_stochastic(k, accum[k] + dwpe128.get(k), random);
     }
     dwpe128.store(t * C + c);
-    dwpe128.update_absmax(threadIdx.x, blockDim.x, true);
+    dwpe128.update_absmax(1);
 }
 
 // ----------------------------------------------------------------------------

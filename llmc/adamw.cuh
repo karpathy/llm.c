@@ -22,7 +22,6 @@ __device__ size_t adamw_update_part(TensorGPU<Tparam> param_tensor, size_t idx, 
                                     unsigned int seed, int num_params_tensors, size_t num_parameters, size_t num_opt_parameters,
                                     float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction,
                                     float eps, float wd, float grad_scale, int t) {
-    constexpr size_t block_size = 64;
     auto out_master128 = new_tensor128(master_tensor, true);
     auto out_opt_m128 = new_tensor128(opt_m_tensor, true);
     auto out_opt_v128 = new_tensor128(opt_v_tensor, true);
@@ -97,7 +96,7 @@ __device__ size_t adamw_update_part(TensorGPU<Tparam> param_tensor, size_t idx, 
         }
         idx += stride;
     }
-    out_param128.update_absmax(threadIdx.x, block_size, false);
+    out_param128.update_absmax(1);
     return idx;
 }
 

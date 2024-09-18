@@ -63,18 +63,15 @@ __global__ void permute_kernel_backward(tensorX dinp,
         dinp128_q.set(i, dq[idx+i]);
         dinp128_k.set(i, dk[idx+i]);
         dinp128_v.set(i, dv[idx+i]);
-        // to allow us to update the absmax only once
-        dinp128_k.add_value_stats(dk[idx+i], dinp128_k.get128()[i]);
-        dinp128_v.add_value_stats(dv[idx+i], dinp128_v.get128()[i]);
+
+        // to allow us to update the absmax only once for the q vector
+        dinp128_q.add_value_stats(dk[idx+i], dinp128_k.get128()[i]);
+        dinp128_q.add_value_stats(dv[idx+i], dinp128_v.get128()[i]);
     }
     dinp128_q.store(inp_idx);
     dinp128_k.store(inp_idx + NH * d);
     dinp128_v.store(inp_idx + 2 * (NH * d));
-
-    // todo - merge this into 1 update
-    dinp128_q.update_absmax(threadIdx.x, blockDim.x, false);
-    dinp128_k.update_absmax(threadIdx.x, blockDim.x, false);
-    dinp128_v.update_absmax(threadIdx.x, blockDim.x, true);
+    dinp128_q.update_absmax(1);
 }
 
 __global__ void unpermute_kernel(tensorX out, floatX* inp, int B, int N, int NH, int d) {
@@ -96,7 +93,7 @@ __global__ void unpermute_kernel(tensorX out, floatX* inp, int B, int N, int NH,
         out128.set(i, __ldcs(&inp[idx + i]));
     }
     out128.store(other_idx);
-    out128.update_absmax(threadIdx.x, blockDim.x, true);
+    out128.update_absmax(1);
 }
 
 __global__ void unpermute_kernel_backward(floatX* dout_permuted, tensorX dout, int B, int N, int NH, int d) {
