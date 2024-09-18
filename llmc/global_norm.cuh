@@ -39,11 +39,14 @@ __global__ void __launch_bounds__(256, MAX_WARPS/8) global_norm_tensors_kernel(f
             // but tiny tensors back-to-back might be inefficient
             spec_id++;
             if (spec_id >= num_params_tensors) {
-                return;
+                break;
             }
             opt_v_spec = opt_v_specs[spec_id];
             current_start = opt_v_spec.element_start_end.x;
             current_end = opt_v_spec.element_start_end.y;
+        }
+        if (spec_id >= num_params_tensors) {
+            break; // goto would avoid this but I don't want to go to hell
         }
 
         // offset is 32-bit (checked <=4B elements in add_tensor_spec)
@@ -61,7 +64,10 @@ __global__ void __launch_bounds__(256, MAX_WARPS/8) global_norm_tensors_kernel(f
             offset += stride;
         }
     }
-    out[blockIdx.x] = blockReduce<warpReduceSum>(grad_norm_accumulator);;
+    float output = blockReduce<warpReduceSum>(grad_norm_accumulator);
+    if (threadIdx.x == 0) {
+        out[blockIdx.x] = output;
+    }
 }
 
 // ----------------------------------------------------------------------------
