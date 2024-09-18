@@ -16,42 +16,39 @@ Global norm, used in gralldient clipping
 // currently assumes all gradients are the same type (simplified adamw_update_everything)
 // ZeRO 1 should use shard_idx, while DPP and ZeRO 2/3 should simply set it to 0
 template <typename Tgrad=floatX>
-__global__ void __launch_bounds__(256, MAX_WARPS/8) global_norm_tensors_kernel(float* out, int num_params_tensors, unsigned int shard_idx) {
+__global__ void __launch_bounds__(256, MAX_THREADS/256) global_norm_tensors_kernel(float* out, int num_params_tensors, unsigned int shard_idx) {
     float grad_norm_accumulator = 0.f;
 
     constexpr size_t block_size = 256;
     constexpr size_t iteration_size = Packed128<Tgrad>::size;
-    size_t idx = (blockIdx.x * block_size * iteration_size) + (threadIdx.x * iteration_size);
+    size_t idx = (blockIdx.x * block_size + threadIdx.x) * iteration_size;
     unsigned int stride = gridDim.x * blockDim.x * iteration_size;
 
-    int spec_id = 0;
-    TensorSpec* grad_specs   = tensor_specs_ptr + num_params_tensors;
-    TensorSpec* opt_v_specs  = tensor_specs_ptr + 3 * num_params_tensors;
+    int opt_m_spec_id = 2 * num_params_tensors; // opt_m is sharded with ZeRO 1/2/3
+    int last_opt_m_id = 3 * num_params_tensors - 1;
 
-    TensorSpec opt_v_spec = opt_v_specs[spec_id];
-    size_t current_start = opt_v_spec.element_start_end.x;
-    size_t current_end = opt_v_spec.element_start_end.y;
+    size_t current_end = tensor_end_element_ptr[opt_m_spec_id];
 
     while (true) {
         while (idx >= current_end) {
-            // todo - check performance, misses probably okay if they reduce the tail effect
-            // (fastest block/SM "prefetches" for the slower ones)
-            // but tiny tensors back-to-back might be inefficient
-            spec_id++;
-            if (spec_id >= num_params_tensors) {
-                break;
-            }
-            opt_v_spec = opt_v_specs[spec_id];
-            current_start = opt_v_spec.element_start_end.x;
-            current_end = opt_v_spec.element_start_end.y;
+            opt_m_spec_id++;
+            if (opt_m_spec_id > last_opt_m_id) break;
+
+            #if __CUDA_ARCH__ < 800
+            current_end = tensor_end_element_ptr[opt_m_spec_id];
+            #else
+            // on A100+ we can prefetch 256B (32 end values) into the L2
+            asm("ld.global.L1::evict_last.L2::256B.u64 {%0}, [%1];" : "=l"(current_end) : "l"(tensor_end_element_ptr + opt_m_spec_id));
+            #endif
         }
-        if (spec_id >= num_params_tensors) {
-            break; // goto would avoid this but I don't want to go to hell
-        }
+        if (opt_m_spec_id > last_opt_m_id) break;
 
         // offset is 32-bit (checked <=4B elements in add_tensor_spec)
-        unsigned int offset = (idx - current_start) + (shard_idx * opt_v_spec.num_elements);
-        TensorGPU<floatX> grad_tensor  = grad_specs[spec_id];
+        size_t current_start = tensor_specs_ptr[opt_m_spec_id].start_element;
+        unsigned int offset = (idx - current_start) + (shard_idx * tensor_specs_ptr[opt_m_spec_id].num_elements);
+
+        int grad_spec_id = opt_m_spec_id - num_params_tensors;
+        TensorGPU<floatX> grad_tensor  = tensor_specs_ptr[grad_spec_id];
 
         __syncthreads(); // todo - hopefully improves memory locality
         while (idx < current_end) {
@@ -64,6 +61,7 @@ __global__ void __launch_bounds__(256, MAX_WARPS/8) global_norm_tensors_kernel(f
             offset += stride;
         }
     }
+
     float output = blockReduce<warpReduceSum>(grad_norm_accumulator);
     if (threadIdx.x == 0) {
         out[blockIdx.x] = output;
@@ -85,5 +83,7 @@ void global_norm_tensors(float* out, int gpu_process_rank, cudaStream_t stream=m
     int shard_idx = gpu_process_rank % num_shards;
 
     global_norm_tensors_kernel<Tgrad><<<grid_size, block_size, 0, stream>>>(out, num_params_tensors, shard_idx);
+    cudaCheck(cudaGetLastError());
     global_sum_deterministic(out, out, grid_size, stream);
+    cudaCheck(cudaGetLastError());
 }

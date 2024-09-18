@@ -111,30 +111,33 @@ __global__ void adamw_update_everything(int num_params_tensors, unsigned int see
     size_t idx = (blockIdx.x * block_size * iteration_size) + (threadIdx.x * iteration_size);
     unsigned int stride = gridDim.x * blockDim.x * iteration_size;
 
-    int spec_id = 0;
-    TensorSpec* opt_v_specs  = tensor_specs_ptr + 3 * num_params_tensors;
-    TensorSpec opt_v_spec = opt_v_specs[spec_id];
-    size_t current_start = opt_v_spec.element_start_end.x;
-    size_t current_end = opt_v_spec.element_start_end.y;
+    int opt_m_spec_id = 2 * num_params_tensors;
+    int last_opt_m_id = 3 * num_params_tensors - 1;
+    size_t current_end = tensor_end_element_ptr[opt_m_spec_id];
 
     while (true) {
         while (idx >= current_end) {
-            spec_id++;
-            if (spec_id >= num_params_tensors) {
-                return;
-            }
-            opt_v_spec = opt_v_specs[spec_id];
-            current_start = opt_v_spec.element_start_end.x;
-            current_end = opt_v_spec.element_start_end.y;
+            opt_m_spec_id++;
+            if (opt_m_spec_id > last_opt_m_id) break;
+
+            #if __CUDA_ARCH__ < 800
+            current_end = tensor_end_element_ptr[opt_m_spec_id];
+            #else
+            // on A100+ we can prefetch 256B (32 end values) into the L2
+            asm("ld.global.L1::evict_last.L2::256B.u64 {%0}, [%1];" : "=l"(current_end) : "l"(tensor_end_element_ptr + opt_m_spec_id));
+            #endif
         }
+        if (opt_m_spec_id > last_opt_m_id) break;
+        int spec_id = opt_m_spec_id - 2 * num_params_tensors;
+        size_t current_start = tensor_specs_ptr[opt_m_spec_id].start_element;
 
         TensorSpec param_spec = tensor_specs_ptr[spec_id];
-        float wd = (param_spec.flags & TENSOR_2D) ? weight_decay : 0.0f;
-
-        TensorGPU<float> master_tensor = use_master_weights ? tensor_specs_ptr[spec_id + 4*num_params_tensors] : opt_v_spec;
         TensorGPU<floatX> grad_tensor  = tensor_specs_ptr[spec_id + 1*num_params_tensors];
-        TensorGPU<float> opt_m_tensor  = tensor_specs_ptr[spec_id + 2*num_params_tensors];;
-        TensorGPU<float> opt_v_tensor  = opt_v_spec;
+        TensorGPU<float> opt_m_tensor  = tensor_specs_ptr[spec_id + 2*num_params_tensors];
+        TensorGPU<float> opt_v_tensor  = tensor_specs_ptr[spec_id + 3*num_params_tensors];
+        TensorGPU<float> master_tensor = use_master_weights ? tensor_specs_ptr[spec_id + 4*num_params_tensors] : opt_m_tensor;
+
+        float wd = (param_spec.flags & TENSOR_2D) ? weight_decay : 0.0f;
 
         if (param_spec.data_type == DType::FP32) {
             idx = adamw_update_part<use_master_weights>((TensorGPU<float>)param_spec,

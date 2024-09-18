@@ -34,14 +34,17 @@ extern cudaStream_t main_stream;
 // Defining here like this possibly allows the compiler to optimize better
 #define WARP_SIZE 32U
 
-// try to make sure that 2 blocks fit on A100/H100 to maximise latency tolerance
+// optimise the number of blocks that fit to maximise latency tolerance
 // this needs to be defines rather than queried to be used for __launch_bounds__
-#if __CUDA_ARCH__ == 800 || __CUDA_ARCH__ >= 900
+#if __CUDA_ARCH__ >= 900 || __CUDA_ARCH__ == 800 || __CUDA_ARCH__ <= 700
 #define MAX_1024_THREADS_BLOCKS 2
-#define MAX_WARPS 64
+#define MAX_THREADS 2048 // H100/A100/V100/Pascal/Maxwell(/Blackwell?)
+#elif __CUDA_ARCH__ == 750
+#define MAX_1024_THREADS_BLOCKS 1
+#define MAX_THREADS 1024 // Turing
 #else
 #define MAX_1024_THREADS_BLOCKS 1
-#define MAX_WARPS 48
+#define MAX_THREADS 1536 // Consumer Ampere & Ada Lovelace
 #endif
 
 // convenience macro for calculating grid/block dimensions for kernels

@@ -97,6 +97,8 @@ TT current_tensor_type = TT::PARAMETER;
 int current_absmax_index = 0;
 float* gpu_scale_memory = NULL;
 unsigned int* gpu_absmax_memory = NULL;
+size_t* gpu_tensor_end_element = NULL;
+
 tensorX null_tensorX = {0};
 
 // ----------------------------------------------------------------------------
@@ -344,17 +346,22 @@ void gpt2_allocate(GPT2 *model) {
     }
 
     // Set the GPU pointer for each tensor spec (so we don't need to know the base and the offset)
-    // also specify 1st and end elements explicitly to optimise kernels iterating over the tensors
+    // also specify the end elements explicitly to optimise kernels iterating over the tensors
+    size_t* cpu_tensor_end_element = (size_t*)mallocCheck(sizeof(size_t) * num_tensor_specs + 256);
     for (size_t i = 0; i < num_tensor_specs; i++) {
         TensorSpec* spec = &tensor_specs[i];
         spec->ptr = model->tensor_memory[spec->tensor_type] + spec->offset;
-        spec->element_start_end.x = spec->offset / sizeof_dtype(spec->data_type);
-        spec->element_start_end.y = spec->element_start_end.x + spec->num_elements;
+        cpu_tensor_end_element[i] = spec->start_element + spec->num_elements;
     }
 
     // we are finished creating the tensors specs and copy them to the GPU (they are effectively read-only)
     cudaMalloc((void**)&tensor_specs_gpu, sizeof(TensorSpec) * num_tensor_specs);
     cudaMemcpy(tensor_specs_gpu, tensor_specs, sizeof(TensorSpec) * num_tensor_specs, cudaMemcpyHostToDevice);
+    // also upload the "end element" array which we use to optimise iterating through tensors in our kernels
+    // extra 256B so that we can avoid bounds checking when prefetching etc.
+    cudaMalloc(&gpu_tensor_end_element, sizeof(size_t) * num_tensor_specs + 256);
+    cudaMemcpy(gpu_tensor_end_element, cpu_tensor_end_element, sizeof(size_t) * num_tensor_specs + 256, cudaMemcpyHostToDevice);
+    free(cpu_tensor_end_element);
 
     printf("number of parameter bytes: %zu MiB\n", tensors_bytes[TT::PARAMETER] / (1024*1024));
     printf("number of parameter gradient bytes: %zu MiB\n", tensors_bytes[TT::PARAMETER_GRAD] / (1024*1024));
@@ -372,7 +379,7 @@ void gpt2_allocate(GPT2 *model) {
     cudaMemcpyToSymbol(tensor_specs_ptr, &tensor_specs_gpu, sizeof(TensorSpec*));
     cudaMemcpyToSymbol(gpu_scale_memory_ptr, &gpu_scale_memory, sizeof(float*));
     cudaMemcpyToSymbol(gpu_absmax_memory_ptr, &gpu_absmax_memory, sizeof(unsigned int*));
-
+    cudaMemcpyToSymbol(tensor_end_element_ptr, &gpu_tensor_end_element, sizeof(size_t*));
     // =======================
     // allocate_state stuff
     // =======================

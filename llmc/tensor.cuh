@@ -48,10 +48,13 @@ extern TT current_tensor_type; // todo - avoid having this somehow?
 extern int current_absmax_index; // todo - move into model struct?
 extern float* gpu_scale_memory;
 extern unsigned int* gpu_absmax_memory;
+// end element of each tensor to optimise iterating through them in kernels
+extern size_t* gpu_tensor_end_element;
 
 __device__ __constant__ TensorSpec* tensor_specs_ptr;
 __device__ __constant__ float* gpu_scale_memory_ptr;
 __device__ __constant__ unsigned int* gpu_absmax_memory_ptr;
+__device__ __constant__ size_t* tensor_end_element_ptr;
 
 // ----------------------------------------------------------------------------
 // Helper macros for accessing tensors in the training loop
@@ -154,21 +157,18 @@ extern TensorGPU<floatX> null_tensorX;
 // they all implicitly refer to this (in tensor_specs[] and tensor_specs_gpu[] for now) with the id
 // and these other classes are created by converting from this one (sometimes implicitly)
 struct TensorSpec {
-    char* ptr;
     int id;
-
+    char* ptr; // = model->tensor_memory[tensor_type] + offset
     char name[16];
     TT tensor_type;
     DType data_type;
     int flags;
 
-    size_t offset; // into base pointer
+    size_t offset; // into tensor type's base pointer
+    size_t start_element; // on this shard
     size_t num_elements; // per shard
     short num_shards;
     short remaining_layers;
-
-    // explicit as performance optimization for optimizer critical path
-    ulonglong2 element_start_end;
 
     template <typename T>
     __host__ __device__ operator T*() const {
@@ -274,6 +274,7 @@ int add_tensor_spec(const char* name, size_t total_elements, size_t num_shards, 
     // todo - either 1) 32-bit everywhere (with a DEFINE?), 2) 64-bit everywhere despite the small performance impact
     assert(total_elements < 4UL*1024*1024*1024 || spec->tensor_type == TT::MULTIUSE);
 
+    spec->start_element = tensors_elements[spec->tensor_type];
     spec->num_elements = total_elements / num_shards;
     spec->num_shards = num_shards;
     spec->remaining_layers = 0;
