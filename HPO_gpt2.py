@@ -19,6 +19,7 @@ import datetime
 from smac.facade.abstract_facade import AbstractFacade
 import submitit
 import pickle
+import torch
 
 global log_file_name
 
@@ -133,10 +134,11 @@ def print_with_tabs(obj, num_tabs=1):
 
 def main_smac(args):
     
+    device = "cuda" if torch.cuda.is_available() else "cpu"  
     setup_logger()
     logger = logging.getLogger(__name__)
     logger.info(f'============Starting============\n')
-
+    hp_details = []
     logger.info("\t== Creating the Partial/Target/Evaluation function ==")
     partial_function = partial(train_eval_hpo, 
                                input_bin=args.input_bin, 
@@ -152,6 +154,7 @@ def main_smac(args):
                                zero_stage=args.zero_stage,
                                logger=logger, 
                                multi_objective=args.multiobjective,
+                            #    hp_details=hp_details
                                )
 
     logger.info(f"\t{print_with_tabs(partial_function,1)}")
@@ -172,10 +175,10 @@ def main_smac(args):
                     cs,
                     # name="SMAC",
                     objectives=["val_loss", "train_time"],
-                    walltime_limit=60*60*23,  
+                    walltime_limit=1*60*60,#60*60*23,  
                     n_trials=args.n_trials, #500,  # Evaluate max 500 different trials
-                    min_budget=0.75*60*60,  # Train the MLP using a hyperparameter configuration for at least 5 epochs
-                    max_budget=24*60*60,  # Train the MLP using a hyperparameter configuration for at most 25 epochs
+                    min_budget=0.03*60*60, #0.75*60*60,  # Train the MLP using a hyperparameter configuration for at least 5 epochs
+                    max_budget=0.12*60*60,  # Train the MLP using a hyperparameter configuration for at most 25 epochs
                     n_workers=1,
                     deterministic=True
         )
@@ -183,10 +186,10 @@ def main_smac(args):
         scenario = Scenario(
             cs,
             # objectives=["val_loss", "train_time"],
-            walltime_limit=60*60*23,  
+            walltime_limit=1*60*60, #60*60*23,  
             n_trials=args.n_trials, #500,  # Evaluate max 500 different trials
-            min_budget=0.75*60*60,  # Train the MLP using a hyperparameter configuration for at least 5 epochs
-            max_budget=24*60*60,  # Train the MLP using a hyperparameter configuration for at most 25 epochs
+            min_budget=0.03*60*60,#0.75*60*60,  # Train the MLP using a hyperparameter configuration for at least 5 epochs
+            max_budget=0.12*60*60,  # Train the MLP using a hyperparameter configuration for at most 25 epochs
             n_workers=1,
             deterministic=True
         )
@@ -276,8 +279,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # file system input / output
     parser.add_argument("-s", "--slurm", type=bool, default=False, help="flag to run training on slurm") # if not provided you can just run it from terminal (for debugging)
-    parser.add_argument('-i', "--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_train.bin", help="input .bin to train on")
-    parser.add_argument('-j', "--input_val_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to eval validation loss on")
+    parser.add_argument('-i', "--input_bin", type=str, default="dev/data/fineweb10B/fineweb_train_*.bin", help="input .bin to train on")
+    parser.add_argument('-j', "--input_val_bin", type=str, default="dev/data/fineweb10B/fineweb_val_*.bin", help="input .bin to eval validation loss on")
     parser.add_argument('-o', "--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument('-e', "--model", type=str, default="d6", help="gpt2-tiny|gpt2|gpt2-medium|gpt2-large|gpt2-xl|d6|d12|d24|d36|d48")
     # token layout for each step of the optimization
@@ -288,14 +291,14 @@ if __name__ == "__main__":
     # parser.add_argument('-x', "--num_iterations", type=int, default=-1, help="number of iterations to run")
     # optimization
     # parser.add_argument('-l', "--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
-    parser.add_argument('-u', "--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
-    parser.add_argument('-q', "--learning_rate_decay_frac", type=float, default=1.0, help="learning rate warmup iterations")
+    parser.add_argument('-u', "--warmup_iters", type=int, default=700, help="learning rate warmup iterations")
+    parser.add_argument('-q', "--learning_rate_decay_frac", type=float, default=0.0, help="learning rate warmup iterations")
     # parser.add_argument('-c', "--weight_decay", type=float, default=0.0, help="weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
     # evaluation
     parser.add_argument('-m', "--val_max_steps", type=int, default=20, help="how many batches of val to average?")
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
-    parser.add_argument('-z', "--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
+    parser.add_argument('-z', "--zero_stage", type=int, default=1, help="zero redundancy optimizer stage (0/1/2/3)")
     # python -> C bridge
     parser.add_argument("--multiobjective", type=bool, default=False, help="multiobjective optimization")
     parser.add_argument("--n_initial", type=int, default=5, help="number of initial configurations to evaluate")

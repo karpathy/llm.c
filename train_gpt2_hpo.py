@@ -13,6 +13,8 @@ import math
 import torch.distributed as dist
 from ConfigSpace import Configuration, ConfigurationSpace, Float
 import numpy as np
+import pickle
+
 
 def train_eval_hpo(
     config_space: ConfigurationSpace, 
@@ -34,11 +36,18 @@ def train_eval_hpo(
     zero_stage: int = 0,
     logger = None,
     multi_objective: bool = False,
-    hp_details: list = None
 ):
-    
+
+    if os.path.exists("hp_details.pkl"):
+        with open("hp_details.pkl", "rb") as f:
+            hp_details = pickle.load(f)
+    else:
+        hp_details = []
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     section_tab = 3*"\t"
-    print(f"Running train_eval_hpo with budget: {budget}, config_space: {config_space.get_dictionary()}")
+    print(f"Running train_eval_hpo with budget: {budget}, config_space: {config_space.get_dictionary()}, seed: {seed}, budget: {budget}")
     
     step = None
     time_elapsed = None
@@ -47,15 +56,7 @@ def train_eval_hpo(
     sequence_length = config_space["sequence_length"]
     
     save_name = f"{model}_bs_{batch_size}_lr_{learning_rate}_wd_{weight_decay}_seq_{sequence_length}_budget_{budget}"
-    
-    if os.path.exists(f"dev/models/{save_name}.pth"):
-        print(f'loading previous training states from: {save_name}')
-        ckpt = torch.load(f"dev/models/{save_name}.pth", map_location=device)
-        model.load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        step = ckpt['step']
-        time_elapsed = ckpt['time_elapsed']
-    
+       
     logger.info(f"{section_tab}== Running train_eval_hpo ==")
     # log all the arguments
     logger.info(f"{section_tab}== Arguments:\n"
@@ -119,10 +120,6 @@ def train_eval_hpo(
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
     total_batch_size = total_batch_size if total_batch_size > 0 else tokens_per_fwdbwd
-
-    num_iterations = train_loader.ntok_total // total_batch_size    
-    assert total_batch_size % tokens_per_fwdbwd == 0
-    grad_accum_steps = total_batch_size // tokens_per_fwdbwd
     
     logger.info(f"{section_tab}== Running setup:\n" 
                 + section_tab + f"\tConfig_space:{config_space.get_dictionary()} \n"
@@ -148,7 +145,7 @@ def train_eval_hpo(
     # init (and write) the tokenizer
     enc = tiktoken.get_encoding("gpt2")
 
-    model_name = model.copy()
+    model_name = model
     # init the model, either from scratch or from OpenAI pretrained checkpoint
     if model[0] == "d":
         # from scratch (random weights)
@@ -179,7 +176,10 @@ def train_eval_hpo(
     if input_val_bin:
         val_loader = DistributedDataLoader(input_val_bin, B, 1024, ddp_rank, ddp_world_size)
 
-    num_iterations = num_iterations if num_iterations > 0 else train_loader.ntok_total // total_batch_size
+    assert total_batch_size % tokens_per_fwdbwd == 0
+    grad_accum_steps = total_batch_size // tokens_per_fwdbwd
+    
+    num_iterations = train_loader.ntok_total // total_batch_size
     num_iterations = int(num_iterations)
 
     logger.info(f"{section_tab}== Data setup:\n"
@@ -225,6 +225,17 @@ def train_eval_hpo(
     
     model_to_size = {"gpt2-tiny": "30M", "gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
     model_to_size.update({f"d{d}": f"d{d}" for d in [6, 12, 24, 36, 48]})
+    
+    print(f"saving model to: {save_name}")
+    print(f"path does exist: {os.path.exists(f'./dev/models/{save_name}.pth')}")
+    if os.path.exists(f"./dev/models/{save_name}.pth"):
+        print(f'loading previous training states from: {save_name}')
+        ckpt = torch.load(f"./dev/models/{save_name}.pth", map_location=device)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        step = ckpt['step']
+        time_elapsed = ckpt['time_elapsed'] 
+    
     
     timings = []
     norm = -1.0   # dummy value to print in inference-only mode
@@ -291,7 +302,7 @@ def train_eval_hpo(
         timings.append(t1-t0)
         step += 1
         
-        if step % 1000:
+        if step % 1000 == 0:
             # store scheduler and optimizer state and model weights
             ckpt = {
                 'model_state_dict': model.state_dict(),
@@ -299,7 +310,7 @@ def train_eval_hpo(
                 'time_elapsed': time.time() - start_time,
                 'step': step,
             }
-            torch.save(ckpt, f"/dev/models/{save_name}.pth")
+            torch.save(ckpt, f"./dev/models/{save_name}.pth")
                     
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
@@ -337,6 +348,11 @@ def train_eval_hpo(
     hp_details.append({"val_loss": val_loss, "train_loss": train_loss, "train_time": train_time, "model_size": model_to_size[model_name],
                         "batch_size": B, "learning_rate": learning_rate, "weight_decay": weight_decay, "sequence_length": T,
                        })    
+    
+    with open(f"hp_details.pkl", "wb") as f:
+        pickle.dump(hp_details, f)
+    
+    # print(f"hp_details: {hp_details}")
     
     if multi_objective:
         return {"val_loss": val_loss, "train_time": train_time}
