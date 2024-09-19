@@ -270,8 +270,8 @@ int add_tensor_spec(const char* name, size_t total_elements, size_t num_shards, 
     spec->data_type = data_type;
     spec->flags = flags;
 
-    // parameter tensors must fit in a 32-bit unsigned integer (used as a performance optimisation in some kernels)
-    // todo - either 1) 32-bit everywhere (with a DEFINE?), 2) 64-bit everywhere despite the small performance impact
+    // parameter tensors must fit in a 32-bit unsigned integer (used as an optimisation in e.g. global_norm_tensors_loop)
+    // todo - either 1) 32-bit everywhere (with a DEFINE?), 2) 64-bit everywhere despite the small performance impact, 3) ?
     assert(total_elements < 4UL*1024*1024*1024 || spec->tensor_type == TT::MULTIUSE);
 
     spec->start_element = tensors_elements[spec->tensor_type];

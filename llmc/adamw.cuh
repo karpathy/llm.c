@@ -26,7 +26,7 @@ __device__ size_t adamw_update_part(TensorGPU<Tparam> param_tensor,
     auto out_opt_v128 = new_tensor128(opt_v_tensor, true);
     auto out_param128 = new_tensor128(param_tensor);
 
-    __syncthreads(); // todo - hopefully improves memory locality
+    __syncthreads(); // todo - this should improve memory locality
     while (idx < current_end) {
         unsigned int random = get_random_noise(seed, idx);
 
@@ -102,32 +102,33 @@ __device__ size_t adamw_update_part(TensorGPU<Tparam> param_tensor,
 }
 
 template <bool use_master_weights=true>
-__global__ void adamw_update_everything(int num_params_tensors, unsigned int seed , unsigned int shard_idx,
+__global__ void adamw_update_everything(int num_params_tensors, int start_tensor, int last_tensor, unsigned int seed , unsigned int shard_idx,
                                         float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction,
                                         float eps, float weight_decay, float grad_scale, int t) {
     // ...
-    constexpr size_t block_size = 64; // 64 ==> 4KiB chunks with iteration_size=16 for FP32 opt/master
-    constexpr size_t iteration_size = 16;
+    constexpr size_t block_size = 64;
+    constexpr size_t iteration_size = 16; // todo - this causes sparsit and bank clashes for FP32/BF16 loads/stores
     size_t idx = (blockIdx.x * block_size * iteration_size) + (threadIdx.x * iteration_size);
     unsigned int stride = gridDim.x * blockDim.x * iteration_size;
 
     int opt_m_spec_id = 2 * num_params_tensors;
-    int last_opt_m_id = 3 * num_params_tensors - 1;
-    size_t current_end = tensor_end_element_ptr[opt_m_spec_id];
+    int last_opt_m_id = opt_m_spec_id + last_tensor; // opt_m is sharded with ZeRO 1 so use it as reference
+    opt_m_spec_id += start_tensor - 1; // -1 to compensate for the increment at the start of the loop below
 
     while (true) {
-        while (idx >= current_end) {
+        size_t current_end;
+        do {
             opt_m_spec_id++;
-            if (opt_m_spec_id > last_opt_m_id) break;
+            if (opt_m_spec_id > last_opt_m_id) return; // done!
 
+            // on A100+ we can prefetch 256B (32 values) into the L2, on older GPUs just use a regular load
             #if __CUDA_ARCH__ < 800
             current_end = tensor_end_element_ptr[opt_m_spec_id];
             #else
-            // on A100+ we can prefetch 256B (32 end values) into the L2
-            asm("ld.global.L1::evict_last.L2::256B.u64 {%0}, [%1];" : "=l"(current_end) : "l"(tensor_end_element_ptr + opt_m_spec_id));
+            asm("ld.global.L2::256B.u64 {%0}, [%1];" : "=l"(current_end) : "l"(tensor_end_element_ptr + opt_m_spec_id));
             #endif
-        }
-        if (opt_m_spec_id > last_opt_m_id) break;
+        } while (idx >= current_end);
+
         int spec_id = opt_m_spec_id - 2 * num_params_tensors;
         size_t current_start = tensor_specs_ptr[opt_m_spec_id].start_element;
 

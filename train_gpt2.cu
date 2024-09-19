@@ -1013,11 +1013,16 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 
     const int block_size = 64;
     const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
+
+    int start_tensor = tensors_start[PARAMETER];
+    int last_tensor = tensors_start[PARAMETER+1] - 1;
+    int num_tensors = last_tensor - start_tensor + 1;
+
     if (model->use_master_weights) {
-        adamw_update_everything<true><<<grid_size, block_size, 0, main_stream>>>(tensors_start[PARAMETER+1], seed, shard_idx,
+        adamw_update_everything<true><<<grid_size, block_size, 0, main_stream>>>(num_tensors, start_tensor, last_tensor, seed, shard_idx,
                                learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, grad_scale, t);
     } else {
-        adamw_update_everything<false><<<grid_size, block_size, 0, main_stream>>>(tensors_start[PARAMETER+1], seed, shard_idx,
+        adamw_update_everything<false><<<grid_size, block_size, 0, main_stream>>>(num_tensors, start_tensor, last_tensor, seed, shard_idx,
                                learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, grad_scale, t);
     }
 

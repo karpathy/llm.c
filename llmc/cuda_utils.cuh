@@ -275,7 +275,7 @@ __device__ inline float warpReduceMax(float val) {
     }
     return val;
 }
-// requires all 32 threads in the warp to be active, but should work for any block size
+// requires all 32 threads in the warp to be active, but should work for any 1D(!) block size
 // uses non-dynamic shared memory so every call increases shared memory requirements by 128 bytes
 // the fact it's unique shared memory allows us to avoid an extra __syncthreads() call at the end
 // but if called inside a loop, the shared memory will be implicitly reused, so set final_sync to 1
