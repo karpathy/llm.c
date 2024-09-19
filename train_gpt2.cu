@@ -1147,6 +1147,8 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     state_header[3] = multi_gpu_config.process_rank; // rank of this process
     state_header[4] = model->use_master_weights;  // whether we're using fp32 master weights
     state_header[5] = loader->should_shuffle; // shuffle state of the dataloader
+    state_header[6] = num_tensor_specs; // number of tensor specs (must match)
+    state_header[7] = MAX_ABSMAX_HISTORY; // size of the absmax history (0 = disabled or old version)
     // int main state, start at 10 to leave some padding
     state_header[10] = step; // step of the optimization
     // model rng state, start at 20 to leave some padding
@@ -1173,6 +1175,11 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
         fwriteCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
         fwriteCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
     }
+
+    // write absmax history and scale/descale memory
+    device_to_file(state_file, gpu_absmax_memory, num_tensor_specs * sizeof(float) * (MAX_ABSMAX_HISTORY + 1), IO_BUF_SIZE, main_stream);
+    device_to_file(state_file, gpu_scale_memory, num_tensor_specs * sizeof(float) * 2, IO_BUF_SIZE, main_stream);
+
     fcloseCheck(state_file);
 }
 
@@ -1184,6 +1191,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     assert(state_header[1] == 1); // version number
     assert(state_header[2] == multi_gpu_config.num_processes); // number of processes
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
+    assert(state_header[6] == num_tensor_specs); // number of tensor specs
     int use_master_weights = state_header[4];  // whether we're using fp32 master weights
     int should_shuffle = state_header[5]; // shuffle state of the dataloader
     *step = state_header[10]; // step of the optimization
@@ -1191,6 +1199,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     model->rng_state_last_update = *((unsigned long long*)&state_header[22]); // last gpt2_update
     size_t current_shard_idx = *((size_t*)&state_header[30]); // shard index
     size_t current_sample_idx = *((size_t*)&state_header[32]); // position in shard
+    bool restore_absmax_history = (state_header[7] == MAX_ABSMAX_HISTORY); // todo - restore even if not an exact match
 
     // read AdamW m, v, master_weights (they are all float)
     // allocate all the needed memory as necessary
@@ -1229,6 +1238,11 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         freadCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
     }
     dataloader_resume(loader, current_shard_idx, current_sample_idx);
+
+    if (restore_absmax_history) {
+        file_to_device(gpu_absmax_memory, state_file, num_tensor_specs * sizeof(float) * (MAX_ABSMAX_HISTORY + 1), IO_BUF_SIZE, main_stream);
+        file_to_device(gpu_scale_memory, state_file, num_tensor_specs * sizeof(float) * 2, IO_BUF_SIZE, main_stream);
+    }
 
     // all done, close state file
     fcloseCheck(state_file);
