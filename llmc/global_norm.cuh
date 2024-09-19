@@ -1,7 +1,7 @@
 // TODO - BUGGED - just committing my WIP, not sure why grad norm is zero, probably something silly!
 
 /*
-Global norm, used in gralldient clipping
+Global norm, used in gradient clipping
 */
 #include <assert.h>
 #include <stddef.h>

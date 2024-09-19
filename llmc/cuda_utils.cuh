@@ -89,7 +89,7 @@ __device__ void store128_same_length(ElementType* target, Packed128<ElementType>
     }
 }
 
-// todo - can we unify this with non-cs function somehow?
+// with streaming cache hint (low persistence in L1/L2 caches)
 template<class OriginalType, class ElementType>
 __device__ void store128_same_length_cs(ElementType* target, Packed128<ElementType> value) {
     int4 bits = value.get_bits();
@@ -201,8 +201,8 @@ __device__ void stochastic_rounding(float in, Ti &out, unsigned int random, floa
     } else if constexpr (std::is_same<Ti, __nv_fp8_e4m3>::value) {
         // CUDA doesn't have round down/up instructions for FP8 (in SW or HW) so we do it ourselves
         // ARM-Intel-NVIDIA style FP8 E4M3 (different for AMD-Graphcore-Qualcomm format!)
-        // tried this approach to avoid fake_fp8 bug (didn't help), keeping it for now...
-        // todo: compare perf & accuracy to bit shifting method (do exhaustive testing)
+        // tried this approach to avoid bug with fake_fp8 (didn't help), keeping it for now...
+        // todo: check whether it properly matches the bit shifting method (do exhaustive testing!)
         float low = in;
         float high = in;
 
@@ -230,8 +230,8 @@ __device__ void stochastic_rounding(float in, Ti &out, unsigned int random, floa
 }
 
 // ----------------------------------------------------------------------------
-__device__ float fake_fp8(bool faking, float input, float scale, float descale, bool mode_e5, bool stochastic=false) {
-#ifdef FAKE_FP8
+__device__ float fake_low_precision(bool faking, float input, float scale, float descale, bool mode_e5, bool stochastic=false) {
+#ifdef FAKE_LOW_PRECISION
     unsigned int random_number;
     if (faking && scale != 1.0f) {
         assert(scale == 1.0f/descale || descale == 1.0f/scale || scale == 1.0f);

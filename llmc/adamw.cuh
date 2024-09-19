@@ -138,7 +138,7 @@ __global__ void adamw_update_everything(int num_params_tensors, int start_tensor
         TensorGPU<float> opt_v_tensor  = tensor_specs_ptr[spec_id + 3*num_params_tensors];
         TensorGPU<float> master_tensor = use_master_weights ? tensor_specs_ptr[spec_id + 4*num_params_tensors] : opt_m_tensor;
 
-        float wd = (param_spec.flags & TENSOR_2D) ? weight_decay : 0.0f;
+        float wd = (param_spec.tensor_flags & TENSOR_2D) ? weight_decay : 0.0f;
 
         if (param_spec.data_type == DType::FP32) {
             idx = adamw_update_part<use_master_weights>((TensorGPU<float>)param_spec,

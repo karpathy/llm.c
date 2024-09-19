@@ -36,8 +36,7 @@ __device__ float gelu_forward_elementwise(float x) {
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
-// Same as copy_simple_kernel but with optional absmax and elementwise function options
-// absmax is calculated before scaling but after the elementwise function
+// Advanced copy with optional format conversion, absmax, scaling and elementwise operation
 template <bool reversed_order=false, bool disable_scaling=false,
           elementwise_func_t elementwise_func=nothing_elementwise,
           typename Tin=float, typename Tout=float>

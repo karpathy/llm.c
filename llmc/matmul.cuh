@@ -117,9 +117,6 @@ void matmul_cublaslt(tensorX d, const tensorX a, const tensorX b, const tensorX 
                      bool accumulate=false, tensorX pre_gelu=null_tensorX, bool backward=false)
 {
     NVTX_RANGE_FN();
-    bool has_bias = (bias.data_ptr != NULL);
-    bool has_gelu = (pre_gelu.data_ptr != NULL);
-
     // check alignment (some modes work unaligned but it always best to be aligned for performance)
     if(((uintptr_t)a.data_ptr % 16) != 0 || ((uintptr_t)b.data_ptr % 16) != 0 || ((uintptr_t)d.data_ptr % 16) != 0 || ((uintptr_t)bias.data_ptr % 16) != 0) {
         printf("All cuBLASLt pointers must be aligned!\n");
@@ -177,24 +174,24 @@ void matmul_cublaslt(tensorX d, const tensorX a, const tensorX b, const tensorX 
 
     // setup epilogue and associated pointers for bias & gelu
     cublasLtEpilogue_t epilogue;
-    if (has_gelu) {
+    if (pre_gelu.enabled()) {
         int64_t gelu_ld = m; // todo - is this affected by anything else?
         cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD, &gelu_ld, sizeof(gelu_ld)));
         cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER, &pre_gelu.data_ptr, sizeof(pre_gelu.data_ptr)));
         if (backward) {
-            assert(!has_bias); // we shouldn't have any backward matmuls that use both GELU and bias
+            assert(!bias.enabled()); // we shouldn't have any backward matmuls that use both GELU and bias
             epilogue = CUBLASLT_EPILOGUE_DGELU;
         } else {
-            epilogue = has_bias ? CUBLASLT_EPILOGUE_GELU_AUX_BIAS : CUBLASLT_EPILOGUE_GELU_AUX;
+            epilogue = bias.enabled() ? CUBLASLT_EPILOGUE_GELU_AUX_BIAS : CUBLASLT_EPILOGUE_GELU_AUX;
         }
-    } else if(has_bias){
+    } else if(bias.enabled()){
         epilogue = backward ? CUBLASLT_EPILOGUE_BGRADB : CUBLASLT_EPILOGUE_BIAS;
     } else {
         epilogue = CUBLASLT_EPILOGUE_DEFAULT;
     }
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
 
-    if (has_bias) {
+    if (bias.enabled()) {
         // cuBLASLt requires bias in FP8 mode to be BF16... (sigh)
         cublasDataType_t bias_data_type = (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP; // force BF16 bias for FP8 mode
         cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_data_type, sizeof(bias_data_type)));
@@ -210,7 +207,7 @@ void matmul_cublaslt(tensorX d, const tensorX a, const tensorX b, const tensorX 
     cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc, ALayout, BLayout, CLayout, DLayout,
                                    preference, 1, &heuristic, &returnedResults);
     if (returnedResults == 0) {
-        printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d\n", n, m, k, has_bias);
+        printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d\n", n, m, k, bias.enabled());
         exit(EXIT_FAILURE);
     }
 
@@ -222,8 +219,8 @@ void matmul_cublaslt(tensorX d, const tensorX a, const tensorX b, const tensorX 
                                &alpha, a, ALayout, b, BLayout, &beta, d, CLayout, d, DLayout,
                                &heuristic.algo, cublaslt_workspace, cublaslt_workspace_size, stream));
 
-    #ifdef FAKE_FP8
-    update_absmax(d, false); // fake FP8 requires the absmax to work
+    #ifdef FAKE_LOW_PRECISION
+    update_absmax(d, false); // fake FP8 requires the absmax to work (cuBLAS can't do it for BF16)
     #endif
 
     // cleanups

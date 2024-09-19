@@ -1,4 +1,5 @@
-#define ENABLE_FP8
+#define ENABLE_FP8 // todo - makefile option
+bool write_as_floatX = true; // todo - make command line option (and test it properly)
 
 /*
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
@@ -41,7 +42,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // Packed128, f128, x128
 // warpReduceSum, warpReduceMax, blockReduce
 #include "llmc/cuda_utils.cuh"
-// ... todo ...
+// todo - document what tensor.cuh implements
 #include "llmc/tensor.cuh"
 // defines: CUBLAS_LOWP, cublasCheck, cublaslt_workspace_size, cublaslt_workspace
 // defines: cublas_compute, cublaslt_handle, cublas_handle
@@ -77,7 +78,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/zero.cuh"
 
 // ----------------------------------------------------------------------------
-// global vars regarding GPU process and disk I/O
+// global vars regarding the GPU process and disk I/O
 cudaDeviceProp deviceProp; // fills in common_start()
 cudaStream_t main_stream;
 char filename_buffer[512];
@@ -363,6 +364,7 @@ void gpt2_allocate(GPT2 *model) {
     cudaMemcpy(gpu_tensor_end_element, cpu_tensor_end_element, sizeof(size_t) * num_tensor_specs + 256, cudaMemcpyHostToDevice);
     free(cpu_tensor_end_element);
 
+    // todo - move this elsewhere so it's not in the middle of the parameter table...
     printf("number of parameter bytes: %zu MiB\n", tensors_bytes[TT::PARAMETER] / (1024*1024));
     printf("number of parameter gradient bytes: %zu MiB\n", tensors_bytes[TT::PARAMETER_GRAD] / (1024*1024));
     printf("number of m bytes: %zu MiB\n", tensors_bytes[TT::PARAMETER_OPT_M] / (1024*1024));
@@ -449,7 +451,8 @@ void convert_fixed_parameters(GPT2* model, char* gpu_buffer, size_t fixed_size_b
     cudaMemset(gpu_buffer, 0, fixed_size_bytes);
 }
 
-// to convert from variable precision parameters to a single precision (e.g. before checkpointing)
+// convert from variable precision parameters to a single precision (e.g. before checkpointing)
+// todo
 template<typename Tout=floatX>
 void convert_to_fixed_parameters(GPT2* model, char* gpu_buffer) {
     size_t offset = 0;
@@ -466,7 +469,6 @@ void convert_to_fixed_parameters(GPT2* model, char* gpu_buffer) {
         }
     }
 }
-
 
 // helper function to initialise sharded master weights from unsharded weights
 template<typename Tin, typename Tout>
@@ -511,7 +513,6 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model_header[7] = model->config.padded_vocab_size;
     fwriteCheck(model_header, sizeof(int), 256, model_file);
     // write the parameters
-    bool write_as_floatX = true;
     if (write_as_floatX && model->num_parameters_bytes != model->num_parameters * sizeof(floatX)) {
         // convert the parameters to floatX before writing them
         assert(tensors_bytes[MULTIUSE] >= model->num_parameters * sizeof(floatX)); // todo - make this always work
@@ -575,7 +576,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->config.channels = model_header[6];
     model->config.padded_vocab_size = model_header[7];
 
-    // key line to allocate all of the GPU buffers for all of the tensos
+    // key line to allocate all of the GPU buffers for all of the tensors
     gpt2_allocate(model);
 
     // if the number of bytes in the checkpoint doesn't match the number of bytes allocated,
@@ -684,12 +685,12 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     int num_param_tensors = tensors_start[PARAMETER+1];
     for (int i = 0; i < num_param_tensors; i++) {
         TensorSpec tensor = tensor_specs[i];
-        if ((tensor.flags & TFlags::LAYERNORM) && !(tensor.flags & BIAS)) {
+        if ((tensor.tensor_flags & TFlags::LAYERNORM) && !(tensor.tensor_flags & BIAS)) {
             for (size_t j = 0; j < tensor.num_elements; j++) {
                 params_memory_cpu[offset + j] = (floatX)1.0f;
             }
         }
-        if (tensor.flags & TENSOR_2D) {
+        if (tensor.tensor_flags & TENSOR_2D) {
             size_t n = tensor.num_elements;
             if (n == model->config.padded_vocab_size * model->config.channels) {
                 n = model->config.vocab_size * model->config.channels;
@@ -698,7 +699,7 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
             // in GPT-2, the projections back into the residual stream are additionally
             // scaled by 1/sqrt(2*L) for training stability
             float scale = 0.02f;
-            if (strstr(tensor.name, "proj") != NULL) { // always love a good strstr()... /s
+            if (strstr(tensor.name, "proj") != NULL) { // todo: yuck - use TFlags!
                 scale *= residual_scale;
             }
 
@@ -742,7 +743,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     if (!CUDNN_ENABLED && T != model->seq_len) {
         cudaCheck(cudaMemset(ACT_0(att), 0, L * B * NH * T * T * sizeof(floatX)));
     }
-    // validate inputs, all indices mucst be in the range [0, V)
+    // validate inputs, all indices must be in the range [0, V)
     tokenCheck(inputs, B*T, V);
 
     // copy inputs/targets to the model (fully synchronous with the host for now)

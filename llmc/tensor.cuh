@@ -2,7 +2,7 @@
 #define TENSOR_CUH
 
 // ...
-//#define FAKE_FP8
+//#define FAKE_LOW_PRECISION
 #define UNIQUE_TENSOR_MEMORY false
 #define LAYERS_PER_ACTIVATION_CHECKPOINT 0 // 0 = disabled
 // ...
@@ -113,7 +113,7 @@ struct TensorGPU {
     static constexpr bool no_scaling = (sizeof(ElementType) != 1); // todo - this prevents scaling FP16
 
     __device__ __host__ float get_scalar(size_t index, bool disable_scaling=no_scaling) const {
-        #ifdef FAKE_FP8
+        #ifdef FAKE_LOW_PRECISION
         disable_scaling = true;
         #endif
         ElementType* __restrict__ data_ptr_restricted = data_ptr;
@@ -125,7 +125,7 @@ struct TensorGPU {
     }
 
     __device__ __host__ ElementType set_scalar(size_t index, float value, bool disable_scaling=no_scaling) {
-        #ifdef FAKE_FP8
+        #ifdef FAKE_LOW_PRECISION
         disable_scaling = true;
         #endif
         ElementType* __restrict__ data_ptr_restricted = data_ptr;
@@ -162,7 +162,7 @@ struct TensorSpec {
     char name[16];
     TT tensor_type;
     DType data_type;
-    int flags;
+    short tensor_flags;
 
     size_t offset; // into tensor type's base pointer
     size_t start_element; // on this shard
@@ -215,7 +215,7 @@ void print_tensor_elements(int tensor_id) {
     cudaMemcpy(&descale, &gpu_scale_memory[spec.id * 2 + 1], sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(&absmax, &gpu_absmax_memory[spec.id], sizeof(float), cudaMemcpyDeviceToHost);
 
-    printf("Printing tensor %s (tensor_type: %d, data_type: %d, flags: %d)\n", tensor_name, (int)tensor_type, (int)dtype, spec.flags);
+    printf("Printing tensor %s (tensor_type: %d, data_type: %d, flags: %d)\n", tensor_name, (int)tensor_type, (int)dtype, spec.tensor_flags);
     printf("GPU memory: %p\n", gpu_tensor);
     printf("CPU memory: %p\n", cpu_tensor);
     printf("Num elements: %zu\n", num_elements);
@@ -268,7 +268,7 @@ int add_tensor_spec(const char* name, size_t total_elements, size_t num_shards, 
     spec->name[15] = 0;
     spec->tensor_type = (tensor_type == TT::DEFAULT) ? current_tensor_type : tensor_type;
     spec->data_type = data_type;
-    spec->flags = flags;
+    spec->tensor_flags = flags;
 
     // parameter tensors must fit in a 32-bit unsigned integer (used as an optimisation in e.g. global_norm_tensors_loop)
     // todo - either 1) 32-bit everywhere (with a DEFINE?), 2) 64-bit everywhere despite the small performance impact, 3) ?
@@ -281,7 +281,7 @@ int add_tensor_spec(const char* name, size_t total_elements, size_t num_shards, 
 
     if (copy_offset_from >= 0) {
         TensorSpec base_spec = tensor_specs[copy_offset_from];
-        base_spec.flags |= (flags & REUSED_MEMORY);
+        base_spec.tensor_flags |= (flags & REUSED_MEMORY);
         spec->offset = base_spec.offset;
 
         size_t original_tensor_bytes = base_spec.num_elements * sizeof_dtype(base_spec.data_type);
@@ -343,8 +343,8 @@ __global__ void update_scale_descale_kernel(int num_tensor_specs, int absmax_his
 
     // FP8 e4m3 vs e5m2 (the latter is currently only used for activation gradients)
     bool use_e5m2 = (tensor_specs_ptr[tid].data_type == DType::FP8E5M2);
-    #ifdef FAKE_FP8
-    if (tensor_specs_ptr[tid].flags & TFlags::GRADIENT && tensor_specs_ptr[tid].tensor_type == TT::MULTIUSE) {
+    #ifdef FAKE_LOW_PRECISION
+    if (tensor_specs_ptr[tid].tensor_flags & TFlags::GRADIENT && tensor_specs_ptr[tid].tensor_type == TT::MULTIUSE) {
         use_e5m2 = true;
     }
     #endif
@@ -401,9 +401,9 @@ private:
     bool wrote_absmax = false;
     int id = -1;
 
-    // fake fp8 mode (ignored without FAKE_FP8 define)
-    bool faking_fp8 = false;
-    bool mode_e5 = false;
+    // fake fp8 mode (ignored without FAKE_LOW_PRECISION define)
+    bool faking_low_precision = false;
+    bool faking_mode_e5 = false;
 
 public:
     bool scaling = (sizeof(ElementType) == 1);
@@ -414,14 +414,14 @@ public:
         data_ptr = tensor.data_ptr;
         id = tensor.id;
 
-#ifdef FAKE_FP8
+#ifdef FAKE_LOW_PRECISION
         // fake FP8 only applies to specific tensors to test expected training performance
         // todo - expand this to support more unusual formats and test things like blockwise scaling(?)
         if (!disable_scaling && id >= 0 && sizeof(ElementType) == 2 && tensor_specs_ptr[id].tensor_type != TT::PARAMETER_GRAD) {
-            if ((tensor_specs_ptr[id].flags & (TFlags::RESIDUAL | TFlags::EMBEDDING | TFlags::BIAS)) == 0) {
-                faking_fp8 = true;
-                if  ((tensor_specs_ptr[id].flags & TFlags::GRADIENT) && (tensor_specs_ptr[id].tensor_type == TT::MULTIUSE)) {
-                    mode_e5 = true;
+            if ((tensor_specs_ptr[id].tensor_flags & (TFlags::RESIDUAL | TFlags::EMBEDDING | TFlags::BIAS)) == 0) {
+                faking_low_precision = true;
+                if  ((tensor_specs_ptr[id].tensor_flags & TFlags::GRADIENT) && (tensor_specs_ptr[id].tensor_type == TT::MULTIUSE)) {
+                    faking_mode_e5 = true;
                 }
             }
         }
@@ -465,16 +465,17 @@ public:
         new_absmax = max(new_absmax, fabsf(value));
     }
 
-    // get and set automatically apply scaling/descaling for FP8 values
+    // get() and set() automatically apply scaling & descaling for FP8 values
     __device__ float get(int index) {
         float value = (float)data128[index] * (scaling ? descale : 1.0f);
-        value = fake_fp8(faking_fp8, value, scale, descale, mode_e5); // ignored without FAKE_FP8
+        // used to simulate FP8 and below (just returns the input without FAKE_LOW_PRECISION)
+        value = fake_low_precision(faking_low_precision, value, scale, descale, faking_mode_e5);
         return value;
     }
 
     __device__ void set(int index, float value) {
         float output = value * (scaling ? scale : 1.0f);
-        output = fake_fp8(faking_fp8, output, scale, descale, mode_e5);
+        output = fake_low_precision(faking_low_precision, output, scale, descale, faking_mode_e5);
         data128[index] = (ElementType)(output);
         add_value_stats(value, data128[index]);
     }
@@ -510,8 +511,8 @@ public:
 
     // return value: if true, we can skip __syncthreads() in the calling function as we have just done one
     __device__ bool update_absmax(int thread_id, int num_threads, bool exit=false, bool forced=false) {
-        #ifdef FAKE_FP8
-        if (absmax_ptr == NULL || !faking_fp8) {
+        #ifdef FAKE_LOW_PRECISION
+        if (absmax_ptr == NULL || !faking_low_precision) {
             return false;
         }
         forced = true;
