@@ -94,7 +94,7 @@ size_t tensors_elements[TT::COUNT] = {0};
 int num_tensor_specs = 0;
 
 TT current_tensor_type = TT::PARAMETER;
-int current_absmax_index = 0;
+int absmax_history_index = 0;
 float* gpu_scale_memory = NULL;
 unsigned int* gpu_absmax_memory = NULL;
 size_t* gpu_tensor_end_element = NULL;
@@ -372,8 +372,8 @@ void gpt2_allocate(GPT2 *model) {
 
     // absmax/scale/descale buffers for FP8 & Friends (scale is initialised via update_scales_from_absmax)
     cudaMalloc(&gpu_scale_memory, 2 * num_tensor_specs * sizeof(float));
-    cudaMalloc(&gpu_absmax_memory,   sizeof(unsigned int) * num_tensor_specs * MAX_ABSMAX_HISTORY);
-    cudaMemset(gpu_absmax_memory, 0, sizeof(unsigned int) * num_tensor_specs * MAX_ABSMAX_HISTORY);
+    cudaMalloc(&gpu_absmax_memory,   sizeof(unsigned int) * num_tensor_specs * (MAX_ABSMAX_HISTORY + 1));
+    cudaMemset(gpu_absmax_memory, 0, sizeof(unsigned int) * num_tensor_specs * (MAX_ABSMAX_HISTORY + 1));
 
     // copy pointers to constant buffers for easy access on the GPU
     cudaMemcpyToSymbol(tensor_specs_ptr, &tensor_specs_gpu, sizeof(TensorSpec*));
@@ -1026,65 +1026,33 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, grad_scale, t);
     }
 
-    // AdamW update
-    // handle adamw for all the transformer blocks
-    /*
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        // generate a unique seed for each tensor
-        unsigned int seed = random_u32(&model->rng_state);
-
-        int num_layers = model->config.num_layers;
-        if((i < 2 || i > 13)) {
-            num_layers = 1;
-        }
-
-        ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
-        ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
-        ptrdiff_t local_offset_full = tensor.offset + shard.offset;
-        ptrdiff_t local_offset_partial = tensor.offset / multi_gpu_config->num_processes;
-
-        // we only want to weight decay the 2D tensors and leave all 1D tensors alone
-        // in particular this also decays the embedding weights, but this is ok:
-        // - the token embeddings are weight shared and participate in the final projection to logits
-        // - the position embeddings actively participate at every forward/backward pass
-        float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
-        floatX* param_ptr = (floatX*)model->tensor_memory + local_offset_full;
-        floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
-
-        ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ?  local_offset_full : local_offset_partial;
-        float* m_ptr = model->m_memory + opt_state_offset;
-        float* v_ptr = model->v_memory + opt_state_offset;
-        float* master_ptr = nullptr;
-        if (model->master_weights != nullptr) { master_ptr = model->master_weights + opt_state_offset; }
-        // ok finally call the kernel to update the weights with AdamW
-        adamw_update(param_ptr, master_ptr, grad_ptr,
-                    m_ptr, v_ptr,
-                    shard.size, tensor.size, tensor.size, shard.size, num_layers,
-                    learning_rate,
-                    beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
-
-        if (multi_gpu_config->zero_stage == 1) {
 #if MULTI_GPU
-            ncclCheck(ncclGroupStart());
-            for(int l = 0; l < num_layers; ++l) {
-                // gather updated shards of model->tensor_memory from each process
-                ncclCheck(ncclAllGather(param_ptr + l * tensor.size,
-                                        (floatX*) model->tensor_memory + tensor.offset + l * tensor.size,
-                                        shard.size, ncclFloatX,
-                                        multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
-            }
-            ncclCheck(ncclGroupEnd());
-#endif
+    if (multi_gpu_config->zero_stage == 1) {
+        ncclCheck(ncclGroupStart());
+        for (int id = 0; id < num_tensors; id++) {
+            TensorSpec param_tensor = tensor_specs[id];
+            TensorSpec opt_tensor = tensor_specs[id + tensors_start[PARAMETER_OPT_M]];
+
+            size_t sendcount = opt_tensor.num_elements * sizeof_dtype(opt_tensor.data_type);
+            void* recvbuff = param_tensor.ptr;
+            void* sendbuff = param_tensor.ptr + (multi_gpu_config->process_rank * sendcount);
+
+            ncclCheck(ncclAllGather(sendbuff, recvbuff, sendcount, ncclFloatX,
+                                    multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
         }
+        ncclCheck(ncclGroupEnd());
     }
-    */
+    // combine the absmax of all the GPUs
+    ncclCheck(ncclAllReduce(gpu_absmax_memory, gpu_absmax_memory, num_tensors, ncclFloat, ncclMax,
+                           multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
+#endif
+    // todo - smarter synchronization with double buffering etc...
+    cudaCheck(cudaDeviceSynchronize());
 
     // update FP8 scale & descale multipliers based on the absmax
     // since we just updated the parameters with the old scale,
     // the descale of parameters is "delayed" by one step.
     update_scales_from_absmax();
-
-    cudaCheck(cudaDeviceSynchronize());
 }
 
 float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {

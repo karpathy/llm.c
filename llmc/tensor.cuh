@@ -45,7 +45,7 @@ extern size_t tensors_elements[TT::COUNT];
 extern int num_tensor_specs;
 
 extern TT current_tensor_type; // todo - avoid having this somehow?
-extern int current_absmax_index; // todo - move into model struct?
+extern int absmax_history_index; // todo - move into model struct?
 extern float* gpu_scale_memory;
 extern unsigned int* gpu_absmax_memory;
 // end element of each tensor to optimise iterating through them in kernels
@@ -321,57 +321,69 @@ int add_layer_specs(int num_layers, const char* name, size_t total_elements, siz
 
 // ----------------------------------------------------------------------------
 
-// todo - should this be moved elsewhere? maybe to copy_and_fp8.h?
-__global__ void update_scale_descale_kernel(int num_tensor_specs) {
+// the 1st num_tensor_specs values are the absmax of the current/last step
+// the next [MAX_ABSMAX_HISTORY * num_tensor_specs] values are the history from previous steps
+__global__ void update_scale_descale_kernel(int num_tensor_specs, int absmax_history_index) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_tensor_specs) return;
 
-    // Get the absmax value for this tensor
-    unsigned int absmax_uint = gpu_absmax_memory_ptr[tid];
-    float absmax = __uint_as_float(absmax_uint);
+    // copy current absmax to history then clear it
+    gpu_absmax_memory_ptr[tid + (absmax_history_index * num_tensor_specs)] = gpu_absmax_memory_ptr[tid];
+    gpu_absmax_memory_ptr[tid] = 0;
+    float absmax = 0.0f;
 
-    // Calculate scale and descale
-    float scale = 1.0f;
-    float descale = 1.0f;
-    if (absmax != 0.0f) {
-        scale = 1.0f / absmax;
-        descale = absmax;
+    // get the maximum absmax from the history (todo - do we want to mitigate outliers here?)
+    #pragma unroll
+    for (int i = 1; i <= MAX_ABSMAX_HISTORY; i++) {
+        absmax = max(absmax, __uint_as_float(gpu_absmax_memory_ptr[tid + (i * num_tensor_specs)]));
     }
 
-    if  ((tensor_specs_ptr[tid].flags & TFlags::GRADIENT) && (tensor_specs_ptr[tid].tensor_type == TT::MULTIUSE)) {
-        // e5
+    // calculate scale based on the maximum absmax
+    float scale = (absmax != 0.0f) ? (1.0f / absmax) : 1.0f;
+
+    // FP8 e4m3 vs e5m2 (the latter is currently only used for activation gradients)
+    bool use_e5m2 = (tensor_specs_ptr[tid].data_type == DType::FP8E5M2);
+    #ifdef FAKE_FP8
+    if (tensor_specs_ptr[tid].flags & TFlags::GRADIENT && tensor_specs_ptr[tid].tensor_type == TT::MULTIUSE) {
+        use_e5m2 = true;
+    }
+    #endif
+
+    if  (use_e5m2) {
         if (absmax != 0.0f) {
             scale *= 32768.0f;
-            descale *= 1.0f/32768.0f;
         } else {
-            // default so that things are not as bad for gradients on the first step
+            // hacky default to avoid extreme gradient underflow on the 1st step
             scale = 4096.0f;
-            descale = 1.0f/4096.0f;
         }
-    } else {
-        // e4
+    } else if (tensor_specs_ptr[tid].data_type == DType::FP8E4M3) {
         // todo - power benefit of making sure top bit of exponent is (nearly always) zero?
         // this can be done simply by *not* multiplying here, so that the "maximum" is 1.0f
+        // we probably want some threshold for badly behaved parameters to use the full range
         //if (tensor_specs_ptr[tid].tensor_type != TT::PARAMETER || absmax >= 4.0f) {
         if (absmax != 0.0f) {
             scale *= 256.0f;
-            descale *= (1.0f/256.0f);
         }
     }
 
-    // Update gpu_scale_memory
-    // todo: descale should be delayed by one step for parameters (see comment in gpt2_update).
+    // update scale and descale memory
+    // descale must be delayed by one step for parameters (see comment in gpt2_update).
     gpu_scale_memory_ptr[tid * 2] = scale;
-    gpu_scale_memory_ptr[tid * 2 + 1] = descale;
 
-    // todo: circular buffer !!!
-    //gpu_absmax_memory[tid] = 0.0f;
+    if (tensor_specs_ptr[tid].tensor_type == TT::PARAMETER) {
+        float old_scale = gpu_scale_memory_ptr[tid * 2];
+        gpu_scale_memory_ptr[tid * 2 + 1] = 1.0f / old_scale;
+    } else {
+        gpu_scale_memory_ptr[tid * 2 + 1] = 1.0f / scale;
+    }
 }
 
 void update_scales_from_absmax() {
     int block_size = 256;
     int num_blocks = CEIL_DIV(num_tensor_specs, block_size);
-    update_scale_descale_kernel<<<num_blocks, block_size>>>(num_tensor_specs);
+
+    update_scale_descale_kernel<<<num_blocks, block_size>>>(num_tensor_specs, absmax_history_index + 1);
+    absmax_history_index = (absmax_history_index + 1) % MAX_ABSMAX_HISTORY;
 }
 
 // ----------------------------------------------------------------------------
