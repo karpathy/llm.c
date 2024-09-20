@@ -875,6 +875,7 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
 }
 
+
 __global__ void softmax_forward_kernel5_lowp(floatX* out, float inv_temperature,
                                              const floatX* inp, int N, int T) {
     // inp, out shape: (N, T, T), where N = B * NH
@@ -926,6 +927,7 @@ __global__ void softmax_forward_kernel5_lowp(floatX* out, float inv_temperature,
 
     // divide the whole row by the sum
     for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
+        // recalculation is faster than doing the round-trip through memory.
         float ev[4];
         for (int k = 0; k < 4; k++) {
             ev[k] = expf(inv_temperature * ((float)__ldcs(x + 4*i+k) - global_maxval));

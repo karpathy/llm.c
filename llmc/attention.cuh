@@ -143,6 +143,7 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
 
     // divide the whole row by the sum
     for (int i = lane_id; i < pos_by_4; i += WARP_SIZE) {
+        // recalculation is faster than doing the round-trip through memory.
         float ev[4];
         for (int k = 0; k < 4; k++) {
             ev[k] = expf(inv_temperature * ((float)__ldcs(x + 4*i+k) - global_maxval));
