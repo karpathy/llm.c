@@ -233,9 +233,9 @@ __global__ void attention_softmax_kernel1(float* att, const float* preatt,
 }
 
 // warp-level reduction for finding the maximum value
-__device__ float warpReduceMax(float val) {
+__device__ inline float warpReduceMax(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
     }
     return val;
 }
@@ -273,27 +273,10 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     // now within-warp reductions for maxval
     maxval = warpReduceMax(maxval);
 
-    // the 0th thread of each warp writes the maxval of that warp to shared memory
-    if (laneId == 0) maxvals[warpId] = maxval;
-    __syncthreads();
-
-    // now the 0th thread reduces the maxvals in shared memory, i.e. across warps
-    if (tid == 0) {
-        float val = maxvals[tid];
-        for (int i = 1; i < warpsPerBlock; i++) {
-            val = fmaxf(val, maxvals[i]);
-        }
-        // store the final max in the first position
-        maxvals[0] = val;
-    }
-    __syncthreads();
-    // broadcast the max to all threads
-    float offset = maxvals[0];
-
     // compute expf and write the result to global memory
     for (int i = tid; i < C; i += blockDim.x) {
         // subtract max for numerical stability
-        out[idx * C + i] = expf(x[i] - offset);
+        out[idx * C + i] = expf(x[i] - maxval);
     }
 
     // okay now we calculated exp(x - max(x))
@@ -892,7 +875,6 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
 }
 
-
 __global__ void softmax_forward_kernel5_lowp(floatX* out, float inv_temperature,
                                              const floatX* inp, int N, int T) {
     // inp, out shape: (N, T, T), where N = B * NH
@@ -943,10 +925,20 @@ __global__ void softmax_forward_kernel5_lowp(floatX* out, float inv_temperature,
     float norm = 1.f / sum;
 
     // divide the whole row by the sum
-    for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
-        // recalculation is faster than doing the round-trip through memory.
-        float ev = expf(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
-        __stcs(out + idx * T + i, (floatX)(ev * norm));
+    for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
+        float ev[4];
+        for (int k = 0; k < 4; k++) {
+            ev[k] = expf(inv_temperature * ((float)__ldcs(x + 4*i+k) - global_maxval));
+        }
+        for (int k = 0; k < 4; k++) {
+            __stcs(out + idx * T + 4*i+k, (floatX)(ev[k] * norm));
+        }
+    }
+
+    if(4*pos_by_4 + warp.thread_rank() <= own_pos) {
+
+        float ev = expf(inv_temperature * ((float)__ldcs(x + 4*pos_by_4 + warp.thread_rank()) - global_maxval));
+        __stcs(out + idx * T + 4*pos_by_4 + warp.thread_rank(), (floatX)(ev * norm));
     }
 }
 
