@@ -257,10 +257,7 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     // the number of warps per block. recall that blockDim.x is block_size
     int warpsPerBlock = blockDim.x / 32;
 
-    // shared[] must be allocated to have 2 * warpsPerBlock elements
-    // first half for max values, the second half for sum values
-    float* maxvals = shared;
-    float* sumvals = &shared[warpsPerBlock];
+    float* sumvals = shared;
 
     // one row of inp, i.e. inp[idx, :] of shape (C,)
     const float* x = inp + idx * C;
@@ -798,7 +795,7 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     // softmax. preatt is (B, NH, T, T) but we view it as (B * NH * T, T) and use the softmax kernel
     int softmax_block_size = 256;
     int grid_size = B * NH * T;
-    size_t shared_mem_size = 2 * softmax_block_size / 32 * sizeof(float);
+    size_t shared_mem_size = softmax_block_size / 32 * sizeof(float);
     softmax_forward_kernel4<<<grid_size, softmax_block_size, shared_mem_size>>>(att, preatt, B * NH * T, T);
 
     // new approach: first cuBLAS another batched matmul
