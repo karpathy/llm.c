@@ -188,12 +188,16 @@ int main(int argc, char **argv) {
     }
     printf("Using kernel %d\n", kernel_num);
 
+#ifdef DEBUG
     log_mat(doutp, B, T, Cout, hd, qh, nrep*kh, nrep*vh, "doutp");
+#endif // DEBUG
 
     // CPU reference calculate
     repkv_backward_cpu(dinp, inp, doutp, B, T, Cout, hd, qh, kh, vh);
 
+#ifdef DEBUG
     log_mat(dinp, B, T, Cin, hd, qh, kh, vh, "dinp");
+#endif // DEBUG
 
     // check the correctness of the kernel at all block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
