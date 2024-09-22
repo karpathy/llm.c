@@ -181,9 +181,6 @@ int main(int argc, char **argv) {
     cudaCheck(cudaMalloc(&d_inp, B * T * Cin * sizeof(float)));
     cudaCheck(cudaMalloc(&d_doutp, B * T * Cout * sizeof(float)));
 
-    // cudaCheck(memcpy_convert(d_dinp, inp, B * T * Cin));
-    // cudaCheck(memcpy_convert(d_doutp, doutp, B * T * Cout));
-
     // read kernel_num from command line
     int kernel_num = 1;
     if (argc > 1) {
@@ -198,7 +195,6 @@ int main(int argc, char **argv) {
 
     log_mat(dinp, B, T, Cin, hd, qh, kh, vh, "dinp");
 
-    //  TODO: update after CPU kernel
     // check the correctness of the kernel at all block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
     cudaCheck(cudaMemcpy(d_dinp, inp, B * T * Cin * sizeof(float), cudaMemcpyHostToDevice));
