@@ -67,6 +67,7 @@ global_norm: global_norm.cu
 
 permute: permute.cu
 repkv: repkv.cu
+repkv_backward: repkv_backward.cu
 
 # NCCL communication kernels
 nccl_all_reduce: nccl_all_reduce.cu
