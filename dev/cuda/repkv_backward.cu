@@ -68,11 +68,13 @@ void repkv_backward_cpu(float* dinp, const float* inp, const float* doutp,
     }
 }
 
-// TODO: update after CPU kernel
 // kernels
-__global__ void repkv_backward_kernel1(floatX* replicated_qkv,
-                               const floatX* gqa_qkv,
-                               int B, int N, int NH, int replicate_factor, int HD) {
+__global__ void repkv_backward_kernel1(floatX* dinp,
+                                const floatX* inp, const floatX* doutp,
+                                int B, int N, int NH, int replicate_factor, int HD) {
+
+    // TODO: update after CPU kernel
+#if 0
     // we have a single tensor gqa_qkv of shape (B, N, (NH + 2*(NH/replicate_factor)) * HD)
     // we want to replicate it into (B, N, 3 * NH * HD)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -100,6 +102,7 @@ __global__ void repkv_backward_kernel1(floatX* replicated_qkv,
     }
 
     replicated_qkv[idx_flat] = __ldcs(&gqa_qkv[inp_idx]);
+#endif
 }
 
 // TODO: update after CPU kernel
@@ -109,19 +112,19 @@ void repkv_backward1(floatX* dinp, const floatX* inp, const floatX* doutp,
     int total_threads = B * T * (3 * NH) * d;
     int num_blocks = ceil_div(total_threads, block_size);
     int replicate_factor = NH / NH_KV;
-    repkv_backward_kernel1<<<num_blocks, block_size>>>(out, inp, B, T, NH, replicate_factor, d);
+    repkv_backward_kernel1<<<num_blocks, block_size>>>(dinp, inp, doutp, B, T, NH, replicate_factor, d);
     cudaCheck(cudaGetLastError());
 }
 
 // TODO: update after CPU kernel
 // kernel dispatcher
 void repkv_backward(int kernel_num,
-                   floatX* out, const floatX* inp,
+                   floatX* dinp, const floatX* inp, const floatX* doutp,
                    int B, int T, int NH, int NH_KV, int d,
                    int block_size) {
     switch (kernel_num) {
         case 1:
-            repkv_backward1(out, inp, B, T, NH, NH_KV, d, block_size);
+            repkv_backward1(dinp, inp, doutp, B, T, NH, NH_KV, d, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -209,7 +212,7 @@ int main(int argc, char **argv) {
     cudaCheck(cudaMalloc(&d_inp, B * T * Cin * sizeof(float)));
     cudaCheck(cudaMalloc(&d_doutp, B * T * Cout * sizeof(float)));
 
-    // cudaCheck(memcpy_convert(d_inp, inp, B * T * Cin));
+    // cudaCheck(memcpy_convert(d_dinp, inp, B * T * Cin));
     // cudaCheck(memcpy_convert(d_doutp, doutp, B * T * Cout));
 
     // read kernel_num from command line
@@ -229,16 +232,18 @@ int main(int argc, char **argv) {
     //  TODO: update after CPU kernel
     // check the correctness of the kernel at all block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
-    cudaCheck(cudaMemcpy(d_inp, inp, B * T * Cin * sizeof(float), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(d_dinp, inp, B * T * Cin * sizeof(float), cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(d_doutp, doutp, B * T * Cout * sizeof(float), cudaMemcpyHostToDevice));
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
-        repkv_backward(kernel_num, d_out, d_inp, B, T, qh, kh, hd, block_size);
+        repkv_backward(kernel_num, d_dinp, d_inp, d_doutp, B, T, qh, kh, hd, block_size);
         validate_result(d_dinp, dinp, "out", B * T * Cin, 1e-5f);
     }
     printf("All results match. Starting benchmarks.\n\n");
 
+    // TODO: update
+#if 0
     // now benchmark
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
@@ -247,6 +252,7 @@ int main(int argc, char **argv) {
                                             d_out, d_inp, B, T, qh, kh, hd, block_size);
         printf("block_size %4d time %.4f ms\n", block_size, elapsed_time);
     }
+#endif
 
     // free memory
     free(inp);
