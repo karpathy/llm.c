@@ -27,15 +27,12 @@ block_size 128 seems fastest on H100
 #include "common.h"
 
 // cpu reference code
-void repkv_backward_cpu(float* dinp, const float* inp, const float* dout,
+void repkv_backward_cpu(float* dinp, const float* inp, const float* doutp,
                        const int B, const int T, const int Cout,
                        const int hd, const int qh, const int kh, const int vh) {
 
     assert(Cout == (hd * (3 * qh)));
     assert(kh == vh);
-    // assert((kh % nrep == 0) && (vh % nrep == 0));
-    // int kh_g = kh / nrep;
-    // int vh_g = vh / nrep;
 
     int nrep = qh / kh; // number of times to replicate key/value vectors
 
@@ -43,9 +40,8 @@ void repkv_backward_cpu(float* dinp, const float* inp, const float* dout,
 
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            // seek to the input position dout[b,t,:]
-            // TODO check
-            const float* x = dout + b * T * Cout + t * Cout;
+            // seek to the input position doutp[b,t,:]
+            const float* x = doutp + b * T * Cout + t * Cout;
             // seek to the output position out[b,t,:]
             float* y = dinp + b * T * Cin + t * Cin;
             // copy all the query vectors, no changes
@@ -54,8 +50,6 @@ void repkv_backward_cpu(float* dinp, const float* inp, const float* dout,
             y += hd * qh; // advance output pointer
             // copy key vectors, and replicate them nrep times
             for (int h = 0; h < kh; h++) {
-                // initilize
-                // for (int i = 0; i < hd; i++) { y[i] = 0.0f; }
                 for (int n = 0; n < nrep; n++) {
                     for (int i = 0; i < hd; i++) { y[i] += x[i]; }
                     x += hd; // advance input pointer
@@ -64,8 +58,6 @@ void repkv_backward_cpu(float* dinp, const float* inp, const float* dout,
             }
             // copy value vectors, and replicate them nrep times
             for (int h = 0; h < vh; h++) {
-                // initilize
-                // for (int i = 0; i < hd; i++) { y[i] = 0.0f; }
                 for (int n = 0; n < nrep; n++) {
                     for (int i = 0; i < hd; i++) { y[i] += x[i]; }
                     x += hd; // advance input pointer
@@ -112,7 +104,8 @@ __global__ void repkv_backward_kernel1(floatX* replicated_qkv,
 
 // TODO: update after CPU kernel
 // kernel launchers
-void repkv_backward1(floatX* out, const floatX* inp, int B, int T, int NH, int NH_KV, int d, int block_size) {
+void repkv_backward1(floatX* dinp, const floatX* inp, const floatX* doutp,
+    const int B, const int T, const int NH, const int NH_KV, const int d, int block_size) {
     int total_threads = B * T * (3 * NH) * d;
     int num_blocks = ceil_div(total_threads, block_size);
     int replicate_factor = NH / NH_KV;
@@ -193,6 +186,7 @@ int main(int argc, char **argv) {
     int qh = 32; // num query heads
     int kh = 8; // num key heads
     int vh = 8; // num value heads
+    int nrep = qh/kh;
 #endif
 
     int deviceIdx = 0;
@@ -200,7 +194,6 @@ int main(int argc, char **argv) {
 
     int Cout = hd * (qh * 3); // out, upstream channels
     int Cin = hd * (qh + kh + vh); // in, downstream channels
-    // int nrep = 4;
 
     // allocate (and fill) CPU memory
     float* dinp = (float*)malloc(B * T * Cin * sizeof(float));
@@ -208,14 +201,16 @@ int main(int argc, char **argv) {
     float* inp = make_random_float(B * T * Cin);
     float* doutp = make_random_float(B * T * Cout * sizeof(float));
 
-    // TODO: update after CPU kernel
     // allocate GPU memory
-#if 0
+    float* d_dinp;
     float* d_inp;
-    float* d_out;
-    cudaCheck(cudaMalloc(&d_inp, B * T * C * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_out, B * T * Cout * sizeof(float)));
-#endif
+    float* d_doutp;
+    cudaCheck(cudaMalloc(&d_dinp, B * T * Cin * sizeof(float)));
+    cudaCheck(cudaMalloc(&d_inp, B * T * Cin * sizeof(float)));
+    cudaCheck(cudaMalloc(&d_doutp, B * T * Cout * sizeof(float)));
+
+    // cudaCheck(memcpy_convert(d_inp, inp, B * T * Cin));
+    // cudaCheck(memcpy_convert(d_doutp, doutp, B * T * Cout));
 
     // read kernel_num from command line
     int kernel_num = 1;
@@ -226,22 +221,21 @@ int main(int argc, char **argv) {
 
     log_mat(doutp, B, T, Cout, hd, qh, nrep*kh, nrep*vh, "doutp");
 
-    // TODO: update
     // CPU reference calculate
     repkv_backward_cpu(dinp, inp, doutp, B, T, Cout, hd, qh, kh, vh);
 
-    log_mat(dinp, B, T, Cout, hd, qh, kh, vh, "dinp");
+    log_mat(dinp, B, T, Cin, hd, qh, kh, vh, "dinp");
 
     //  TODO: update after CPU kernel
-#if 0
     // check the correctness of the kernel at all block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
-    cudaCheck(cudaMemcpy(d_inp, inp, B * T * C * sizeof(float), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(d_inp, inp, B * T * Cin * sizeof(float), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(d_doutp, doutp, B * T * Cout * sizeof(float), cudaMemcpyHostToDevice));
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
-        repkv_forward(kernel_num, d_out, d_inp, B, T, qh, kh, hd, block_size);
-        validate_result(d_out, out, "out", B * T * Cout, 1e-5f);
+        repkv_backward(kernel_num, d_out, d_inp, B, T, qh, kh, hd, block_size);
+        validate_result(d_dinp, dinp, "out", B * T * Cin, 1e-5f);
     }
     printf("All results match. Starting benchmarks.\n\n");
 
@@ -249,18 +243,18 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         int repeat_times = 1000;
-        float elapsed_time = benchmark_kernel(repeat_times, repkv_forward, kernel_num,
+        float elapsed_time = benchmark_kernel(repeat_times, repkv_backward, kernel_num,
                                             d_out, d_inp, B, T, qh, kh, hd, block_size);
         printf("block_size %4d time %.4f ms\n", block_size, elapsed_time);
     }
-#endif
+
     // free memory
     free(inp);
     free(dinp);
     free(doutp);
 
-    //  TODO: update after CPU kernel
-    // cudaCheck(cudaFree(d_inp));
-    // cudaCheck(cudaFree(d_out));
+    cudaCheck(cudaFree(d_dinp));
+    cudaCheck(cudaFree(d_inp));
+    cudaCheck(cudaFree(d_doutp));
 }
 
