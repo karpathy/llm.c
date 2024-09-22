@@ -1,6 +1,6 @@
 /*
 
-TODO: update after CPU kernel
+TODO: update the description
 
 Layer that takes a QKV tensor of shape (B, T, C) and replicates the K,V
 some number of times. For example, if B=4, T=64, C=6144, and we have that:
@@ -14,8 +14,8 @@ We want to replicate the key/value vectors 4X, so that we get:
 Each of these vectors should be replicated by simple copying/concat 4X times.
 
 Compile and run as:
-make repkv
-./repkv
+make repkv_backward
+./repkv_backward 1
 
 block_size 128 seems fastest on H100
 */
@@ -74,38 +74,8 @@ __global__ void repkv_backward_kernel1(floatX* dinp,
                                 int B, int N, int NH, int replicate_factor, int HD) {
 
     // TODO: update after CPU kernel
-#if 0
-    // we have a single tensor gqa_qkv of shape (B, N, (NH + 2*(NH/replicate_factor)) * HD)
-    // we want to replicate it into (B, N, 3 * NH * HD)
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * N * 3 * NH * HD) { return; }
-    int idx_flat = idx; // keep backup
-
-    // decode the output index
-    int d = idx % HD;
-    idx /= HD;
-    int nh = idx % NH;
-    idx /= NH;
-    int c = idx % 3;
-    idx /= 3;
-    int n = idx % N;
-    int b = idx / N;
-
-    int inp_idx;
-    int nh_total = NH + 2 * (NH / replicate_factor);
-    if (c == 0) {
-        inp_idx = b * N * nh_total * HD + n * nh_total * HD + 0 * NH * HD + nh * HD + d;
-    } else if (c == 1) {
-        inp_idx = b * N * nh_total * HD + n * nh_total * HD + 1 * NH * HD + (nh / replicate_factor) * HD + d;
-    } else {
-        inp_idx = b * N * nh_total * HD + n * nh_total * HD + (NH * HD + (NH / replicate_factor) * HD) + (nh / replicate_factor) * HD + d;
-    }
-
-    replicated_qkv[idx_flat] = __ldcs(&gqa_qkv[inp_idx]);
-#endif
 }
 
-// TODO: update after CPU kernel
 // kernel launchers
 void repkv_backward1(floatX* dinp, const floatX* inp, const floatX* doutp,
     const int B, const int T, const int NH, const int NH_KV, const int d, int block_size) {
@@ -116,7 +86,6 @@ void repkv_backward1(floatX* dinp, const floatX* inp, const floatX* doutp,
     cudaCheck(cudaGetLastError());
 }
 
-// TODO: update after CPU kernel
 // kernel dispatcher
 void repkv_backward(int kernel_num,
                    floatX* dinp, const floatX* inp, const floatX* doutp,
@@ -132,6 +101,7 @@ void repkv_backward(int kernel_num,
     }
 }
 
+// TODO: update
 void log_mat(float *inp, int B, int T, int C, int hd, int qh, int kh, int vh, char *title)
 {
     printf("%s -----\n", title);
@@ -169,12 +139,11 @@ void log_mat(float *inp, int B, int T, int C, int hd, int qh, int kh, int vh, ch
     printf("\n");
 }
 
-// TODO: update after CPU kernel
 // tester
 int main(int argc, char **argv) {
     srand(0);
 
-#ifndef DEBUG
+#ifdef DEBUG
     int B = 1;
     int T = 2;
     int hd = 3; // head dim
