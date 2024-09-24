@@ -233,9 +233,9 @@ __global__ void attention_softmax_kernel1(float* att, const float* preatt,
 }
 
 // warp-level reduction for finding the maximum value
-__device__ inline float warpReduceMax(float val) {
+__device__ float warpReduceMax(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
+        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
     }
     return val;
 }
@@ -257,7 +257,10 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     // the number of warps per block. recall that blockDim.x is block_size
     int warpsPerBlock = blockDim.x / 32;
 
-    float* sumvals = shared;
+    // shared[] must be allocated to have 2 * warpsPerBlock elements
+    // first half for max values, the second half for sum values
+    float* maxvals = shared;
+    float* sumvals = &shared[warpsPerBlock];
 
     // one row of inp, i.e. inp[idx, :] of shape (C,)
     const float* x = inp + idx * C;
@@ -270,10 +273,27 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     // now within-warp reductions for maxval
     maxval = warpReduceMax(maxval);
 
+    // the 0th thread of each warp writes the maxval of that warp to shared memory
+    if (laneId == 0) maxvals[warpId] = maxval;
+    __syncthreads();
+
+    // now the 0th thread reduces the maxvals in shared memory, i.e. across warps
+    if (tid == 0) {
+        float val = maxvals[tid];
+        for (int i = 1; i < warpsPerBlock; i++) {
+            val = fmaxf(val, maxvals[i]);
+        }
+        // store the final max in the first position
+        maxvals[0] = val;
+    }
+    __syncthreads();
+    // broadcast the max to all threads
+    float offset = maxvals[0];
+
     // compute expf and write the result to global memory
     for (int i = tid; i < C; i += blockDim.x) {
         // subtract max for numerical stability
-        out[idx * C + i] = expf(x[i] - maxval);
+        out[idx * C + i] = expf(x[i] - offset);
     }
 
     // okay now we calculated exp(x - max(x))
@@ -795,7 +815,7 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     // softmax. preatt is (B, NH, T, T) but we view it as (B * NH * T, T) and use the softmax kernel
     int softmax_block_size = 256;
     int grid_size = B * NH * T;
-    size_t shared_mem_size = softmax_block_size / 32 * sizeof(float);
+    size_t shared_mem_size = 2 * softmax_block_size / 32 * sizeof(float);
     softmax_forward_kernel4<<<grid_size, softmax_block_size, shared_mem_size>>>(att, preatt, B * NH * T, T);
 
     // new approach: first cuBLAS another batched matmul
