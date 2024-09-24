@@ -92,162 +92,149 @@ def plot_pareto(smac: AbstractFacade, incumbents: list[Configuration]) -> None:
     plt.savefig(f"pareto_front_{log_file_name}.png", format='png', dpi=300)  # Save as PNG with high resolution
     plt.show()
     
-
-def main_smac(args):
-    
-    setup_logger('HPO_gpt2')
-    logger = logging.getLogger('HPO_gpt2')
-    
-    device = "cuda" if torch.cuda.is_available() else "cpu"  
-    logger.info(f'============Starting============\n')
-    hp_details = []
-    logger.info("\t== Creating the Partial/Target/Evaluation function ==")
-    # partial_function = partial(train_eval_hpo, 
-    #                            input_bin=args.input_bin, 
-    #                            input_val_bin=args.input_val_bin, 
-    #                            model=args.model, 
-    #                            batch_size=args.batch_size, 
-    #                            total_batch_size=args.total_batch_size, 
-    #                            warmup_iters=args.warmup_iters, 
-    #                            learning_rate_decay_frac=args.learning_rate_decay_frac, 
-    #                            grad_clip=args.grad_clip, 
-    #                            val_max_steps=args.val_max_steps, 
-    #                            dtype=args.dtype, 
-    #                            zero_stage=args.zero_stage,
-    #                            logger=logger, 
-    #                            multi_objective=args.multiobjective,
-    #                         #    hp_details=hp_details
-    #                            )
-    
-    partial_function = train_eval_hpo
-
-    logger.info(f"\t{print_with_tabs(partial_function,1)}")
-    
-    
-    # Define the configuration space
-    cs = ConfigurationSpace()
-    learning_rate = UniformFloatHyperparameter("learning_rate", 1e-6, 1e-3, default_value=1e-4, log=True)
-    weight_decay = UniformFloatHyperparameter("weight_decay", 1e-6, 0.1, default_value=0.01, log=True)
-    sequence_length = UniformIntegerHyperparameter("sequence_length", 256, 1024, default_value=1024)
-    cs.add_hyperparameters([learning_rate, weight_decay, sequence_length])
-
-    logger.info(f"\t== SMAC ConfigSpace ==\n\t{print_with_tabs(cs,1)}")
-
-
-    if args.multiobjective:
-        scenario = Scenario(
-                    cs,
-                    name="SMAC_trial",
-                    objectives=["val_loss", "train_time"],
-                    walltime_limit=23*60*60,#60*60*23,  
-                    n_trials=args.n_trials, #500,  # Evaluate max 500 different trials
-                    min_budget=20*60, #0.75*60*60,  # Train the MLP using a hyperparameter configuration for at least 5 epochs
-                    max_budget=23*60*60,  # Train the MLP using a hyperparameter configuration for at most 25 epochs
-                    n_workers=1,
-                    seed=0,
-                    deterministic=True
-        )
-    else:
-        scenario = Scenario(
-            cs,
-            name="SMAC_trial",
-            # objectives=["val_loss", "train_time"],
-            walltime_limit=23*60*60, #60*60*23,  
-            n_trials=args.n_trials, #500,  # Evaluate max 500 different trials
-            min_budget=20*60,#0.75*60*60,  # Train the MLP using a hyperparameter configuration for at least 5 epochs
-            max_budget=23*60*60,  # Train the MLP using a hyperparameter configuration for at most 25 epochs
-            n_workers=1,
-            seed=0,
-            deterministic=True
-        )
-
-    logger.info(f"\t{print_with_tabs(scenario,1)}")
-
-    # # Set up the Gaussian Process model with Matern Kernel
-    # kernel = MaternKernel(nu=2.5)  # Matern kernel with nu=2.5 (commonly used)
-    if args.surrogate == "gp":
-        kernel = MaternKernel(nu=2.5) * ConstantKernel(1.0, constant_value_bounds="fixed")  # Radial Basis Function (RBF) kernel
-        model = GaussianProcess(configspace=cs, kernel=kernel)
-    else:
-        model = RandomForest(configspace=cs)
+class AskTellSMACOptimizer:
+    def __init__(self, args):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.logger = self.setup_logger('HPO_gpt2')
+        self.logger.info(f'============Starting============\n')
         
-    multi_objective_algorithm = ParEGO(scenario)
+        self.args = args
+        self.hp_details = []
+        
+        self.partial_function = train_eval_hpo
+        
+        self.logger.info("\t== Creating the Partial/Target/Evaluation function ==")
+        self.logger.info(f"\t{self.partial_function}")
+        
+        # Define the configuration space
+        self.cs = ConfigurationSpace()
+        learning_rate = UniformFloatHyperparameter("learning_rate", 1e-6, 1e-3, default_value=1e-4, log=True)
+        weight_decay = UniformFloatHyperparameter("weight_decay", 1e-6, 0.1, default_value=0.01, log=True)
+        sequence_length = UniformIntegerHyperparameter("sequence_length", 256, 1024, default_value=1024)
+        self.cs.add_hyperparameters([learning_rate, weight_decay, sequence_length])
+        
+        self.logger.info(f"\t== SMAC ConfigSpace ==\n\t{self.cs}")
+        
+        # Create the scenario
+        self.scenario = self.create_scenario(args.multiobjective)
+        
+        # Choose the model
+        self.model = self.select_model(args.surrogate)
 
-    # rf_model = RandomForest(configspace=cs)
-    # Use Expected Improvement (EI) as the acquisition function
-    # acquisition_function = EI(model=gp_model)
-    initial_design = MultiFidelityFacade.get_initial_design(scenario, n_configs=args.n_initial)
-    if args.multiobjective:
-        intensifier = SuccessiveHalving(scenario, eta=args.eta, incumbent_selection="highest_budget")
-    else:
-        intensifier = SuccessiveHalving(scenario, eta=args.eta)
+        # Select multi-objective algorithm if needed
+        self.multi_objective_algorithm = ParEGO(self.scenario) if args.multiobjective else None
+        
+        # Initialize intensifier
+        self.initial_design = MultiFidelityFacade.get_initial_design(self.scenario, n_configs=args.n_initial)
+        self.intensifier = SuccessiveHalving(self.scenario, eta=args.eta, incumbent_selection="highest_budget" if args.multiobjective else None)
+
+        # Initialize SMAC optimizer
+        self.smac = self.create_smac()
+        
+        self.logger.info(f"\t Multi-objective optimization: {args.multiobjective}")
+        self.logger.info(f"\t Number of initial configurations: {args.n_initial}")
+        self.logger.info(f"\t Number of trials: {args.n_trials}")
+        self.logger.info(f"\t eta: {args.eta}")
     
-    logger.info("\t== Creating SMAC MultiFidelityFacade ==")
-
-    if args.multiobjective:
-        smac = MultiFidelityFacade(
-            scenario=scenario,
-            target_function=partial_function,
-            initial_design=initial_design,
-            intensifier=intensifier,
-            multi_objective_algorithm=multi_objective_algorithm,
-            overwrite=False,            
-            model=model,
-            # acquisition_function=acquisition_function,
-        )
-    else:
-        smac = MultiFidelityFacade(
-            scenario=scenario,
-            target_function=partial_function,
-            initial_design=initial_design,
-            intensifier=intensifier,
-            overwrite=False,            
-            model=model,
-            # acquisition_function=acquisition_function,
-        )
-
-    logger.info(f"\t{print_with_tabs(smac, 1)}")
-    logger.info(f"\t== SMAC Configuration ==\n\t{print_with_tabs(smac._scenario,1)}")
-    print(f"== SMAC Configuration ==\n\t{print_with_tabs(smac._scenario,1)}")
-    logger.info(f"\t== SMAC Configuration ==\n\t{print_with_tabs(smac._intensifier,1)}")
-    print(f"== SMAC Configuration ==\n\t{print_with_tabs(smac._intensifier,1)}")
-    logger.info(f"\t== SMAC Configuration ==\n\t{print_with_tabs(smac._multi_objective_algorithm,1)}")
-    print(f"== SMAC Configuration ==\n\t{print_with_tabs(smac._multi_objective_algorithm,1)}")
-    logger.info(f"\t== SMAC Configuration ==\n\t{print_with_tabs(smac._model,1)}")
-    print(f"== SMAC Configuration ==\n\t{print_with_tabs(smac._model,1)}")
-
-    logger.info(f"\t Multi-objective optimization: {args.multiobjective}")
-    print(f"Multi-objective optimization: {args.multiobjective}")
-    logger.info(f"\t Number of initial configurations: {args.n_initial}")
-    print(f"Number of initial configurations: {args.n_initial}")
-    logger.info(f"\t Number of trials: {args.n_trials}")
-    print(f"Number of trials: {args.n_trials}")
-    logger.info(f"\t eta: {args.eta}")
-    print(f"eta: {args.eta}")
-    logger.info("\t== Starting the optimization ==")
+    def setup_logger(self, name):
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(name)
+        return logger
     
-    # Start the optimization
-    # incumbents = smac.optimize()
-    
-    for i in range(args.n_trials):
-        info = smac.ask()
-        assert info.seed is not None
-        # print(info)
-        cost = train_eval_hpo(info.config, budget=info.budget, seed=info.seed)
-        value = TrialValue(cost=cost, time=0.5)
+    def create_scenario(self, multiobjective):
+        if multiobjective:
+            return Scenario(
+                self.cs,
+                name="SMAC_trial",
+                objectives=["val_loss", "train_time"],
+                walltime_limit=23*60*60,
+                n_trials=self.args.n_trials,
+                min_budget=20*60,
+                max_budget=23*60*60,
+                n_workers=1,
+                seed=0,
+                deterministic=True
+            )
+        else:
+            return Scenario(
+                self.cs,
+                name="SMAC_trial",
+                walltime_limit=23*60*60,
+                n_trials=self.args.n_trials,
+                min_budget=20*60,
+                max_budget=23*60*60,
+                n_workers=1,
+                seed=0,
+                deterministic=True
+            )
 
-        smac.tell(info, value)
+    def select_model(self, surrogate_type):
+        if surrogate_type == "gp":
+            kernel = MaternKernel(nu=2.5) * ConstantKernel(1.0, constant_value_bounds="fixed")
+            return GaussianProcess(configspace=self.cs, kernel=kernel)
+        else:
+            return RandomForest(configspace=self.cs)
 
-    incumbents = smac.intensifier.get_incumbents()
-    # Print the best configuration
-    print(f"Best found configuration: {incumbents}")
+    def create_smac(self):
+        if self.args.multiobjective:
+            return MultiFidelityFacade(
+                scenario=self.scenario,
+                target_function=self.partial_function,
+                initial_design=self.initial_design,
+                intensifier=self.intensifier,
+                multi_objective_algorithm=self.multi_objective_algorithm,
+                overwrite=False,            
+                model=self.model,
+            )
+        else:
+            return MultiFidelityFacade(
+                scenario=self.scenario,
+                target_function=self.partial_function,
+                initial_design=self.initial_design,
+                intensifier=self.intensifier,
+                overwrite=False,            
+                model=self.model,
+            )
     
-    if args.multiobjective:
-        plot_pareto(smac, incumbents)
+    def ask(self):
+        """
+        Ask for a new candidate configuration from the optimizer.
+        """
+        return self.smac.ask()
+
+    def tell(self, config, result):
+        """
+        Tell the optimizer the result of evaluating the candidate.
+        Args:
+        - config: The configuration evaluated.
+        - result: The outcome or evaluation metric for the configuration.
+        """
+        self.smac.tell(config, result)
     
-    global log_file_name
-    pickle.dump(incumbents, open(f"{log_file_name}_incumbents.pkl", "wb"))
-    pickle.dump(smac, open(f"{log_file_name}_smac.pkl", "wb"))
+    def optimize(self, n_trials=None):
+        """
+        Run the optimization loop for a given number of trials.
+        """
+        n_trials = n_trials if n_trials is not None else self.args.n_trials
+        
+        for i in range(n_trials):
+            info = self.ask()
+            assert info.seed is not None
+            cost = self.partial_function(info.config, budget=info.budget, seed=info.seed)
+            value = TrialValue(cost=cost, time=0.5)  # Assuming a sample result, this can be customized.
+            self.tell(info, value)
+        
+        incumbents = self.smac.intensifier.get_incumbents()
+        return incumbents
+    
+    def save_results(self, incumbents):
+        """
+        Save the optimization results to disk.
+        """
+        global log_file_name
+        pickle.dump(incumbents, open(f"{log_file_name}_incumbents.pkl", "wb"))
+        pickle.dump(self.smac, open(f"{log_file_name}_smac.pkl", "wb"))
+
 
 
 
@@ -292,10 +279,13 @@ if __name__ == "__main__":
         log_folder = './logs_cluster/'
         maximum_runtime = set_queue('mlhiwi', log_folder)
         submit_func = ex.submit
-        job = submit_func(main_smac, args)
+        ask_tell_interface = AskTellSMACOptimizer(args)
+        main_smac = ask_tell_interface.optimize
+        job = submit_func(main_smac)
 
         print(job)
     else:
         print("Running on local machine")
         print(args.slurm)
-        main_smac(args)
+        ask_tell_interface = AskTellSMACOptimizer(args)
+        ask_tell_interface.optimize()

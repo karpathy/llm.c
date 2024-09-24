@@ -14,30 +14,94 @@ import torch.distributed as dist
 from ConfigSpace import Configuration, ConfigurationSpace, Float
 import numpy as np
 import pickle
+import logging
+import datetime
+import wandb
+
+
+def setup_logger(name=None):
+
+    if name is None:
+        logger = logging.getLogger(__name__)
+    else:
+        logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+
+    current_time = datetime.datetime.now()
+    formatted_date = current_time.strftime("%Y-%m-%d_%H-%M-%S")
+
+    # File handler
+    file_handler = logging.FileHandler(f'logs/smac_{formatted_date}.log')
+
+    global log_file_name
+    log_file_name = f'logs/smac_{formatted_date}'
+    #formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter('%(message)s',  datefmt='%H:%M:%S')
+    file_handler.setFormatter(formatter)
+
+    # Add the handler to the logger
+    logger.addHandler(file_handler)
+    logger.propagate = False
+    logging.captureWarnings(True)
+
+def print_with_tabs(obj, num_tabs=1):
+    # Convert the object to a string representation
+    obj_str = str(obj)
+
+    # Split the string representation into lines
+    lines = obj_str.split('\n')
+
+    # first line should not be tabbed
+    tabbed_lines = ["\t"*num_tabs +lines[0] + "\n"]
+
+    # Add a tab at the beginning of each line
+    tabbed_lines = tabbed_lines + ['\t'*(num_tabs+1) + line + "\n" for line in lines[1:]]
+
+    # Join the tabbed lines back into a single string and print
+    return "".join(tabbed_lines).rstrip("\n")
+
+
+# setup_logger('train_eval_hpo')
+logger = logging.getLogger('HPO_gpt2')
 
 
 def train_eval_hpo(
     config_space: ConfigurationSpace, 
-    seed: int = 0,
-    budget: int = 10,
-    input_bin: str = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin",
-    input_val_bin: str = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin",
+    seed: int,
+    budget: int,
+    input_bin: str = "dev/data/fineweb10B/fineweb_train_*.bin",
+    input_val_bin: str = "dev/data/fineweb10B/fineweb_val_*.bin",
     model: str = "d6",
-    batch_size: int = 4,
+    batch_size: int = 8,
     # sequence_length: int = 1024,
     total_batch_size: int = -1,
     # learning_rate: float = 1e-4,
-    warmup_iters: int = 0,
-    learning_rate_decay_frac: float = 1.0,
+    warmup_iters: int = 700, #0,
+    learning_rate_decay_frac: float = 0.0, #1.0,
     # weight_decay: float = 0.0,
     grad_clip: float = 1.0,
-    val_max_steps: int = 20,
+    val_max_steps: int = 200,
     dtype: str = "float32",
-    zero_stage: int = 0,
-    logger = None,
+    zero_stage: int = 1,# 0,
+    # logger = None,
     multi_objective: bool = False,
 ):
 
+    run = wandb.init(
+            project="LLMs",
+            entity="o-swelam",
+            # Track hyperparameters and run metadata
+            # add the inputs of the function
+            config={"config_space":config_space.get_dictionary(), "seed": seed, "budget": budget, 
+                    "input_bin": input_bin, "input_val_bin": input_val_bin, "model": model, "batch_size": batch_size,
+                    "total_batch_size": total_batch_size, "warmup_iters": warmup_iters, "learning_rate_decay_frac": learning_rate_decay_frac,
+                    "grad_clip": grad_clip, "val_max_steps": val_max_steps, "dtype": dtype, "zero_stage": zero_stage, "multi_objective": multi_objective},
+            name="lr_" + str(config_space["learning_rate"]) + "_wd_" + str(config_space["weight_decay"]) + "_sl_" + str(config_space["sequence_length"]) + "_seed_" + str(seed) 
+            + "_bud_" + str(budget),
+        )
+
+    # setup_logger()
+    # logger = logging.getLogger(__name__)
     if os.path.exists("hp_details.pkl"):
         with open("hp_details.pkl", "rb") as f:
             hp_details = pickle.load(f)
@@ -55,7 +119,7 @@ def train_eval_hpo(
     weight_decay = config_space["weight_decay"]
     sequence_length = config_space["sequence_length"]
     
-    save_name = f"{model}_bs_{batch_size}_lr_{learning_rate}_wd_{weight_decay}_seq_{sequence_length}_budget_{budget}"
+    save_name = f"{model}_bs_{batch_size}_lr_{learning_rate}_wd_{weight_decay}_seq_{sequence_length}"
        
     logger.info(f"{section_tab}== Running train_eval_hpo ==")
     # log all the arguments
@@ -135,15 +199,6 @@ def train_eval_hpo(
     # set up a context manager following the desired dtype and device
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
     ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
-
-    # rng / reproducibility
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
-
-
-    # init (and write) the tokenizer
-    enc = tiktoken.get_encoding("gpt2")
 
     model_name = model
     # init the model, either from scratch or from OpenAI pretrained checkpoint
@@ -276,7 +331,7 @@ def train_eval_hpo(
         lossf = lossf.item()
     
         training_losses.append(lossf)
-        if len(training_losses) > val_max_steps:
+        if len(training_losses) > 200:
             training_losses.pop(0)
         
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -290,6 +345,7 @@ def train_eval_hpo(
         if step % 200 == 0:
             logger.info(f"{section_tab} \tStep: {step}/{num_iterations} | Loss: {lossf} | LR: {get_lr(step)} | Norm: {norm}")
             print(f"Step: {step}/{num_iterations} | Loss: {lossf} | LR: {get_lr(step)} | Norm: {norm}")
+            wandb.log({"avg train loss": np.mean(training_losses), "lr": lr, "step":step, "remaining_time": budget - (time.time() - start_time)})
         
         # wait on the CPU for all device work to end so we get accurate per-iteration timings below
         if device == "mps":
@@ -302,7 +358,7 @@ def train_eval_hpo(
         timings.append(t1-t0)
         step += 1
         
-        if step % 1000 == 0:
+        if step % 2000 == 0:
             # store scheduler and optimizer state and model weights
             ckpt = {
                 'model_state_dict': model.state_dict(),
@@ -311,7 +367,21 @@ def train_eval_hpo(
                 'step': step,
             }
             torch.save(ckpt, f"./dev/models/{save_name}.pth")
-                    
+        
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                val_loss = 0.0
+                for i in range(val_max_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    _, loss = model(x, y, return_logits=False)
+                    val_loss += loss.item()
+                    if i % 50 == 0:
+                        print(f"Validation step: {i}/{val_max_steps} | Loss: {val_loss / (i+1)}")
+                val_loss /= val_max_steps
+                wandb.log({"val_loss": val_loss, "step":step, "remaining_time": budget - (time.time() - start_time)})
+        
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
     
@@ -343,6 +413,8 @@ def train_eval_hpo(
                 + section_tab + f"\tval_loss: {val_loss} \n"
                 + section_tab + f"\ttrain_time: {train_time} \n")
     print(f"val_loss: {val_loss} \n train_time: {train_time}")
+    wandb.log({"val_loss": val_loss, "step":step})
+
     train_loss = np.mean(training_losses)
     
     hp_details.append({"val_loss": val_loss, "train_loss": train_loss, "train_time": train_time, "model_size": model_to_size[model_name],
@@ -351,6 +423,8 @@ def train_eval_hpo(
     
     with open(f"hp_details.pkl", "wb") as f:
         pickle.dump(hp_details, f)
+        
+    wandb.finish()
     
     # print(f"hp_details: {hp_details}")
     
