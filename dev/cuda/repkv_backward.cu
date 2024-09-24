@@ -72,8 +72,53 @@ void repkv_backward_cpu(float* dinp, const float* inp, const float* doutp,
 __global__ void repkv_backward_kernel1(floatX* dinp,
                                 const floatX* inp, const floatX* doutp,
                                 int B, int N, int NH, int replicate_factor, int HD) {
+    // we have a single tensor doutp of shapae of (B, N 3 * NH * HD)
+    // we want to reduce sum (for K and V) into  (B, N, (NH + 2*(NH/replicate_factor)) * HD)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // TODO: update after CPU kernel
+    // ??
+    if (idx >= B * N * 3 * NH * HD) { return;}
+    // ??
+    int doutp_idx = idx; // keep backp
+
+    // decode the doutp index
+    int d = idx % HD;
+    idx /= HD;
+    int nh = idx % NH;
+    idx /= NH;
+    int c = idx % 3;
+    idx /= 3;
+    int n = idx % N;
+    int b = idx / N;
+
+    int dinp_idx;
+    // int nh_total = NH * 3;
+    int nh_total = NH + 2 * (NH / replicate_factor);
+
+    if (c == 0) {
+        dinp_idx = b * N * nh_total * HD + n * nh_total * HD + 0 * NH * HD * nh * HD + d;
+        dinp[dinp_idx] = __ldca(&doutp[doutp_idx]);
+    } else if (c == 1) {
+        dinp_idx = b * N * nh_total * HD + n * nh_total * HD + 1 * NH * HD + (nh / replicate_factor) * HD + d;
+        // float reduced_sum = 0;
+        // if (doutp_idx % replicate_factor == 0) {
+        //     for (int i = doutp_idx; i < doutp_idx+replicate_factor; i++)
+        //         reduced_sum += __ldcs(&doutp[i]);
+        //     dinp[dinp_idx] = reduced_sum;
+        // }
+        // ??
+        dinp[dinp_idx] = __ldca(&doutp[doutp_idx]);
+    } else {
+        dinp_idx = b * N * nh_total * HD + n * nh_total * HD + (NH * HD + (NH / replicate_factor) * HD) + (nh / replicate_factor) * HD + d;
+        // float reduced_sum = 0;
+        // if (doutp_idx % replicate_factor == 0) {
+        //     for (int i = doutp_idx; i < doutp_idx + replicate_factor; i++)
+        //         reduced_sum += __ldcs(&doutp[i]);
+        //     dinp[dinp_idx] = reduced_sum;
+        // }
+        // ??
+        dinp[dinp_idx] = __ldca(&doutp[doutp_idx]);
+    }
 }
 
 // kernel launchers
