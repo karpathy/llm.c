@@ -63,6 +63,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/adamw.cuh"
 // defines: global_norm_squared
 #include "llmc/global_norm.cuh"
+// defines: repkv_forward
+#include "llmc/repkv.cuh"
 // ----------- Multi-GPU support -----------
 // defines: ncclFloatX, ncclCheck, MultiGpuConfig, ShardInfo
 // defines: printf0, multi_gpu_config
@@ -133,9 +135,9 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     // calculation following the .py code inside CausalSelfAttention
     // we have to calculate the number of channels in the QKV projection
     size_t n_head = config.num_heads;
-    size_t n_kn_head = config.num_kv_heads;
+    size_t n_kv_head = config.num_kv_heads;
     size_t hd = C / n_head; // head dimension
-    size_t qkv_channels = (n_head + 2*n_kn_head) * hd; // Q, K, V channels
+    size_t qkv_channels = (n_head + 2*n_kv_head) * hd; // Q, K, V channels
     // calculation following the .py code inside MLP
     // we have to calculate the number of channels in the SwiGLU projections c_fc + c_fc2
     size_t hidden_dim = 4 * C;
@@ -244,10 +246,10 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     const size_t L = config.num_layers;
     const size_t NH = config.num_heads;
     const size_t C = config.channels;
-    const size_t n_head = config.num_heads;
-    const size_t n_kn_head = config.num_kv_heads;
-    const size_t hd = C / n_head; // head dimension
-    const size_t qkv_channels = (n_head + 2*n_kn_head) * hd; // Q, K, V channels
+    const size_t n_head = config.num_heads; // num query heads
+    const size_t n_kv_head = config.num_kv_heads; // num key and value heads
+    const size_t hd = C / n_head; // the size of each head
+    const size_t qkv_channels = (n_head + 2*n_kv_head) * hd; // Q, K, V channels
 
     tensors[0] = TENSOR_SPEC(data->encoded, B * T * C);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
@@ -603,9 +605,9 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     const size_t NH = model->config.num_heads;
     const size_t C = model->config.channels;
     const size_t n_head = model->config.num_heads;
-    const size_t n_kn_head = model->config.num_kv_heads;
+    const size_t n_kv_head = model->config.num_kv_heads;
     const size_t hd = C / n_head; // head dimension
-    const size_t qkv_channels = (n_head + 2*n_kn_head) * hd; // Q, K, V channels
+    const size_t qkv_channels = (n_head + 2*n_kv_head) * hd; // Q, K, V channels
 
     // validate B,T are not larger than the values used at initialisation
     // (smaller B,T are okay for inference only)
@@ -626,18 +628,6 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     encoder_forward(acts.encoded, model->inputs, params.wte, NULL, B, T, C, main_stream); // encoding goes into residual[0]
     // first layernorm isn't fused
     rmsnorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_rstd, acts.encoded, params.ln1w, B, T, C, main_stream);
-
-    // ------------------------------------------------------------------------
-    // DEBUGGING: we only work until this point right now, so exit here
-    // transfer the first 32 elements to CPU and print them
-    floatX* output = (model->recompute < 2) ? acts.ln1 : acts.lnf;
-    floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
-    cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
-    for (int i = 0; i < 32; i++) {
-        printf("cpu[%d] = %.8f\n", i, (float) cpu[i]);
-    }
-    exit(0);
-    // ------------------------------------------------------------------------
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
@@ -670,21 +660,39 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
         floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
+        floatX* qkv_rep_scratch = (floatX*)acts.scratch_bt4c; // we can use the BT4C scratch for qkv replication
 
-        // now start the block forward pass
+        // Attention block
+        // The input l_ln1 now holds the (already layernormed) input
         #ifdef ENABLE_CUDNN
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, qkv_channels, main_stream);
-        float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
+            printf("cuDNN path TODO\n"); exit(0);
+            matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, qkv_channels, main_stream);
+            float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
+            attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
-        floatX* l_att = acts.att + l * B * NH * T * T;
-        if (T != model->seq_len) { // unused parts of attention buffer must be zeroed (T-dependent)
-            cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX)));
-        }
-        // these are only needed as scratchpads for the forward pass, but
-        // need not be stored for backward
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, qkv_channels, main_stream);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
+            // unused parts of attention buffer must be zeroed (T-dependent)
+            floatX* l_att = acts.att + l * B * NH * T * T;
+            if (T != model->seq_len) { cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX))); }
+            // 1) projection to QKV vectors (note k,v may be fewer heads than q)
+            matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, qkv_channels, main_stream);
+            // 2) replicate k,v so that all of q,k,v have the same number of heads. done for simplicity, for now
+            repkv_forward(qkv_rep_scratch, scratch, B, T, n_head, n_kv_head, hd);
+
+            // ------------------------------------------------------------------------
+            // DEBUGGING: we only work until this point right now, so exit here
+            // transfer the first 32 elements to CPU and print them
+            floatX* output = qkv_rep_scratch;
+            floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
+            cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
+            for (int i = 0; i < 32; i++) {
+                printf("q[%d] = %.8f\n", i, (float) cpu[i]);
+            }
+            exit(0);
+            // ------------------------------------------------------------------------
+
+            // 3) apply RoPE to q,k
+            // 4) attention: att <- softmax(qk^T)v
+            attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
         #endif
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
