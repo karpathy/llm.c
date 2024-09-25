@@ -216,6 +216,11 @@ class MLP(nn.Module):
 
     def forward(self, x):
         # SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))  <-- 3. difference compared to GPT-2
+        x1 = self.c_fc(x)
+        x2 = self.c_fc2(x)
+        x2 = F.silu(x2)
+        x = x1 * x2
+        x = self.c_proj(x)
 
         # ---------------------------------------------------------------------
         # DEBUGGING: print first 32 elements of x
@@ -227,11 +232,6 @@ class MLP(nn.Module):
         breakpoint()
         # ---------------------------------------------------------------------
 
-        x1 = self.c_fc(x)
-        x2 = self.c_fc2(x)
-        x2 = F.silu(x2)
-        x = x1 * x2
-        x = self.c_proj(x)
         return x
 
 class Block(nn.Module):

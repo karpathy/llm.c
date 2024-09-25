@@ -70,7 +70,7 @@ __global__ void rope_forward_kernel1(floatX *out, const floatX *inp, const float
     out[idxi + 1] = x_real * freqs_sin + x_imag * freqs_cos;
 }
 
-void rope_forward(floatX *out, const floatX *inp, const floatX *freqs_cis, int B, int T, int n_head, int head_dim) {
+void rope_forward(floatX *out, const floatX *inp, const floatX *freqs_cis, int B, int T, int n_head, int head_dim, cudaStream_t stream) {
     // the input and output to this kernel are (B, T, 3, NH, HD) where the 3 is q,k,v
     // we are going to launch exactly one thread per element of the output,
     // except divide by two because the work is in "tuples"
@@ -78,6 +78,6 @@ void rope_forward(floatX *out, const floatX *inp, const floatX *freqs_cis, int B
     const int block_size = 128;
     int total_threads = B * T * 3 * n_head * head_dim / 2;
     int num_blocks = CEIL_DIV(total_threads, block_size);
-    rope_forward_kernel1<<<num_blocks, block_size>>>(out, inp, freqs_cis, B, T, n_head, head_dim);
+    rope_forward_kernel1<<<num_blocks, block_size, 0, stream>>>(out, inp, freqs_cis, B, T, n_head, head_dim);
     cudaCheck(cudaGetLastError());
 }
