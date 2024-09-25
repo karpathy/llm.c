@@ -166,14 +166,6 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, freqs_cis=None, start_pos=None, mask=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # ---------------------------------------------------------------------
-        # DEBUGGING: print first 32 elements of x
-        for i in range(32):
-            print("acts[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
-        breakpoint()
-        # ---------------------------------------------------------------------
-
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
         q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
@@ -206,6 +198,18 @@ class CausalSelfAttention(nn.Module):
             y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
+
+        # ---------------------------------------------------------------------
+        # DEBUGGING: print first 32 elements of x
+        x = y.contiguous()
+        for i in range(32):
+            print("q[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
+        # write to .bin file
+        with open("ref.bin", "wb") as f:
+            f.write(x.view(-1).cpu().detach().numpy().tobytes())
+        breakpoint()
+        # ---------------------------------------------------------------------
+
         return y
 
 class MLP(nn.Module):

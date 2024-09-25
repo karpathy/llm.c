@@ -65,6 +65,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/global_norm.cuh"
 // defines: repkv_forward
 #include "llmc/repkv.cuh"
+// defines: precompute_freqs_cis, rope_forward
+#include "llmc/rope.cuh"
 // ----------- Multi-GPU support -----------
 // defines: ncclFloatX, ncclCheck, MultiGpuConfig, ShardInfo
 // defines: printf0, multi_gpu_config
@@ -344,6 +346,7 @@ typedef struct {
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
+    floatX* freqs_cis; // (T, hd) for RoPE
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -373,6 +376,7 @@ void gpt2_init_common(GPT2 *model) {
     model->init_state = true;
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+    model->freqs_cis = NULL;
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -422,6 +426,15 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     assert((size_t)(model->batch_size * model->seq_len) * num_c_groups < (1ULL<<31ULL)); // todo - maybe an issue for llama3-400B(?)
     model->workload_indices = (int*)mallocCheck(sizeof(int) * model->batch_size * model->seq_len * num_c_groups);
     model->bucket_info = (int4*)mallocCheck(sizeof(int4) * model->batch_size * model->seq_len * num_c_groups);
+
+    // precompute freqs_cis for RoPE
+    int hd = model->config.channels / model->config.num_heads;
+    printf("calculating and allocating %zu KiB for freqs_cis\n", (T * hd * sizeof(floatX)) >> 10);
+    floatX* freqs_cis_cpu = (floatX*)mallocCheck(T * hd * sizeof(floatX));
+    precompute_freqs_cis(freqs_cis_cpu, hd, T, model->config.rope_theta, model->config.use_scaled_rope);
+    cudaCheck(cudaMalloc((void**)&model->freqs_cis, T * hd * sizeof(floatX)));
+    cudaCheck(cudaMemcpy(model->freqs_cis, freqs_cis_cpu, T * hd * sizeof(floatX), cudaMemcpyHostToDevice));
+    free(freqs_cis_cpu);
 
     // cudaMallocConditionallyManaged can fall back to cudaMallocManaged if not enough memory on device
     // and returns a status code of 1 if it had to fall back, in that case we want to print warning.
@@ -677,25 +690,33 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
             matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, qkv_channels, main_stream);
             // 2) replicate k,v so that all of q,k,v have the same number of heads. done for simplicity, for now
             repkv_forward(qkv_rep_scratch, scratch, B, T, n_head, n_kv_head, hd);
-
-            // ------------------------------------------------------------------------
-            // DEBUGGING: we only work until this point right now, so exit here
-            // transfer the first 32 elements to CPU and print them
-            floatX* output = qkv_rep_scratch;
-            floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
-            cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
-            for (int i = 0; i < 32; i++) {
-                printf("q[%d] = %.8f\n", i, (float) cpu[i]);
-            }
-            exit(0);
-            // ------------------------------------------------------------------------
-
-            // 3) apply RoPE to q,k
+            // 3) apply RoPE to q,k in place
+            rope_forward(qkv_rep_scratch, qkv_rep_scratch, model->freqs_cis, B, T, n_head, hd);
             // 4) attention: att <- softmax(qk^T)v
-            attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
+            attention_forward(l_atty, l_qkvr, l_att, qkv_rep_scratch, B, T, C, NH, main_stream);
         #endif
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+
+        // ------------------------------------------------------------------------
+        // DEBUGGING: we only work until this point right now, so exit here
+        // transfer the first 32 elements to CPU and print them
+        floatX* output = scratch;
+        floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
+        cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < 32; i++) {
+            printf("q[%d] = %.8f\n", i, (float) cpu[i]);
+        }
+        // write to .bin file
+        // move output to cpu
+        floatX* cpu_output = (floatX*)mallocCheck(B*T*C * sizeof(floatX));
+        cudaCheck(cudaMemcpy(cpu_output, output, B*T*C * sizeof(floatX), cudaMemcpyDeviceToHost));
+        FILE* f = fopen("out.bin", "wb");
+        fwrite(cpu_output, sizeof(floatX), B*T*C, f);
+        fclose(f);
+        exit(0);
+        // ------------------------------------------------------------------------
+
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
         matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
