@@ -110,7 +110,7 @@ typedef struct {
 constexpr const int NUM_PARAMETER_TENSORS = 16;
 typedef struct {
     floatX* wte; // (V, C)
-    floatX* wpe; // (maxT, C)
+    floatX* wpe; // (V, C)
     floatX* ln1w; // (L, C)
     floatX* ln1b; // (L, C)
     floatX* qkvw; // (L, 3*C, C)
@@ -715,42 +715,18 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         swiglu_forward(l_fch_gelu, l_fch, B, T, ffn_channels_post_gelu, main_stream);
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, ffn_channels_post_gelu, C, main_stream);
 
-        // ------------------------------------------------------------------------
-        // DEBUGGING: we only work until this point right now, so exit here
-        // transfer the first 32 elements to CPU and print them
-        floatX* output = scratch;
-        floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
-        cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
-        for (int i = 0; i < 32; i++) {
-            printf("q[%d] = %.8f\n", i, (float) cpu[i]);
-        }
-        // write to .bin file
-        // move output to cpu
-        floatX* cpu_output = (floatX*)mallocCheck(B*T*C * sizeof(floatX));
-        cudaCheck(cudaMemcpy(cpu_output, output, B*T*C * sizeof(floatX), cudaMemcpyDeviceToHost));
-        FILE* f = fopen("out.bin", "wb");
-        fwrite(cpu_output, sizeof(floatX), B*T*C, f);
-        fclose(f);
-        exit(0);
-        // ------------------------------------------------------------------------
-
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
-            float* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
             float* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
-            const floatX* l_ln1b = params.ln1b + (l + 1) * C;
-            fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
-                                    B * T, C, main_stream);
+            fused_residual_rmsnorm_forward5(l_residual3, l_ln1, l_ln1_rstd, l_residual2, scratch, l_ln1w, B * T, C, main_stream);
         } else {
-            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
-                                    params.lnfw, params.lnfb,
-                                    B * T, C, main_stream);
+            fused_residual_rmsnorm_forward5(l_residual3, acts.lnf, acts.lnf_rstd, l_residual2, scratch, params.lnfw, B * T, C, main_stream);
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wpe, NULL, B, T, C, Vp, main_stream);
     cudaCheck(cudaDeviceSynchronize());
 }
 
@@ -821,6 +797,26 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     tokenCheck(targets, B*T, V);
     fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, True, main_stream);
 
+    // ------------------------------------------------------------------------
+    // DEBUGGING: we only work until this point right now, so exit here
+    // transfer the first 32 elements to CPU and print them
+    float* output = acts.losses;
+    floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
+    cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < 32; i++) {
+        printf("q[%d] = %.8f\n", i, (float) cpu[i]);
+    }
+    // write to .bin file
+    // move output to cpu
+    floatX* cpu_output = (floatX*)mallocCheck(B*T * sizeof(floatX));
+    cudaCheck(cudaMemcpy(cpu_output, output, B*T * sizeof(floatX), cudaMemcpyDeviceToHost));
+    FILE* f = fopen("out.bin", "wb");
+    fwrite(cpu_output, sizeof(floatX), B*T, f);
+    fclose(f);
+    exit(0);
+    // ------------------------------------------------------------------------
+
+    // ------------------------------------------------------------------------
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
 
     // reset residual stream gradients (put here to work with gradient accumulation)

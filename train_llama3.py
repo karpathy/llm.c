@@ -221,17 +221,6 @@ class MLP(nn.Module):
         x2 = F.silu(x2)
         x = x1 * x2
         x = self.c_proj(x)
-
-        # ---------------------------------------------------------------------
-        # DEBUGGING: print first 32 elements of x
-        for i in range(32):
-            print("q[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
-        # write to .bin file
-        with open("ref.bin", "wb") as f:
-            f.write(x.view(-1).cpu().detach().numpy().tobytes())
-        breakpoint()
-        # ---------------------------------------------------------------------
-
         return x
 
 class Block(nn.Module):
@@ -322,6 +311,17 @@ class LLaMA(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]).float() # note: using list [-1] to preserve the time dim
             loss = None
+
+        # ---------------------------------------------------------------------
+        # DEBUGGING: print first 32 elements of x
+        x = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
+        for i in range(32):
+            print("q[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
+        # write to .bin file
+        with open("ref.bin", "wb") as f:
+            f.write(x.view(-1).cpu().detach().numpy().tobytes())
+        breakpoint()
+        # ---------------------------------------------------------------------
 
         # there are performance reasons why not returning logits is prudent, if not needed
         if not return_logits:
