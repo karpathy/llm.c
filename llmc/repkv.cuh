@@ -48,14 +48,14 @@ __global__ void repkv_forward_kernel1(floatX* replicated_qkv,
     replicated_qkv[idx_flat] = __ldcs(&gqa_qkv[inp_idx]);
 }
 
-void repkv_forward(floatX* out, const floatX* inp, int B, int T, int NH, int NH_KV, int HD) {
+void repkv_forward(floatX* out, const floatX* inp, int B, int T, int NH, int NH_KV, int HD, cudaStream_t stream) {
     // NH = number of query heads, NH_KV = number of key and value heads, HD = head dimension
     const int block_size = 128;
     int total_threads = B * T * (3 * NH) * HD; // one thread per output element
     int num_blocks = CEIL_DIV(total_threads, block_size);
     int replicate_factor = NH / NH_KV;
     if (replicate_factor > 1) {
-        repkv_forward_kernel1<<<num_blocks, block_size>>>(out, inp, B, T, NH, replicate_factor, HD);
+        repkv_forward_kernel1<<<num_blocks, block_size, 0, stream>>>(out, inp, B, T, NH, replicate_factor, HD);
     } else {
         cudaMemcpy(out, inp, total_threads * sizeof(floatX), cudaMemcpyDeviceToDevice);
     }

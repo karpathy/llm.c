@@ -46,7 +46,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines: encoder_forward, encoder_backward
 #include "llmc/encoder.cuh"
 // defines: layernorm_forward, residual_forward, fused_residual_forward5, layernorm_backward
-// defines: rmsnorm_forward
+// defines: rmsnorm_forward, fused_residual_rmsnorm_forward5
 #include "llmc/layernorm.cuh"
 // defines: matmul_cublaslt, matmul_forward, matmul_backward, gelu_forward, gelu_backward_inplace
 #include "llmc/matmul.cuh"
@@ -65,6 +65,10 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/global_norm.cuh"
 // defines: repkv_forward
 #include "llmc/repkv.cuh"
+// defines: precompute_freqs_cis, rope_forward
+#include "llmc/rope.cuh"
+// defines: swiglu_forward
+#include "llmc/swiglu.cuh"
 // ----------- Multi-GPU support -----------
 // defines: ncclFloatX, ncclCheck, MultiGpuConfig, ShardInfo
 // defines: printf0, multi_gpu_config
@@ -106,7 +110,7 @@ typedef struct {
 constexpr const int NUM_PARAMETER_TENSORS = 16;
 typedef struct {
     floatX* wte; // (V, C)
-    floatX* wpe; // (maxT, C)
+    floatX* wpe; // (V, C)
     floatX* ln1w; // (L, C)
     floatX* ln1b; // (L, C)
     floatX* qkvw; // (L, 3*C, C)
@@ -250,6 +254,13 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     const size_t n_kv_head = config.num_kv_heads; // num key and value heads
     const size_t hd = C / n_head; // the size of each head
     const size_t qkv_channels = (n_head + 2*n_kv_head) * hd; // Q, K, V channels
+    // SwiGLU-related calculation to determine the number of channels here
+    size_t hidden_dim = 4 * C;
+    hidden_dim = (2 * hidden_dim) / 3;
+    hidden_dim = config.ffn_dim_multiplier * hidden_dim;
+    hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) / config.multiple_of);
+    size_t ffn_channels = hidden_dim * 2; // c_fc + c_fc2 concatenated
+    size_t ffn_channels_post_gelu = hidden_dim; // swiglu will halve the channels
 
     tensors[0] = TENSOR_SPEC(data->encoded, B * T * C);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
@@ -268,9 +279,9 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[7] = TENSOR_SPEC(data->ln2, (recompute < 2) ? L * B * T * C : 0);
     tensors[8] = TENSOR_SPEC(data->ln2_mean, L * B * T);
     tensors[9] = TENSOR_SPEC(data->ln2_rstd, L * B * T);
-    tensors[10] = TENSOR_SPEC(data->fch, L * B * T * 4*C);
+    tensors[10] = TENSOR_SPEC(data->fch, L * B * T * ffn_channels);
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
-    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
+    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * ffn_channels_post_gelu : B * T * ffn_channels_post_gelu);
     tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C);
     tensors[13] = TENSOR_SPEC(data->lnf, B * T * C);
     tensors[14] = TENSOR_SPEC(data->lnf_mean, B * T);
@@ -344,6 +355,7 @@ typedef struct {
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
+    floatX* freqs_cis; // (T, hd) for RoPE
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -373,6 +385,7 @@ void gpt2_init_common(GPT2 *model) {
     model->init_state = true;
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+    model->freqs_cis = NULL;
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -422,6 +435,15 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     assert((size_t)(model->batch_size * model->seq_len) * num_c_groups < (1ULL<<31ULL)); // todo - maybe an issue for llama3-400B(?)
     model->workload_indices = (int*)mallocCheck(sizeof(int) * model->batch_size * model->seq_len * num_c_groups);
     model->bucket_info = (int4*)mallocCheck(sizeof(int4) * model->batch_size * model->seq_len * num_c_groups);
+
+    // precompute freqs_cis for RoPE
+    int hd = model->config.channels / model->config.num_heads;
+    printf("calculating and allocating %zu KiB for freqs_cis\n", (T * hd * sizeof(floatX)) >> 10);
+    floatX* freqs_cis_cpu = (floatX*)mallocCheck(T * hd * sizeof(floatX));
+    precompute_freqs_cis(freqs_cis_cpu, hd, T, model->config.rope_theta, model->config.use_scaled_rope);
+    cudaCheck(cudaMalloc((void**)&model->freqs_cis, T * hd * sizeof(floatX)));
+    cudaCheck(cudaMemcpy(model->freqs_cis, freqs_cis_cpu, T * hd * sizeof(floatX), cudaMemcpyHostToDevice));
+    free(freqs_cis_cpu);
 
     // cudaMallocConditionallyManaged can fall back to cudaMallocManaged if not enough memory on device
     // and returns a status code of 1 if it had to fall back, in that case we want to print warning.
@@ -608,6 +630,12 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     const size_t n_kv_head = model->config.num_kv_heads;
     const size_t hd = C / n_head; // head dimension
     const size_t qkv_channels = (n_head + 2*n_kv_head) * hd; // Q, K, V channels
+    size_t hidden_dim = 4 * C;
+    hidden_dim = (2 * hidden_dim) / 3;
+    hidden_dim = model->config.ffn_dim_multiplier * hidden_dim;
+    hidden_dim = model->config.multiple_of * ((hidden_dim + model->config.multiple_of - 1) / model->config.multiple_of);
+    size_t ffn_channels = hidden_dim * 2; // c_fc + c_fc2 concatenated
+    size_t ffn_channels_post_gelu = hidden_dim; // swiglu halves the channels
 
     // validate B,T are not larger than the values used at initialisation
     // (smaller B,T are okay for inference only)
@@ -640,10 +668,9 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_attprojb = params.attprojb + l * C;
         floatX* l_ln2w = params.ln2w + l * C;
-        floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcb = params.fcb + l * 4*C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
+        floatX* l_fcw = params.fcw + l * ffn_channels * C;
+        floatX* l_fcb = params.fcb + l * ffn_channels;
+        floatX* l_fcprojw = params.fcprojw + l * C * ffn_channels_post_gelu;
         floatX* l_fcprojb = params.fcprojb + l * C;
 
         // get the pointers of the activations for this layer
@@ -652,12 +679,11 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
-        float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch = acts.fch + l * B * T * 4*C;
+        floatX* l_fch = acts.fch + l * B * T * ffn_channels;
         // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
-        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * ffn_channels_post_gelu : acts.fch_gelu;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
         floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
         floatX* qkv_rep_scratch = (floatX*)acts.scratch_bt4c; // we can use the BT4C scratch for qkv replication
@@ -676,46 +702,31 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
             // 1) projection to QKV vectors (note k,v may be fewer heads than q)
             matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, qkv_channels, main_stream);
             // 2) replicate k,v so that all of q,k,v have the same number of heads. done for simplicity, for now
-            repkv_forward(qkv_rep_scratch, scratch, B, T, n_head, n_kv_head, hd);
-
-            // ------------------------------------------------------------------------
-            // DEBUGGING: we only work until this point right now, so exit here
-            // transfer the first 32 elements to CPU and print them
-            floatX* output = qkv_rep_scratch;
-            floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
-            cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
-            for (int i = 0; i < 32; i++) {
-                printf("q[%d] = %.8f\n", i, (float) cpu[i]);
-            }
-            exit(0);
-            // ------------------------------------------------------------------------
-
-            // 3) apply RoPE to q,k
+            repkv_forward(qkv_rep_scratch, scratch, B, T, n_head, n_kv_head, hd, main_stream);
+            // 3) apply RoPE to q,k in place
+            rope_forward(qkv_rep_scratch, qkv_rep_scratch, model->freqs_cis, B, T, n_head, hd, main_stream);
             // 4) attention: att <- softmax(qk^T)v
-            attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
+            attention_forward(l_atty, l_qkvr, l_att, qkv_rep_scratch, B, T, C, NH, main_stream);
         #endif
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
-        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
-        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+        fused_residual_rmsnorm_forward5(l_residual2, l_ln2, l_ln2_rstd, residual, scratch, l_ln2w, B*T, C, main_stream);
+        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, ffn_channels, main_stream);
+        swiglu_forward(l_fch_gelu, l_fch, B, T, ffn_channels_post_gelu, main_stream);
+        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, ffn_channels_post_gelu, C, main_stream);
+
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
-            float* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
             float* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
-            const floatX* l_ln1b = params.ln1b + (l + 1) * C;
-            fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
-                                    B * T, C, main_stream);
+            fused_residual_rmsnorm_forward5(l_residual3, l_ln1, l_ln1_rstd, l_residual2, scratch, l_ln1w, B * T, C, main_stream);
         } else {
-            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
-                                    params.lnfw, params.lnfb,
-                                    B * T, C, main_stream);
+            fused_residual_rmsnorm_forward5(l_residual3, acts.lnf, acts.lnf_rstd, l_residual2, scratch, params.lnfw, B * T, C, main_stream);
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wpe, NULL, B, T, C, Vp, main_stream);
     cudaCheck(cudaDeviceSynchronize());
 }
 
@@ -786,6 +797,26 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     tokenCheck(targets, B*T, V);
     fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, True, main_stream);
 
+    // ------------------------------------------------------------------------
+    // DEBUGGING: we only work until this point right now, so exit here
+    // transfer the first 32 elements to CPU and print them
+    float* output = acts.losses;
+    floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
+    cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < 32; i++) {
+        printf("q[%d] = %.8f\n", i, (float) cpu[i]);
+    }
+    // write to .bin file
+    // move output to cpu
+    floatX* cpu_output = (floatX*)mallocCheck(B*T * sizeof(floatX));
+    cudaCheck(cudaMemcpy(cpu_output, output, B*T * sizeof(floatX), cudaMemcpyDeviceToHost));
+    FILE* f = fopen("out.bin", "wb");
+    fwrite(cpu_output, sizeof(floatX), B*T, f);
+    fclose(f);
+    exit(0);
+    // ------------------------------------------------------------------------
+
+    // ------------------------------------------------------------------------
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
 
     // reset residual stream gradients (put here to work with gradient accumulation)

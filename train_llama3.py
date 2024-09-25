@@ -166,14 +166,6 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, freqs_cis=None, start_pos=None, mask=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # ---------------------------------------------------------------------
-        # DEBUGGING: print first 32 elements of x
-        for i in range(32):
-            print("acts[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
-        breakpoint()
-        # ---------------------------------------------------------------------
-
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
         q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
@@ -319,6 +311,17 @@ class LLaMA(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]).float() # note: using list [-1] to preserve the time dim
             loss = None
+
+        # ---------------------------------------------------------------------
+        # DEBUGGING: print first 32 elements of x
+        x = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
+        for i in range(32):
+            print("q[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
+        # write to .bin file
+        with open("ref.bin", "wb") as f:
+            f.write(x.view(-1).cpu().detach().numpy().tobytes())
+        breakpoint()
+        # ---------------------------------------------------------------------
 
         # there are performance reasons why not returning logits is prudent, if not needed
         if not return_logits:

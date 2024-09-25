@@ -28,6 +28,7 @@ void repkv_forward_cpu(float* out, const float* inp,
                        int B, int T, int C,
                        int hd, int qh, int kh, int vh) {
     // inp is (B, T, C)
+    // out is (B, T, 3, NH, HD)
     // hd = head dimension
     // qh, kh, vh = number of query, key, value heads
     assert(C == hd * (qh + kh + vh));
