@@ -198,18 +198,6 @@ class CausalSelfAttention(nn.Module):
             y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
-
-        # ---------------------------------------------------------------------
-        # DEBUGGING: print first 32 elements of x
-        x = y.contiguous()
-        for i in range(32):
-            print("q[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
-        # write to .bin file
-        with open("ref.bin", "wb") as f:
-            f.write(x.view(-1).cpu().detach().numpy().tobytes())
-        breakpoint()
-        # ---------------------------------------------------------------------
-
         return y
 
 class MLP(nn.Module):
@@ -228,6 +216,17 @@ class MLP(nn.Module):
 
     def forward(self, x):
         # SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))  <-- 3. difference compared to GPT-2
+
+        # ---------------------------------------------------------------------
+        # DEBUGGING: print first 32 elements of x
+        for i in range(32):
+            print("q[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
+        # write to .bin file
+        with open("ref.bin", "wb") as f:
+            f.write(x.view(-1).cpu().detach().numpy().tobytes())
+        breakpoint()
+        # ---------------------------------------------------------------------
+
         x1 = self.c_fc(x)
         x2 = self.c_fc2(x)
         x2 = F.silu(x2)
