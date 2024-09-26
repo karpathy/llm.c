@@ -1,7 +1,4 @@
 /*
-
-TODO: update the description
-
 Layer that takes a QKV tensor of shape (B, T, C) and replicates the K,V
 some number of times. For example, if B=4, T=64, C=6144, and we have that:
 - head dimension (hd) is 128 channels
@@ -76,10 +73,8 @@ __global__ void repkv_backward_kernel1(floatX* dinp,
     // we want to reduce sum (for K and V) into  (B, N, (NH + 2*(NH/replicate_factor)) * HD)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // ??
     if (idx >= B * N * 3 * NH * HD) { return;}
-    // ??
-    int doutp_idx = idx; // keep backp
+    int doutp_idx = idx; // keep backup
 
     // decode the doutp index
     int d = idx % HD;
@@ -92,32 +87,31 @@ __global__ void repkv_backward_kernel1(floatX* dinp,
     int b = idx / N;
 
     int dinp_idx;
-    // int nh_total = NH * 3;
     int nh_total = NH + 2 * (NH / replicate_factor);
 
     if (c == 0) {
-        dinp_idx = b * N * nh_total * HD + n * nh_total * HD + 0 * NH * HD * nh * HD + d;
-        dinp[dinp_idx] = __ldca(&doutp[doutp_idx]);
+        dinp_idx = b * N * nh_total * HD + n * nh_total * HD + 0 * NH * HD + nh * HD + d;
+        dinp[dinp_idx] = __ldcs(&doutp[doutp_idx]);
     } else if (c == 1) {
-        dinp_idx = b * N * nh_total * HD + n * nh_total * HD + 1 * NH * HD + (nh / replicate_factor) * HD + d;
-        // float reduced_sum = 0;
-        // if (doutp_idx % replicate_factor == 0) {
-        //     for (int i = doutp_idx; i < doutp_idx+replicate_factor; i++)
-        //         reduced_sum += __ldcs(&doutp[i]);
-        //     dinp[dinp_idx] = reduced_sum;
-        // }
-        // ??
-        dinp[dinp_idx] = __ldca(&doutp[doutp_idx]);
+        if (nh % replicate_factor == 0) {
+            float reduced_sum = 0;
+            for (int i = 0; i < replicate_factor; i++) {
+                reduced_sum += __ldcs(&doutp[doutp_idx+HD*i]);
+            }
+
+            dinp_idx = b * N * nh_total * HD + n * nh_total * HD + 1 * NH * HD + (nh / replicate_factor) * HD + d;
+            dinp[dinp_idx] = reduced_sum;
+        }
+
     } else {
-        dinp_idx = b * N * nh_total * HD + n * nh_total * HD + (NH * HD + (NH / replicate_factor) * HD) + (nh / replicate_factor) * HD + d;
-        // float reduced_sum = 0;
-        // if (doutp_idx % replicate_factor == 0) {
-        //     for (int i = doutp_idx; i < doutp_idx + replicate_factor; i++)
-        //         reduced_sum += __ldcs(&doutp[i]);
-        //     dinp[dinp_idx] = reduced_sum;
-        // }
-        // ??
-        dinp[dinp_idx] = __ldca(&doutp[doutp_idx]);
+        if (nh % replicate_factor == 0) {
+            float reduced_sum = 0;
+            for (int i = 0; i < replicate_factor; i++) {
+                reduced_sum += __ldcs(&doutp[doutp_idx+HD*i]);
+            }
+            dinp_idx = b * N * nh_total * HD + n * nh_total * HD + (NH * HD + (NH / replicate_factor) * HD) + (nh / replicate_factor) * HD + d;
+            dinp[dinp_idx] = reduced_sum;
+        }
     }
 }
 
@@ -146,8 +140,8 @@ void repkv_backward(int kernel_num,
     }
 }
 
-// TODO: update
-void log_mat(float *inp, int B, int T, int C, int hd, int qh, int kh, int vh, char *title)
+#ifdef DEBUG
+static void log_mat(float *inp, int B, int T, int C, int hd, int qh, int kh, int vh, char *title)
 {
     printf("%s -----\n", title);
     for (int b = 0; b < B; b++) {
@@ -183,6 +177,7 @@ void log_mat(float *inp, int B, int T, int C, int hd, int qh, int kh, int vh, ch
     }
     printf("\n");
 }
+#endif // DEBUG
 
 // tester
 int main(int argc, char **argv) {
@@ -195,7 +190,6 @@ int main(int argc, char **argv) {
     int qh = 4; // num query heads
     int kh = 2; // num key heads
     int vh = 2; // num value heads
-    int nrep = qh/kh;
 #else
     int B = 8;
     int T = 1024;
@@ -203,7 +197,6 @@ int main(int argc, char **argv) {
     int qh = 32; // num query heads
     int kh = 8; // num key heads
     int vh = 8; // num value heads
-    int nrep = qh/kh;
 #endif
 
     int deviceIdx = 0;
@@ -234,6 +227,7 @@ int main(int argc, char **argv) {
     printf("Using kernel %d\n", kernel_num);
 
 #ifdef DEBUG
+    int nrep = qh/kh;
     log_mat(doutp, B, T, Cout, hd, qh, nrep*kh, nrep*vh, "doutp");
 #endif // DEBUG
 
@@ -256,17 +250,14 @@ int main(int argc, char **argv) {
     }
     printf("All results match. Starting benchmarks.\n\n");
 
-    // TODO: update
-#if 0
     // now benchmark
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         int repeat_times = 1000;
         float elapsed_time = benchmark_kernel(repeat_times, repkv_backward, kernel_num,
-                                            d_out, d_inp, B, T, qh, kh, hd, block_size);
+                                            d_dinp, d_inp, d_doutp, B, T, qh, kh, hd, block_size);
         printf("block_size %4d time %.4f ms\n", block_size, elapsed_time);
     }
-#endif
 
     // free memory
     free(inp);
