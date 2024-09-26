@@ -301,7 +301,10 @@ class LLaMA(nn.Module):
 
         for i, block in enumerate(self.transformer.h):
             x = block(x, freqs_cis, start_pos, mask)
-        x = self.transformer.ln_f(x)
+
+        self.DEBUG_INPUT = x.detach()
+        self.DEBUG_INPUT.requires_grad = True
+        x = self.transformer.ln_f(self.DEBUG_INPUT)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -311,17 +314,6 @@ class LLaMA(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]).float() # note: using list [-1] to preserve the time dim
             loss = None
-
-        # ---------------------------------------------------------------------
-        # DEBUGGING: print first 32 elements of x
-        x = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
-        for i in range(32):
-            print("q[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
-        # write to .bin file
-        with open("ref.bin", "wb") as f:
-            f.write(x.view(-1).cpu().detach().numpy().tobytes())
-        breakpoint()
-        # ---------------------------------------------------------------------
 
         # there are performance reasons why not returning logits is prudent, if not needed
         if not return_logits:
@@ -1264,6 +1256,18 @@ if __name__ == "__main__":
             # backward pass
             if not args.inference_only:
                 loss.backward()
+
+                # ---------------------------------------------------------------------
+                # DEBUGGING: print first 32 elements of x
+                x = model.DEBUG_INPUT.grad
+                for i in range(32):
+                    print("q[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
+                # write to .bin file
+                with open("ref.bin", "wb") as f:
+                    f.write(x.view(-1).cpu().detach().numpy().tobytes())
+                breakpoint()
+                # ---------------------------------------------------------------------
+
         if ddp:
             dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()

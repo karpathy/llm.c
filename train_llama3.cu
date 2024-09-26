@@ -46,8 +46,9 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines: encoder_forward, encoder_backward
 #include "llmc/encoder.cuh"
 // defines: layernorm_forward, residual_forward, fused_residual_forward5, layernorm_backward
-// defines: rmsnorm_forward, fused_residual_rmsnorm_forward5
 #include "llmc/layernorm.cuh"
+// defines: rmsnorm_forward, fused_residual_rmsnorm_forward5, rmsnorm_backward
+#include "llmc/rmsnorm.cuh"
 // defines: matmul_cublaslt, matmul_forward, matmul_backward, gelu_forward, gelu_backward_inplace
 #include "llmc/matmul.cuh"
 #ifdef ENABLE_CUDNN
@@ -796,26 +797,6 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B*T, V);
     fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, True, main_stream);
-
-    // ------------------------------------------------------------------------
-    // DEBUGGING: we only work until this point right now, so exit here
-    // transfer the first 32 elements to CPU and print them
-    float* output = acts.losses;
-    floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
-    cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
-    for (int i = 0; i < 32; i++) {
-        printf("q[%d] = %.8f\n", i, (float) cpu[i]);
-    }
-    // write to .bin file
-    // move output to cpu
-    floatX* cpu_output = (floatX*)mallocCheck(B*T * sizeof(floatX));
-    cudaCheck(cudaMemcpy(cpu_output, output, B*T * sizeof(floatX), cudaMemcpyDeviceToHost));
-    FILE* f = fopen("out.bin", "wb");
-    fwrite(cpu_output, sizeof(floatX), B*T, f);
-    fclose(f);
-    exit(0);
-    // ------------------------------------------------------------------------
-
     // ------------------------------------------------------------------------
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
 
@@ -832,10 +813,29 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    matmul_backward(model->acts.scratch_bt4c, grads.wpe, NULL, acts.output, acts.lnf, params.wpe, NULL, B, T, C, Vp, main_stream);
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
+    rmsnorm_backward(dresidual, grads.lnfw, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_rstd, B, T, C, main_stream);
+
+    // ------------------------------------------------------------------------
+    // DEBUGGING: we only work until this point right now, so exit here
+    // transfer the first 32 elements to CPU and print them
+    float* output = (float*)dresidual;
+    floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
+    cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < 32; i++) {
+        printf("q[%d] = %.8f\n", i, (float) cpu[i]);
+    }
+    // write to .bin file
+    // move output to cpu
+    floatX* cpu_output = (floatX*)mallocCheck(B*T*C * sizeof(floatX));
+    cudaCheck(cudaMemcpy(cpu_output, output, B*T*C * sizeof(floatX), cudaMemcpyDeviceToHost));
+    FILE* f = fopen("out.bin", "wb");
+    fwrite(cpu_output, sizeof(floatX), B*T*C, f);
+    fclose(f);
+    exit(0);
+    // ------------------------------------------------------------------------
 
     // from this point on, we no longer need the values stored in the last residual, so we can reuse that memory as generic
     // scratch for backward computations
