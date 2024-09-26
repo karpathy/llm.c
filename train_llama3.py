@@ -3,7 +3,7 @@ Reference code for LLaMA-3.1 training and inference.
 Will save the model weights into files, to be read from C as initialization.
 
 This code differs from GPT-2 very slightly, there are three main differences:
-1) RoPE: LLaMA uses a different positional encoding scheme called Relative Positional Encoding (RoPE).
+1) RoPE: LLaMA uses a different positional encoding scheme called Rotary Position Embedding (RoPE).
 2) GQA: Grouped Query Attention (GQA) is used to reduce the number of attention heads.
 3) SwiGLU: Swish-Gated Linear Unit (SwiGLU) is used as the activation function in the MLP.
 
