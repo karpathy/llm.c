@@ -64,9 +64,9 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/adamw.cuh"
 // defines: global_norm_squared
 #include "llmc/global_norm.cuh"
-// defines: repkv_forward
+// defines: repkv_forward, repkv_backward
 #include "llmc/repkv.cuh"
-// defines: precompute_freqs_cis, rope_forward
+// defines: precompute_freqs_cis, rope_forward, rope_backward_inplace
 #include "llmc/rope.cuh"
 // defines: swiglu_forward, swiglu_backward
 #include "llmc/swiglu.cuh"
@@ -197,7 +197,7 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     return params_memory;
 }
 
-constexpr int NUM_ACTIVATION_TENSORS = 21;
+constexpr int NUM_ACTIVATION_TENSORS = 22;
 typedef struct {
     floatX* encoded; // (B, T, C)
     floatX* ln1; // (L, B, T, C)
@@ -234,6 +234,7 @@ typedef struct {
     // some additional scratch buffers
     floatX* scratch_bt4c;   // (B, T, 4*C)
     floatX* scratch_btc;    // (B, T, C)
+    floatX* scratch_bt4c2;  // (B, T, 4*C), for simplicify use this one for backward pass too, probably not needed
 } ActivationTensors;
 
 
@@ -292,6 +293,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[18] = TENSOR_SPEC(data->output, B * T * max(qkv_channels, max(ffn_channels, max(NH*T, Vp))));
     tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * ffn_channels);
     tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
+    tensors[21] = TENSOR_SPEC(data->scratch_bt4c2, B * T * ffn_channels);
 }
 
 void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]) {
@@ -839,7 +841,6 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
         // get the pointers of the weights for this layer
         floatX* l_ln1w = params.ln1w + l * C;
-        floatX* l_ln1b = params.ln1b + l * C;
         floatX* l_qkvw = params.qkvw + l * qkv_channels * C;
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_ln2w = params.ln2w + l * C;
@@ -860,13 +861,11 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* dl_fcprojb = grads.fcprojb + l * C;
         // get the pointers of the activations for this layer
         floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
-        float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         floatX* l_qkvr = acts.qkvr + l * B * T * qkv_channels;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
-        float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch_pre_gelu = acts.fch + l * B * T * ffn_channels;
         floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * ffn_channels_post_gelu : acts.fch_gelu;
@@ -875,6 +874,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // re-using this memory in every Transformer block as we calculate backward pass
 
         floatX* dl_bt4c = (floatX*)model->acts.scratch_bt4c;
+        floatX* dl_bt4c2 = (floatX*)model->acts.scratch_bt4c2; // same size as dl_bt4c, just a second buffer
 
         // start the backward pass for this layer
         if(model->recompute >= 1) {
@@ -886,13 +886,16 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // backward the 2nd matmul of MLP
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, ffn_channels_post_gelu, C, main_stream);
         // backward the swiglu here, use scratchX to hold the grad because SwiGLU can't be inplace
-        swiglu_backward(scratchX, dl_bt4c, l_fch_pre_gelu, B, T, ffn_channels_post_gelu, main_stream);
+        swiglu_backward(dl_bt4c2, dl_bt4c, l_fch_pre_gelu, B, T, ffn_channels_post_gelu, main_stream);
         // backward the 1st matmul of MLP
         if(model->recompute >= 2) {
             // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
             rmsnorm_forward(l_ln2, l_ln2_rstd, l_residual2, l_ln2w, B, T, C, main_stream);
         }
-        matmul_backward(dl_btc, dl_fcw, dl_fcb, scratchX, l_ln2, l_fcw, scratchF, B, T, C, ffn_channels, main_stream);
+        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c2, l_ln2, l_fcw, scratchF, B, T, C, ffn_channels, main_stream);
+        // rmsnorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
+        rmsnorm_backward(dresidual, dl_ln2w, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_rstd, B, T, C, main_stream);
+        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
 
         // ------------------------------------------------------------------------
         // DEBUGGING: we only work until this point right now, so exit here
@@ -905,19 +908,18 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         }
         // write to .bin file
         // move output to cpu
-        floatX* cpu_output = (floatX*)mallocCheck(B*T*C * sizeof(floatX));
-        cudaCheck(cudaMemcpy(cpu_output, output, B*T*C * sizeof(floatX), cudaMemcpyDeviceToHost));
+        // int sz = B*T*qkv_channels; //B*T*C;
+        int sz = B*T*C;
+        floatX* cpu_output = (floatX*)mallocCheck(sz * sizeof(floatX));
+        cudaCheck(cudaMemcpy(cpu_output, output, sz * sizeof(floatX), cudaMemcpyDeviceToHost));
         FILE* f = fopen("out.bin", "wb");
-        fwrite(cpu_output, sizeof(floatX), B*T*C, f);
+        fwrite(cpu_output, sizeof(floatX), sz, f);
         fclose(f);
         exit(0);
         // ------------------------------------------------------------------------
 
-        // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
-        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
-        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
-
         #ifdef ENABLE_CUDNN
+        printf("cuDNN path TODO\n"); exit(0);
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
         attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C, main_stream);
         #else
@@ -927,13 +929,19 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         #endif
+        // backward rope (this can be done in-place)
+        rope_backward_inplace(dl_bt4c, dl_bt4c, model->freqs_cis, B, T, NH, hd, main_stream);
+        // backward repkv (use scratchX as gradient buffer here)
+        repkv_backward(dl_bt4c2, dl_bt4c, B, T, NH, n_kv_head, hd);
+
+        // <--- here the gradients don't match, so there is an issue in between
+
+        // backward QKV projection
         if(model->recompute >= 2) {
-            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
+            rmsnorm_forward(l_ln1, l_ln1_rstd, residual, l_ln1w, B, T, C, main_stream);
         }
-        // QKV parameter gradients
-        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
-        // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
+        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c2, l_ln1, l_qkvw, scratchF, B, T, C, qkv_channels, main_stream);
+        rmsnorm_backward(dresidual, dl_ln1w, scratchF, dl_btc, residual, l_ln1w, l_ln1_rstd, B, T, C, main_stream);
 
         // Accumulate gradients from this layer in a background stream.
         if(last_step) {

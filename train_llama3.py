@@ -197,6 +197,12 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(scores.float(), dim=-1).type_as(q)
             y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        DEBUG_POINT = y.detach()
+        DEBUG_POINT = DEBUG_POINT.requires_grad_(True)
+        self.DEBUG_POINT = DEBUG_POINT
+        y = DEBUG_POINT
+
         y = self.c_proj(y)
         return y
 
@@ -234,11 +240,7 @@ class Block(nn.Module):
 
     def forward(self, x, freqs_cis=None, start_pos=None, mask=None):
         x = x + self.attn(self.ln_1(x), freqs_cis, start_pos, mask)
-        MLP_INPUT = self.ln_2(x)
-        MLP_INPUT = MLP_INPUT.detach()
-        MLP_INPUT.requires_grad = True
-        self.MLP_INPUT = MLP_INPUT
-        x = x + self.mlp(MLP_INPUT)
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -1260,7 +1262,7 @@ if __name__ == "__main__":
 
                 # ---------------------------------------------------------------------
                 # DEBUGGING: print first 32 elements of x
-                x = model.transformer.h[-1].MLP_INPUT.grad
+                x = model.transformer.h[-1].attn.DEBUG_POINT.grad
                 for i in range(32):
                     print("q[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
                 # write to .bin file
