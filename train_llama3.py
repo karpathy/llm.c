@@ -234,7 +234,11 @@ class Block(nn.Module):
 
     def forward(self, x, freqs_cis=None, start_pos=None, mask=None):
         x = x + self.attn(self.ln_1(x), freqs_cis, start_pos, mask)
-        x = x + self.mlp(self.ln_2(x))
+        MLP_INPUT = self.ln_2(x)
+        MLP_INPUT = MLP_INPUT.detach()
+        MLP_INPUT.requires_grad = True
+        self.MLP_INPUT = MLP_INPUT
+        x = x + self.mlp(MLP_INPUT)
         return x
 
 # -----------------------------------------------------------------------------
@@ -301,10 +305,7 @@ class LLaMA(nn.Module):
 
         for i, block in enumerate(self.transformer.h):
             x = block(x, freqs_cis, start_pos, mask)
-
-        self.DEBUG_INPUT = x.detach()
-        self.DEBUG_INPUT.requires_grad = True
-        x = self.transformer.ln_f(self.DEBUG_INPUT)
+        x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -1259,7 +1260,7 @@ if __name__ == "__main__":
 
                 # ---------------------------------------------------------------------
                 # DEBUGGING: print first 32 elements of x
-                x = model.DEBUG_INPUT.grad
+                x = model.transformer.h[-1].MLP_INPUT.grad
                 for i in range(32):
                     print("q[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
                 # write to .bin file
