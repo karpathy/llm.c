@@ -168,6 +168,12 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
+
+        DEBUG_POINT = qkv.detach()
+        DEBUG_POINT = DEBUG_POINT.requires_grad_(True)
+        self.DEBUG_POINT = DEBUG_POINT
+        qkv = DEBUG_POINT
+
         q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
         q, k, v = map(lambda t: t.view(B, T, -1, self.hd), (q, k, v))  # (B, T, NH, HD)
         q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)  <-- 1. difference compared to GPT-2
@@ -197,12 +203,6 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(scores.float(), dim=-1).type_as(q)
             y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-
-        DEBUG_POINT = y.detach()
-        DEBUG_POINT = DEBUG_POINT.requires_grad_(True)
-        self.DEBUG_POINT = DEBUG_POINT
-        y = DEBUG_POINT
-
         y = self.c_proj(y)
         return y
 

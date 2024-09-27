@@ -11,39 +11,46 @@ Block size 128 seems fastest on H100
 
 // cpu reference code
 void repkv_backward_cpu(float* dinp, const float* dout,
-                       const int B, const int T, const int Cout,
-                       const int hd, const int qh, const int kh, const int vh) {
-
-    assert(Cout == (hd * (3 * qh)));
+                       int B, int T, int C,
+                       int hd, int qh, int kh, int vh) {
+    // inp is (B, T, C)
+    // out is (B, T, 3, NH, HD)
+    // hd = head dimension
+    // qh, kh, vh = number of query, key, value heads
+    assert(C == hd * (qh + kh + vh));
     assert(kh == vh);
     int nrep = qh / kh; // number of times to replicate key/value vectors
-    int Cin = hd * (qh + kh + vh); // output channels
+    int Cout = hd * (qh * 3); // output channels
 
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            // seek to the input position dout[b,t,:]
-            const float* x = dout + b * T * Cout + t * Cout;
+            // seek to the input position inp[b,t,:]
+            float* dx = dinp + b * T * C + t * C;
             // seek to the output position out[b,t,:]
-            float* y = dinp + b * T * Cin + t * Cin;
+            const float* dy = dout + b * T * Cout + t * Cout;
             // copy all the query vectors, no changes
-            for (int i = 0; i < hd * qh; i++) { y[i] = x[i]; }
-            x += hd * qh; // advance input pointer
-            y += hd * qh; // advance output pointer
-            // copy key vectors, and replicate them nrep times
+            for (int i = 0; i < hd * qh; i++) { dx[i] = dy[i]; }
+            dx += hd * qh; // advance input pointer
+            dy += hd * qh; // advance output pointer
+            // gather gradients from the key vectors
             for (int h = 0; h < kh; h++) {
+                // init the gradient to 0
+                for (int i = 0; i < hd; i++) { dx[i] = 0.0f; }
                 for (int n = 0; n < nrep; n++) {
-                    for (int i = 0; i < hd; i++) { y[i] += x[i]; }
-                    x += hd; // advance input pointer
+                    for (int i = 0; i < hd; i++) { dx[i] += dy[i]; }
+                    dy += hd; // advance output pointer
                 }
-                y += hd; // advance output pointer
+                dx += hd; // advance input pointer
             }
-            // copy value vectors, and replicate them nrep times
+            // gather gradients from the value vectors
             for (int h = 0; h < vh; h++) {
+                // init the gradient to 0
+                for (int i = 0; i < hd; i++) { dx[i] = 0.0f; }
                 for (int n = 0; n < nrep; n++) {
-                    for (int i = 0; i < hd; i++) { y[i] += x[i]; }
-                    x += hd; // advance input pointer
+                    for (int i = 0; i < hd; i++) { dx[i] += dy[i]; }
+                    dy += hd; // advance output pointer
                 }
-                y += hd; // advance output pointer
+                dx += hd; // advance input pointer
             }
         }
     }
@@ -76,7 +83,7 @@ __global__ void repkv_backward_kernel1(floatX* dinp, const floatX* dout,
         dinp[dinp_idx] = __ldcs(&dout[dout_idx]);
     } else if (c == 1) {
         if (nh % replicate_factor == 0) {
-            float reduced_sum = 0;
+            float reduced_sum = 0.0f;
             for (int i = 0; i < replicate_factor; i++) {
                 reduced_sum += __ldcs(&dout[dout_idx+HD*i]);
             }
@@ -87,7 +94,7 @@ __global__ void repkv_backward_kernel1(floatX* dinp, const floatX* dout,
 
     } else {
         if (nh % replicate_factor == 0) {
-            float reduced_sum = 0;
+            float reduced_sum = 0.0f;
             for (int i = 0; i < replicate_factor; i++) {
                 reduced_sum += __ldcs(&dout[dout_idx+HD*i]);
             }
@@ -141,7 +148,6 @@ int main(int argc, char **argv) {
 
     // allocate (and fill) CPU memory
     float* dinp = (float*)malloc(B * T * Cin * sizeof(float));
-    memset(dinp, 0, B * T * Cin * sizeof(float));
     float* dout = make_random_float(B * T * Cout * sizeof(float));
 
     // allocate GPU memory
@@ -160,7 +166,7 @@ int main(int argc, char **argv) {
     printf("Using kernel %d\n", kernel_num);
 
     // CPU reference calculate
-    repkv_backward_cpu(dinp, dout, B, T, Cout, hd, qh, kh, vh);
+    repkv_backward_cpu(dinp, dout, B, T, Cin, hd, qh, kh, vh);
 
     // check the correctness of the kernel at all block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};

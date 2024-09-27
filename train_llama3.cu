@@ -897,26 +897,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         rmsnorm_backward(dresidual, dl_ln2w, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_rstd, B, T, C, main_stream);
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
 
-        // ------------------------------------------------------------------------
-        // DEBUGGING: we only work until this point right now, so exit here
-        // transfer the first 32 elements to CPU and print them
-        float* output = (float*)dl_btc;
-        floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
-        cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
-        for (int i = 0; i < 32; i++) {
-            printf("q[%d] = %.8f\n", i, (float) cpu[i]);
-        }
-        // write to .bin file
-        // move output to cpu
-        // int sz = B*T*qkv_channels; //B*T*C;
-        int sz = B*T*C;
-        floatX* cpu_output = (floatX*)mallocCheck(sz * sizeof(floatX));
-        cudaCheck(cudaMemcpy(cpu_output, output, sz * sizeof(floatX), cudaMemcpyDeviceToHost));
-        FILE* f = fopen("out.bin", "wb");
-        fwrite(cpu_output, sizeof(floatX), sz, f);
-        fclose(f);
-        exit(0);
-        // ------------------------------------------------------------------------
+        // <--- gradient here matches OK
 
         #ifdef ENABLE_CUDNN
         printf("cuDNN path TODO\n"); exit(0);
@@ -934,7 +915,29 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // backward repkv (use scratchX as gradient buffer here)
         repkv_backward(dl_bt4c2, dl_bt4c, B, T, NH, n_kv_head, hd);
 
-        // <--- here the gradients don't match, so there is an issue in between
+        // <--- here the gradients don't match
+        // so there is an issue with one of attention, rope, or repkv, or how they are called
+
+        // ------------------------------------------------------------------------
+        // DEBUGGING: we only work until this point right now, so exit here
+        // transfer the first 32 elements to CPU and print them
+        float* output = (float*)dl_bt4c2;
+        floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
+        cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < 32; i++) {
+            printf("q[%d] = %.8f\n", i, (float) cpu[i]);
+        }
+        // write to .bin file
+        // move output to cpu
+        // int sz = B*T*qkv_channels; //B*T*C;
+        int sz = B*T*qkv_channels;
+        floatX* cpu_output = (floatX*)mallocCheck(sz * sizeof(floatX));
+        cudaCheck(cudaMemcpy(cpu_output, output, sz * sizeof(floatX), cudaMemcpyDeviceToHost));
+        FILE* f = fopen("out.bin", "wb");
+        fwrite(cpu_output, sizeof(floatX), sz, f);
+        fclose(f);
+        exit(0);
+        // ------------------------------------------------------------------------
 
         // backward QKV projection
         if(model->recompute >= 2) {

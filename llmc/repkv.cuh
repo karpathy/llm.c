@@ -74,7 +74,7 @@ __global__ void repkv_backward_kernel1(floatX* dinp, const floatX* dout,
         dinp[dinp_idx] = __ldcs(&dout[dout_idx]);
     } else if (c == 1) {
         if (nh % replicate_factor == 0) {
-            float reduced_sum = 0;
+            float reduced_sum = 0.0f;
             for (int i = 0; i < replicate_factor; i++) {
                 reduced_sum += (float) __ldcs(&dout[dout_idx+HD*i]);
             }
@@ -85,7 +85,7 @@ __global__ void repkv_backward_kernel1(floatX* dinp, const floatX* dout,
 
     } else {
         if (nh % replicate_factor == 0) {
-            float reduced_sum = 0;
+            float reduced_sum = 0.0f;
             for (int i = 0; i < replicate_factor; i++) {
                 reduced_sum += (float) __ldcs(&dout[dout_idx+HD*i]);
             }
