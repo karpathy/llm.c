@@ -97,7 +97,7 @@ __global__ void repkv_backward_kernel2(floatX* dinp, const floatX* dout,
         dinp[dinp_idx] = reduced_sum;
     } else {
         float reduced_sum = 0.0f;
-        c = 2 * replicate_factor;   // we need this to align for out_idx (full KV)
+        c = 2 * replicate_factor;   // we need this to align for dout_idx (full KV)
         dout_idx = b * N * nh_total * HD + n * nh_total * HD + c * NKV * HD + nkv * HD * replicate_factor + d;
         for (int i = 0; i < replicate_factor; i++) {
             reduced_sum += __ldcs(&dout[dout_idx+HD*i]);
