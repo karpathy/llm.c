@@ -91,6 +91,12 @@ typedef __nv_bfloat16 floatX;
 #define PRECISION_MODE PRECISION_BF16
 #endif
 
+#if defined(OPTIMIZER_LOW_PRECISION)
+typedef floatX floatOpt;
+#else
+typedef float floatOpt;
+#endif
+
 // ----------------------------------------------------------------------------
 // Load and store with streaming cache hints
 // Older nvcc does not provide __ldcs and __stcs for bfloat16, despite these
