@@ -943,27 +943,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         }
     }
 
-    // ------------------------------------------------------------------------
-    // DEBUGGING: we only work until this point right now, so exit here
-    // transfer the first 32 elements to CPU and print them
-    float* output = (float*)dresidual;
-    floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
-    cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
-    for (int i = 0; i < 32; i++) {
-        printf("q[%d] = %.8f\n", i, (float) cpu[i]);
-    }
-    // write to .bin file
-    // move output to cpu
-    int sz = B*T*C;
-    floatX* cpu_output = (floatX*)mallocCheck(sz * sizeof(floatX));
-    cudaCheck(cudaMemcpy(cpu_output, output, sz * sizeof(floatX), cudaMemcpyDeviceToHost));
-    FILE* f = fopen("out.bin", "wb");
-    fwrite(cpu_output, sizeof(floatX), sz, f);
-    fclose(f);
-    exit(0);
-    // ------------------------------------------------------------------------
-
-    encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
+    encoder_backward(grads.wte, NULL, scratchX, model->workload_indices, model->bucket_info,
                      dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
 
     // Aggregate all gradients that are not part of the transformer blocks
@@ -977,7 +957,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         cudaCheck(cudaMemcpyAsync(&model->mean_loss, model->accumulated_mean_loss, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
         // reduce the gradients for non-transformer block parameters
         floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
-        const size_t nelem[] = {Vp * C, T * C, C, C};
+        const size_t nelem[] = {Vp * C, Vp * C, C, C};
         multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
     }
 

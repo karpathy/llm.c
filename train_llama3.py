@@ -299,11 +299,6 @@ class LLaMA(nn.Module):
         freqs_cis = self.freqs_cis[start_pos:start_pos+t]
         mask = torch.triu(torch.ones((t, t), device=next(self.parameters()).device, dtype=torch.bool), diagonal=1)
 
-        DEBUG_POINT = x.detach()
-        DEBUG_POINT = DEBUG_POINT.requires_grad_(True)
-        self.DEBUG_POINT = DEBUG_POINT
-        x = DEBUG_POINT
-
         for i, block in enumerate(self.transformer.h):
             x = block(x, freqs_cis, start_pos, mask)
         x = self.transformer.ln_f(x)
@@ -1258,18 +1253,6 @@ if __name__ == "__main__":
             # backward pass
             if not args.inference_only:
                 loss.backward()
-
-                # ---------------------------------------------------------------------
-                # DEBUGGING: print first 32 elements of x
-                x = model.DEBUG_POINT.grad
-                for i in range(32):
-                    print("q[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
-                # write to .bin file
-                with open("ref.bin", "wb") as f:
-                    f.write(x.view(-1).cpu().detach().numpy().tobytes())
-                breakpoint()
-                # ---------------------------------------------------------------------
-
         if ddp:
             dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
