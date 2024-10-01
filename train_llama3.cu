@@ -289,7 +289,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[14] = TENSOR_SPEC(data->lnf_mean, B * T);
     tensors[15] = TENSOR_SPEC(data->lnf_rstd, B * T);
     tensors[16] = TENSOR_SPEC(data->losses, B * T);
-    tensors[17] = TENSOR_SPEC(data->qkvr, L * B * T * qkv_channels);
+    tensors[17] = TENSOR_SPEC(data->qkvr, L * B * T * 3*C); // 3*C is correct - this is QKV after replication of KV
     tensors[18] = TENSOR_SPEC(data->output, B * T * max(qkv_channels, max(ffn_channels, max(NH*T, Vp))));
     tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * ffn_channels);
     tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
@@ -678,7 +678,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
         // get the pointers of the activations for this layer
         floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
-        floatX* l_qkvr = acts.qkvr + l * B * T * qkv_channels;
+        floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
@@ -862,7 +862,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // get the pointers of the activations for this layer
         floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        floatX* l_qkvr = acts.qkvr + l * B * T * qkv_channels;
+        floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
@@ -914,31 +914,6 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         rope_backward_inplace(dl_bt4c, dl_bt4c, model->freqs_cis, B, T, NH, hd, main_stream);
         // backward repkv (use scratchX as gradient buffer here)
         repkv_backward(dl_bt4c2, dl_bt4c, B, T, NH, n_kv_head, hd);
-
-        // <--- here the gradients don't match
-        // so there is an issue with one of attention, rope, or repkv, or how they are called
-
-        // ------------------------------------------------------------------------
-        // DEBUGGING: we only work until this point right now, so exit here
-        // transfer the first 32 elements to CPU and print them
-        float* output = (float*)dl_bt4c2;
-        floatX* cpu = (floatX*)mallocCheck(32 * sizeof(floatX));
-        cudaCheck(cudaMemcpy(cpu, output, 32 * sizeof(floatX), cudaMemcpyDeviceToHost));
-        for (int i = 0; i < 32; i++) {
-            printf("q[%d] = %.8f\n", i, (float) cpu[i]);
-        }
-        // write to .bin file
-        // move output to cpu
-        // int sz = B*T*qkv_channels; //B*T*C;
-        int sz = B*T*qkv_channels;
-        floatX* cpu_output = (floatX*)mallocCheck(sz * sizeof(floatX));
-        cudaCheck(cudaMemcpy(cpu_output, output, sz * sizeof(floatX), cudaMemcpyDeviceToHost));
-        FILE* f = fopen("out.bin", "wb");
-        fwrite(cpu_output, sizeof(floatX), sz, f);
-        fclose(f);
-        exit(0);
-        // ------------------------------------------------------------------------
-
         // backward QKV projection
         if(model->recompute >= 2) {
             rmsnorm_forward(l_ln1, l_ln1_rstd, residual, l_ln1w, B, T, C, main_stream);
@@ -958,16 +933,17 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             };
             const size_t nelem[] = {
                 C, C,
-                3 * C * C, 3 * C,
+                qkv_channels * C, qkv_channels,
                 C * C, C,
                 C, C,
-                4 * C * C, 4 * C,
-                C * 4 * C, C
+                ffn_channels * C, ffn_channels,
+                C * ffn_channels_post_gelu, C
             };
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
         }
     }
-    encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
+
+    encoder_backward(grads.wte, NULL, scratchX, model->workload_indices, model->bucket_info,
                      dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
 
     // Aggregate all gradients that are not part of the transformer blocks
@@ -981,7 +957,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         cudaCheck(cudaMemcpyAsync(&model->mean_loss, model->accumulated_mean_loss, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
         // reduce the gradients for non-transformer block parameters
         floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
-        const size_t nelem[] = {Vp * C, T * C, C, C};
+        const size_t nelem[] = {Vp * C, Vp * C, C, C};
         multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
     }
 

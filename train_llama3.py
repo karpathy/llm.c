@@ -168,12 +168,6 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
-
-        DEBUG_POINT = qkv.detach()
-        DEBUG_POINT = DEBUG_POINT.requires_grad_(True)
-        self.DEBUG_POINT = DEBUG_POINT
-        qkv = DEBUG_POINT
-
         q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
         q, k, v = map(lambda t: t.view(B, T, -1, self.hd), (q, k, v))  # (B, T, NH, HD)
         q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)  <-- 1. difference compared to GPT-2
@@ -1259,18 +1253,6 @@ if __name__ == "__main__":
             # backward pass
             if not args.inference_only:
                 loss.backward()
-
-                # ---------------------------------------------------------------------
-                # DEBUGGING: print first 32 elements of x
-                x = model.transformer.h[-1].attn.DEBUG_POINT.grad
-                for i in range(32):
-                    print("q[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
-                # write to .bin file
-                with open("ref.bin", "wb") as f:
-                    f.write(x.view(-1).cpu().detach().numpy().tobytes())
-                breakpoint()
-                # ---------------------------------------------------------------------
-
         if ddp:
             dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
