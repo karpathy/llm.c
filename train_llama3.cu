@@ -334,8 +334,8 @@ typedef struct {
     ParameterTensors grads;
     void* grads_memory;
     // buffers for the AdamW optimizer
-    float* m_memory;
-    float* v_memory;
+    floatOpt* m_memory;
+    floatOpt* v_memory;
     float* master_weights;     // is NULL unless fp32 weights is enabled.
     // the activations of the model, and their sizes
     ActivationTensors acts;
@@ -455,12 +455,12 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     // we will now init the optimizer states and master weights
     // this is usually a substantial amount of memory allocation right here.
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters; // num parameters we are responsible for
-    printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
-    printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
+    printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(floatOpt)) >> 20);
+    printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(floatOpt)) >> 20);
     assert(model->m_memory == nullptr);
     assert(model->v_memory == nullptr);
-    memory_status |= cudaMallocConditionallyManaged((void**)&model->m_memory, shard_num_parameters * sizeof(float));
-    memory_status |= cudaMallocConditionallyManaged((void**)&model->v_memory, shard_num_parameters * sizeof(float));
+    memory_status |= cudaMallocConditionallyManaged((void**)&model->m_memory, shard_num_parameters * sizeof(floatOpt));
+    memory_status |= cudaMallocConditionallyManaged((void**)&model->v_memory, shard_num_parameters * sizeof(floatOpt));
 
     if (model->use_master_weights == 1) {
         assert(model->master_weights == nullptr);
@@ -1047,8 +1047,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     if(init_state) {
         model->init_state = false;
         NvtxRange rng("InitOpt");
-        cudaCheck(cudaMemset(model->m_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->m_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(floatOpt)));
+        cudaCheck(cudaMemset(model->v_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(floatOpt)));
     }
 
     // save RNG state at this point so we can round from master weights identically when restoring from a checkpoint
@@ -1079,8 +1079,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
 
         ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ?  local_offset_full : local_offset_partial;
-        float* m_ptr = model->m_memory + opt_state_offset;
-        float* v_ptr = model->v_memory + opt_state_offset;
+        floatOpt* m_ptr = model->m_memory + opt_state_offset;
+        floatOpt* v_ptr = model->v_memory + opt_state_offset;
         float* master_ptr = nullptr;
         if (model->master_weights != nullptr) { master_ptr = model->master_weights + opt_state_offset; }
         if(init_state && model->master_weights != nullptr ) {
@@ -1225,10 +1225,10 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     *((size_t*)&state_header[32]) = loader->current_sample_idx; // position in shard
     fwriteCheck(state_header, sizeof(int), 256, state_file);
 
-    // write AdamW m, v, and master_weights here (they are all float)
+    // write AdamW m, v, and master_weights here (they are all float, unless OPTIMIZER_LOW_PRECISION is defined)
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
-    device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-    device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(floatOpt), IO_BUF_SIZE, main_stream);
+    device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(floatOpt), IO_BUF_SIZE, main_stream);
     if(model->use_master_weights) {
         device_to_file(state_file, model->master_weights, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     }
@@ -1273,8 +1273,8 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     model->init_state = false;      // we just got the state from file, no need to do first-touch init
     assert(model->m_memory != nullptr);
     assert(model->v_memory != nullptr);
-    file_to_device(model->m_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-    file_to_device(model->v_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    file_to_device(model->m_memory, state_file, shard_num_parameters * sizeof(floatOpt), IO_BUF_SIZE, main_stream);
+    file_to_device(model->v_memory, state_file, shard_num_parameters * sizeof(floatOpt), IO_BUF_SIZE, main_stream);
     if(model->use_master_weights) {
         assert(model->master_weights != nullptr);
         file_to_device(model->master_weights, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
