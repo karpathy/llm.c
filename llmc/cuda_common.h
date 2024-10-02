@@ -179,7 +179,7 @@ inline void file_to_device(void* dest, FILE* src, size_t num_bytes, size_t buffe
     // prime the read buffer;
     char* gpu_write_ptr = (char*)dest;
     size_t copy_amount = std::min(buffer_size, num_bytes);
-    freadCheck(read_buffer, 1, copy_amount, src);
+    // freadCheck(read_buffer, 1, copy_amount, src);
 
     size_t rest_bytes = num_bytes - copy_amount;
     size_t write_buffer_size = copy_amount;
@@ -192,7 +192,7 @@ inline void file_to_device(void* dest, FILE* src, size_t num_bytes, size_t buffe
         cudaCheck(cudaMemcpyAsync(gpu_write_ptr, write_buffer, write_buffer_size, cudaMemcpyHostToDevice, stream));
         gpu_write_ptr += write_buffer_size;
         // while this is going on, read from disk
-        freadCheck(read_buffer, 1, copy_amount, src);
+        //freadCheck(read_buffer, 1, copy_amount, src);
         cudaCheck(cudaStreamSynchronize(stream));     // wait for both buffers to be ready.
 
         std::swap(read_buffer, write_buffer);
