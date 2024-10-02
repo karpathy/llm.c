@@ -265,8 +265,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     size_t ffn_channels = hidden_dim * 2; // c_fc + c_fc2 concatenated
     size_t ffn_channels_post_gelu = hidden_dim; // swiglu will halve the channels
 
-    // activation checkpointing: only need memory for a small number of layers
-    // except for residual3 (todo - reduce residual3 further?)
+    // activation checkpointing: only need memory for Lc layers (except for residual3)
     int Lc = layers_per_checkpoint ? layers_per_checkpoint : L;
 
     tensors[0] = TENSOR_SPEC(data->encoded, B * T * C);
@@ -289,7 +288,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[10] = TENSOR_SPEC(data->fch, Lc * B * T * ffn_channels);
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
     tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? Lc * B * T * ffn_channels_post_gelu : B * T * ffn_channels_post_gelu);
-    tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C); // full number of layer (L rather than Lc)!
+    tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C); // full number of layers (L rather than Lc)!
     tensors[13] = TENSOR_SPEC(data->lnf, B * T * C);
     tensors[14] = TENSOR_SPEC(data->lnf_mean, B * T);
     tensors[15] = TENSOR_SPEC(data->lnf_rstd, B * T);
@@ -700,7 +699,9 @@ void transformer_layer_forward(GPT2* model, size_t B, size_t T, int l, bool reco
     swiglu_forward(l_fch_gelu, l_fch, B, T, ffn_channels_post_gelu, main_stream);
 
     if (!recompute_from_checkpoint) {
-        swiglu_forward(l_fch_gelu, l_fch, B, T, ffn_channels_post_gelu, main_stream);
+        // by saving the residual of every single layer, we avoid one of the 2 big matmuls
+        // we could save even a bit more memory by e.g. only saving 1 in 2 residuals when layers_per_checkpoint=2
+        // but that would result in needing to recompute this matmul *and* more complex code for the pointer calculations
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, ffn_channels_post_gelu, C, main_stream);
         // OK, fusion across blocks.
         if(l+1 != L) {
