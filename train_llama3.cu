@@ -267,6 +267,10 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
 
     // activation checkpointing: only need memory for Lc layers (except for residual3)
     int Lc = layers_per_checkpoint ? layers_per_checkpoint : L;
+    if (layers_per_checkpoint && (L % Lc) != 0) {
+        printf("Error: number of layers (%d) must be divisible by layers_per_checkpoint (-ac %d)\n", L, Lc);
+        exit(1);
+    }
 
     tensors[0] = TENSOR_SPEC(data->encoded, B * T * C);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
