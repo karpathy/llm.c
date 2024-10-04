@@ -74,7 +74,8 @@ __global__ void init_from_master_kernel(Tp* params_memory, float* master_params_
     if (idx >= num_parameters) { return; }
     params_memory += blockIdx.y * w_stride; // adjust for layer offset
     master_params_memory += blockIdx.y * s_stride;
-    stochastic_rounding(master_params_memory[idx], &params_memory[idx], seed);
+    unsigned int random = Get2dNoiseUint(idx, blockIdx.y, seed);
+    stochastic_rounding(master_params_memory[idx], &params_memory[idx], random, false);
 }
 
 template <typename Tp, typename Tg>
