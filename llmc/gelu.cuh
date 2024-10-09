@@ -47,13 +47,27 @@ __global__ void gelu_backward_inplace_kernel(floatX* d_in_out, const floatX* inp
 // ----------------------------------------------------------------------------
 // kernel launchers
 
-void gelu_forward(floatX* out, const floatX* inp, int N, cudaStream_t stream) {
+void gelu_forward(floatX* out, const floatX* inp, int N, float* coord_check_data, int cc_cnt, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 512;
     assert(N % (block_size * x128::size) == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
     gelu_forward_kernel2<<<grid_size, block_size, 0, stream>>>(out, inp);
     cudaCheck(cudaGetLastError());
+    // data collection
+    if (coord_check_data != NULL) {
+        float sum = 0.0;
+        float* sum_d;
+        cudaMalloc(&sum_d, sizeof(float));
+        cudaCheck(cudaMemsetAsync(sum_d, 0, sizeof(float), stream));
+        assert(N % WARP_SIZE == 0);
+        int grid_size = CEIL_DIV(N, WARP_SIZE);
+        abs_sum_kernel<<<grid_size, WARP_SIZE, 0, stream>>>(out, grid_size, WARP_SIZE, sum_d);
+        cudaCheck(cudaGetLastError());
+        cudaCheck(cudaMemcpy(&sum, sum_d, sizeof(float), cudaMemcpyDeviceToHost));
+        cudaCheck(cudaFree(sum_d));
+        coord_check_data[cc_cnt] = sum / N;
+    }
 }
 
 void gelu_backward_inplace(floatX* d_in_out, const floatX* inp, const int N, cudaStream_t stream) {

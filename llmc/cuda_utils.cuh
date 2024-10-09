@@ -283,4 +283,17 @@ __device__ __forceinline__ void stochastic_rounding(float in, float *out, unsign
     *out = in; // dummy function for when floatX is float (FP32 mode)
 }
 
+__global__ void abs_sum_kernel(floatX* data, int N, int C, float* sum) {
+    float accumulator = 0.f;
+    for(size_t i = threadIdx.x; i < C; i += WARP_SIZE) {
+        int idx = blockIdx.x * C + i;
+        accumulator += fabsf((float)data[idx]);
+    }
+    accumulator = warpReduceSum(accumulator);
+    if(threadIdx.x == 0) {
+        // This is just used for data collection so no need for deterministic reduction
+        atomicAdd(sum, accumulator);
+    }
+}
+
 #endif

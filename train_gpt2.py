@@ -76,7 +76,9 @@ class CausalSelfAttention(nn.Module):
         else:
             # manual implementation of attention
             # this materializes the large (T,T) matrix for all the queries and keys
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            score = k.size(-1) if self.use_mup else math.sqrt(k.size(-1))
+            attn_mult = self.mup_base_attn_mult if self.use_mup else 1.0
+            att = (q @ k.transpose(-2, -1)) * (attn_mult / score)
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -124,6 +126,9 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    use_mup: int = 0
+    mup_width_mult: float = 1.0
+    mup_base_attn_mult: float = 1.0
 
 class GPT(nn.Module):
 
@@ -150,12 +155,19 @@ class GPT(nn.Module):
         if isinstance(module, nn.Linear):
             # apply special scaled init to the residual projections, per GPT-2 paper
             std = 0.02 if not hasattr(module, 'LLMC_RESIDUAL_SCALE_FLAG') else 0.02/math.sqrt(2 * self.config.n_layer)
+            if self.config.use_mup and any(module._get_name().endswith(w) for w in ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']):
+                std *= 1.0 / math.sqrt(self.config.mup_width_mult)
             # we want to skip initializing lm_head, which shares parameters with wte
             # and wte was already initialized down below during the Embedding init
             if not hasattr(module, 'LLMC_SKIP_INIT'):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=std, generator=self.init_rng)
+            else:
+                if self.config.use_mup: torch.nn.init.zeros_(module.weight)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
+
+            if self.config.use_mup and "c_attn" in module._get_name():
+                torch.nn.init.zeros_(module.weight[:self.config.n_embd])  # init query vector to all zeros
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
 
@@ -173,6 +185,9 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
+
+        if self.config.use_mup and self.config.mup_width_mult != 1.0:
+            x = x / self.config.mup_width_mult
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -238,19 +253,36 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage, use_mup, mup_width_mult):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
+        if use_mup:
+            mup_params_keys = set([pn for pn in param_dict.keys() if any(pn.endswith(w)
+                for w in ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight'])])
+            dim2_params_keys = set([pn for pn in param_dict.keys() if param_dict[pn].dim() >= 2])
+            assert dim2_params_keys.difference(mup_params_keys) == {'transformer.wte.weight', 'transformer.wpe.weight'}
+            assert mup_params_keys.difference(dim2_params_keys) == set()
+            dim2_params_keys = dim2_params_keys.difference(mup_params_keys)
+
+            mup_parameters = [p for n, p in param_dict.items() if n in mup_params_keys]
+            decay_params = [p for n, p in param_dict.items() if n in dim2_params_keys]
+            nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+            optim_groups = [
+                {'params': mup_parameters, 'weight_decay': weight_decay * mup_width_mult, 'lr': learning_rate / mup_width_mult},
+                {'params': decay_params, 'weight_decay': weight_decay, 'lr': learning_rate},
+                {'params': nodecay_params, 'weight_decay': 0.0, 'lr': learning_rate}
+            ]
+        else:
+            decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+            nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+            optim_groups = [
+                {'params': decay_params, 'weight_decay': weight_decay},
+                {'params': nodecay_params, 'weight_decay': 0.0}
+            ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print0(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
@@ -262,11 +294,11 @@ class GPT(nn.Module):
         if zero_stage == 1:
             print0("using ZeroRedundancyOptimizer")
             optimizer = ZeroRedundancyOptimizer(**optim_groups[0], optimizer_class=torch.optim.AdamW,
-                                                lr=learning_rate, betas=betas, fused=use_fused)
+                                                betas=betas, fused=use_fused)
             optimizer.add_param_group(optim_groups[1])
         else:
             print0("using regular AdamW")
-            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
+            optimizer = torch.optim.AdamW(optim_groups, betas=betas, fused=use_fused)
         return optimizer
 
     @torch.no_grad()
@@ -559,6 +591,10 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate_decay_frac", type=float, default=1.0, help="learning rate warmup iterations")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
+    # mup - maximum update parametrization
+    parser.add_argument("--use_mup", type=int, default=0, help="should we use maximum update parametrization")
+    parser.add_argument("--mup_width_mult", type=float, default=1.0, help="width multiplier - ratio of width to base model width")
+    parser.add_argument("--mup_base_attn_mult", type=float, default=1.0, help="base attention multiplier")
     # evaluation
     parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
     parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
@@ -657,10 +693,21 @@ if __name__ == "__main__":
             "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
             "d48": GPTConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600),
         }[args.model]
+        if args.use_mup:
+            model_config.use_mup = args.use_mup
+            model_config.mup_base_attn_mult = args.mup_base_attn_mult
+            model_config.mup_width_mult = args.mup_width_mult
         model = GPT(model_config)
     else:
         # load the GPT-2 model weights
         model = GPT.from_pretrained(args.model)
+
+    for m in model.modules():
+        m.use_mup = args.use_mup
+        if args.use_mup:
+            m.mup_base_attn_mult = args.mup_base_attn_mult
+            m.mup_width_mult = args.mup_width_mult
+
     model.train()
     model.to(device)
     if args.compile:
@@ -710,7 +757,8 @@ if __name__ == "__main__":
     # init the optimizer
     optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
                                                learning_rate=args.learning_rate, betas=(0.9, 0.95),
-                                               device_type=device, zero_stage=zero_stage)
+                                               device_type=device, zero_stage=zero_stage,
+                                               use_mup=args.use_mup, mup_width_mult=args.mup_width_mult)
 
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):

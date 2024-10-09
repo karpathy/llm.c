@@ -319,6 +319,9 @@ typedef struct {
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
+    int use_mup; // use muP (maximum update) [1] or SP (standard) parametrization [0]
+    float mup_width_mult; // muP width multiplier
+    float mup_base_attn_mult; // base attention multiplier
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -348,6 +351,9 @@ void gpt2_init_common(GPT2 *model) {
     model->init_state = true;
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+    model->use_mup = 0; // default: use standard parametrization
+    model->mup_width_mult = 1.0f; // default: no width multiplier
+    model->mup_base_attn_mult = 1.0f; // default: no base attention multiplier
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -516,42 +522,56 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     cudaCheck(cudaDeviceSynchronize());
 }
 
-void gpt2_set_hyperparameters(GPT2Config* config, const char* depth_str) {
+void gpt2_set_hyperparameters(GPT2Config* config, const char* depth_str, int mup_width, int mup_coord_check) {
     int depth = atoi(depth_str);
     assert(depth > 0); // atoi returns 0 if not a number
     int channels, num_heads;
-    if      (depth == 6)  { channels = 384; num_heads = 6; }   // (unofficial) gpt2-tiny (30M)
-    else if (depth == 12) { channels = 768; num_heads = 12; }  // gpt2 (124M)
-    else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
-    else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
-    else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
-    else if (depth == 60) { channels = 1920; num_heads = 30; } // (unofficial) 2.7B
-    else if (depth == 72) { channels = 2880; num_heads = 30; } // (unofficial) 7.3B
-    else if (depth == 84) { channels = 3456; num_heads = 36; } // (unofficial) 12.2B
-    else { fprintf(stderr, "Unsupported GPT-2 depth: %d\n", depth); exit(EXIT_FAILURE); }
+    if (mup_coord_check) {
+        // for the mup_coord_check, we use a small model
+        depth = 2;
+        num_heads = 2;
+        channels = mup_width;
+    } else {
+        if      (depth == 6)  { channels = 384; num_heads = 6; }   // (unofficial) gpt2-tiny (30M)
+        else if (depth == 12) { channels = 768; num_heads = 12; }  // gpt2 (124M)
+        else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
+        else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
+        else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
+        else if (depth == 60) { channels = 1920; num_heads = 30; } // (unofficial) 2.7B
+        else if (depth == 72) { channels = 2880; num_heads = 30; } // (unofficial) 7.3B
+        else if (depth == 84) { channels = 3456; num_heads = 36; } // (unofficial) 12.2B
+        else { fprintf(stderr, "Unsupported GPT-2 depth: %d\n", depth); exit(EXIT_FAILURE); }
+    }
     config->num_layers = depth;
     config->channels = channels;
     config->num_heads = num_heads;
     config->max_seq_len = 1024;
 }
 
-void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
+void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str, int mup_width, int mup_coord_check) {
     // we use channels instead of depth for GPT-3 because GPT-3 model depths are not one-to-one
     // note that our models are not necessarily identical to GPT-3 because
     // we use dense attention, not the alternating dense/banded attention of GPT-3
     int channels = atoi(channels_str);
     assert(channels > 0); // atoi returns 0 if not a number
     int depth, head_size;
-    if      (channels == 384)   { depth = 6;  head_size = 64; }  // (unofficial) gpt3-tiny (31M)
-    else if (channels == 768)   { depth = 12; head_size = 64; }  // gpt3-small (125M)
-    else if (channels == 1024)  { depth = 24; head_size = 64; }  // gpt3-medium (350M)
-    else if (channels == 1536)  { depth = 24; head_size = 96; }  // gpt3-large (760M)
-    else if (channels == 2048)  { depth = 24; head_size = 128; } // gpt3-xl (1.3B) [heads fixed]
-    else if (channels == 2560)  { depth = 32; head_size = 80; }  // gpt3-2.7B
-    else if (channels == 4096)  { depth = 32; head_size = 128; } // gpt3-6.7B
-    else if (channels == 5140)  { depth = 40; head_size = 128; } // gpt3-13B
-    else if (channels == 12288) { depth = 96; head_size = 128; } // gpt3 (175B)
-    else { fprintf(stderr, "Unsupported GPT-3 channels: %d\n", channels); exit(EXIT_FAILURE); }
+     if (mup_coord_check) {
+        // for the mup_coord_check, we use a small model
+        depth = 2;
+        head_size = mup_width / 2;  // 2 heads
+        channels = mup_width;
+    } else {
+        if      (channels == 384)   { depth = 6;  head_size = 64; }  // (unofficial) gpt3-tiny (31M)
+        else if (channels == 768)   { depth = 12; head_size = 64; }  // gpt3-small (125M)
+        else if (channels == 1024)  { depth = 24; head_size = 64; }  // gpt3-medium (350M)
+        else if (channels == 1536)  { depth = 24; head_size = 96; }  // gpt3-large (760M)
+        else if (channels == 2048)  { depth = 24; head_size = 128; } // gpt3-xl (1.3B) [heads fixed]
+        else if (channels == 2560)  { depth = 32; head_size = 80; }  // gpt3-2.7B
+        else if (channels == 4096)  { depth = 32; head_size = 128; } // gpt3-6.7B
+        else if (channels == 5140)  { depth = 40; head_size = 128; } // gpt3-13B
+        else if (channels == 12288) { depth = 96; head_size = 128; } // gpt3 (175B)
+        else { fprintf(stderr, "Unsupported GPT-3 channels: %d\n", channels); exit(EXIT_FAILURE); }
+    }
     assert(channels % head_size == 0);
     config->num_layers = depth;
     config->channels = channels;
@@ -559,7 +579,7 @@ void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
     config->max_seq_len = 2048; // NOTE: GPT-3 uses context length of 2048 tokens, up from 1024 in GPT-2
 }
 
-void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
+void gpt_build_from_descriptor(GPT2 *model, const char* descriptor, int mup_width, int mup_coord_check) {
     // The model descriptor can be:
     // - legacy format "dX", where X is number, e.g. "d12". This creates GPT-2 model with 12 layers.
     // - new explicit format "gpt2:dX", same as above, e.g. "gpt2:d48" for GPT-2 with 48 layers.
@@ -569,11 +589,11 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     assert(descriptor != NULL);
     size_t len = strlen(descriptor);
     if (len > 1 && descriptor[0] == 'd') {
-        gpt2_set_hyperparameters(&model->config, descriptor + 1); // pass along the depth str without the 'd'
+        gpt2_set_hyperparameters(&model->config, descriptor + 1, mup_width, mup_coord_check); // pass along the depth str without the 'd'
     } else if (len > 6 && strncmp(descriptor, "gpt2:d", 6) == 0) {
-        gpt2_set_hyperparameters(&model->config, descriptor + 6); // pass along the depth str without the 'gpt2:d'
+        gpt2_set_hyperparameters(&model->config, descriptor + 6, mup_width, mup_coord_check); // pass along the depth str without the 'gpt2:d'
     } else if (len > 6 && strncmp(descriptor, "gpt3:c", 6) == 0) {
-        gpt3_set_hyperparameters(&model->config, descriptor + 6); // pass along the channels str without the 'gpt3:c'
+        gpt3_set_hyperparameters(&model->config, descriptor + 6, mup_width, mup_coord_check); // pass along the channels str without the 'gpt3:c'
     } else {
         fprintf(stderr, "Unsupported model descriptor: %s\n", descriptor); exit(EXIT_FAILURE);
     }
@@ -597,6 +617,8 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     // so that we can match them up and get correctness and exactly the same initial conditions
     size_t L = model->config.num_layers;
     size_t offset = 0;
+    float mup_scale = sqrtf(model->mup_width_mult);
+    float mup_scale_inv = 1.0f / mup_scale;
     for (int l = 0; l < L; l++) {
         offset = 0;
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -624,11 +646,28 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
                 // in GPT-2, the projections back into the residual stream are additionally
                 // scaled by 1/sqrt(2*L) for training stability
                 float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
+                // --- muP ---
+                scale = (model->use_mup && i != 0 && i != 1) ? mup_scale_inv*scale : scale;
+
                 // okay let's draw the random numbers and write them
                 float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
                 normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
                 for (size_t j = 0; j < n; j++) {
                     params_memory_cpu[offset + layer_offset + j] = (floatX)fp32_buffer[j];
+                }
+                // --- muP ---
+                if (model->use_mup && i == 4) {  // qkv weights, init q with 0.0
+                    assert(n % 3 == 0);
+                    n = n / 3;
+                    for (size_t j = 0; j < n; j++) {
+                        params_memory_cpu[offset + layer_offset + j] = 0.0f;
+                    }
+                }
+                // --- muP ---
+                if (model->use_mup && i == 0) {  // set readout/embedding to all 0.
+                    for (size_t j = 0; j < n; j++) {
+                        params_memory_cpu[offset + layer_offset + j] = 0.f;
+                    }
                 }
                 free(fp32_buffer);
             }
@@ -643,7 +682,7 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
 
 // propagate inputs through the network to produce logits.
 // right now, this function is fully synchronous with the host
-void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
+void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T, int step, float* coord_check_data) {
     NVTX_RANGE_FN();
     // we must be careful and use size_t instead of int, otherwise
     // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
@@ -674,13 +713,23 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // we can do this while the copies are already underway
     tokenCheck(inputs, B*T, V);
 
+    int cc_cnt = step * (3 + model->config.num_layers * 8);
+    if (coord_check_data != NULL && step >= 4) {
+        char filename[100];
+        sprintf(filename, "usemup=%d_width=%d_coord_check_data.bin", model->use_mup, model->config.channels);
+        FILE *f = fopen(filename, "wb");
+        fwrite(coord_check_data, sizeof(float), cc_cnt, f);
+        fclose(f);
+        exit(EXIT_SUCCESS);
+    }
+
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, coord_check_data, cc_cnt++, main_stream); // encoding goes into residual[0]
 
     // first layernorm isn't fused
-    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
+    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, coord_check_data, cc_cnt++, main_stream);
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
@@ -717,8 +766,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // now do the forward pass
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
+        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream, coord_check_data, &cc_cnt);
+        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, model->use_mup, model->mup_base_attn_mult, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         if (T != model->seq_len) { // unused parts of attention buffer must be zeroed (T-dependent)
@@ -726,14 +775,14 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         }
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
+        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream, coord_check_data, &cc_cnt);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, model->use_mup, model->mup_base_attn_mult, coord_check_data, cc_cnt++, main_stream);
         #endif
 
-        matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
-        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
-        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+        matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream, coord_check_data, &cc_cnt);
+        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, 0., 0., coord_check_data, cc_cnt++, main_stream);
+        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, coord_check_data, &cc_cnt, l_fch, model->gelu_fusion);
+        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream, coord_check_data, &cc_cnt);
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
@@ -742,15 +791,15 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
             const floatX* l_ln1b = params.ln1b + (l + 1) * C;
             fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
-                                    B * T, C, main_stream);
+                                    B * T, C, 0., 0., coord_check_data, cc_cnt++, main_stream);
         } else {
             fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
                                     params.lnfw, params.lnfb,
-                                    B * T, C, main_stream);
+                                    B * T, C, model->use_mup, 1. / model->mup_width_mult, coord_check_data, cc_cnt++, main_stream);
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream, coord_check_data, &cc_cnt);
     cudaCheck(cudaDeviceSynchronize());
 }
 
@@ -761,7 +810,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B, size_t T) {
     assert(targets != NULL);
     // forward the model itself
-    gpt2_forward(model, inputs, B, T);
+    gpt2_forward(model, inputs, B, T, -1, NULL);
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
     const size_t V = model->config.vocab_size;
     const size_t Vp = model->config.padded_vocab_size;
@@ -839,7 +888,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
+    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, model->use_mup, model->mup_width_mult, main_stream);
 
     // from this point on, we no longer need the values stored in the last residual, so we can reuse that memory as generic
     // scratch for backward computations
@@ -895,35 +944,35 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         if(model->recompute >= 1) {
             // recompute >= 1 means we recompute gelu. in this case,
             // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
-            gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream);
+            gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, NULL, 0, main_stream);
         }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
         if(model->recompute >= 2) {
             // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
-            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
+            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, NULL, 0, main_stream);
         }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
-        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
+        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, 0., 0., main_stream);
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
 
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C, main_stream);
+        attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C, model->use_mup, model->mup_base_attn_mult, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
-        attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
+        attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, model->use_mup, model->mup_base_attn_mult, main_stream);
         #endif
         if(model->recompute >= 2) {
-            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
+            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, NULL, 0, main_stream);
         }
         // QKV parameter gradients
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
+        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, 0., 0., main_stream);
 
         // Accumulate gradients from this layer in a background stream.
         if(last_step) {
@@ -1078,6 +1127,14 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         // - the token embeddings are weight shared and participate in the final projection to logits
         // - the position embeddings actively participate at every forward/backward pass
         float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
+        float lr = learning_rate;
+
+        // --- mup ---
+        if (model->use_mup && (i == 4 || i == 6 || i == 10 || i == 12)) {
+            wd *= model->mup_width_mult;
+            lr /= model->mup_width_mult;
+        }
+
         floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
         floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
 
@@ -1101,7 +1158,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
             adamw_update(param_ptr, master_ptr, grad_ptr,
                         m_ptr, v_ptr,
                         shard.size, tensor.size, tensor.size, shard.size, num_layers,
-                        learning_rate,
+                        lr,
                         beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
         }
 
@@ -1389,6 +1446,12 @@ void error_usage() {
     fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
     fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes above this in zscore (0.0f=off)\n");
     fprintf(stderr, "  -sg <float> outlier stability: skip update if grad_norm goes above this in zscore (0.0f=off)\n");
+    // muP (maximum update parametrization)
+    fprintf(stderr, "  -me <int> should enable muP? (default 0)\n");
+    fprintf(stderr, "  -mm <float> width multiplier - ratio of width to base model width (default = 1.0f)\n");
+    fprintf(stderr, "  -ma <float> tunable base attn multiplier (default = 1.0f)\n");
+    fprintf(stderr, "  -mc <int> should do muP coordinate check test? (default 0)\n");
+    fprintf(stderr, "  -mw <int> muP coordinate check current width (default 256)\n");
     // evaluation
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
     fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
@@ -1449,6 +1512,12 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    // muP settings
+    int use_mup = 0;  // muP or SP (standard parametrization)
+    float mup_width_mult = 1.f;  // muP width multiplier
+    float mup_base_attn_mult = 1.f;  // muP base attention multiplier
+    int mup_coord_check = 0;  // should do muP coordinate check? tests for correctness of muP
+    int mup_coord_check_width = 256;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1477,7 +1546,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm' && argv[i][2] == '\0') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g' && argv[i][2] == 'e') { gelu_fusion = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
@@ -1498,9 +1567,21 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm' && argv[i][2] == 'e') { use_mup = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm' && argv[i][2] == 'm') { mup_width_mult = atof(argv[i+1]); }
+        else if (argv[i][1] == 'm' && argv[i][2] == 'a') { mup_base_attn_mult = atof(argv[i+1]); }
+        else if (argv[i][1] == 'm' && argv[i][2] == 'c') { mup_coord_check = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm' && argv[i][2] == 'w') { mup_coord_check_width = atof(argv[i+1]); }
         else { error_usage(); }
     }
-
+    if (mup_coord_check) {
+        load_filename = "d2";
+        recompute = 0;
+        #ifdef ENABLE_CUDNN
+        printf("cuDNN is enabled, muP coordinate check is not supported with cuDNN\n");
+        exit(EXIT_FAILURE);
+        #endif
+    }
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
     common_start(override_enable_tf32, false); // common init code for train/test/profile
 
@@ -1571,6 +1652,9 @@ int main(int argc, char *argv[]) {
     // build the GPT-2 model
     GPT2 model;
     gpt2_init_common(&model);
+    model.use_mup = use_mup;
+    model.mup_width_mult = mup_width_mult;
+    model.mup_base_attn_mult = mup_base_attn_mult;
     if (resuming == 1) {
         // if `-y 1` was set, then we are resuming from the latest checkpoint
         // if we are using master weights, we'll init them later inside load_state()
@@ -1582,7 +1666,7 @@ int main(int argc, char *argv[]) {
     } else {
         // if it's not .bin, it could be a "special descriptor". This descriptor is used to
         // construct GPT-2 / GPT-3 models in a convenient format. See the function for docs.
-        gpt_build_from_descriptor(&model, load_filename);
+        gpt_build_from_descriptor(&model, load_filename, mup_coord_check_width, mup_coord_check);
     }
 
     model.use_master_weights = use_master_weights;
@@ -1652,6 +1736,9 @@ int main(int argc, char *argv[]) {
     printf0("batch_size B=%d * seq_len T=%d * num_processes=%d and total_batch_size=%d\n",
             B, T, multi_gpu_config.num_processes, total_batch_size);
     printf0("=> setting grad_accum_steps=%d\n", grad_accum_steps);
+    if (mup_coord_check) {
+        assert(grad_accum_steps == 1);
+    }
 
     // set up logging
     if (multi_gpu_config.process_rank == 0) { create_dir_if_not_exists(output_log_dir); }
@@ -1709,6 +1796,14 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaProfilerStart());
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
+
+    // 4 * (3 + model.config.num_layers * 8) <- we collect 4 steps of stats
+    const int cc_buffer_size = 76;  // windows CI requires a constant here
+    float coord_check_data[cc_buffer_size];
+    for (int i = 0; i < cc_buffer_size; i++) {
+        coord_check_data[i] = 0.0f;
+    }
+
     for (; step <= train_num_batches; step++) {
         NvtxRange step_range("Train step", step);
 
@@ -1769,7 +1864,7 @@ int main(int argc, char *argv[]) {
                 // on cuDNN 9.2.1 with cuDNN FrontEnd 1.5.2, T >= 256 seems bit-for-bit identical
                 // (but even if it wasn't fully identical that's probably not the end of the world)
                 // note this is still somewhat wasteful because we don't have a KV cache!
-                gpt2_forward(&model, gen_tokens, 1, CEIL_DIV(t, min(T,256)) * min(T,256));
+                gpt2_forward(&model, gen_tokens, 1, CEIL_DIV(t, min(T,256)) * min(T,256), -1, NULL);
                 // get the V-dimensional vector probs[0, t-1, :]
                 floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
                 // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
@@ -1830,7 +1925,7 @@ int main(int argc, char *argv[]) {
             // fetch the next data batch
             dataloader_next_batch(&train_loader);
             // forward pass. note that we pass in grad_accum_steps, which scales down the loss
-            gpt2_forward(&model, train_loader.inputs, B, T);
+            gpt2_forward(&model, train_loader.inputs, B, T, step, mup_coord_check ? coord_check_data : NULL);
             // backward pass. all model params accumulate gradients with += inside this inner loop
             gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
         }

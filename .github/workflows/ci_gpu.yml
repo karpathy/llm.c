@@ -59,6 +59,15 @@ jobs:
       - name: Run recompute LN
         run: ./test_gpt2cu -r 2
 
+      - name: Set correct state for mup
+        run: python train_gpt2.py --use_mup 1
+
+      - name: Run muP
+        run: ./test_gpt2cu -m 1
+
+      - name: Reset state
+        run: python train_gpt2.py
+
       - name: Build BF16 precision
         run: PRECISION=BF16 make train_gpt2cu test_gpt2cu profile_gpt2cu
 
@@ -73,6 +82,15 @@ jobs:
 
       - name: Run recompute LN
         run: ./test_gpt2cu -r 2
+
+      - name: Set correct state for mup
+        run: python train_gpt2.py --use_mup 1
+
+      - name: Run muP
+        run: ./test_gpt2cu -m 1
+
+      - name: Reset state
+        run: python train_gpt2.py
 
       - name: Train model fp32 (With OpenMP)
         run: OMP_NUM_THREADS=8 ./train_gpt2fp32cu
@@ -93,7 +111,7 @@ jobs:
         run: NO_OMP=1 ./train_gpt2fp32cu
 
       - name: Execute testing program (No OpenMP)
-        run: ./test_gpt2cu -b 32
+        run: ./test_gpt2cu
 
       - name: Execute testing program fp32 (No OpenMP)
         run: ./test_gpt2fp32cu
