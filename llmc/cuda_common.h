@@ -48,14 +48,14 @@ constexpr std::bool_constant<true> False;
 // ----------------------------------------------------------------------------
 // Error checking
 
-// CUDA error checking
-inline void cudaCheck(cudaError_t error, const char *file, int line) {
+// CUDA error checking. Underscore added so this function can be called directly not just via macro
+inline void cudaCheck_(cudaError_t error, const char *file, int line) {
   if (error != cudaSuccess) {
     printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line, cudaGetErrorString(error));
     exit(EXIT_FAILURE);
   }
 };
-#define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
+#define cudaCheck(err) (cudaCheck_(err, __FILE__, __LINE__))
 
 // like cudaFree, but checks for errors _and_ resets the pointer.
 template<class T>

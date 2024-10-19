@@ -16,17 +16,17 @@ Example launches to only benchmark the speed of bfloat16 compiled GPU training:
 TODO: add the actual commands
 """
 
+import argparse
 import os
 import math
 import glob
 import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass
-import json
 from pathlib import Path
+import time
 from typing import (
     AbstractSet,
-    Callable,
     Collection,
     Dict,
     Iterator,
@@ -54,9 +54,6 @@ from tiktoken.load import load_tiktoken_bpe
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the LLaMA 3.x model
-
-# using a global to toggle flash-attention
-FLASH = 0
 
 # Used in Grouped Query Attention (GQA), broadcasts the key and value tensors
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -157,6 +154,7 @@ class CausalSelfAttention(nn.Module):
         self.n_rep = self.n_head // self.n_kv_head
         self.hd = config.n_embd // config.n_head
         self.use_kv = config.use_kv
+        self.flash = config.flash
 
         self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.hd, bias=False)  # key, query, value projections
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)  # output projection
@@ -186,9 +184,12 @@ class CausalSelfAttention(nn.Module):
 
         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # (B, NH, T, HD)
 
-        if FLASH:
+        if self.flash:
             # flashattention
-            y = F.scaled_dot_product_attention(q, k, v, mask)
+            # if T == 1 no need to mask, otherwise the function complains
+            # scaled_dot_product_attention expects a mask where value of True indicates that the element should take part in attention
+            # our mask is the opposite, so we need to invert it
+            y = F.scaled_dot_product_attention(q, k, v, mask == 0 if T > 1 else None)
         else:
             # manual implementation of attention
             # this materializes the large (T,T) matrix for all the queries and keys
@@ -257,6 +258,7 @@ class LlamaConfig:
     use_scaled_rope: bool = True
     max_gen_batch_size: int = 4
     use_kv: bool = True
+    flash: bool = False  # use flashattention?
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -402,7 +404,7 @@ class LLaMA(nn.Module):
     def from_pretrained_llama3_hf(cls, model_id):
         """Loads pretrained LLaMA model weights from HuggingFace"""
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        assert model_id == "meta-llama/Meta-Llama-3.1-8B", "Only the 8B-bae model is supported for now"
+        assert model_id == "meta-llama/Meta-Llama-3.1-8B", "Only the 8B-base model is supported for now"
         model_args = LlamaConfig()
 
         model = AutoModelForCausalLM.from_pretrained(model_id)
@@ -477,7 +479,6 @@ class LLaMA(nn.Module):
         max_gen_len: int,
         temperature: float = 0.6,
         top_p: float = 0.9,
-        logprobs: bool = False,
         echo: bool = False,
     ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
         """
@@ -488,32 +489,28 @@ class LLaMA(nn.Module):
             max_gen_len (int): Maximum length of the generated text sequence.
             temperature (float, optional): Temperature value for controlling randomness in sampling. Defaults to 0.6.
             top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
-            logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
             echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
 
         Returns:
-            Tuple[List[List[int]], Optional[List[List[float]]]]: A tuple containing generated token sequences and, if logprobs is True, corresponding token log probabilities.
+            Tuple[List[List[int]], Optional[List[List[float]]]]: A tuple containing generated token sequences.
 
         Note:
             This method uses the provided prompts as a basis for generating text. It employs nucleus sampling to produce text with controlled randomness.
-            If logprobs is True, token log probabilities are computed for each generated token.
 
         """
         bsz = len(prompt_tokens)
-        assert bsz <= self.config.max_gen_batch_size, (bsz, self.config.max_gen_batch_size)
+        assert bsz <= self.config.max_gen_batch_size, f"Batch size {bsz} exceeds the maximum generation batch size {self.config.max_gen_batch_size}"
         device = next(self.parameters()).device
 
         min_prompt_len = min(len(t) for t in prompt_tokens)
         max_prompt_len = max(len(t) for t in prompt_tokens)
-        assert max_prompt_len <= self.config.block_size
+        assert max_prompt_len <= self.config.block_size, f"Prompt length {max_prompt_len} exceeds the maximum block size {self.config.block_size}"
         total_len = min(self.config.block_size, max_gen_len + max_prompt_len)
 
         pad_id = self.tokenizer.pad_id
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
-        for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
-        if logprobs:
-            token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
+        for idx, t in enumerate(prompt_tokens):
+            tokens[idx, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
 
         prev_pos = 0
         eos_reached = torch.tensor([False] * bsz, device=device)
@@ -521,12 +518,6 @@ class LLaMA(nn.Module):
 
         if min_prompt_len == total_len:
             logits, _ = self.forward(tokens, start_pos=prev_pos)
-            token_logprobs = -F.cross_entropy(
-                input=logits.transpose(1, 2),
-                target=tokens,
-                reduction="none",
-                ignore_index=pad_id,
-            )
 
         stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens)).to(device)
 
@@ -542,41 +533,25 @@ class LLaMA(nn.Module):
             # only replace token if prompt has already been generated
             next_token = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token)
             tokens[:, cur_pos] = next_token
-            if logprobs:
-                token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
-                    input=logits.transpose(1, 2),
-                    target=tokens[:, prev_pos + 1 : cur_pos + 1],
-                    reduction="none",
-                    ignore_index=pad_id,
-                )
-            eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                torch.isin(next_token, stop_tokens)
-            )
+            eos_reached |= ~input_text_mask[:, cur_pos] & torch.isin(next_token, stop_tokens)
             prev_pos = cur_pos
             if all(eos_reached):
                 break
 
-        if logprobs:
-            token_logprobs = token_logprobs.tolist()
-        out_tokens, out_logprobs = [], []
+        out_tokens = []
         for i, toks in enumerate(tokens.tolist()):
             # cut to max gen len
             start = 0 if echo else len(prompt_tokens[i])
             toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
-            probs = None
-            if logprobs:
-                probs = token_logprobs[i][start : len(prompt_tokens[i]) + max_gen_len]
             # cut to after eos tok if any
             for stop_token in self.tokenizer.stop_tokens:
                 try:
                     eos_idx = toks.index(stop_token)
                     toks = toks[:eos_idx]
-                    probs = probs[:eos_idx] if logprobs else None
                 except ValueError:
                     pass
             out_tokens.append(toks)
-            out_logprobs.append(probs)
-        return (out_tokens, out_logprobs if logprobs else None)
+        return out_tokens
 
 # -----------------------------------------------------------------------------
 # sampling utils
@@ -959,18 +934,16 @@ def print0(*args, **kwargs):
         print(*args, **kwargs)
 
 if __name__ == "__main__":
-    import time
-    import argparse
     print0(f"Running pytorch {torch.version.__version__}")
 
     # default settings will overfit a tiny batch of data
     # and save model weights and debug state to disk on the first iteration
     parser = argparse.ArgumentParser()
     parser.add_argument("--use_hf", type=int, default=1, help="use HuggingFace (default) or use Meta's model")
-    parser.add_argument("--ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint")
-    parser.add_argument("--tokenizer_path", type=str, default=None, help="path to llama3 tokenizer")
+    parser.add_argument("--ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint (needed if use_hf=0)")
+    parser.add_argument("--tokenizer_path", type=str, default=None, help="path to llama3 tokenizer (needed if use_hf=0)")
     # file system input / output
-    parser.add_argument("--input_bin", type=str, default="dev/data/tinystories/TinyStories_val.bin", help="input .bin to train on")
+    parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B", help="chose the llama model")
@@ -982,7 +955,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
     # optimization
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="learning rate warmup iterations")
     parser.add_argument("--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
     parser.add_argument("--learning_rate_decay_frac", type=float, default=1.0, help="learning rate warmup iterations")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
@@ -998,7 +971,6 @@ if __name__ == "__main__":
     # memory management
     parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
-    parser.add_argument("--flash", type=int, default=0, help="use flash attention")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|float16|bfloat16")
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
     # python -> C bridge
@@ -1052,9 +1024,9 @@ if __name__ == "__main__":
                 device = "cuda"
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 device = "mps"
-    print(f"using device: {device}")
     device_type = 'cuda' if 'cuda' in device else 'cpu'
-    assert device_type in {'cuda'}  # we need to load LLaMA as bf16 on CUDA
+    assert device_type in {'cuda'}, "GPU required to run LLaMA 3"  # we need to load LLaMA as bf16 on CUDA
+    print(f"using device: {device}")
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
@@ -1077,16 +1049,12 @@ if __name__ == "__main__":
     if args.tensorcores:
         torch.set_float32_matmul_precision('high')
 
-    # turn on/off flash attention
-    assert args.flash in {0, 1}
-    FLASH = args.flash
-
     # init the model
-    assert args.ckpt_dir is not None and os.path.exists(args.ckpt_dir), f"llama3 ckpt dir {args.ckpt_dir} does not exist"
-    assert args.tokenizer_path is not None and os.path.exists(args.tokenizer_path), f"llama3 tokenizer path {args.tokenizer_path} does not exist"
     if args.use_hf:
         model = LLaMA.from_pretrained_llama3_hf(args.model)
     else:  # use Meta's checkpoint
+        assert args.ckpt_dir is not None and os.path.exists(args.ckpt_dir), f"llama3 ckpt dir {args.ckpt_dir} does not exist"
+        assert args.tokenizer_path is not None and os.path.exists(args.tokenizer_path), f"llama3 tokenizer path {args.tokenizer_path} does not exist"
         model = LLaMA.from_pretrained_llama3_meta(args.ckpt_dir, args.tokenizer_path)
 
     model.train()
@@ -1201,7 +1169,7 @@ if __name__ == "__main__":
             else:  # Meta
                 prompt_tokens = [model.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
 
-            generation_tokens, _ = model.generate(prompt_tokens, max_gen_len=64, temperature=0.6, top_p=0.9, logprobs=False, echo=False)
+            generation_tokens = model.generate(prompt_tokens, max_gen_len=64, temperature=0.6, top_p=0.9, echo=False)
             results = [{"generation": model.tokenizer.decode(t)} for t in generation_tokens]
             for prompt, result in zip(prompts, results):
                 print(prompt, end="")
