@@ -88,7 +88,7 @@ def convert(filepath, output, push_to_hub=False, out_dtype="bfloat16"):
         data = np.frombuffer(f.read(num_elements * np.dtype(dtype).itemsize), dtype=dtype)
         w[key] = data.reshape(shape)
         # The binary file saves the padded vocab - drop the padding back to GPT2 size
-        if shape[0] == Vp:
+        if shape[0] == Vp and V != Vp:
             w[key] = w[key].reshape(shape)[:(V-Vp), :]
     # Ensure the file is fully read and then close
     assert f.read() == b''
