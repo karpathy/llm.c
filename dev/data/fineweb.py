@@ -55,7 +55,6 @@ local_dir, remote_name = directories[(args.type, args.version)]
 # create the cache the local directory if it doesn't exist yet
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
-print(f"Writing data to {DATA_CACHE_DIR}")
 # download the dataset
 if args.type == "classic":
     fw = load_dataset("HuggingFaceFW/fineweb", name=remote_name, split="train")
