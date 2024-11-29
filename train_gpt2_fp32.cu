@@ -316,17 +316,27 @@ __global__ void gelu_forward_kernel(float* out, const float* inp, int N) {
     }
 }
 
-__global__ void gelu_backward_kernel(float* dinp, const float* inp, const float* dout, const int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void gelu_backward_kernel(float4* dinp, const float4* inp, const float4* dout, const int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = 4 * idx; // Each thread processes 4 floats
     if (i < N) {
-        float x = inp[i];
-        float cube = 0.044715f * x * x * x;
-        float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
-        float tanh_out = tanhf(tanh_arg);
-        float coshf_out = coshf(tanh_arg);
-        float sech_out = 1.0f / (coshf_out * coshf_out);
-        float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
-        dinp[i] = local_grad * dout[i];
+        float4 x = inp[idx];
+        float4 dout_vec = dout[idx];
+        float4 dinp_vec;
+
+        for (int j = 0; j < 4; ++j) {
+            if (i + j < N) { // Check bounds for each float component
+                float xj = vec_at(x, j);
+                float cube = 0.044715f * xj * xj * xj;
+                float tanh_arg = GELU_SCALING_FACTOR * (xj + cube);
+                float tanh_out = tanhf(tanh_arg);
+                float coshf_out = coshf(tanh_arg);
+                float sech_out = 1.0f / (coshf_out * coshf_out);
+                float local_grad = 0.5f * (1.0f + tanh_out) + xj * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * xj * xj);
+                vec_at(dinp_vec, j) = local_grad * vec_at(dout_vec, j);
+            }
+        }
+        dinp[idx] = dinp_vec;
     }
 }
 
@@ -798,8 +808,8 @@ void gelu_forward(float* out, const float* inp, int N) {
 
 void gelu_backward(float* dinp, const float* inp, const float* dout, const int N) {
     const int block_size = 128;
-    const int grid_size = CEIL_DIV(N, block_size);
-    gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout, N);
+    const int grid_size = CEIL_DIV(N/4, block_size);
+    gelu_backward_kernel<<<grid_size, block_size>>>((float4 *)dinp, (float4 *)inp,(float4 *) dout, N);
     cudaCheck(cudaGetLastError());
 }
 
