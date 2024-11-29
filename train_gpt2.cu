@@ -1238,10 +1238,8 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
 
     // write dataloader state if we are using the Permuted version of it
     if (loader->should_shuffle) {
-        fwriteCheck(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);  // number of shards
-        fwriteCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
-        fwriteCheck(&loader->shard_num_samples, sizeof(size_t), 1, state_file);
-        fwriteCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
+        fwriteCheck(&loader->shard_rng, sizeof(mt19937_state), 1, state_file);
+        fwriteCheck(&loader->intra_shard_rng, sizeof(mt19937_state), 1, state_file);
         fwriteCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
     }
     fcloseCheck(state_file);
@@ -1290,21 +1288,10 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     // revive the DataLoader object and its state
     loader->should_shuffle = should_shuffle;
     if (should_shuffle == 1) {
-        // ensure the number of shards matches
-        size_t glob_result_gl_pathc;
-        freadCheck(&glob_result_gl_pathc, sizeof(size_t), 1, state_file);
-        assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
         // read the shard indices
-        loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
-        freadCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
-        // ensure the number of samples matches
-        size_t shard_num_samples;
-        freadCheck(&shard_num_samples, sizeof(size_t), 1, state_file);
-        assert(shard_num_samples == loader->shard_num_samples);
-        // read the intra-shard indices
-        loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
-        freadCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
         // read the shuffle rng state
+        freadCheck(&loader->shard_rng, sizeof(mt19937_state), 1, state_file);
+        freadCheck(&loader->intra_shard_rng, sizeof(mt19937_state), 1, state_file);
         freadCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
     }
     dataloader_resume(loader, current_shard_idx, current_sample_idx);
