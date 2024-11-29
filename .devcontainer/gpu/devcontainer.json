@@ -1,0 +1,25 @@
+{
+    "name": "GPU Development Environment",    
+    "image": "mcr.microsoft.com/devcontainers/base:debian",
+    "features": {
+        "ghcr.io/devcontainers/features/python": {
+            "version": "3.10"
+        },
+        "ghcr.io/devcontainers/features/nvidia-cuda:1": {}
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools-extension-pack"
+            ]
+        }
+    },
+    "postStartCommand": [
+        "pip install -r requirements.txt",
+        "python prepro_tinyshakespeare.py"
+    ],
+    "runArgs": [
+		"--gpus",
+		"all"        
+    ]
+}
