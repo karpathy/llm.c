@@ -115,6 +115,31 @@ __global__ void encoder_forward_kernel3(floatX* out,
     }
 }
 
+__global__ void encoder_forward_kernel4(floatX* out,
+                                        const int* inp, const floatX* wte, const floatX* wpe,
+                                        int C) {
+    int c = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    int t = blockIdx.y;
+    int b = blockIdx.z;
+
+    if (c < C) {
+        int ix = inp[b * gridDim.y + t];
+
+        floatX* out_btc = out + b * gridDim.y * C + t * C + c;
+        const floatX* wte_ix = wte + ix * C + c;
+        const floatX* wpe_tc = wpe + t * C + c;
+
+        x128 packed_out;
+        x128 wte128 = load128cs(wte_ix);
+        x128 wpe128 = load128cs(wpe_tc);
+        #pragma unroll
+        for (int k = 0; k < x128::size; k++) {
+            packed_out[k] = (floatX)((float)wte128[k] + (float)wpe128[k]);
+        }
+        store128(out_btc, packed_out);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -148,6 +173,17 @@ void encoder_forward3(floatX* out,
     cudaCheck(cudaGetLastError());
 }
 
+void encoder_forward4(floatX* out,
+                      const int* inp, const floatX* wte, const floatX* wpe,
+                      int B, int T, int C,
+                      const int block_size) {
+    const int num_c_blocks = ceil_div(C, x128::size * block_size);
+    const int actual_block_size = (C < x128::size * block_size) ? (C / x128::size) : block_size;
+    dim3 grid_size(num_c_blocks, T, B);
+    encoder_forward_kernel4<<<grid_size, actual_block_size>>>(out, inp, wte, wpe, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void encoder_forward(int kernel_num,
                      floatX* out,
@@ -163,6 +199,9 @@ void encoder_forward(int kernel_num,
             break;
         case 3:
             encoder_forward3(out, inp, wte, wpe, B, T, C, block_size);
+            break;
+        case 4:
+            encoder_forward4(out, inp, wte, wpe, B, T, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
