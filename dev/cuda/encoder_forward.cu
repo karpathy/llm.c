@@ -237,10 +237,11 @@ int main(int argc, char **argv) {
                                               kernel_num, d_out, d_inp, d_wte, d_wpe, B, T, C, block_size
                                               );
 
-        // napkin math: estimate the memory bandwidth achieved
-        // for each (B,T,C) output element, we do 3 reads and 1 write, 4 bytes each
-        // and e.g. A100 40GB PCIe is advertised at 1,555GB/s
-        long memory_ops = B * T * C * 4 * 4;
+        // Estimate memory bandwidth achieved: Total memory_ops * bytes per value.
+        // * Read one inp token (B, T), one wte float (B, T, C), one wpe float (B, T, C)
+        // * Write one out float (B, T, C)
+        // Total = (1 + 3C) ops, 2 bytes each (4 bytes if f32)
+        long memory_ops = B * T * (1 + 3 * C) * sizeof(floatX);
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
 
         printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
