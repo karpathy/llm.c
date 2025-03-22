@@ -489,11 +489,12 @@ void crossentropy_forward(float* losses,
     // output: losses is (B,T) of the individual losses at each position
     // input: probs are (B,T,Vp) of the probabilities
     // input: targets is (B,T) of integers giving the correct index in logits
+    int tot = 0;
     for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
+        for (int t = 0; t < T && tot != B * T - 1; tot++, t++) {
             // loss = -log(probs[target])
             float* probs_bt = probs + b * T * Vp + t * Vp;
-            int ix = targets[b * T + t];
+            int ix = targets[b * T + t + 1];
             losses[b * T + t] = -logf(probs_bt[ix]);
         }
     }
