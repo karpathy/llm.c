@@ -144,7 +144,7 @@ int main(int argc, char *argv[]) {
             } else {
                 printf("LOSS OK: %f %f\n", model.mean_loss, *expected_loss);
             }
-
+            
             // finally check all the gradients
             int gradoks[16];
             ParameterTensors grads = model.grads;

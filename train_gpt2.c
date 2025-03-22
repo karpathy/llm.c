@@ -447,13 +447,13 @@ void residual_backward(float* dinp1, float* dinp2, float* dout, int N) {
 }
 
 void softmax_forward(float* probs, float* logits, int B, int T, int V, int Vp) {
-    // output: probs are (B,T,Vp) of the probabilities (sums to 1.0 in each b,t position)
-    // input: logits is (B,T,Vp) of the unnormalized log probabilities
+    // output: probs are (B, T - 1, Vp) of the probabilities (sums to 1.0 in each b,t position)
+    // input: logits is (B, T - 1, Vp) of the unnormalized log probabilities
     // Vp is the padded vocab size (for efficiency), V is the "real" vocab size
     // example: Vp is 50304 and V is 50257
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
+        for (int t = 0; t < T - 1; t++) {
             // probs <- softmax(logits)
             float* logits_bt = logits + b * T * Vp + t * Vp;
             float* probs_bt = probs + b * T * Vp + t * Vp;
@@ -486,16 +486,15 @@ void softmax_forward(float* probs, float* logits, int B, int T, int V, int Vp) {
 void crossentropy_forward(float* losses,
                           float* probs, int* targets,
                           int B, int T, int Vp) {
-    // output: losses is (B,T) of the individual losses at each position
-    // input: probs are (B,T,Vp) of the probabilities
-    // input: targets is (B,T) of integers giving the correct index in logits
-    int tot = 0;
+    // output: losses is (B, T - 1) of the individual losses at each position
+    // input: probs are (B, T - 1, Vp) of the probabilities
+    // input: targets is (B, T - 1) of integers giving the correct index in logits
     for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T && tot != B * T - 1; tot++, t++) {
+        for (int t = 0; t < T - 1; t++) {
             // loss = -log(probs[target])
             float* probs_bt = probs + b * T * Vp + t * Vp;
             int ix = targets[b * T + t + 1];
-            losses[b * T + t] = -logf(probs_bt[ix]);
+            losses[b * (T - 1) + t] = -logf(probs_bt[ix]);
         }
     }
 }
@@ -882,8 +881,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         crossentropy_forward(model->acts.losses, model->acts.probs, targets, B, T, Vp);
         // for convenience also evaluate the mean loss
         float mean_loss = 0.0f;
-        for (int i=0; i<B*T; i++) { mean_loss += model->acts.losses[i]; }
-        mean_loss /= B*T;
+        for (int i=0; i<B*(T-1); i++) { mean_loss += model->acts.losses[i]; }
+        mean_loss /= B*(T-1);
         model->mean_loss = mean_loss;
     } else {
         // if we don't have targets, we don't have a loss
