@@ -700,18 +700,21 @@ void llama3_forward(LLama3 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_fch_swiglu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * ffn_channels_post_gelu : acts.fch_gelu;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
         floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
-        floatX* qkv_rep_scratch = (floatX*)acts.scratch_bt4c; // we can use the BT4C scratch for qkv replication
 
         // Attention block
         // The input l_ln1 now holds the (already layernormed) input
         #ifdef ENABLE_CUDNN
-            printf("cuDNN path TODO\n"); exit(0);
+            // 1) projection to QKV vectors (note k,v may be fewer heads than q)
             matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, qkv_channels, main_stream);
+            // 2) apply RoPE to q,k in place
+            rope_forward(l_qkvr, l_qkvr, model->freqs_cis, B, T, n_head, n_kv_head, hd, main_stream);
+            // 4) attention: att <- softmax(qk^T)v
             float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-            attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
+            attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, n_kv_head, hd, main_stream);
         #else
             // unused parts of attention buffer must be zeroed (T-dependent)
             floatX* l_att = acts.att + l * B * NH * T * T;
+            floatX* qkv_rep_scratch = (floatX*)acts.scratch_bt4c; // we can use the BT4C scratch for qkv replication
             if (T != model->seq_len) { cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX))); }
             // 1) projection to QKV vectors (note k,v may be fewer heads than q)
             matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, qkv_channels, main_stream);
@@ -910,18 +913,17 @@ void llama3_backward_and_reduce(LLama3 *model, int* inputs, const int* targets, 
         // <--- gradient here matches OK
 
         #ifdef ENABLE_CUDNN
-        printf("cuDNN path TODO\n"); exit(0);
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C, main_stream);
+        attention_backward_cudnn(dl_bt4c2, dl_btc, l_qkvr, l_atty, l_att, B, T, NH, n_kv_head, hd, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
-        #endif
         // backward repkv (use scratchX as gradient buffer here)
         repkv_backward(dl_bt4c2, dl_bt4c, B, T, NH, n_kv_head, hd);
+        #endif
         // backward rope (this can be done in-place)
         rope_backward_inplace(dl_bt4c2, dl_bt4c2, model->freqs_cis, B, T, NH, n_kv_head, hd, main_stream);
         // backward QKV projection
