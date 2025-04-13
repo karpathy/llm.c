@@ -120,10 +120,12 @@ jobs:
 
   build-and-test-llama3:
     runs-on: ubicloud-gpu-standard-1-latest
-
+    env:
+      HF_TOKEN: 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
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - run: echo "::add-mask::$HF_TOKEN"
 
       - name: Install OpenMP
         run: sudo apt-get update && sudo apt-get install -y libomp-dev
@@ -173,3 +175,4 @@ jobs:
 
       - name: Test Device<->File IO
         run: cd dev/test && nvcc -o device_file_io device_file_io.cu && ./device_file_io
+
