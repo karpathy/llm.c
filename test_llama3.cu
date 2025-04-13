@@ -294,7 +294,7 @@ int main(int argc, char *argv[]) {
 
         float grad_norm = llama3_calculate_grad_norm(&model, &multi_gpu_config);
         float grad_scale = (grad_norm > 1.0f) ? 1.0f / grad_norm : 1.0f;
-        llama3_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, grad_scale, step+1, &multi_gpu_config);
+        llama3_update(&model, 1e-5f, 0.9f, 0.95f, 1e-8f, 0.0f, grad_scale, step+1, &multi_gpu_config);
 
         // print the timing information at the end
         printf("step %d: loss %f (took %f ms)\n", step+1, model.mean_loss, time_elapsed_s * 1000);
