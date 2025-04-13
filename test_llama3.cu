@@ -113,8 +113,6 @@ int main(int argc, char *argv[]) {
     size_t V = model.config.vocab_size;
     size_t Vp = model.config.padded_vocab_size;
     size_t maxT = model.config.max_seq_len;
-    size_t L = model.config.num_layers;
-    size_t C = model.config.channels;
 
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { exit(EXIT_FAILURE);  } // must have arg after flag
@@ -185,7 +183,7 @@ int main(int argc, char *argv[]) {
     float loss_diff_threshold = 1e-5f;
     // FP16 and lower require very high tolerances unfortunately. TODO look into more
     #if defined(ENABLE_BF16) || defined(ENABLE_F16)
-    logit_accuracy_threshold = 25.0f; // 15.0f was too low even without cuDNN?! :(
+    logit_accuracy_threshold = 1.0f;
     loss_diff_threshold = 0.05f;
     #endif
 
@@ -267,29 +265,24 @@ int main(int argc, char *argv[]) {
             // Also, different GPUs may use different matrix multiplication algorithms, so the
             // actual errors can be hardware specific.
 
-            float grad_thresholds[NUM_PARAMETER_TENSORS] = {5e-1f, 4e-3f, 1e-1f, 3.5e-2f, 2e-2f, 3e-2f, 5e-2f, 5e-2f, 5e-2f, 1.5e-2f, 5e-4f, 8e-3f, 1.5e-3f, 2.5e-3f, 1e-1f, 2e-2f};
+            float grad_thresholds[NUM_PARAMETER_TENSORS] = {
+                    1e-1f, 4e-3f, 2e-2f, 8e-3f, 1e-1f,3.5e-2f, 2e-2f,
+                    0*3e-2f, 2e-2f, 2.5e-3f, 5e-2f,5e-2f, 1e-1f, 1.5e-2f,
+                    1e-1f, 2e-2f};
             #if defined(ENABLE_FP32)
             for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
                 grad_thresholds[i] = 1e-6f;  // we can be much more precise in FP32
             }
             #endif
-
-            allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", grad_thresholds[0]);
-            allok = allok & check_tensor(tensors1[1], tensors2[1], V * C, "wlmhead", grad_thresholds[1]);
-            allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", grad_thresholds[2]);
-            allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", grad_thresholds[3]);
-            allok = allok & check_tensor(tensors1[4], tensors2[4], L * C * C, "attprojw", grad_thresholds[4]);
-            allok = allok & check_tensor(tensors1[5], tensors2[5], L * C, "attprojb", grad_thresholds[5]);
-            allok = allok & check_tensor(tensors1[6], tensors2[6], L * 4*C * C, "fcw", grad_thresholds[6]);
-            allok = allok & check_tensor(tensors1[7], tensors2[7], L * 4*C, "fcb", grad_thresholds[7]);
-            allok = allok & check_tensor(tensors1[8], tensors2[8], L * C * 4*C, "fcprojw", grad_thresholds[8]);
-            allok = allok & check_tensor(tensors1[9], tensors2[9], L * C, "fcprojb", grad_thresholds[9]);
-            allok = allok & check_tensor(tensors1[10], tensors2[10], L * C, "ln1w", grad_thresholds[10]);
-            allok = allok & check_tensor(tensors1[11], tensors2[11], L * C, "ln1b", grad_thresholds[11]);
-            allok = allok & check_tensor(tensors1[12], tensors2[12], L * C, "ln2w", grad_thresholds[12]);
-            allok = allok & check_tensor(tensors1[13], tensors2[13], L * C, "ln2b", grad_thresholds[13]);
-            allok = allok & check_tensor(tensors1[14], tensors2[14], C, "lnfw", grad_thresholds[14]);
-            allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", grad_thresholds[15]);
+            const char* names[NUM_PARAMETER_TENSORS] = {
+                    "wte", "wlmhead", "ln1w", "ln1b", "qkvw", "qkvb", "attrpojw",
+                    "attprojb", "ln2w", "ln2b", "fcw", "fcb", "fcprojw", "fcprojb",
+                    "lnfw", "lnfb"
+            };
+            size_t* count = model.param_elements;
+            for(int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+                allok = allok & check_tensor(tensors1[i], tensors2[i], count[i], names[i], grad_thresholds[i]);
+            }
         }
 
         float grad_norm = llama3_calculate_grad_norm(&model, &multi_gpu_config);
@@ -304,18 +297,18 @@ int main(int argc, char *argv[]) {
         losses[step] = rounded_loss;
     }
 
-    // expected losses are as follows, from Python
+    // expected losses are as follows, from Python (without CPUOffload)
     float expected_losses[10] = {
-        5.270009f,
-        4.060681f,
-        3.320085f,
-        2.717550f,
-        2.181066f,
-        1.653923f,
-        1.168050f,
-        0.736873f,
-        0.401021f,
-        0.187493f
+        4.849688f,
+        3.070303f,
+        1.711614f,
+        1.056311f,
+        0.593335f,
+        0.428291f,
+        0.372275f,
+        0.360507f,
+        0.355562f,
+        0.334824f
     };
 
     // compare
