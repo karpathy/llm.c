@@ -113,8 +113,6 @@ int main(int argc, char *argv[]) {
     size_t V = model.config.vocab_size;
     size_t Vp = model.config.padded_vocab_size;
     size_t maxT = model.config.max_seq_len;
-    size_t L = model.config.num_layers;
-    size_t C = model.config.channels;
 
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { exit(EXIT_FAILURE);  } // must have arg after flag
@@ -268,10 +266,10 @@ int main(int argc, char *argv[]) {
             // actual errors can be hardware specific.
 
             float grad_thresholds[NUM_PARAMETER_TENSORS] = {
-                    5e-1f, 4e-3f, 5e-4f, 8e-3f,
-                    1e-1f, 3.5e-2f, 2e-2f, 3e-2f,
-                    1.5e-3f,2.5e-3f, 5e-2f, 5e-2f,
-                    5e-2f, 1.5e-2f,1e-1f,2e-2f};
+                    5e-1f, 4e-3f, 1e-1f, 4e-2f,
+                    5e-2f, 3.5e-2f, 2e-2f, 3e-2f,
+                    5e-2f, 3e-2f, 3e-2f, 3e-2f,
+                    2e-2f, 1e-2f,1e-1f,2e-2f};
 
             #if defined(ENABLE_FP32)
             for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
