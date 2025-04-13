@@ -105,6 +105,7 @@ typedef struct {
     float ffn_dim_multiplier; // multiplier used in feedforward layer, e.g. 1.3 (<-- new in Llama 3)
     float norm_eps; // epsilon used in layernorm, e.g. 1e-5
     float rope_theta; // theta used in ROPE attention, e.g. 500000.0 (<-- new in Llama 3)
+    bool use_biases;  // we always allocate memory for biases; to match llama3 they are not used
 } LLama3Config;
 
 // the parameters of the model
@@ -569,6 +570,7 @@ void llama3_build_from_checkpoint(LLama3 *model, const char* checkpoint_path, bo
     model->config.channels = header_int[7];
     model->config.multiple_of = header_int[8];
     model->config.use_scaled_rope = header_int[9];
+    model->config.use_biases = false;
     int major_version = header_int[10]; // currently unused, e.g. 3
     int minor_version = header_int[11]; // currently unused, e.g. 1 (so Llama 3.1)
     // now the float section
@@ -667,14 +669,14 @@ void llama3_forward(LLama3 *model, const int* inputs, size_t B, size_t T) {
 
         // get the pointers of the weights for this layer
         floatX* l_qkvw = params.qkvw + l * qkv_channels * C;
-        floatX* l_qkvb = params.qkvb + l * qkv_channels;
+        floatX* l_qkvb = model->config.use_biases ? params.qkvb + l * qkv_channels: nullptr;
         floatX* l_attprojw = params.attprojw + l * C * C;
-        floatX* l_attprojb = params.attprojb + l * C;
+        floatX* l_attprojb = model->config.use_biases ? params.attprojb + l * C : nullptr;
         floatX* l_ln2w = params.ln2w + l * C;
         floatX* l_fcw = params.fcw + l * ffn_channels * C;
-        floatX* l_fcb = params.fcb + l * ffn_channels;
+        floatX* l_fcb = model->config.use_biases ? params.fcb + l * ffn_channels : nullptr;
         floatX* l_fcprojw = params.fcprojw + l * C * ffn_channels_post_gelu;
-        floatX* l_fcprojb = params.fcprojb + l * C;
+        floatX* l_fcprojb = model->config.use_biases ? params.fcprojb + l * C : nullptr;
 
         // get the pointers of the activations for this layer
         floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
@@ -850,15 +852,15 @@ void llama3_backward_and_reduce(LLama3 *model, int* inputs, const int* targets, 
         floatX* dl_ln1w = grads.ln1w + l * C;
         floatX* dl_ln1b = grads.ln1b + l * C;
         floatX* dl_qkvw = grads.qkvw + l * qkv_channels * C;
-        floatX* dl_qkvb = grads.qkvb + l * qkv_channels;
+        floatX* dl_qkvb = model->config.use_biases ? grads.qkvb + l * qkv_channels : nullptr;
         floatX* dl_attprojw = grads.attprojw + l * C * C;
-        floatX* dl_attprojb = grads.attprojb + l * C;
+        floatX* dl_attprojb = model->config.use_biases ? grads.attprojb + l * C : nullptr;
         floatX* dl_ln2w = grads.ln2w + l * C;
-        floatX* dl_ln2b = grads.ln2b + l * C;
+        floatX* dl_ln2b = model->config.use_biases ? grads.ln2b + l * C : nullptr;
         floatX* dl_fcw = grads.fcw + l * ffn_channels * C;
-        floatX* dl_fcb = grads.fcb + l * ffn_channels;
+        floatX* dl_fcb = model->config.use_biases ? grads.fcb + l * ffn_channels : nullptr;
         floatX* dl_fcprojw = grads.fcprojw + l * C * ffn_channels_post_gelu;
-        floatX* dl_fcprojb = grads.fcprojb + l * C;
+        floatX* dl_fcprojb = model->config.use_biases ? grads.fcprojb + l * C : nullptr;
         // get the pointers of the activations for this layer
         floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
@@ -883,7 +885,7 @@ void llama3_backward_and_reduce(LLama3 *model, int* inputs, const int* targets, 
             swiglu_forward(l_fch_swiglu, l_fch_pre_gelu, B, T, ffn_channels_post_gelu, main_stream);
         }
         // backward the 2nd matmul of MLP
-        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_swiglu, l_fcprojw, nullptr, B, T, ffn_channels_post_gelu, C, main_stream);
+        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_swiglu, l_fcprojw, scratchF, B, T, ffn_channels_post_gelu, C, main_stream);
         // backward the swiglu here, use scratchX to hold the grad because SwiGLU can't be inplace
         swiglu_backward(dl_bt4c2, dl_bt4c, l_fch_pre_gelu, B, T, ffn_channels_post_gelu, main_stream);
         // backward the 1st matmul of MLP
