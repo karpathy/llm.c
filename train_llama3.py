@@ -317,12 +317,13 @@ class LLaMA(nn.Module):
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(42)
 
-        self.freqs_cis = precompute_freqs_cis(
+        freqs_cis = precompute_freqs_cis(
             config.n_embd // config.n_head,
             config.block_size * 2,
             config.rope_theta,
             config.use_scaled_rope,
         )
+        self.register_buffer('freqs_cis', freqs_cis, persistent=False)
 
     def forward(self, idx, targets=None, return_logits=True, start_pos=0):
         _, t = idx.size()
@@ -1095,7 +1096,7 @@ if __name__ == "__main__":
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 device = "mps"
     device_type = 'cuda' if 'cuda' in device else 'cpu'
-    assert device_type in {'cuda'}, "GPU required to run LLaMA 3"  # we need to load LLaMA as bf16 on CUDA
+    #assert device_type in {'cuda'}, "GPU required to run LLaMA 3"  # we need to load LLaMA as bf16 on CUDA
     print(f"using device: {device}")
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
@@ -1131,6 +1132,7 @@ if __name__ == "__main__":
     if args.dtype == "float32":
         model = model.to(torch.float32)
 
+    model = model.to(device)
     model.train()
     if args.compile:
         if hasattr(config, "coordinate_descent_tuning"):

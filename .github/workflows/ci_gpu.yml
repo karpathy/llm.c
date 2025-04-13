@@ -9,9 +9,10 @@ on:
   pull_request:
     branches:
       - master
+      - llama3
 
 jobs:
-  build-and-test-gpu:
+  build-and-test-gpt2:
     runs-on: ubicloud-gpu-standard-1-latest
 
     steps:
@@ -116,6 +117,53 @@ jobs:
 
       - name: Execute testing program fp32 with cuDNN
         run: ./test_gpt2fp32cu
+
+  build-and-test-llama3:
+    runs-on: ubicloud-gpu-standard-1-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install OpenMP
+        run: sudo apt-get update && sudo apt-get install -y libomp-dev
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run preprocessing
+        run: python dev/data/tinyshakespeare.py --model_desc llama-3
+
+      - name: Train model
+        # modle is too big to fit on our runner GPUs. Thus, we run it on cpu :(
+        run: python train_llama3.py --write_tensors 1 --dtype float32 --device cpu
+
+      - name: Build FP32 precision
+        run: PRECISION=FP32 make test_llama3cu
+
+      - name: Run default
+        run: ./test_llama3cu
+
+      - name: Run no recompute GeLU
+        run: ./test_llama3cu -r 0
+
+      - name: Run recompute LN
+        run: ./test_llama3cu -r 2
+
+      - name: Build BF16 precision
+        run: PRECISION=BF16 make train_llama3cu test_llama3cu
+
+      - name: Run default
+        run: ./test_llama3cu
+
+      - name: Run no recompute GeLU
+        run: ./test_llama3cu -r 0
+
+      - name: Run no master weights
+        run: ./test_llama3cu -w 0
+
+      - name: Run recompute LN
+        run: ./test_llama3cu -r 2
 
   unit-tests-gpu:
     runs-on: ubicloud-gpu-standard-1-latest
