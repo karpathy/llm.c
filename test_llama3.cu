@@ -1,5 +1,5 @@
 #define TESTING
-#include "train_gpt2.cu"
+#include "train_llama3.cu"
 
 // poor man's tensor checker
 int check_tensor(float *a, float *b, int n, const char* label, float threshold=1e-0) {
@@ -48,7 +48,7 @@ int check_tensor(float *a, float *b, int n, const char* label, float threshold=1
 // the same tensors as in the train file, but in float, which are used as reference
 typedef struct {
     float*  wte; // (Vp, C)
-    float*  wpe; // (maxT, C)
+    float*  wlmhead; // (Vp, C)
     float*  ln1w; // (L, C)
     float*  ln1b; // (L, C)
     float*  qkvw; // (L, 3*C, C)
@@ -76,7 +76,7 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
     // everything is float so number of bytes to allocate is a simple multiplication
     float* params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
     float** ptrs[] = {
-        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
+        &params->wte, &params->wlmhead, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
         &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
     };
@@ -100,16 +100,16 @@ int main(int argc, char *argv[]) {
 
     // set the right paths
     #if defined(ENABLE_BF16)
-    const char* load_filename = "gpt2_124M_bf16.bin";
+    const char* load_filename = "llama3.2_1B_bf16.bin";
     #else
-    const char* load_filename = "gpt2_124M.bin";
+    const char* load_filename = "llama3.2_1B.bin";
     #endif
 
     // build the GPT-2 model from a checkpoint
-    GPT2 model;
-    gpt2_init_common(&model);
+    LLama3 model;
+    llama3_init_common(&model);
 
-    gpt2_build_from_checkpoint(&model, load_filename);
+    llama3_build_from_checkpoint(&model, load_filename);
     size_t V = model.config.vocab_size;
     size_t Vp = model.config.padded_vocab_size;
     size_t maxT = model.config.max_seq_len;
@@ -126,13 +126,13 @@ int main(int argc, char *argv[]) {
     }
 
     // load additional information that we will use for debugging and error checking
-    FILE *state_file = fopenCheck("gpt2_124M_debug_state.bin", "rb");
+    FILE *state_file = fopenCheck("llama3_1B_debug_state.bin", "rb");
     int state_header[256];
     freadCheck(state_header, sizeof(int), 256, state_file);
-    if (state_header[0] != 20240327) { fprintf(stderr, "Bad magic state file\n"); exit(EXIT_FAILURE); }
+    if (state_header[0] != 20240803) { fprintf(stderr, "Bad magic state file\n"); exit(EXIT_FAILURE); }
     if (state_header[1] != 2) {
-        fprintf(stderr, "Bad version in state file\n");
-        fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
+        fprintf(stderr, "Bad version in state file: %d\n", state_header[1]);
+        fprintf(stderr, "---> HINT: try to re-run `python train_llama3.py`\n");
         exit(EXIT_FAILURE);
     }
     int B = state_header[2]; // batch size, e.g. 4
@@ -168,10 +168,10 @@ int main(int argc, char *argv[]) {
     // overall OK signal for the test
     int allok = 1;
 
-    gpt2_allocate_state(&model, B, T);
+    llama3_allocate_state(&model, B, T);
 
     // First, do target-free forward pass to validate logits
-    gpt2_forward(&model, x, B, T);
+    llama3_forward(&model, x, B, T);
     // at this point, target should be equal to expected_logits, let's compare
     // copy logits to CPU so we can compare them
     floatX* logits_cpu_raw = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
@@ -220,8 +220,8 @@ int main(int argc, char *argv[]) {
     for (int step = 0; step < 10; step++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
-        gpt2_forward(&model, x, B, T);
-        gpt2_backward_and_reduce(&model, x, y, 1, 0);
+        llama3_forward(&model, x, B, T);
+        llama3_backward_and_reduce(&model, x, y, 1, 0);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
@@ -275,7 +275,7 @@ int main(int argc, char *argv[]) {
             #endif
 
             allok = allok & check_tensor(tensors1[0], tensors2[0], V * C, "wte", grad_thresholds[0]);
-            allok = allok & check_tensor(tensors1[1], tensors2[1], maxT * C, "wpe", grad_thresholds[1]);
+            allok = allok & check_tensor(tensors1[1], tensors2[1], V * C, "wlmhead", grad_thresholds[1]);
             allok = allok & check_tensor(tensors1[2], tensors2[2], L * 3*C * C, "qkvw", grad_thresholds[2]);
             allok = allok & check_tensor(tensors1[3], tensors2[3], L * 3*C, "qkvb", grad_thresholds[3]);
             allok = allok & check_tensor(tensors1[4], tensors2[4], L * C * C, "attprojw", grad_thresholds[4]);
@@ -292,9 +292,9 @@ int main(int argc, char *argv[]) {
             allok = allok & check_tensor(tensors1[15], tensors2[15], C, "lnfb", grad_thresholds[15]);
         }
 
-        float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
+        float grad_norm = llama3_calculate_grad_norm(&model, &multi_gpu_config);
         float grad_scale = (grad_norm > 1.0f) ? 1.0f / grad_norm : 1.0f;
-        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, grad_scale, step+1, &multi_gpu_config);
+        llama3_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, grad_scale, step+1, &multi_gpu_config);
 
         // print the timing information at the end
         printf("step %d: loss %f (took %f ms)\n", step+1, model.mean_loss, time_elapsed_s * 1000);
@@ -329,32 +329,32 @@ int main(int argc, char *argv[]) {
     }
 
     // Finally, let's check determinism
-    gpt2_write_to_checkpoint(&model, "test_gpt2cu_model.ckpt");
+    llama3_write_to_checkpoint(&model, "test_llama3cu_model.ckpt");
 
     DataLoader loader;
     dataloader_init(&loader, "dev/data/tinyshakespeare/tiny_shakespeare_val.bin", B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 1);
-    save_state("test_gpt2cu_state.ckpt", 10, &model, &loader);
+    save_state("test_llama3cu_state.ckpt", 10, &model, &loader);
     int tokens[10];
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
-        gpt2_forward(&model, loader.inputs, B, T);
-        gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, 0);
-        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
+        llama3_forward(&model, loader.inputs, B, T);
+        llama3_backward_and_reduce(&model, loader.inputs, loader.targets, 1, 0);
+        llama3_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
         losses[step] = model.mean_loss;
         tokens[step] = loader.inputs[0];
     }
 
     // reload
-    gpt2_free(&model);
-    gpt2_build_from_checkpoint(&model, "test_gpt2cu_model.ckpt");
+    llama3_free(&model);
+    llama3_build_from_checkpoint(&model, "test_llama3cu_model.ckpt");
     int ld_step;
-    gpt2_allocate_state(&model, B, T);
-    load_state(&ld_step, &model, &loader, "test_gpt2cu_state.ckpt");
+    llama3_allocate_state(&model, B, T);
+    load_state(&ld_step, &model, &loader, "test_llama3cu_state.ckpt");
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
-        gpt2_forward(&model, loader.inputs, B, T);
-        gpt2_backward_and_reduce(&model, loader.inputs, loader.targets, 1, 0);
-        gpt2_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
+        llama3_forward(&model, loader.inputs, B, T);
+        llama3_backward_and_reduce(&model, loader.inputs, loader.targets, 1, 0);
+        llama3_update(&model, 1e-4f, 0.9f, 0.95f, 1e-8f, 0.0f, 1.0f, step+11, &multi_gpu_config);
 
         if(loader.inputs[0] != tokens[step]) {
             printf("Nondeterminism! Token mismatch at step %d: %d vs %d\n", step, tokens[step], loader.inputs[0]);
@@ -375,12 +375,12 @@ int main(int argc, char *argv[]) {
     printf("overall okay: %d\n", allok);
 
     // delete intermediate test files
-    remove("test_gpt2cu_model.ckpt");
-    remove("test_gpt2cu_state.ckpt");
+    remove("test_llama3cu_model.ckpt");
+    remove("test_llama3cu_state.ckpt");
 
     // free everything
     dataloader_free(&loader);
-    gpt2_free(&model);
+    llama3_free(&model);
     common_free(model);
     free(x);
     free(y);
