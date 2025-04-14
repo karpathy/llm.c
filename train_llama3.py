@@ -1048,6 +1048,7 @@ if __name__ == "__main__":
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|float16|bfloat16")
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
+    parser.add_argument("--offload", type=int, default=0, help="offload optimizer to CPU")
     # python -> C bridge
     parser.add_argument("--write_tensors", type=int, default=0, help="write tensors to disk")
     args = parser.parse_args()
@@ -1182,14 +1183,9 @@ if __name__ == "__main__":
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
     # init the optimizer
-    offload = False
-    gpu_memory_mib = torch.cuda.get_device_properties(0).total_memory // 1024 // 1024
-    if not ddp and gpu_memory_mib < 24_000:
-        print(f"GPU has only {gpu_memory_mib} MiB of memory, offloading optimizer to CPU")
-        offload = True
     optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
                                                learning_rate=args.learning_rate, betas=(0.9, 0.95),
-                                               device_type=device, zero_stage=zero_stage, offload=offload)
+                                               device_type=device, zero_stage=zero_stage, offload=args.offload)
 
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):
@@ -1302,6 +1298,17 @@ if __name__ == "__main__":
             dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        if args.offload:
+            # CPUOffloadOptimizer is *not* compatible with gradient clipping and will *silently*
+            # give wrong results. So we
+            # a) explicitly wait for it to finish its gradients transfers
+            # b) overwrite the CPU gradients with the clipped GPU gradients.
+            # This is terribly inefficient, but correct and lets us run CI on
+            # small(ish) GPUs
+            torch.cuda.synchronize()
+            for gpu, cpu in optimizer.param_d2h_map.items():
+                cpu.grad[...] = gpu.grad[...]
+
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
         for param_group in optimizer.param_groups:

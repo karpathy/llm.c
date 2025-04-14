@@ -137,7 +137,7 @@ jobs:
         run: python dev/data/tinyshakespeare.py --model_desc llama-3
 
       - name: Train model
-        run: python train_llama3.py --write_tensors 1 --dtype float32
+        run: python train_llama3.py --write_tensors 1 --dtype float32 --offload 1
 
       - name: Build FP32 precision
         run: PRECISION=FP32 make test_llama3cu
