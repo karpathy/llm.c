@@ -122,7 +122,7 @@ def precompute_freqs_cis(
         freqs = apply_scaling(freqs)
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
+    return torch.view_as_real(freqs_cis)
 
 # -----------------------------------------------------------------------------
 # LLaMA building blocks
@@ -331,7 +331,7 @@ class LLaMA(nn.Module):
 
         # forward the LLaMA model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        freqs_cis = self.freqs_cis[start_pos:start_pos+t]
+        freqs_cis = torch.view_as_complex(self.freqs_cis[start_pos:start_pos+t])
         mask = torch.triu(torch.ones((t, t), device=next(self.parameters()).device, dtype=torch.bool), diagonal=1)
 
         for i, block in enumerate(self.transformer.h):
