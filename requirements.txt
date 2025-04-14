@@ -5,3 +5,4 @@ tiktoken
 transformers
 datasets
 requests
+torchao

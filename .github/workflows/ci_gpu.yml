@@ -135,8 +135,7 @@ jobs:
         run: python dev/data/tinyshakespeare.py --model_desc llama-3
 
       - name: Train model
-        # modle is too big to fit on our runner GPUs. Thus, we run it on cpu :(
-        run: python train_llama3.py --write_tensors 1 --dtype float32 --device cpu
+        run: python train_llama3.py --write_tensors 1 --dtype float32
 
       - name: Build FP32 precision
         run: PRECISION=FP32 make test_llama3cu

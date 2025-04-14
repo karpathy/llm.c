@@ -472,7 +472,7 @@ class LLaMA(nn.Module):
         model.tokenizer = tokenizer
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage, offload):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -494,10 +494,14 @@ class LLaMA(nn.Module):
         use_fused = fused_available and device_type == 'cuda'
         print0(f"using fused AdamW: {use_fused}")
         if zero_stage == 1:
+            assert not offload
             print0("using ZeroRedundancyOptimizer")
             optimizer = ZeroRedundancyOptimizer(**optim_groups[0], optimizer_class=torch.optim.AdamW,
                                                 lr=learning_rate, betas=betas, fused=use_fused)
             optimizer.add_param_group(optim_groups[1])
+        elif offload:
+            from torchao.prototype.low_bit_optim import CPUOffloadOptimizer
+            optimizer = CPUOffloadOptimizer(optim_groups, torch.optim.AdamW, lr=learning_rate, betas=betas, fused=use_fused)
         else:
             print0("using regular AdamW")
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
@@ -1178,9 +1182,14 @@ if __name__ == "__main__":
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
     # init the optimizer
+    offload = False
+    gpu_memory_mib = torch.cuda.get_device_properties(0).total_memory // 1024 // 1024
+    if not ddp and gpu_memory_mib < 24_000:
+        print(f"GPU has only {gpu_memory_mib} MiB of memory, offloading optimizer to CPU")
+        offload = True
     optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
                                                learning_rate=args.learning_rate, betas=(0.9, 0.95),
-                                               device_type=device, zero_stage=zero_stage)
+                                               device_type=device, zero_stage=zero_stage, offload=offload)
 
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):
