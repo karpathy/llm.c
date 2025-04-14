@@ -495,16 +495,25 @@ void llama3_write_to_checkpoint(LLama3 *model, const char* checkpoint_path) {
     // write the header first
     int model_header[256];
     memset(model_header, 0, sizeof(model_header));
-    model_header[0] = 20240326; // magic number
+    model_header[0] = 20240803; // magic number
     assert(PRECISION_MODE == PRECISION_FP32 || PRECISION_MODE == PRECISION_BF16);
     model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : 5; // version
     model_header[2] = model->config.max_seq_len;
     model_header[3] = model->config.vocab_size;
     model_header[4] = model->config.num_layers;
     model_header[5] = model->config.num_heads;
-    model_header[6] = model->config.channels;
-    model_header[7] = model->config.padded_vocab_size;
+    model_header[6] = model->config.num_kv_heads;
+    model_header[7] = model->config.channels;
+    model_header[8] = model->config.multiple_of;
+    model_header[9] = model->config.use_scaled_rope;
+    model_header[10] = 3;
+    model_header[11] = 1;
     fwriteCheck(model_header, sizeof(int), 256, model_file);
+    float float_header[256];
+    float_header[0] = model->config.ffn_dim_multiplier;
+    float_header[1] = model->config.norm_eps;
+    float_header[2] = model->config.rope_theta;
+    fwriteCheck(float_header, sizeof(float), 256, model_file);
     // write the parameters
     device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
                    IO_BUF_SIZE, main_stream);
