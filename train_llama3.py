@@ -435,10 +435,16 @@ class LLaMA(nn.Module):
         return checkpoint
 
     @classmethod
-    def from_pretrained_llama3_hf(cls, model_id):
+    def from_pretrained_llama3_hf(cls, model_id, untie):
         """Loads pretrained LLaMA model weights from HuggingFace"""
         from transformers import AutoModelForCausalLM, AutoTokenizer
         model_args = MODEL_DICT[model_id]
+        if untie:
+            if not model_args.tied_embeddings:
+                print("Model embeddings are not tied, --untie has no effect.")
+            else:
+                print("Untying token embeddings and LM head.")
+                model_args.tied_embeddings = False
 
         model = AutoModelForCausalLM.from_pretrained(model_id)
         checkpoint = LLaMA.adapt_llama_state_dict_keys_hf(model.state_dict(), model_args)
@@ -1026,6 +1032,7 @@ if __name__ == "__main__":
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B", help="chose the llama model")
+    parser.add_argument("--untie", type=int, default=False, help="Untie token embeddings and LM-head, even if they are tied in the checkpoint.")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -1131,7 +1138,7 @@ if __name__ == "__main__":
 
     # init the model
     if args.use_hf:
-        model = LLaMA.from_pretrained_llama3_hf(args.model)
+        model = LLaMA.from_pretrained_llama3_hf(args.model, args.untie)
     else:  # use Meta's checkpoint
         assert args.ckpt_dir is not None and os.path.exists(args.ckpt_dir), f"llama3 ckpt dir {args.ckpt_dir} does not exist"
         assert args.tokenizer_path is not None and os.path.exists(args.tokenizer_path), f"llama3 tokenizer path {args.tokenizer_path} does not exist"

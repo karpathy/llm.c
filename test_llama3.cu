@@ -301,7 +301,7 @@ int main(int argc, char *argv[]) {
     }
 
     // expected losses are as follows, from Python (without CPUOffload)
-    float expected_losses[10] = {
+    float expected_losses_untied[10] = {
         4.849688f,
         3.070303f,
         1.711614f,
@@ -313,6 +313,20 @@ int main(int argc, char *argv[]) {
         0.355562f,
         0.334824f
     };
+    float expected_losses_tied[10] = {
+        4.849688f,
+        3.072875f,
+        1.714160f,
+        1.060224f,
+        0.596433f,
+        0.431257f,
+        0.373330f,
+        0.361544f,
+        0.357920f,
+        0.336123f
+    };
+
+    float* expected_losses = model.config.tied_weights ? expected_losses_tied : expected_losses_untied;
 
     // compare
     for (int i = 0; i < 10; i++) {
