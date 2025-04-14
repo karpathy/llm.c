@@ -85,6 +85,9 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
         *(ptrs[i]) = params_memory_iterator;
         params_memory_iterator += param_sizes[i];
     }
+    if(param_sizes[1] == 0) {
+        params->wlmhead = nullptr;
+    }
     return params_memory;
 }
 
