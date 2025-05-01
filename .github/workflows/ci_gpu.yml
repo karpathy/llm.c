@@ -166,6 +166,19 @@ jobs:
       - name: Run recompute LN
         run: ./test_llama3cu -r 2
 
+      - name: Install cuDNN-frontend
+        run:
+          git clone https://github.com/NVIDIA/cudnn-frontend.git
+
+      - name: Build with cuDNN
+        run: USE_CUDNN=1 PRECISION=BF16 make train_llama3cu test_llama3cu
+
+      - name: Train model with cuDNN
+        run: ./train_llama3cu
+
+      - name: Execute testing program with cuDNN
+        run: ./test_llama3cu
+
   unit-tests-gpu:
     runs-on: ubicloud-gpu-standard-1-latest
 
