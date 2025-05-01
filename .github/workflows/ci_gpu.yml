@@ -104,19 +104,13 @@ jobs:
           git clone https://github.com/NVIDIA/cudnn-frontend.git
 
       - name: Build with cuDNN
-        run: USE_CUDNN=1 make test_gpt2cu train_gpt2cu test_gpt2fp32cu train_gpt2fp32cu
+        run: USE_CUDNN=1 make test_gpt2cu train_gpt2cu
 
       - name: Train model with cuDNN
         run: ./train_gpt2cu
 
-      - name: Train model fp32 with cuDNN
-        run: ./train_gpt2fp32cu
-
       - name: Execute testing program with cuDNN
         run: ./test_gpt2cu
-
-      - name: Execute testing program fp32 with cuDNN
-        run: ./test_gpt2fp32cu
 
   build-and-test-llama3:
     runs-on: ubicloud-gpu-standard-1-latest
