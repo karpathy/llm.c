@@ -234,3 +234,11 @@ jobs:
 
       - name: Build BF16
         run: PRECISION=BF16 make test_llama3cu train_llama3cu
+
+      - name: Get cudnn
+        run: |
+          apt-get update && apt-get install -y git
+          git clone https://github.com/NVIDIA/cudnn-frontend.git
+
+      - name: Build cuDNN
+        run: PRECISION=BF16 USE_CUDNN=1 make test_llama3cu train_llama3cu
