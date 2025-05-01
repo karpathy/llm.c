@@ -106,6 +106,7 @@ typedef struct {
     float norm_eps; // epsilon used in layernorm, e.g. 1e-5
     float rope_theta; // theta used in ROPE attention, e.g. 500000.0 (<-- new in Llama 3)
     bool use_biases;  // we always allocate memory for biases; to match llama3 they are not used
+    bool tied_weights; // untied for large models (3.1 8B/70B/405B), tied for small (3.2 1B/3B)
 } LLama3Config;
 
 // the parameters of the model
@@ -153,7 +154,12 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, LLama3Co
     size_t ffn_channels = hidden_dim * 2; // c_fc + c_fc2 concatenated
     // now populate the parameter sizes
     param_sizes[0] = Vp * C; // wte
-    param_sizes[1] = Vp * C; // (3) lm_head (final classifier layer weights)
+    if(config.tied_weights) {
+        param_sizes[1] = 0; // no lm_head with tied weights
+    } else {
+        param_sizes[1] = Vp * C; // (3) lm_head (final classifier layer weights)
+    }
+
     param_sizes[2] = L * C; // ln1w
     param_sizes[3] = L * C; // ln1b; (1) all biases are zero it's ok
     param_sizes[4] = L * (qkv_channels) * C; // qkvw
@@ -194,6 +200,10 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         *(ptrs[i]) = (floatX*)params_memory_iterator;
         params_memory_iterator += param_elements[i] * param_sizeof[i];
+    }
+    // tied weights?
+    if(param_elements[1] == 0) {
+        params->wlmhead = nullptr;
     }
     return params_memory;
 }
@@ -506,8 +516,9 @@ void llama3_write_to_checkpoint(LLama3 *model, const char* checkpoint_path) {
     model_header[7] = model->config.channels;
     model_header[8] = model->config.multiple_of;
     model_header[9] = model->config.use_scaled_rope;
-    model_header[10] = 3;
-    model_header[11] = 1;
+    model_header[10] = model->config.tied_weights;
+    model_header[11] = 3;
+    model_header[12] = model->config.tied_weights ? 2 : 1;
     fwriteCheck(model_header, sizeof(int), 256, model_file);
     float float_header[256];
     float_header[0] = model->config.ffn_dim_multiplier;
@@ -580,8 +591,9 @@ void llama3_build_from_checkpoint(LLama3 *model, const char* checkpoint_path, bo
     model->config.multiple_of = header_int[8];
     model->config.use_scaled_rope = header_int[9];
     model->config.use_biases = false;
-    int major_version = header_int[10]; // currently unused, e.g. 3
-    int minor_version = header_int[11]; // currently unused, e.g. 1 (so Llama 3.1)
+    model->config.tied_weights = header_int[10];
+    int major_version = header_int[11]; // currently unused, e.g. 3
+    int minor_version = header_int[12]; // 1 or 2
     // now the float section
     model->config.ffn_dim_multiplier = header_float[0];
     model->config.norm_eps = header_float[1];
@@ -740,7 +752,9 @@ void llama3_forward(LLama3 *model, const int* inputs, size_t B, size_t T) {
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wlmhead, NULL, B, T, C, Vp, main_stream);
+    floatX* lm_head = model->config.tied_weights ? params.wte : params.wlmhead;
+    matmul_forward_cublaslt(acts.output, acts.lnf, lm_head, NULL, B, T, C, Vp, main_stream);
+
     cudaCheck(cudaDeviceSynchronize());
 }
 
@@ -836,7 +850,10 @@ void llama3_backward_and_reduce(LLama3 *model, int* inputs, const int* targets, 
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(model->acts.scratch_bt4c, grads.wlmhead, NULL, acts.output, acts.lnf, params.wlmhead, NULL, B, T, C, Vp, main_stream);
+    floatX* w_lm_head = model->config.tied_weights ? params.wte : params.wlmhead;
+    floatX* g_lm_head = model->config.tied_weights ? grads.wte : grads.wlmhead;
+
+    matmul_backward(model->acts.scratch_bt4c, g_lm_head, NULL, acts.output, acts.lnf, w_lm_head, NULL, B, T, C, Vp, main_stream);
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     rmsnorm_backward(dresidual, grads.lnfw, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_rstd, B, T, C, main_stream);
@@ -1076,6 +1093,8 @@ void llama3_update(LLama3 *model, float learning_rate, float beta1, float beta2,
         }
 
         ShardInfo tensor = llama3_get_tensor_at_layer(model, 0, i);
+        if(tensor.size == 0)
+            continue;
         ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
         ptrdiff_t local_offset_full = tensor.offset + shard.offset;
         ptrdiff_t local_offset_partial = tensor.offset / multi_gpu_config->num_processes;
@@ -1144,6 +1163,10 @@ float llama3_estimate_mfu(LLama3 *model, int num_tokens, float dt) {
     second is the attention matmul, which is also usually a small contribution.
     */
     size_t N = model->num_parameters;
+    if(!model->config.tied_weights) {
+        N -= model->param_elements[0];      // remove embedding parameters, which can be significant at 128k vocab
+    }
+
     int L = model->config.num_layers;
     int C = model->config.channels;
     int T = model->seq_len;

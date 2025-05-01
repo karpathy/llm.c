@@ -119,6 +119,7 @@ jobs:
         run: ./test_gpt2fp32cu
 
   build-and-test-llama3:
+    name: Build and test LLama3.2 1B
     runs-on: ubicloud-gpu-standard-1-latest
     env:
       HF_TOKEN: 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
@@ -154,17 +155,51 @@ jobs:
       - name: Build BF16 precision
         run: PRECISION=BF16 make train_llama3cu test_llama3cu
 
+      - name: Run default (BF16)
+        run: ./test_llama3cu
+
+      - name: Run no recompute GeLU (BF16)
+        run: ./test_llama3cu -r 0
+
+      - name: Run no master weights (BF16)
+        run: ./test_llama3cu -w 0
+
+      - name: Run recompute LN (BF16)
+        run: ./test_llama3cu -r 2
+
+  build-and-test-llama3-untied:
+    name: Build and test LLama3.2 1B with untie weights
+    runs-on: ubicloud-gpu-standard-1-latest
+    env:
+      HF_TOKEN: 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
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - run: echo "::add-mask::$HF_TOKEN"
+
+      - name: Install OpenMP
+        run: sudo apt-get update && sudo apt-get install -y libomp-dev
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run preprocessing
+        run: python dev/data/tinyshakespeare.py --model_desc llama-3
+
+      - name: Train model
+        run: python train_llama3.py --write_tensors 1 --dtype float32 --untie 1 --offload 1
+
+      - name: Build FP32 precision
+        run: PRECISION=FP32 make test_llama3cu
+
       - name: Run default
         run: ./test_llama3cu
 
-      - name: Run no recompute GeLU
-        run: ./test_llama3cu -r 0
+      - name: Build BF16 precision
+        run: PRECISION=BF16 make train_llama3cu test_llama3cu
 
-      - name: Run no master weights
-        run: ./test_llama3cu -w 0
-
-      - name: Run recompute LN
-        run: ./test_llama3cu -r 2
+      - name: Run default
+        run: ./test_llama3cu
 
   unit-tests-gpu:
     runs-on: ubicloud-gpu-standard-1-latest

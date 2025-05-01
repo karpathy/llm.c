@@ -312,6 +312,8 @@ class LLaMA(nn.Module):
             ln_f = RMSNorm(config.n_embd, config.norm_eps),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        if config.tied_embeddings:
+            self.transformer.wte.weight = self.lm_head.weight
 
         # init all weights, use a torch rng object to be very careful
         self.init_rng = torch.Generator()
@@ -433,10 +435,16 @@ class LLaMA(nn.Module):
         return checkpoint
 
     @classmethod
-    def from_pretrained_llama3_hf(cls, model_id):
+    def from_pretrained_llama3_hf(cls, model_id, untie):
         """Loads pretrained LLaMA model weights from HuggingFace"""
         from transformers import AutoModelForCausalLM, AutoTokenizer
         model_args = MODEL_DICT[model_id]
+        if untie:
+            if not model_args.tied_embeddings:
+                print("Model embeddings are not tied, --untie has no effect.")
+            else:
+                print("Untying token embeddings and LM head.")
+                model_args.tied_embeddings = False
 
         model = AutoModelForCausalLM.from_pretrained(model_id)
         checkpoint = LLaMA.adapt_llama_state_dict_keys_hf(model.state_dict(), model_args)
@@ -880,7 +888,7 @@ def write_bf16(tensor, file):
     b = t.numpy().tobytes()
     file.write(b)
 
-def write_tensors(model_tensors, L, file, dtype):
+def write_tensors(model_tensors, L, tied, file, dtype):
     # writes LLaMA 3 model's weights to a binary file
     # things get a bit more complicated though:
     # 1) We want to maintain the ability to finetune just the biases in the C code
@@ -898,7 +906,8 @@ def write_tensors(model_tensors, L, file, dtype):
     assert dtype in {"float32", "bfloat16"}
     write_fun = write_fp32 if dtype == "float32" else write_bf16
     write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
-    write_fun(model_tensors["lm_head.weight"], file) # (V, C) # <--- hack (3) here!
+    if not tied:
+        write_fun(model_tensors["lm_head.weight"], file) # (V, C) # <--- hack (3) here!
     for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
     for i in range(L): # (L, C)
@@ -958,8 +967,9 @@ def write_model(model, filename, dtype):
     header_int[7] = model.config.n_embd
     header_int[8] = model.config.multiple_of
     header_int[9] = int(model.config.use_scaled_rope)
-    header_int[10] = int(model.config.version.split('.')[0]) # major version
-    header_int[11] = int(model.config.version.split('.')[1]) # minor version
+    header_int[10] = int(model.config.tied_embeddings)
+    header_int[11] = int(model.config.version.split('.')[0]) # major version
+    header_int[12] = int(model.config.version.split('.')[1]) # minor version
     # float section of the header
     header_float = torch.zeros(256, dtype=torch.float32)
     header_float[0] = model.config.ffn_dim_multiplier
@@ -971,7 +981,7 @@ def write_model(model, filename, dtype):
     with open(filename, "wb") as file:
         file.write(header_int.numpy().tobytes()) # int header
         file.write(header_float.numpy().tobytes()) # float header
-        write_tensors(params, model.config.n_layer, file, dtype) # params
+        write_tensors(params, model.config.n_layer, model.config.tied_embeddings, file, dtype) # params
     print(f"wrote {filename}")
 
 def write_state(model, x, y, logits, loss, filename):
@@ -996,7 +1006,7 @@ def write_state(model, x, y, logits, loss, filename):
         # loss (single float, result of the cross entropy loss)
         write_fp32(loss.cpu(), file)
         # gradients
-        write_tensors(grads, model.config.n_layer, file, "float32")
+        write_tensors(grads, model.config.n_layer, model.config.tied_embeddings, file, "float32")
     print(f"wrote {filename}")
 
 # -----------------------------------------------------------------------------
@@ -1022,6 +1032,7 @@ if __name__ == "__main__":
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B", help="chose the llama model")
+    parser.add_argument("--untie", type=int, default=False, help="Untie token embeddings and LM-head, even if they are tied in the checkpoint.")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -1127,7 +1138,7 @@ if __name__ == "__main__":
 
     # init the model
     if args.use_hf:
-        model = LLaMA.from_pretrained_llama3_hf(args.model)
+        model = LLaMA.from_pretrained_llama3_hf(args.model, args.untie)
     else:  # use Meta's checkpoint
         assert args.ckpt_dir is not None and os.path.exists(args.ckpt_dir), f"llama3 ckpt dir {args.ckpt_dir} does not exist"
         assert args.tokenizer_path is not None and os.path.exists(args.tokenizer_path), f"llama3 tokenizer path {args.tokenizer_path} does not exist"
