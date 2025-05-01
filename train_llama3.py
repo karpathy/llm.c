@@ -122,7 +122,7 @@ def precompute_freqs_cis(
         freqs = apply_scaling(freqs)
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
+    return torch.view_as_real(freqs_cis)
 
 # -----------------------------------------------------------------------------
 # LLaMA building blocks
@@ -242,14 +242,15 @@ class Block(nn.Module):
 
 @dataclass
 class LlamaConfig:
-    version: str = "3.1"
+    version: str
+    n_layer: int
+    n_head: int
+    n_embd: int
+    ffn_dim_multiplier: float
+    tied_embeddings: bool
     block_size: int = 8192
     vocab_size: int = 128256
-    n_layer: int = 32
-    n_head: int = 32
     n_kv_head: int = 8
-    n_embd: int = 4096
-    ffn_dim_multiplier: float = 1.3
     multiple_of: int = 1024
     norm_eps: float = 1e-5
     rope_theta: float = 500000.0
@@ -258,13 +259,46 @@ class LlamaConfig:
     use_kv: bool = True
     flash: bool = False  # use flashattention?
 
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            if hasattr(self, k):
-                setattr(self, k, v)
+    def __post_init__(self):
         assert self.n_kv_head <= self.n_head
         assert self.n_head % self.n_kv_head == 0
         assert self.n_embd % self.n_head == 0
+
+
+LLama3_8BConfig = LlamaConfig(
+    version="3.1",
+    n_layer=32,
+    n_head=32,
+    n_embd=4096,
+    ffn_dim_multiplier=1.3,
+    tied_embeddings=False
+)
+
+LLama3_3BConfig = LlamaConfig(
+    version="3.2",
+    n_layer=28,
+    n_head=24,
+    n_embd=3072,
+    ffn_dim_multiplier=1.0,
+    tied_embeddings=True
+)
+
+LLama3_1BConfig = LlamaConfig(
+    version="3.2",
+    n_layer=16,
+    n_head=32,
+    n_embd=2048,
+    ffn_dim_multiplier=1.4,
+    tied_embeddings=True
+)
+
+
+MODEL_DICT: Dict[str, LlamaConfig] = {
+    "meta-llama/Meta-Llama-3.1-8B": LLama3_8BConfig,
+    "meta-llama/Llama-3.2-3B": LLama3_3BConfig,
+    "meta-llama/Llama-3.2-1B": LLama3_1BConfig,
+}
+
 
 class LLaMA(nn.Module):
 
@@ -283,12 +317,13 @@ class LLaMA(nn.Module):
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(42)
 
-        self.freqs_cis = precompute_freqs_cis(
+        freqs_cis = precompute_freqs_cis(
             config.n_embd // config.n_head,
             config.block_size * 2,
             config.rope_theta,
             config.use_scaled_rope,
         )
+        self.register_buffer('freqs_cis', freqs_cis, persistent=False)
 
     def forward(self, idx, targets=None, return_logits=True, start_pos=0):
         _, t = idx.size()
@@ -296,7 +331,7 @@ class LLaMA(nn.Module):
 
         # forward the LLaMA model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        freqs_cis = self.freqs_cis[start_pos:start_pos+t]
+        freqs_cis = torch.view_as_complex(self.freqs_cis[start_pos:start_pos+t])
         mask = torch.triu(torch.ones((t, t), device=next(self.parameters()).device, dtype=torch.bool), diagonal=1)
 
         for i, block in enumerate(self.transformer.h):
@@ -401,8 +436,7 @@ class LLaMA(nn.Module):
     def from_pretrained_llama3_hf(cls, model_id):
         """Loads pretrained LLaMA model weights from HuggingFace"""
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        assert model_id == "meta-llama/Meta-Llama-3.1-8B", "Only the 8B-base model is supported for now"
-        model_args = LlamaConfig()
+        model_args = MODEL_DICT[model_id]
 
         model = AutoModelForCausalLM.from_pretrained(model_id)
         checkpoint = LLaMA.adapt_llama_state_dict_keys_hf(model.state_dict(), model_args)
@@ -422,7 +456,7 @@ class LLaMA(nn.Module):
     @classmethod
     def from_pretrained_llama3_meta(cls, ckpt_dir, tokenizer_path):
         """Loads pretrained LLaMA model weights from a checkpoint directory"""
-        model_args = LlamaConfig()
+        model_args = LLama3_8BConfig
 
         ckpt_path = sorted(Path(ckpt_dir).glob("*.pth"))[0]
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
@@ -438,7 +472,7 @@ class LLaMA(nn.Module):
         model.tokenizer = tokenizer
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage, offload):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -460,10 +494,14 @@ class LLaMA(nn.Module):
         use_fused = fused_available and device_type == 'cuda'
         print0(f"using fused AdamW: {use_fused}")
         if zero_stage == 1:
+            assert not offload
             print0("using ZeroRedundancyOptimizer")
             optimizer = ZeroRedundancyOptimizer(**optim_groups[0], optimizer_class=torch.optim.AdamW,
                                                 lr=learning_rate, betas=betas, fused=use_fused)
             optimizer.add_param_group(optim_groups[1])
+        elif offload:
+            from torchao.prototype.low_bit_optim import CPUOffloadOptimizer
+            optimizer = CPUOffloadOptimizer(optim_groups, torch.optim.AdamW, lr=learning_rate, betas=betas, fused=use_fused)
         else:
             print0("using regular AdamW")
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
@@ -942,8 +980,9 @@ def write_state(model, x, y, logits, loss, filename):
     # this can be used for checking the computation correctness in C
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240803 # magic
-    header[1] = x.size(0) # batch size of the batch, B
-    header[2] = x.size(1) # temporal extent of the batch, T
+    header[1] = 2 # version
+    header[2] = x.size(0) # batch size of the batch, B
+    header[3] = x.size(1) # temporal extent of the batch, T
     grads = {name: param.grad.cpu() for name, param in model.named_parameters()}
     with open(filename, "wb") as file:
         # header
@@ -982,7 +1021,7 @@ if __name__ == "__main__":
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
-    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B", help="chose the llama model")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B", help="chose the llama model")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -1009,6 +1048,7 @@ if __name__ == "__main__":
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|float16|bfloat16")
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
+    parser.add_argument("--offload", type=int, default=0, help="offload optimizer to CPU")
     # python -> C bridge
     parser.add_argument("--write_tensors", type=int, default=0, help="write tensors to disk")
     args = parser.parse_args()
@@ -1017,7 +1057,7 @@ if __name__ == "__main__":
     B, T = args.batch_size, args.sequence_length
     assert 1 <= T <= 8192, "sequence length must be between 1 and 8192"
     assert args.dtype in {"float32", "float16", "bfloat16"}
-    assert args.model in {"meta-llama/Meta-Llama-3.1-8B"}  # only 8B base model supported for now
+    assert args.model in MODEL_DICT.keys()
 
     # create the logging directory if it does not exist
     logfile = None
@@ -1061,7 +1101,7 @@ if __name__ == "__main__":
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 device = "mps"
     device_type = 'cuda' if 'cuda' in device else 'cpu'
-    assert device_type in {'cuda'}, "GPU required to run LLaMA 3"  # we need to load LLaMA as bf16 on CUDA
+    #assert device_type in {'cuda'}, "GPU required to run LLaMA 3"  # we need to load LLaMA as bf16 on CUDA
     print(f"using device: {device}")
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
@@ -1097,6 +1137,7 @@ if __name__ == "__main__":
     if args.dtype == "float32":
         model = model.to(torch.float32)
 
+    model = model.to(device)
     model.train()
     if args.compile:
         if hasattr(config, "coordinate_descent_tuning"):
@@ -1123,10 +1164,10 @@ if __name__ == "__main__":
         logits, loss = model(x, y)
         loss.backward()
         # save model params, in bfloat16
-        model_to_size = {"meta-llama/Meta-Llama-3.1-8B": "8B"}
-        model_size_str = model_to_size[args.model] # e.g. "8B"
-        write_model(model, os.path.join(args.output_dir, f"llama3.1_{model_size_str}.bin"), dtype="float32")
-        write_model(model, os.path.join(args.output_dir, f"llama3.1_{model_size_str}_bf16.bin"), dtype="bfloat16")
+        model_size_str = args.model.split("-")[-1]
+        model_version = MODEL_DICT[args.model].version
+        write_model(model, os.path.join(args.output_dir, f"llama{model_version}_{model_size_str}.bin"), dtype="float32")
+        write_model(model, os.path.join(args.output_dir, f"llama{model_version}_{model_size_str}_bf16.bin"), dtype="bfloat16")
         # save x, y, logits, loss, and parameter gradients, for debugging C
         # always store these in fp32 to have an accurate reference (?)
         write_state(model, x, y, logits, loss, os.path.join(args.output_dir, f"llama3_{model_size_str}_debug_state.bin"))
@@ -1144,7 +1185,7 @@ if __name__ == "__main__":
     # init the optimizer
     optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
                                                learning_rate=args.learning_rate, betas=(0.9, 0.95),
-                                               device_type=device, zero_stage=zero_stage)
+                                               device_type=device, zero_stage=zero_stage, offload=args.offload)
 
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):
@@ -1257,6 +1298,17 @@ if __name__ == "__main__":
             dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        if args.offload:
+            # CPUOffloadOptimizer is *not* compatible with gradient clipping and will *silently*
+            # give wrong results. So we
+            # a) explicitly wait for it to finish its gradients transfers
+            # b) overwrite the CPU gradients with the clipped GPU gradients.
+            # This is terribly inefficient, but correct and lets us run CI on
+            # small(ish) GPUs
+            torch.cuda.synchronize()
+            for gpu, cpu in optimizer.param_d2h_map.items():
+                cpu.grad[...] = gpu.grad[...]
+
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
