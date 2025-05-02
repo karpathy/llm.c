@@ -104,22 +104,18 @@ jobs:
           git clone https://github.com/NVIDIA/cudnn-frontend.git
 
       - name: Build with cuDNN
-        run: USE_CUDNN=1 make test_gpt2cu train_gpt2cu test_gpt2fp32cu train_gpt2fp32cu
+        run: USE_CUDNN=1 make test_gpt2cu train_gpt2cu
 
       - name: Train model with cuDNN
         run: ./train_gpt2cu
 
-      - name: Train model fp32 with cuDNN
-        run: ./train_gpt2fp32cu
-
       - name: Execute testing program with cuDNN
         run: ./test_gpt2cu
 
-      - name: Execute testing program fp32 with cuDNN
-        run: ./test_gpt2fp32cu
-
   build-and-test-llama3:
     runs-on: ubicloud-gpu-standard-1-latest
+    container:
+      image: nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
     env:
       HF_TOKEN: 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
     steps:
@@ -128,19 +124,19 @@ jobs:
       - run: echo "::add-mask::$HF_TOKEN"
 
       - name: Install OpenMP
-        run: sudo apt-get update && sudo apt-get install -y libomp-dev
+        run: apt-get update && apt-get install -y libomp-dev libopenmpi-dev python3-pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Run preprocessing
-        run: python dev/data/tinyshakespeare.py --model_desc llama-3
+        run: python3 dev/data/tinyshakespeare.py --model_desc llama-3
 
       - name: Train model
-        run: python train_llama3.py --write_tensors 1 --dtype float32 --offload 1
+        run: python3 train_llama3.py --write_tensors 1 --dtype float32 --offload 1
 
       - name: Build FP32 precision
-        run: PRECISION=FP32 make test_llama3cu
+        run: PRECISION=FP32 NO_MULTI_GPU=1 make test_llama3cu
 
       - name: Run default
         run: ./test_llama3cu
@@ -152,7 +148,7 @@ jobs:
         run: ./test_llama3cu -r 2
 
       - name: Build BF16 precision
-        run: PRECISION=BF16 make train_llama3cu test_llama3cu
+        run: PRECISION=BF16 NO_MULTI_GPU=1 make train_llama3cu test_llama3cu
 
       - name: Run default
         run: ./test_llama3cu
@@ -165,6 +161,19 @@ jobs:
 
       - name: Run recompute LN
         run: ./test_llama3cu -r 2
+
+      - name: Install cuDNN-frontend
+        run:
+          git clone https://github.com/NVIDIA/cudnn-frontend.git
+
+      - name: Build with cuDNN
+        run: USE_CUDNN=1 PRECISION=BF16 NO_MULTI_GPU=1 make train_llama3cu test_llama3cu
+
+      - name: Train model with cuDNN
+        run: ./train_llama3cu
+
+      - name: Execute testing program with cuDNN
+        run: ./test_llama3cu
 
   unit-tests-gpu:
     runs-on: ubicloud-gpu-standard-1-latest

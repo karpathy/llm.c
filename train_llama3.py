@@ -1133,9 +1133,11 @@ if __name__ == "__main__":
         assert args.tokenizer_path is not None and os.path.exists(args.tokenizer_path), f"llama3 tokenizer path {args.tokenizer_path} does not exist"
         model = LLaMA.from_pretrained_llama3_meta(args.ckpt_dir, args.tokenizer_path)
 
-    # convert the model to the desired precision
-    if args.dtype == "float32":
-        model = model.to(torch.float32)
+    # PT optimizer doesn't do stochastic rounding, so we
+    # really want the model to be in fp32 precision:
+    # --dtype should only enable AMP
+    # as the original checkpoints are in 16 bit, we need to convert
+    model = model.to(torch.float32)
 
     model = model.to(device)
     model.train()
