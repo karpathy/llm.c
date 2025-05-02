@@ -923,7 +923,7 @@ void llama3_backward_and_reduce(LLama3 *model, int* inputs, const int* targets, 
         // backward rope (this can be done in-place)
         rope_backward_inplace(dl_bt4c, dl_bt4c, model->freqs_cis, B, T, NH, hd, main_stream);
         // backward repkv (use scratchX as gradient buffer here)
-        repkv_backward(dl_bt4c2, dl_bt4c, B, T, NH, n_kv_head, hd);
+        repkv_backward(dl_bt4c2, dl_bt4c, B, T, NH, n_kv_head, hd, main_stream);
         // backward QKV projection
         if(model->recompute >= 2) {
             rmsnorm_forward(l_ln1, l_ln1_rstd, residual, l_ln1w, B, T, C, main_stream);
