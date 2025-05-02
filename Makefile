@@ -122,7 +122,7 @@ ifeq ($(USE_CUDNN), 1)
       $(error ✗ cuDNN not found. See the README for install instructions and the Makefile for hard-coded paths)
     endif
     NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
-    NVCC_LDFLAGS += -lcudnn
+    NVCC_LDFLAGS += -lcudnn -L$(CUDNN_LIB_DIR)
     NVCC_FLAGS += -DENABLE_CUDNN
     NVCC_CUDNN = $(BUILD_DIR)/cudnn_att.o
   else
