@@ -922,7 +922,7 @@ void llama3_backward_and_reduce(LLama3 *model, int* inputs, const int* targets, 
         floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         // backward repkv (use scratchX as gradient buffer here)
-        repkv_backward(dl_bt4c2, dl_bt4c, B, T, NH, n_kv_head, hd);
+        repkv_backward(dl_bt4c2, dl_bt4c, B, T, NH, n_kv_head, hd, main_stream);
         #endif
         // backward rope (this can be done in-place)
         rope_backward_inplace(dl_bt4c2, dl_bt4c2, model->freqs_cis, B, T, NH, n_kv_head, hd, main_stream);
