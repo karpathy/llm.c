@@ -290,7 +290,7 @@ int main(int argc, char *argv[]) {
         llama3_update(&model, 1e-5f, 0.9f, 0.95f, 1e-8f, 0.0f, grad_scale, step+1, &multi_gpu_config);
 
         // print the timing information at the end
-        printf("step %d: loss %f (took %f ms)\n", step+1, model.mean_loss, time_elapsed_s * 1000);
+        printf("step %d: loss %f norm %f (took %f ms)\n", step+1, model.mean_loss, grad_norm, time_elapsed_s * 1000);
         // the expected losses from PyTorch were copied over after the print formatting rounded
         // them to 6 decimal places, so we do the same here
         float rounded_loss = roundf(model.mean_loss * 1000000) / 1000000;
