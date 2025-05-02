@@ -115,29 +115,29 @@ jobs:
   build-and-test-llama3:
     name: Build and test LLama3.2 1B
     runs-on: ubicloud-gpu-standard-1-latest
-    env:
-      HF_TOKEN: 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
+    container:
+      image: nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - run: echo "::add-mask::$HF_TOKEN"
+      - run: echo "::add-mask::$(echo us_xrYQGKBiJeqDMlTxkGhSgjelZKYbJHTgDY | tr 'A-Za-z' 'N-ZA-Mn-za-m')"
 
       - name: Install OpenMP
-        run: sudo apt-get update && sudo apt-get install -y libomp-dev
+        run: apt-get update && apt-get install -y libomp-dev libopenmpi-dev python3-pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Run preprocessing
-        run: python dev/data/tinyshakespeare.py --model_desc llama-3
+        run: HF_TOKEN=$(echo us_xrYQGKBiJeqDMlTxkGhSgjelZKYbJHTgDY | tr 'A-Za-z' 'N-ZA-Mn-za-m') python3 dev/data/tinyshakespeare.py --model_desc llama-3
 
       - name: Train model
         # use the first 10 layers, so that everything fits into the 20GB of
         # the A4000 Ada that we have in CI
-        run: python train_llama3.py --write_tensors 1 --dtype float32 --depth 10
+        run: HF_TOKEN=$(echo us_xrYQGKBiJeqDMlTxkGhSgjelZKYbJHTgDY | tr 'A-Za-z' 'N-ZA-Mn-za-m') python3 train_llama3.py --write_tensors 1 --dtype float32 --depth 10
 
       - name: Build FP32 precision
-        run: PRECISION=FP32 make test_llama3cu
+        run: PRECISION=FP32 NO_MULTI_GPU=1 make test_llama3cu
 
       - name: Run default
         run: ./test_llama3cu
@@ -149,7 +149,7 @@ jobs:
         run: ./test_llama3cu -r 2
 
       - name: Build BF16 precision
-        run: PRECISION=BF16 make train_llama3cu test_llama3cu
+        run: PRECISION=BF16 NO_MULTI_GPU=1 make train_llama3cu test_llama3cu
 
       - name: Run default (BF16)
         run: ./test_llama3cu
@@ -166,15 +166,12 @@ jobs:
   build-and-test-llama3-untied:
     name: Build and test LLama3.2 1B with untie weights
     runs-on: ubicloud-gpu-standard-1-latest
-    env:
-      HF_TOKEN: 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
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - run: echo "::add-mask::$HF_TOKEN"
 
       - name: Install OpenMP
-        run: sudo apt-get update && sudo apt-get install -y libomp-dev
+        run: sudo apt-get update && sudo apt-get install -y libomp-dev git
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -202,7 +199,7 @@ jobs:
           git clone https://github.com/NVIDIA/cudnn-frontend.git
 
       - name: Build with cuDNN
-        run: USE_CUDNN=1 PRECISION=BF16 make train_llama3cu test_llama3cu
+        run: USE_CUDNN=1 PRECISION=BF16 NO_MULTI_GPU=1 make train_llama3cu test_llama3cu
 
       - name: Train model with cuDNN
         run: ./train_llama3cu
