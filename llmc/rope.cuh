@@ -43,20 +43,27 @@ void precompute_freqs_cis(floatX *freqs_cis, int dim, int end, float theta, int 
     }
 }
 
-__global__ void rope_forward_inplace_kernel1(floatX *inout, const floatX *freqs_cis, int B, int T, int n_head, int head_dim) {
+__global__ void rope_forward_inplace_kernel1(floatX *inout, const floatX *freqs_cis, int B, int T, int Nq, int Nkv, int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int head_dim_half = head_dim / 2;
-    if (idx >= B * T * 3 * n_head * head_dim_half) return;
+    int N = Nq + 2*Nkv;
+    if (idx >= B * T * N * head_dim_half) return;
     // decode the qkv index early so we can early exit if it's a value index
-    int qkv = (idx / (n_head * head_dim_half)) % 3;
+    int h = (idx / head_dim_half) % N;
+    int qkv = 2;
+    if(h < Nq) {
+        qkv = 0;        // query head
+    } else if (h < Nq + Nkv) {
+        qkv = 1;        // key head
+        h -= Nq;
+    }
     if (qkv == 2) return; // no-op for v
     // decode the individual indices and get the input index
-    int b = idx / (T * 3 * n_head * head_dim_half);
-    int t = (idx / (3 * n_head * head_dim_half)) % T;
-    int h = (idx / head_dim_half) % n_head;
+    int b = idx / (T * N * head_dim_half);
+    int t = (idx / (N * head_dim_half)) % T;
     int d = idx % head_dim_half;
-    int idx_bt = b * (T * 3 * n_head * head_dim) + t * (3 * n_head * head_dim);
-    int idx_bth = idx_bt + qkv * (n_head * head_dim) + h * head_dim;
+    int idx_bt = b * (T * N * head_dim) + t * (N * head_dim);
+    int idx_bth = idx_bt + qkv * (Nq * head_dim) + h * head_dim;
     int idxi = idx_bth + 2 * d; // index in the input
     // fetch the freqs_cis
     int freqs_idx = t * head_dim + 2 * d;
@@ -70,20 +77,27 @@ __global__ void rope_forward_inplace_kernel1(floatX *inout, const floatX *freqs_
     inout[idxi + 1] = (floatX)(x_real * freqs_sin + x_imag * freqs_cos);
 }
 
-__global__ void rope_backward_inplace_kernel1(floatX *dinout, const floatX *freqs_cis, int B, int T, int n_head, int head_dim) {
+__global__ void rope_backward_inplace_kernel1(floatX *dinout, const floatX *freqs_cis, int B, int T, int Nq, int Nkv, int head_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int head_dim_half = head_dim / 2;
-    if (idx >= B * T * 3 * n_head * head_dim_half) return;
+    int N = Nq + 2*Nkv;
+    if (idx >= B * T * N * head_dim_half) return;
     // decode the qkv index early so we can early exit if it's a value index
-    int qkv = (idx / (n_head * head_dim_half)) % 3;
+    int h = (idx / head_dim_half) % N;
+    int qkv = 2;
+    if(h < Nq) {
+        qkv = 0;        // query head
+    } else if (h < Nq + Nkv) {
+        qkv = 1;        // key head
+        h -= Nq;
+    }
     if (qkv == 2) return; // no-op for v
     // decode the individual indices and get the input index
-    int b = idx / (T * 3 * n_head * head_dim_half);
-    int t = (idx / (3 * n_head * head_dim_half)) % T;
-    int h = (idx / head_dim_half) % n_head;
+    int b = idx / (T * N * head_dim_half);
+    int t = (idx / (N * head_dim_half)) % T;
     int d = idx % head_dim_half;
-    int idx_bt = b * (T * 3 * n_head * head_dim) + t * (3 * n_head * head_dim);
-    int idx_bth = idx_bt + qkv * (n_head * head_dim) + h * head_dim;
+    int idx_bt = b * (T * N * head_dim) + t * (N * head_dim);
+    int idx_bth = idx_bt + qkv * (Nq * head_dim) + h * head_dim;
     int idxi = idx_bth + 2 * d; // index in the input
     // fetch the freqs_cis
     int freqs_idx = t * head_dim + 2 * d;
@@ -96,23 +110,23 @@ __global__ void rope_backward_inplace_kernel1(floatX *dinout, const floatX *freq
     dinout[idxi + 1] = -dout_real * freqs_sin + dout_imag * freqs_cos;
 }
 
-void rope_forward_inplace(floatX *inout, const floatX *freqs_cis, int B, int T, int n_head, int head_dim, cudaStream_t stream) {
-    // the input and output to this kernel are (B, T, 3, NH, HD) where the 3 is q,k,v
+void rope_forward_inplace(floatX *inout, const floatX *freqs_cis, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream) {
+    // the input and output to this kernel are (B, T, Nq + Nk + Nv, HD)
     // we are going to launch exactly one thread per element of the output,
     // except divide by two because the work is in "tuples"
     // so this single kernel launch will do RoPE for both q and k, and the threads for v will be a no-op
     const int block_size = 128;
-    int total_threads = B * T * 3 * n_head * head_dim / 2;
+    int total_threads = B * T * (Nq + 2*Nkv) * head_dim / 2;
     int num_blocks = CEIL_DIV(total_threads, block_size);
-    rope_forward_inplace_kernel1<<<num_blocks, block_size, 0, stream>>>(inout, freqs_cis, B, T, n_head, head_dim);
+    rope_forward_inplace_kernel1<<<num_blocks, block_size, 0, stream>>>(inout, freqs_cis, B, T, Nq, Nkv, head_dim);
     cudaCheck(cudaGetLastError());
 }
 
-void rope_backward_inplace(floatX *dinout, const floatX *freqs_cis, int B, int T, int n_head, int head_dim, cudaStream_t stream) {
+void rope_backward_inplace(floatX *dinout, const floatX *freqs_cis, int B, int T, int Nq, int Nkv, int head_dim, cudaStream_t stream) {
     // backward pass of forward, mirrors the forward kernel in setup and indexing
     const int block_size = 128;
-    int total_threads = B * T * 3 * n_head * head_dim / 2;
+    int total_threads = B * T * (Nq + 2*Nkv) * head_dim / 2;
     int num_blocks = CEIL_DIV(total_threads, block_size);
-    rope_backward_inplace_kernel1<<<num_blocks, block_size, 0, stream>>>(dinout, freqs_cis, B, T, n_head, head_dim);
+    rope_backward_inplace_kernel1<<<num_blocks, block_size, 0, stream>>>(dinout, freqs_cis, B, T, Nq, Nkv, head_dim);
     cudaCheck(cudaGetLastError());
 }

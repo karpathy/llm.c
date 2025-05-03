@@ -718,7 +718,7 @@ void llama3_forward(LLama3 *model, const int* inputs, size_t B, size_t T) {
             // 2) replicate k,v so that all of q,k,v have the same number of heads. done for simplicity, for now
             repkv_forward(qkv_rep_scratch, scratch, B, T, n_head, n_kv_head, hd, main_stream);
             // 3) apply RoPE to q,k in place
-            rope_forward_inplace(qkv_rep_scratch, model->freqs_cis, B, T, n_head, hd, main_stream);
+            rope_forward_inplace(qkv_rep_scratch, model->freqs_cis, B, T, n_head, n_head, hd, main_stream);
             // 4) attention: att <- softmax(qk^T)v
             attention_forward(l_atty, l_qkvr, l_att, qkv_rep_scratch, B, T, C, NH, main_stream);
         #endif
@@ -921,7 +921,7 @@ void llama3_backward_and_reduce(LLama3 *model, int* inputs, const int* targets, 
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         #endif
         // backward rope (this can be done in-place)
-        rope_backward_inplace(dl_bt4c, model->freqs_cis, B, T, NH, hd, main_stream);
+        rope_backward_inplace(dl_bt4c, model->freqs_cis, B, T, NH, NH, hd, main_stream);
         // backward repkv (use scratchX as gradient buffer here)
         repkv_backward(dl_bt4c2, dl_bt4c, B, T, NH, n_kv_head, hd);
         // backward QKV projection
