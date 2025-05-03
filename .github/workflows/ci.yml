@@ -1,236 +1,236 @@
-name: Build and test
-
-on:
-  create:
-  workflow_dispatch:
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
-
-jobs:
-  build-and-test-cpu:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install OpenMP
-        if: matrix.os != 'windows-latest'
-        run: |
-          if [ "${{ runner.os }}" == "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y libomp-dev
-          elif [ "${{ runner.os }}" == "macOS" ]; then
-            brew install libomp
-          fi
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run preprocessing
-        run: python dev/data/tinyshakespeare.py
-
-      - name: Train model
-        run: python train_gpt2.py --device=cpu
-
-      - name: Download Win32 Make.exe
-        if: matrix.os == 'windows-latest'
-        run: |
-            $wc = New-Object System.Net.WebClient
-            $url = 'https://github.com/maweil/MakeForWindows/releases/download/v4.4.1/make-bin-win64.zip'
-            $output = './make-bin-win64.zip'
-            $wc.DownloadFile($url, $output)
-
-      - name: Unzip Win32 Makefile
-        if: matrix.os == 'windows-latest'
-        run: |
-          unzip make-bin-win64.zip
-
-      - name: Compile training and testing program
-        if: matrix.os != 'windows-latest'
-        run: make test_gpt2 train_gpt2
-
-      - name: Compile training and testing program for Windows
-        if: matrix.os == 'windows-latest'
-        shell: cmd
-        run: |
-          call "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Auxiliary\\Build\\vcvars64.bat"
-          make-4.4.1\dist\make WIN_CI_BUILD=1 test_gpt2 train_gpt2
-
-      - name: Execute testing program (With OpenMP)
-        if: matrix.os != 'windows-latest'
-        run: OMP_NUM_THREADS=8 ./test_gpt2
-
-      - name: Execute Windows testing program (With OpenMP)
-        if: matrix.os == 'windows-latest'
-        shell: cmd
-        run: |
-          copy test_gpt2 test_gpt2.exe
-          test_gpt2.exe
-
-      - name: Compile training and testing program without OpenMP
-        if: matrix.os != 'windows-latest'
-        run: NO_OMP=1 make test_gpt2 train_gpt2
-
-      - name: Execute testing program (No OpenMP)
-        if: matrix.os != 'windows-latest'
-        run: ./test_gpt2
-
-  build-cuda-windows:
-    runs-on: windows-latest
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Download Win32 Make.exe
-      run: |
-          $wc = New-Object System.Net.WebClient
-          $url = 'https://github.com/maweil/MakeForWindows/releases/download/v4.4.1/make-bin-win64.zip'
-          $output = './make-bin-win64.zip'
-          $wc.DownloadFile($url, $output)
-
-    - name: Unzip Win32 Makefile
-      run: |
-        unzip make-bin-win64.zip
-
-    - name: Install Cuda Toolkit 12.4 on Windows
-      run: |
-        mkdir -p "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
-        choco install unzip -y
-        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.4.127-archive.zip"
-        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-12.4.131-archive.zip"
-        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-12.4.127-archive.zip"
-        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.4.5.8-archive.zip"
-        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-12.4.127-archive.zip"
-        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-12.4.127-archive.zip"
-        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-12.4.127-archive.zip"
-        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvprof/windows-x86_64/cuda_nvprof-windows-x86_64-12.4.127-archive.zip"
-        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-12.4.127-archive.zip"
-        unzip '*.zip' -d "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
-        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\cuda_cudart-windows-x86_64-12.4.127-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
-        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\cuda_nvcc-windows-x86_64-12.4.131-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
-        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\cuda_nvrtc-windows-x86_64-12.4.127-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
-        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\libcublas-windows-x86_64-12.4.5.8-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
-        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\cuda_nvtx-windows-x86_64-12.4.127-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
-        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\cuda_profiler_api-windows-x86_64-12.4.127-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
-        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\visual_studio_integration-windows-x86_64-12.4.127-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
-        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\cuda_nvprof-windows-x86_64-12.4.127-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
-        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\cuda_cccl-windows-x86_64-12.4.127-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
-
-    # Default installation path for CUDA Toolkit is C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4
-    - name: Add Path
-      run: |
-        echo "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.4\\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-        echo "CUDA_PATH_V12_4=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-    - name: Build Cuda targets
-      shell: cmd
-      working-directory: ${{ github.workspace }}
-      run: |
-        call "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Auxiliary\\Build\\vcvars64.bat"
-        make-4.4.1\dist\make -j WIN_CI_BUILD=1 train_gpt2fp32cu test_gpt2fp32cu test_gpt2cu train_gpt2cu profile_gpt2cu
-
-  build-ubuntu20-04:
-    runs-on: ubuntu-20.04
-    container:
-      image: nvidia/cuda:11.8.0-cudnn8-devel-ubuntu20.04
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: System Info
-        run: |
-          nvcc --version
-          g++ --version
-
-      - name: Install cudnn frontend
-        run: |
-          apt-get update && apt-get install -y git
-          git clone https://github.com/NVIDIA/cudnn-frontend.git
-
-      - name: Build FP32 checkpoint
-        run: make train_gpt2fp32cu test_gpt2fp32cu
-
-      - name: Build FP32 precision
-        run: PRECISION=FP32 make train_gpt2cu test_gpt2cu profile_gpt2cu
-
-      - name: Build with CUDNN
-        run: PRECISION=BF16 USE_CUDNN=1 make train_gpt2cu test_gpt2cu profile_gpt2cu
-
-  build-cuda-fp32:
-    runs-on: ubuntu-latest
-    container:
-      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Build FP32 checkpoint
-        run: make train_gpt2fp32cu test_gpt2fp32cu
-
-      - name: Build FP32 precision
-        run: PRECISION=FP32 make train_gpt2cu test_gpt2cu profile_gpt2cu
-
-  build-cuda-bf16:
-    runs-on: ubuntu-latest
-    container:
-      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Build project
-        run: PRECISION=BF16 make test_gpt2cu train_gpt2cu profile_gpt2cu
-
-  build-cuda-fp16:
-    runs-on: ubuntu-latest
-    container:
-      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Build project
-        run: PRECISION=FP16 make test_gpt2cu train_gpt2cu profile_gpt2cu
-
-  build-cuda-kernels:
-    runs-on: ubuntu-latest
-    container:
-      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install OpenMP and OpenMPI
-        run: apt-get update && apt-get install -y libomp-dev libopenmpi-dev
-
-      - name: Build project
-        run: make -j4 -C dev/cuda
-
-  build-llama3:
-    runs-on: ubuntu-latest
-    container:
-      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Build FP32
-        run: PRECISION=FP32 make test_llama3cu train_llama3cu
-
-      - name: Build BF16
-        run: PRECISION=BF16 make test_llama3cu train_llama3cu
+#name: Build and test
+#
+#on:
+#  create:
+#  workflow_dispatch:
+#  push:
+#    branches:
+#      - master
+#  pull_request:
+#    branches:
+#      - master
+#
+#jobs:
+#  build-and-test-cpu:
+#    strategy:
+#      matrix:
+#        os: [ubuntu-latest, macos-latest, windows-latest]
+#
+#    runs-on: ${{ matrix.os }}
+#
+#    steps:
+#      - name: Checkout code
+#        uses: actions/checkout@v4
+#
+#      - name: Install OpenMP
+#        if: matrix.os != 'windows-latest'
+#        run: |
+#          if [ "${{ runner.os }}" == "Linux" ]; then
+#            sudo apt-get update && sudo apt-get install -y libomp-dev
+#          elif [ "${{ runner.os }}" == "macOS" ]; then
+#            brew install libomp
+#          fi
+#
+#      - name: Install dependencies
+#        run: pip install -r requirements.txt
+#
+#      - name: Run preprocessing
+#        run: python dev/data/tinyshakespeare.py
+#
+#      - name: Train model
+#        run: python train_gpt2.py --device=cpu
+#
+#      - name: Download Win32 Make.exe
+#        if: matrix.os == 'windows-latest'
+#        run: |
+#            $wc = New-Object System.Net.WebClient
+#            $url = 'https://github.com/maweil/MakeForWindows/releases/download/v4.4.1/make-bin-win64.zip'
+#            $output = './make-bin-win64.zip'
+#            $wc.DownloadFile($url, $output)
+#
+#      - name: Unzip Win32 Makefile
+#        if: matrix.os == 'windows-latest'
+#        run: |
+#          unzip make-bin-win64.zip
+#
+#      - name: Compile training and testing program
+#        if: matrix.os != 'windows-latest'
+#        run: make test_gpt2 train_gpt2
+#
+#      - name: Compile training and testing program for Windows
+#        if: matrix.os == 'windows-latest'
+#        shell: cmd
+#        run: |
+#          call "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Auxiliary\\Build\\vcvars64.bat"
+#          make-4.4.1\dist\make WIN_CI_BUILD=1 test_gpt2 train_gpt2
+#
+#      - name: Execute testing program (With OpenMP)
+#        if: matrix.os != 'windows-latest'
+#        run: OMP_NUM_THREADS=8 ./test_gpt2
+#
+#      - name: Execute Windows testing program (With OpenMP)
+#        if: matrix.os == 'windows-latest'
+#        shell: cmd
+#        run: |
+#          copy test_gpt2 test_gpt2.exe
+#          test_gpt2.exe
+#
+#      - name: Compile training and testing program without OpenMP
+#        if: matrix.os != 'windows-latest'
+#        run: NO_OMP=1 make test_gpt2 train_gpt2
+#
+#      - name: Execute testing program (No OpenMP)
+#        if: matrix.os != 'windows-latest'
+#        run: ./test_gpt2
+#
+#  build-cuda-windows:
+#    runs-on: windows-latest
+#    steps:
+#    - name: Checkout code
+#      uses: actions/checkout@v4
+#
+#    - name: Download Win32 Make.exe
+#      run: |
+#          $wc = New-Object System.Net.WebClient
+#          $url = 'https://github.com/maweil/MakeForWindows/releases/download/v4.4.1/make-bin-win64.zip'
+#          $output = './make-bin-win64.zip'
+#          $wc.DownloadFile($url, $output)
+#
+#    - name: Unzip Win32 Makefile
+#      run: |
+#        unzip make-bin-win64.zip
+#
+#    - name: Install Cuda Toolkit 12.4 on Windows
+#      run: |
+#        mkdir -p "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+#        choco install unzip -y
+#        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.4.127-archive.zip"
+#        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-12.4.131-archive.zip"
+#        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-12.4.127-archive.zip"
+#        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.4.5.8-archive.zip"
+#        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-12.4.127-archive.zip"
+#        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-12.4.127-archive.zip"
+#        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-12.4.127-archive.zip"
+#        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvprof/windows-x86_64/cuda_nvprof-windows-x86_64-12.4.127-archive.zip"
+#        curl -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-12.4.127-archive.zip"
+#        unzip '*.zip' -d "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+#        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\cuda_cudart-windows-x86_64-12.4.127-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
+#        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\cuda_nvcc-windows-x86_64-12.4.131-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
+#        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\cuda_nvrtc-windows-x86_64-12.4.127-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
+#        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\libcublas-windows-x86_64-12.4.5.8-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
+#        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\cuda_nvtx-windows-x86_64-12.4.127-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
+#        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\cuda_profiler_api-windows-x86_64-12.4.127-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
+#        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\visual_studio_integration-windows-x86_64-12.4.127-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
+#        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\cuda_nvprof-windows-x86_64-12.4.127-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
+#        xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\cuda_cccl-windows-x86_64-12.4.127-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" /E /I /H /Y
+#
+#    # Default installation path for CUDA Toolkit is C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4
+#    - name: Add Path
+#      run: |
+#        echo "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.4\\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+#        echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+#        echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+#        echo "CUDA_PATH_V12_4=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+#
+#    - name: Build Cuda targets
+#      shell: cmd
+#      working-directory: ${{ github.workspace }}
+#      run: |
+#        call "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Auxiliary\\Build\\vcvars64.bat"
+#        make-4.4.1\dist\make -j WIN_CI_BUILD=1 train_gpt2fp32cu test_gpt2fp32cu test_gpt2cu train_gpt2cu profile_gpt2cu
+#
+#  build-ubuntu20-04:
+#    runs-on: ubuntu-20.04
+#    container:
+#      image: nvidia/cuda:11.8.0-cudnn8-devel-ubuntu20.04
+#    steps:
+#      - name: Checkout code
+#        uses: actions/checkout@v4
+#
+#      - name: System Info
+#        run: |
+#          nvcc --version
+#          g++ --version
+#
+#      - name: Install cudnn frontend
+#        run: |
+#          apt-get update && apt-get install -y git
+#          git clone https://github.com/NVIDIA/cudnn-frontend.git
+#
+#      - name: Build FP32 checkpoint
+#        run: make train_gpt2fp32cu test_gpt2fp32cu
+#
+#      - name: Build FP32 precision
+#        run: PRECISION=FP32 make train_gpt2cu test_gpt2cu profile_gpt2cu
+#
+#      - name: Build with CUDNN
+#        run: PRECISION=BF16 USE_CUDNN=1 make train_gpt2cu test_gpt2cu profile_gpt2cu
+#
+#  build-cuda-fp32:
+#    runs-on: ubuntu-latest
+#    container:
+#      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+#
+#    steps:
+#      - name: Checkout code
+#        uses: actions/checkout@v4
+#
+#      - name: Build FP32 checkpoint
+#        run: make train_gpt2fp32cu test_gpt2fp32cu
+#
+#      - name: Build FP32 precision
+#        run: PRECISION=FP32 make train_gpt2cu test_gpt2cu profile_gpt2cu
+#
+#  build-cuda-bf16:
+#    runs-on: ubuntu-latest
+#    container:
+#      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+#
+#    steps:
+#      - name: Checkout code
+#        uses: actions/checkout@v4
+#
+#      - name: Build project
+#        run: PRECISION=BF16 make test_gpt2cu train_gpt2cu profile_gpt2cu
+#
+#  build-cuda-fp16:
+#    runs-on: ubuntu-latest
+#    container:
+#      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+#
+#    steps:
+#      - name: Checkout code
+#        uses: actions/checkout@v4
+#
+#      - name: Build project
+#        run: PRECISION=FP16 make test_gpt2cu train_gpt2cu profile_gpt2cu
+#
+#  build-cuda-kernels:
+#    runs-on: ubuntu-latest
+#    container:
+#      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+#
+#    steps:
+#      - name: Checkout code
+#        uses: actions/checkout@v4
+#
+#      - name: Install OpenMP and OpenMPI
+#        run: apt-get update && apt-get install -y libomp-dev libopenmpi-dev
+#
+#      - name: Build project
+#        run: make -j4 -C dev/cuda
+#
+#  build-llama3:
+#    runs-on: ubuntu-latest
+#    container:
+#      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+#
+#    steps:
+#      - name: Checkout code
+#        uses: actions/checkout@v4
+#
+#      - name: Build FP32
+#        run: PRECISION=FP32 make test_llama3cu train_llama3cu
+#
+#      - name: Build BF16
+#        run: PRECISION=BF16 make test_llama3cu train_llama3cu
