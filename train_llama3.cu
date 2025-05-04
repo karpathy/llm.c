@@ -66,7 +66,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/global_norm.cuh"
 // defines: repkv_forward, repkv_backward
 #include "llmc/repkv.cuh"
-// defines: precompute_freqs_cis, rope_forward, rope_backward_inplace
+// defines: precompute_freqs_cis, rope_forward_inplace, rope_backward_inplace
 #include "llmc/rope.cuh"
 // defines: swiglu_forward, swiglu_backward
 #include "llmc/swiglu.cuh"
@@ -715,10 +715,10 @@ void llama3_forward(LLama3 *model, const int* inputs, size_t B, size_t T) {
             if (T != model->seq_len) { cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX))); }
             // 1) projection to QKV vectors (note k,v may be fewer heads than q)
             matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, qkv_channels, main_stream);
-            // 2) replicate k,v so that all of q,k,v have the same number of heads. done for simplicity, for now
+            // 2) apply RoPE to q,k in place
+            rope_forward_inplace(scratch, model->freqs_cis, B, T, n_head, n_kv_head, hd, main_stream);
+            // 3) replicate k,v so that all of q,k,v have the same number of heads. done for simplicity, for now
             repkv_forward(qkv_rep_scratch, scratch, B, T, n_head, n_kv_head, hd, main_stream);
-            // 3) apply RoPE to q,k in place
-            rope_forward(qkv_rep_scratch, qkv_rep_scratch, model->freqs_cis, B, T, n_head, hd, main_stream);
             // 4) attention: att <- softmax(qk^T)v
             attention_forward(l_atty, l_qkvr, l_att, qkv_rep_scratch, B, T, C, NH, main_stream);
         #endif
@@ -920,10 +920,10 @@ void llama3_backward_and_reduce(LLama3 *model, int* inputs, const int* targets, 
         floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         #endif
-        // backward rope (this can be done in-place)
-        rope_backward_inplace(dl_bt4c, dl_bt4c, model->freqs_cis, B, T, NH, hd, main_stream);
         // backward repkv (use scratchX as gradient buffer here)
-        repkv_backward(dl_bt4c2, dl_bt4c, B, T, NH, n_kv_head, hd);
+        repkv_backward(dl_bt4c2, dl_bt4c, B, T, NH, n_kv_head, hd, main_stream);
+        // backward rope (this can be done in-place)
+        rope_backward_inplace(dl_bt4c2, model->freqs_cis, B, T, NH, n_kv_head, hd, main_stream);
         // backward QKV projection
         if(model->recompute >= 2) {
             rmsnorm_forward(l_ln1, l_ln1_rstd, residual, l_ln1w, B, T, C, main_stream);
