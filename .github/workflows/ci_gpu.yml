@@ -42,5 +42,8 @@ jobs:
       - name: Build BF16 precision
         run: PRECISION=BF16 make train_llama3cu test_llama3cu
 
+      - name: Run blocking
+        run: CUDA_LAUNCH_BLOCKING=1 ./test_llama3cu
+
       - name: Run default
         run: ./test_llama3cu
