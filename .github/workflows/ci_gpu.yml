@@ -131,7 +131,9 @@ jobs:
         run: python dev/data/tinyshakespeare.py --model_desc llama-3
 
       - name: Train model
-        run: python train_llama3.py --write_tensors 1 --dtype float32 --offload 1
+        # use the first 10 layers, so that everything fits into the 20GB of
+        # the A4000 Ada that we have in CI
+        run: python train_llama3.py --write_tensors 1 --dtype float32 --depth 10
 
       - name: Build FP32 precision
         run: PRECISION=FP32 make test_llama3cu
