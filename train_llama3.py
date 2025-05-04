@@ -1158,21 +1158,21 @@ if __name__ == "__main__":
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
 
     # do one forward pass to generate ground truth for our C tests
-    if master_process and args.write_tensors and (not args.inference_only):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        logits, loss = model(x, y)
-        loss.backward()
-        # save model params, in bfloat16
-        model_size_str = args.model.split("-")[-1]
-        model_version = MODEL_DICT[args.model].version
-        write_model(model, os.path.join(args.output_dir, f"llama{model_version}_{model_size_str}.bin"), dtype="float32")
-        write_model(model, os.path.join(args.output_dir, f"llama{model_version}_{model_size_str}_bf16.bin"), dtype="bfloat16")
-        # save x, y, logits, loss, and parameter gradients, for debugging C
-        # always store these in fp32 to have an accurate reference (?)
-        write_state(model, x, y, logits, loss, os.path.join(args.output_dir, f"llama3_{model_size_str}_debug_state.bin"))
-        # reset the train_loader for the optimization below
-        train_loader.reset()
+    # if master_process and args.write_tensors and (not args.inference_only):
+    #     x, y = train_loader.next_batch()
+    #     x, y = x.to(device), y.to(device)
+    #     logits, loss = model(x, y)
+    #     loss.backward()
+    #     # save model params, in bfloat16
+    #     model_size_str = args.model.split("-")[-1]
+    #     model_version = MODEL_DICT[args.model].version
+    #     write_model(model, os.path.join(args.output_dir, f"llama{model_version}_{model_size_str}.bin"), dtype="float32")
+    #     write_model(model, os.path.join(args.output_dir, f"llama{model_version}_{model_size_str}_bf16.bin"), dtype="bfloat16")
+    #     # save x, y, logits, loss, and parameter gradients, for debugging C
+    #     # always store these in fp32 to have an accurate reference (?)
+    #     write_state(model, x, y, logits, loss, os.path.join(args.output_dir, f"llama3_{model_size_str}_debug_state.bin"))
+    #     # reset the train_loader for the optimization below
+    #     train_loader.reset()
 
     # -------------------------------------------------------------------------
     # main training loop
@@ -1315,6 +1315,25 @@ if __name__ == "__main__":
             param_group['lr'] = lr
         # step the optimizer
         optimizer.step()
+
+        if master_process and args.write_tensors and (not args.inference_only) and step == 5:
+            optimizer.zero_grad(set_to_none=True)
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            logits, loss = model(x, y)
+            loss.backward()
+            # save model params, in bfloat16
+            model_size_str = args.model.split("-")[-1]
+            model_version = MODEL_DICT[args.model].version
+            write_model(model, os.path.join(args.output_dir, f"llama{model_version}_{model_size_str}.bin"), dtype="float32")
+            write_model(model, os.path.join(args.output_dir, f"llama{model_version}_{model_size_str}_bf16.bin"), dtype="bfloat16")
+            # save x, y, logits, loss, and parameter gradients, for debugging C
+            # always store these in fp32 to have an accurate reference (?)
+            write_state(model, x, y, logits, loss, os.path.join(args.output_dir, f"llama3_{model_size_str}_debug_state.bin"))
+            # reset the train_loader for the optimization below
+            optimizer.zero_grad(set_to_none=True)
+            #train_loader.reset()
+
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
 
