@@ -976,9 +976,10 @@ def write_state(model, x, y, logits, loss, filename):
     # this can be used for checking the computation correctness in C
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240803 # magic
-    header[1] = 2 # version
+    header[1] = 3 # version
     header[2] = x.size(0) # batch size of the batch, B
     header[3] = x.size(1) # temporal extent of the batch, T
+    header[4] = 0
     grads = {name: param.grad.cpu() for name, param in model.named_parameters()}
     with open(filename, "wb") as file:
         # header
@@ -994,6 +995,22 @@ def write_state(model, x, y, logits, loss, filename):
         # gradients
         write_tensors(grads, model.config.n_layer, file, "float32")
     print(f"wrote {filename}")
+
+
+def write_training_history(losses, norms, filename):
+    # amends the state file with the sequence of losses and grad norms
+    assert len(norms) == len(losses)
+    with open(filename, "r+b") as f:
+        header = np.frombuffer(f.read(256*4), dtype=np.int32).copy()
+        header[4] = len(losses)
+        f.seek(0, os.SEEK_SET)
+        f.write(header.tobytes())
+        f.seek(0, os.SEEK_END)
+        # write the losses and norms at the end of the file
+        f.write(np.asarray(losses).astype(np.float32).tobytes())
+        f.write(np.asarray(norms).astype(np.float32).tobytes())
+
+    print(f"updated {filename}")
 
 # -----------------------------------------------------------------------------
 # int main
@@ -1208,6 +1225,8 @@ if __name__ == "__main__":
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     timings = []
+    losses = []
+    norms = []
     norm = -1.0   # dummy value to print in inference-only mode
     for step in range(args.num_iterations + 1):
         t0 = time.time()
@@ -1320,6 +1339,8 @@ if __name__ == "__main__":
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
         tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
+        losses.append(lossf)
+        norms.append(norm.item())
         print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
         # log to logile
         if master_process and logfile is not None:
@@ -1329,6 +1350,9 @@ if __name__ == "__main__":
         # keep track of smooth timings, last 20 iterations
         if step > 0 and step > args.num_iterations - 20:
             timings.append(t1-t0)
+
+    if master_process and args.write_tensors and (not args.inference_only):
+        write_training_history(losses, norms, f"llama3_{model_size_str}_debug_state.bin")
 
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
