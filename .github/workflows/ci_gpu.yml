@@ -9,9 +9,10 @@ on:
   pull_request:
     branches:
       - master
+      - llama3
 
 jobs:
-  build-and-test-gpu:
+  build-and-test-gpt2:
     runs-on: ubicloud-gpu-standard-1-latest
 
     steps:
@@ -103,19 +104,63 @@ jobs:
           git clone https://github.com/NVIDIA/cudnn-frontend.git
 
       - name: Build with cuDNN
-        run: USE_CUDNN=1 make test_gpt2cu train_gpt2cu test_gpt2fp32cu train_gpt2fp32cu
+        run: USE_CUDNN=1 make test_gpt2cu train_gpt2cu
 
       - name: Train model with cuDNN
         run: ./train_gpt2cu
 
-      - name: Train model fp32 with cuDNN
-        run: ./train_gpt2fp32cu
-
       - name: Execute testing program with cuDNN
         run: ./test_gpt2cu
 
-      - name: Execute testing program fp32 with cuDNN
-        run: ./test_gpt2fp32cu
+  build-and-test-llama3:
+    runs-on: ubicloud-gpu-standard-1-latest
+    env:
+      HF_TOKEN: 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
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - run: echo "::add-mask::$HF_TOKEN"
+
+      - name: Install OpenMP
+        run: sudo apt-get update && sudo apt-get install -y libomp-dev
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run preprocessing
+        run: python dev/data/tinyshakespeare.py --model_desc llama-3
+
+      - name: Train model
+        # use the first 10 layers, so that everything fits into the 20GB of
+        # the A4000 Ada that we have in CI
+        run: python train_llama3.py --write_tensors 1 --dtype float32 --depth 10
+
+      - name: Build FP32 precision
+        run: PRECISION=FP32 make test_llama3cu
+
+      - name: Run default
+        run: ./test_llama3cu
+
+      - name: Run no recompute GeLU
+        run: ./test_llama3cu -r 0
+
+      - name: Run recompute LN
+        run: ./test_llama3cu -r 2
+
+      - name: Build BF16 precision
+        run: PRECISION=BF16 make train_llama3cu test_llama3cu
+
+      - name: Run default
+        run: ./test_llama3cu
+
+      - name: Run no recompute GeLU
+        run: ./test_llama3cu -r 0
+
+      - name: Run no master weights
+        run: ./test_llama3cu -w 0
+
+      - name: Run recompute LN
+        run: ./test_llama3cu -r 2
 
   unit-tests-gpu:
     runs-on: ubicloud-gpu-standard-1-latest
@@ -126,3 +171,4 @@ jobs:
 
       - name: Test Device<->File IO
         run: cd dev/test && nvcc -o device_file_io device_file_io.cu && ./device_file_io
+
