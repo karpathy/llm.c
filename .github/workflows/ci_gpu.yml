@@ -104,19 +104,13 @@ jobs:
           git clone https://github.com/NVIDIA/cudnn-frontend.git
 
       - name: Build with cuDNN
-        run: USE_CUDNN=1 make test_gpt2cu train_gpt2cu test_gpt2fp32cu train_gpt2fp32cu
+        run: USE_CUDNN=1 make test_gpt2cu train_gpt2cu
 
       - name: Train model with cuDNN
         run: ./train_gpt2cu
 
-      - name: Train model fp32 with cuDNN
-        run: ./train_gpt2fp32cu
-
       - name: Execute testing program with cuDNN
         run: ./test_gpt2cu
-
-      - name: Execute testing program fp32 with cuDNN
-        run: ./test_gpt2fp32cu
 
   build-and-test-llama3:
     runs-on: ubicloud-gpu-standard-1-latest
@@ -137,7 +131,9 @@ jobs:
         run: python dev/data/tinyshakespeare.py --model_desc llama-3
 
       - name: Train model
-        run: python train_llama3.py --write_tensors 1 --dtype float32 --offload 1
+        # use the first 10 layers, so that everything fits into the 20GB of
+        # the A4000 Ada that we have in CI
+        run: python train_llama3.py --write_tensors 1 --dtype float32 --depth 10
 
       - name: Build FP32 precision
         run: PRECISION=FP32 make test_llama3cu

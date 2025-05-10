@@ -128,17 +128,20 @@ int main(int argc, char *argv[]) {
     int state_header[256];
     freadCheck(state_header, sizeof(int), 256, state_file);
     if (state_header[0] != 20240803) { fprintf(stderr, "Bad magic state file\n"); exit(EXIT_FAILURE); }
-    if (state_header[1] != 2) {
+    if (state_header[1] != 3) {
         fprintf(stderr, "Bad version in state file: %d\n", state_header[1]);
         fprintf(stderr, "---> HINT: try to re-run `python train_llama3.py`\n");
         exit(EXIT_FAILURE);
     }
     int B = state_header[2]; // batch size, e.g. 4
     int T = state_header[3]; // time / sequence length (e.g. 64, up to maxT)
+    int steps = state_header[4];
+    float* expected_losses = (float*) malloc(steps * sizeof(float));
     assert(0 <= T && T <= maxT);
     printf("[State]\n");
     printf("batch_size: %d\n", B);
     printf("seq_len: %d\n", T);
+    printf("steps: %d\n", steps);
 
     set_zero_configs(&multi_gpu_config, 0, model.num_parameters);
 
@@ -157,6 +160,7 @@ int main(int argc, char *argv[]) {
     FloatParameterTensors expected_grads; // will be read from file. right now: all in fp32
     float* expected_grads_memory = float_cpu_malloc_and_point_parameters(&expected_grads, model.param_elements);
     freadCheck(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
+    freadCheck(expected_losses, sizeof(float), steps, state_file);
     fcloseCheck(state_file);
 
     // this memory will be used to do one single copy of all (mixed precision) GPU grads to CPU grads
@@ -290,26 +294,12 @@ int main(int argc, char *argv[]) {
         llama3_update(&model, 1e-5f, 0.9f, 0.95f, 1e-8f, 0.0f, grad_scale, step+1, &multi_gpu_config);
 
         // print the timing information at the end
-        printf("step %d: loss %f (took %f ms)\n", step+1, model.mean_loss, time_elapsed_s * 1000);
+        printf("step %d: loss %f norm %f (took %f ms)\n", step+1, model.mean_loss, grad_norm, time_elapsed_s * 1000);
         // the expected losses from PyTorch were copied over after the print formatting rounded
         // them to 6 decimal places, so we do the same here
         float rounded_loss = roundf(model.mean_loss * 1000000) / 1000000;
         losses[step] = rounded_loss;
     }
-
-    // expected losses are as follows, from Python (without CPUOffload)
-    float expected_losses[10] = {
-        4.849688f,
-        3.070303f,
-        1.711614f,
-        1.056311f,
-        0.593335f,
-        0.428291f,
-        0.372275f,
-        0.360507f,
-        0.355562f,
-        0.334824f
-    };
 
     // compare
     for (int i = 0; i < 10; i++) {
@@ -377,6 +367,7 @@ int main(int argc, char *argv[]) {
     common_free(model);
     free(x);
     free(y);
+    free(expected_losses);
     free(logits_cpu_raw);
     free(logits_cpu);
     free(expected_logits);

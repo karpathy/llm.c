@@ -472,7 +472,7 @@ class LLaMA(nn.Module):
         model.tokenizer = tokenizer
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage, offload):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -494,14 +494,10 @@ class LLaMA(nn.Module):
         use_fused = fused_available and device_type == 'cuda'
         print0(f"using fused AdamW: {use_fused}")
         if zero_stage == 1:
-            assert not offload
             print0("using ZeroRedundancyOptimizer")
             optimizer = ZeroRedundancyOptimizer(**optim_groups[0], optimizer_class=torch.optim.AdamW,
                                                 lr=learning_rate, betas=betas, fused=use_fused)
             optimizer.add_param_group(optim_groups[1])
-        elif offload:
-            from torchao.prototype.low_bit_optim import CPUOffloadOptimizer
-            optimizer = CPUOffloadOptimizer(optim_groups, torch.optim.AdamW, lr=learning_rate, betas=betas, fused=use_fused)
         else:
             print0("using regular AdamW")
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
@@ -980,9 +976,10 @@ def write_state(model, x, y, logits, loss, filename):
     # this can be used for checking the computation correctness in C
     header = torch.zeros(256, dtype=torch.int32)
     header[0] = 20240803 # magic
-    header[1] = 2 # version
+    header[1] = 3 # version
     header[2] = x.size(0) # batch size of the batch, B
     header[3] = x.size(1) # temporal extent of the batch, T
+    header[4] = 0
     grads = {name: param.grad.cpu() for name, param in model.named_parameters()}
     with open(filename, "wb") as file:
         # header
@@ -998,6 +995,22 @@ def write_state(model, x, y, logits, loss, filename):
         # gradients
         write_tensors(grads, model.config.n_layer, file, "float32")
     print(f"wrote {filename}")
+
+
+def write_training_history(losses, norms, filename):
+    # amends the state file with the sequence of losses and grad norms
+    assert len(norms) == len(losses)
+    with open(filename, "r+b") as f:
+        header = np.frombuffer(f.read(256*4), dtype=np.int32).copy()
+        header[4] = len(losses)
+        f.seek(0, os.SEEK_SET)
+        f.write(header.tobytes())
+        f.seek(0, os.SEEK_END)
+        # write the losses and norms at the end of the file
+        f.write(np.asarray(losses).astype(np.float32).tobytes())
+        f.write(np.asarray(norms).astype(np.float32).tobytes())
+
+    print(f"updated {filename}")
 
 # -----------------------------------------------------------------------------
 # int main
@@ -1022,6 +1035,7 @@ if __name__ == "__main__":
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B", help="chose the llama model")
+    parser.add_argument("--depth", type=int, default=-1, help="load only a subset of the model's layers")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -1048,7 +1062,6 @@ if __name__ == "__main__":
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|float16|bfloat16")
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
-    parser.add_argument("--offload", type=int, default=0, help="offload optimizer to CPU")
     # python -> C bridge
     parser.add_argument("--write_tensors", type=int, default=0, help="write tensors to disk")
     args = parser.parse_args()
@@ -1133,9 +1146,16 @@ if __name__ == "__main__":
         assert args.tokenizer_path is not None and os.path.exists(args.tokenizer_path), f"llama3 tokenizer path {args.tokenizer_path} does not exist"
         model = LLaMA.from_pretrained_llama3_meta(args.ckpt_dir, args.tokenizer_path)
 
-    # convert the model to the desired precision
-    if args.dtype == "float32":
-        model = model.to(torch.float32)
+    if args.depth > 0:
+        assert args.depth < len(model.transformer.h), f"invalid depth {args.depth}, model has {len(model.transformer.h)} blocks"
+        model.transformer.h = model.transformer.h[0:args.depth]
+        model.config.n_layer = args.depth
+
+    # PT optimizer doesn't do stochastic rounding, so we
+    # really want the model to be in fp32 precision:
+    # --dtype should only enable AMP
+    # as the original checkpoints are in 16 bit, we need to convert
+    model = model.to(torch.float32)
 
     model = model.to(device)
     model.train()
@@ -1185,7 +1205,7 @@ if __name__ == "__main__":
     # init the optimizer
     optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
                                                learning_rate=args.learning_rate, betas=(0.9, 0.95),
-                                               device_type=device, zero_stage=zero_stage, offload=args.offload)
+                                               device_type=device, zero_stage=zero_stage)
 
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):
@@ -1205,6 +1225,8 @@ if __name__ == "__main__":
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     timings = []
+    losses = []
+    norms = []
     norm = -1.0   # dummy value to print in inference-only mode
     for step in range(args.num_iterations + 1):
         t0 = time.time()
@@ -1298,16 +1320,6 @@ if __name__ == "__main__":
             dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        if args.offload:
-            # CPUOffloadOptimizer is *not* compatible with gradient clipping and will *silently*
-            # give wrong results. So we
-            # a) explicitly wait for it to finish its gradients transfers
-            # b) overwrite the CPU gradients with the clipped GPU gradients.
-            # This is terribly inefficient, but correct and lets us run CI on
-            # small(ish) GPUs
-            torch.cuda.synchronize()
-            for gpu, cpu in optimizer.param_d2h_map.items():
-                cpu.grad[...] = gpu.grad[...]
 
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
@@ -1327,6 +1339,8 @@ if __name__ == "__main__":
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
         tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
+        losses.append(lossf)
+        norms.append(norm.item())
         print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
         # log to logile
         if master_process and logfile is not None:
@@ -1336,6 +1350,9 @@ if __name__ == "__main__":
         # keep track of smooth timings, last 20 iterations
         if step > 0 and step > args.num_iterations - 20:
             timings.append(t1-t0)
+
+    if master_process and args.write_tensors and (not args.inference_only):
+        write_training_history(losses, norms, f"llama3_{model_size_str}_debug_state.bin")
 
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]

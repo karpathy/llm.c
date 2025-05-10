@@ -50,7 +50,7 @@ __global__ void repkv_forward_kernel1(floatX* replicated_qkv,
 
 __global__ void repkv_backward_kernel1(floatX* dinp, const floatX* dout,
                                 int B, int N, int NH, int replicate_factor, int HD) {
-    // we have a single tensor dout of shapae of (B, N 3 * NH * HD)
+    // we have a single tensor dout of shape of (B, N 3 * NH * HD)
     // we want to reduce sum (for K and V) into  (B, N, (NH + 2*(NH/replicate_factor)) * HD)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B * N * 3 * NH * HD) { return;}
@@ -111,11 +111,11 @@ void repkv_forward(floatX* out, const floatX* inp, int B, int T, int NH, int NH_
 }
 
 void repkv_backward(floatX* dinp, const floatX* dout,
-                    const int B, const int T, const int NH, const int NH_KV, const int d) {
+                    const int B, const int T, const int NH, const int NH_KV, const int d, cudaStream_t stream) {
     const int block_size = 128;
     int total_threads = B * T * (3 * NH) * d;
     int num_blocks = CEIL_DIV(total_threads, block_size);
     int replicate_factor = NH / NH_KV;
-    repkv_backward_kernel1<<<num_blocks, block_size>>>(dinp, dout, B, T, NH, replicate_factor, d);
+    repkv_backward_kernel1<<<num_blocks, block_size, 0, stream>>>(dinp, dout, B, T, NH, replicate_factor, d);
     cudaCheck(cudaGetLastError());
 }
