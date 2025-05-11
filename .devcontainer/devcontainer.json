@@ -1,0 +1,23 @@
+{
+    "name": "nvidia-cuda",
+    "image": "nvidia/cuda:12.5.0-devel-ubuntu22.04",
+    "hostRequirements": {
+      "gpu": "optional"
+    },
+    "containerEnv": {
+      "NVIDIA_VISIBLE_DEVICES": "all"
+    },
+    "runArgs": [
+      "--gpus",
+      "all"
+    ],
+    "features": {
+      "ghcr.io/devcontainers/features/python:1": {},
+      "ghcr.io/devcontainers/features/git:1": {},
+      "ghcr.io/iterative/features/nvtop:1": {}
+    },
+    "extensions": [
+      "ms-vscode.cpptools"
+    ],
+    "postCreateCommand": "apt-get update && apt-get install -y sudo && sudo apt-get install -y openmpi-bin openmpi-doc libopenmpi-dev && pip install -r requirements.txt"
+  }
