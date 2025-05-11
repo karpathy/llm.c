@@ -247,7 +247,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
     int iterations_C = CEIL_DIV(C, C_per_iteration); // + 2;
 
     // the first half of shared memory is bias, second is weight
-    size_t rounded_C = CEIL_DIV(C, (32 * x128::size)) * (32 * x128::size);
+    size_t rounded_C = iterations_C * C_per_iteration;
     float* dbias_shared = shared;
     float* dweight_shared = shared + rounded_C;
     // warp zero doesn't actually write to the _tmp_shared memory locations, so we don't need to reserve memory
@@ -363,7 +363,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
     // This is done by atomically incrementing a flag (cleared to 0 before launching the kernel)
     unsigned int* scratchFlag = (unsigned int*)(scratch);
     // Increment scratch pointer by a full cacheline so that everything remains cacheline aligned
-    scratch += 32;
+    scratch += WARP_SIZE;
     float* scratch_dbias = scratch;
     float* scratch_dweight = scratch + C;
     for(int i = threadIdx.x * f128::size; i < C; i += BLOCK_SIZE * f128::size) {
@@ -496,8 +496,9 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     const int block_size = 512;
     const int blocks_per_sm = 2; // supported on every architecture and less cache thrashing than 3
     const int grid_size = blocks_per_sm * deviceProp.multiProcessorCount;
-    size_t rounded_C = CEIL_DIV(C, (32 * x128::size)) * (32 * x128::size);
-    size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - 32) * f128::size) * sizeof(float);
+    int C_per_iteration = WARP_SIZE * x128::size;
+    size_t rounded_C = CEIL_DIV(C, C_per_iteration) * C_per_iteration;
+    size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - WARP_SIZE) * f128::size) * sizeof(float);
 
     cudaCheck(cudaMemsetAsync(scratch, 0, 1 * sizeof(float), stream)); // only need to reset the flag to 0
     layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
