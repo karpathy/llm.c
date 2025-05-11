@@ -943,10 +943,21 @@ __global__ void softmax_forward_kernel5_lowp(floatX* out, float inv_temperature,
     float norm = 1.f / sum;
 
     // divide the whole row by the sum
-    for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
+    for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
         // recalculation is faster than doing the round-trip through memory.
-        float ev = expf(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
-        __stcs(out + idx * T + i, (floatX)(ev * norm));
+        float ev[4];
+        for (int k = 0; k < 4; k++) {
+            ev[k] = expf(inv_temperature * ((float)__ldcs(x + 4*i+k) - global_maxval));
+        }
+        for (int k = 0; k < 4; k++) {
+            __stcs(out + idx * T + 4*i+k, (floatX)(ev[k] * norm));
+        }
+    }
+
+    if(4*pos_by_4 + warp.thread_rank() <= own_pos) {
+
+        float ev = expf(inv_temperature * ((float)__ldcs(x + 4*pos_by_4 + warp.thread_rank()) - global_maxval));
+        __stcs(out + idx * T + 4*pos_by_4 + warp.thread_rank(), (floatX)(ev * norm));
     }
 }
 
