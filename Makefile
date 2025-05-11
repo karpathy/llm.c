@@ -124,7 +124,13 @@ ifeq ($(USE_CUDNN), 1)
     NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
     NVCC_LDFLAGS += -lcudnn
     NVCC_FLAGS += -DENABLE_CUDNN
-    NVCC_CUDNN = $(BUILD_DIR)/cudnn_att.o
+    NVCC_CUDNN = $(BUILD_DIR)/cudnn_att.o 
+
+    ifdef CUDNN_PATH
+    	NVCC_INCLUDES += -I$(CUDNN_PATH)/include
+    	NVCC_LDFLAGS += -L$(CUDNN_PATH)/lib -L$(CUDNN_PATH)/lib64
+		endif
+
   else
     ifneq ($(OS), Windows_NT)
       $(info → cuDNN is not supported on MAC OS right now)
