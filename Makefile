@@ -118,6 +118,8 @@ ifeq ($(USE_CUDNN), 1)
     else ifeq ($(shell [ -d cudnn-frontend/include ] && echo "exists"), exists)
       $(info ✓ cuDNN found, will run with flash-attention)
       CUDNN_FRONTEND_PATH ?= cudnn-frontend/include
+    else ifneq ($(CUDNN_FRONTEND_PATH),)
+      $(info ✓ cuDNN found, will run with flash-attention)
     else
       $(error ✗ cuDNN not found. See the README for install instructions and the Makefile for hard-coded paths)
     endif
