@@ -1326,7 +1326,7 @@ void gpt2_backward(GPT2 *model) {
         printf("allocated %zu MiB for parameter gradients\n", (model->num_parameters * sizeof(float)) >> 20);
         // we're going to be clever for the activations backward pass. we don't need to exactly
         // mirror the forward pass acrtivations and we will save memory.
-        size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
+        size_t bw_act_sizes[NUM_BACKWARD_TENSORS];
         GPT2Config cfg = model->config;
         cfg.num_layers = 1; // copy the configuration but override number of layers to 1
         fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, cfg);
