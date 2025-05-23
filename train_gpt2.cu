@@ -319,6 +319,8 @@ typedef struct {
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
+    int use_kv; // whether to use KV cache in attention
+    int kv_offset;
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -348,6 +350,8 @@ void gpt2_init_common(GPT2 *model) {
     model->init_state = true;
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+    model->use_kv = 0; // default: no KV cache
+    model->kv_offset = 0;
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -677,11 +681,10 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, model->use_kv, model->kv_offset, B, T, C, main_stream); // encoding goes into residual[0]
 
     // first layernorm isn't fused
-    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
-
+    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, model->use_kv, model->kv_offset, B, T, C, main_stream);
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
 
@@ -717,7 +720,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // now do the forward pass
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, 0, 0, B, T, C, 3*C, main_stream);
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
@@ -726,14 +729,14 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         }
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
+        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, model->use_kv, model->kv_offset, B, T, C, 3*C, main_stream);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, model->use_kv, model->kv_offset, B, T, C, NH, main_stream);
         #endif
 
-        matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
-        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
-        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+        matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, model->use_kv, model->kv_offset, B, T, C, C, main_stream);
+        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, model->use_kv, model->kv_offset, B, T, C, main_stream);
+        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, model->use_kv, model->kv_offset, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, model->use_kv, model->kv_offset, B, T, 4*C, C, main_stream);
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
@@ -742,15 +745,15 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
             const floatX* l_ln1b = params.ln1b + (l + 1) * C;
             fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
-                                    B * T, C, main_stream);
+                                    model->use_kv, model->kv_offset, B, T, C, main_stream);
         } else {
             fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
                                     params.lnfw, params.lnfb,
-                                    B * T, C, main_stream);
+                                    model->use_kv, model->kv_offset, B, T, C, main_stream);
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, model->use_kv, model->kv_offset, B, T, C, Vp, main_stream);
     cudaCheck(cudaDeviceSynchronize());
 }
 
@@ -895,12 +898,12 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         if(model->recompute >= 1) {
             // recompute >= 1 means we recompute gelu. in this case,
             // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
-            gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream);
+            gelu_forward(l_fch_gelu, l_fch_pre_gelu, 0, 0, B, T, 4*C, main_stream);
         }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
         if(model->recompute >= 2) {
             // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
-            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
+            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, 0, 0, B, T, C, main_stream);
         }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
@@ -918,7 +921,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         #endif
         if(model->recompute >= 2) {
-            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
+            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, 0, 0, B, T, C, main_stream);
         }
         // QKV parameter gradients
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
@@ -1661,6 +1664,9 @@ int main(int argc, char *argv[]) {
     // set up the Tokenizer
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+    if (tokenizer.init_ok == 0) {
+        exit(EXIT_FAILURE);  // error message already printed inside tokenizer_init
+    }
 
     // set up learning rate scheduler
     LearningRateScheduler lr_scheduler;
@@ -1715,7 +1721,7 @@ int main(int argc, char *argv[]) {
         int last_step = step == train_num_batches;
 
         // once in a while estimate the validation loss (all processes collaborate)
-        if (step % val_loss_every == 0 || last_step) {
+        if (val_loss_every > 0 && (step % val_loss_every == 0 || last_step)) {
             NvtxRange validation_range("validation");
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);
@@ -1760,6 +1766,10 @@ int main(int argc, char *argv[]) {
             }
             // now sample from the model autoregressively
             printf("generating:\n---\n");
+            model.use_kv = 1; // we need to use the KV cache for generation
+            #ifdef ENABLE_CUDNN
+            model.use_kv = 0; // KV cache not supported for cuDNN
+            #endif
             for (int t = 1; t < genT; t++) {
                 NvtxRange generation_range("Generation step", t);
                 // we try not to be too wasteful for inference by not calculating all of B,T
@@ -1769,6 +1779,7 @@ int main(int argc, char *argv[]) {
                 // on cuDNN 9.2.1 with cuDNN FrontEnd 1.5.2, T >= 256 seems bit-for-bit identical
                 // (but even if it wasn't fully identical that's probably not the end of the world)
                 // note this is still somewhat wasteful because we don't have a KV cache!
+                model.kv_offset = t - 1;
                 gpt2_forward(&model, gen_tokens, 1, CEIL_DIV(t, min(T,256)) * min(T,256));
                 // get the V-dimensional vector probs[0, t-1, :]
                 floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
@@ -1782,16 +1793,11 @@ int main(int argc, char *argv[]) {
                 float coin = random_f32(&sample_rng_state);
                 int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
-                if (tokenizer.init_ok) {
-                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
-                    safe_printf(token_str);
-                } else {
-                    // fall back to printing the token id
-                    printf("%d ", next_token);
-                }
+                const char* token_str = tokenizer_decode(&tokenizer, next_token);
+                safe_printf(token_str);
                 fflush(stdout);
             }
+            model.use_kv = 0; // don't use the KV cache outside of generation
             printf("\n---\n");
         }
 
