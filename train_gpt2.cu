@@ -9,6 +9,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <string_view>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <pthread.h>
 // ----------- CPU utilities -----------
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 // defines: create_dir_if_not_exists, find_max_step, ends_with_bin
@@ -73,6 +74,23 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // ----------------------------------------------------------------------------
 // global vars for I/O
 char filename_buffer[512];
+pthread_t writer_threads[2] = {0};
+int writer_threads_started = 0;
+
+typedef struct {
+    char* buffer;
+    size_t size;
+    FILE* file;
+} FileWriteTask;
+
+void* file_write_async(void* arg) {
+    FileWriteTask* task = (FileWriteTask*)arg;
+    fwriteCheck(task->buffer, 1, task->size, task->file);
+    fcloseCheck(task->file);
+    cudaCheck(cudaFreeHost(task->buffer));
+    free(task);
+    return NULL;
+}
 
 // ----------------------------------------------------------------------------
 // global vars containing information about the GPU this process is running on
@@ -427,7 +445,7 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     printf0(" -> estimated maximum batch size: %zu\n", B + free / bytes_per_sequence);
 }
 
-void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
+void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path, int async_write) {
     // write the model to a checkpoint file
     printf0("Writing model to %s\n", checkpoint_path);
     FILE *model_file = fopenCheck(checkpoint_path, "wb");
@@ -444,11 +462,29 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model_header[6] = model->config.channels;
     model_header[7] = model->config.padded_vocab_size;
     fwriteCheck(model_header, sizeof(int), 256, model_file);
-    // write the parameters
-    device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
-                   IO_BUF_SIZE, main_stream);
-    // close file, we're done
-    fcloseCheck(model_file);
+
+    if (async_write == 0) {
+        // write the parameters
+        device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
+                    IO_BUF_SIZE, main_stream);
+        // close file, we're done
+        fcloseCheck(model_file);
+    }
+    else {
+        // transfer device data to host memory
+        char* buffer_space;
+        cudaCheck(cudaMallocHost(&buffer_space, model->num_parameters_bytes));
+        cudaCheck(cudaMemcpyAsync(buffer_space, model->params_memory, model->num_parameters_bytes,
+                  cudaMemcpyDeviceToHost, main_stream));
+        cudaCheck(cudaStreamSynchronize(main_stream));
+
+        FileWriteTask* task = (FileWriteTask*)malloc(sizeof(FileWriteTask));
+        task->buffer = buffer_space;
+        task->size = model->num_parameters_bytes;
+        task->file = model_file;
+        // create a new thread to handle the write task asynchronously
+        pthread_create(&writer_threads[0], NULL, file_write_async, (void*)task);
+    }
 }
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool weight_init=true) {
@@ -1206,7 +1242,7 @@ void common_free(GPT2 &model) {
 }
 
 
-void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
+void save_state(const char* filename, int step, GPT2* model, DataLoader* loader, int async_write) {
     printf("Writing state to %s\n", filename);
     FILE *state_file = fopenCheck(filename, "wb");
     int state_header[256];
@@ -1228,14 +1264,6 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     *((size_t*)&state_header[32]) = loader->current_sample_idx; // position in shard
     fwriteCheck(state_header, sizeof(int), 256, state_file);
 
-    // write AdamW m, v, and master_weights here (they are all float)
-    size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
-    device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-    device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-    if(model->use_master_weights) {
-        device_to_file(state_file, model->master_weights, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-    }
-
     // write dataloader state if we are using the Permuted version of it
     if (loader->should_shuffle) {
         fwriteCheck(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);  // number of shards
@@ -1244,7 +1272,38 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
         fwriteCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
         fwriteCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
     }
-    fcloseCheck(state_file);
+
+    if (async_write == 0){
+        // write AdamW m, v, and master_weights here (they are all float)
+        size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
+        device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+        if(model->use_master_weights) {
+            device_to_file(state_file, model->master_weights, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+        }
+        fcloseCheck(state_file);
+    }
+    else {
+        // determine the size of the buffer based on whether we're using master weights
+        size_t shard_num_parameters = multi_gpu_config.shard_num_parameters * sizeof(float);
+        size_t buffer_size = shard_num_parameters * (model->use_master_weights ? 3 : 2);
+        // transfer device data to host memory
+        char* buffer_space;
+        cudaCheck(cudaMallocHost(&buffer_space, buffer_size));
+        cudaCheck(cudaMemcpyAsync(buffer_space, model->m_memory, shard_num_parameters, cudaMemcpyDeviceToHost, main_stream));
+        cudaCheck(cudaMemcpyAsync(buffer_space + shard_num_parameters, model->v_memory, shard_num_parameters, cudaMemcpyDeviceToHost, main_stream));
+        if (model->use_master_weights) {
+            cudaCheck(cudaMemcpyAsync(buffer_space + shard_num_parameters * 2, model->master_weights, shard_num_parameters, cudaMemcpyDeviceToHost, main_stream));
+        }
+        cudaCheck(cudaStreamSynchronize(main_stream));
+
+        FileWriteTask* task = (FileWriteTask*)malloc(sizeof(FileWriteTask));
+        task->buffer = buffer_space;
+        task->size = buffer_size;
+        task->file = state_file;
+        // create a new thread to handle the write task asynchronously
+        pthread_create(&writer_threads[1], NULL, file_write_async, (void*)task);
+    }
 }
 
 void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename) {
@@ -1262,6 +1321,28 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     model->rng_state_last_update = *((unsigned long long*)&state_header[22]); // last gpt2_update
     size_t current_shard_idx = *((size_t*)&state_header[30]); // shard index
     size_t current_sample_idx = *((size_t*)&state_header[32]); // position in shard
+
+    // revive the DataLoader object and its state
+    loader->should_shuffle = should_shuffle;
+    if (should_shuffle == 1) {
+        // ensure the number of shards matches
+        size_t glob_result_gl_pathc;
+        freadCheck(&glob_result_gl_pathc, sizeof(size_t), 1, state_file);
+        assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
+        // read the shard indices
+        loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
+        freadCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
+        // ensure the number of samples matches
+        size_t shard_num_samples;
+        freadCheck(&shard_num_samples, sizeof(size_t), 1, state_file);
+        assert(shard_num_samples == loader->shard_num_samples);
+        // read the intra-shard indices
+        loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
+        freadCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
+        // read the shuffle rng state
+        freadCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
+    }
+    dataloader_resume(loader, current_shard_idx, current_sample_idx);
 
     // read AdamW m, v, master_weights (they are all float)
     // allocate all the needed memory as necessary
@@ -1287,50 +1368,31 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         model->rng_state = *((unsigned long long*)&state_header[20]); // use final RNG state from checkpoint after this
     }
 
-    // revive the DataLoader object and its state
-    loader->should_shuffle = should_shuffle;
-    if (should_shuffle == 1) {
-        // ensure the number of shards matches
-        size_t glob_result_gl_pathc;
-        freadCheck(&glob_result_gl_pathc, sizeof(size_t), 1, state_file);
-        assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
-        // read the shard indices
-        loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
-        freadCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
-        // ensure the number of samples matches
-        size_t shard_num_samples;
-        freadCheck(&shard_num_samples, sizeof(size_t), 1, state_file);
-        assert(shard_num_samples == loader->shard_num_samples);
-        // read the intra-shard indices
-        loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
-        freadCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
-        // read the shuffle rng state
-        freadCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
-    }
-    dataloader_resume(loader, current_shard_idx, current_sample_idx);
-
     // all done, close state file
     fcloseCheck(state_file);
 }
 
-void write_checkpoint(const char* output_log_dir, int step, GPT2* model, DataLoader* train_loader, MultiGpuConfig* multi_gpu_config) {
+void write_checkpoint(const char* output_log_dir, int step, GPT2* model, DataLoader* train_loader, MultiGpuConfig* multi_gpu_config, int async_write) {
     // a checkpoint contains: model weights, optimizer/dataloader state, and a DONE file
     printf0("Writing checkpoint at step %d\n", step);
     int rank = multi_gpu_config->process_rank;
     // only rank 0 writes the model file because it is the same across all ranks
     if (rank == 0) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/model_%08d.bin", output_log_dir, step);
-        gpt2_write_to_checkpoint(model, filename_buffer);
+        gpt2_write_to_checkpoint(model, filename_buffer, async_write);
     }
     // all ranks write their state file
     snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, step, rank);
-    save_state(filename_buffer, step, model, train_loader);
-    // DONE file is a signal that this checkpoint as a whole is complete
-    multi_gpu_barrier(multi_gpu_config);
-    if (rank == 0) {
-        snprintf(filename_buffer, sizeof(filename_buffer), "%s/DONE_%08d", output_log_dir, step);
-        FILE* done_file = fopenCheck(filename_buffer, "w");
-        fcloseCheck(done_file);
+    save_state(filename_buffer, step, model, train_loader, async_write);
+
+    if (async_write == 0) {
+        // DONE file is a signal that this checkpoint as a whole is complete
+        multi_gpu_barrier(multi_gpu_config);
+        if (rank == 0) {
+            snprintf(filename_buffer, sizeof(filename_buffer), "%s/DONE_%08d", output_log_dir, step);
+            FILE* done_file = fopenCheck(filename_buffer, "w");
+            fcloseCheck(done_file);
+        }
     }
 }
 
@@ -1426,6 +1488,7 @@ int main(int argc, char *argv[]) {
     int checkpoint_every = 0; // write checkpoints every how many steps?
     int checkpoints_keep = 0; // how long checkpoint history do we keep? (in units of checkpoints)
     int major_checkpoint_every = 0; // major checkpoints never get deleted when maintaining history
+    int async_checkpointing = 0; // write checkpoints asynchronously using a background thread
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
     int B = 4; // batch size
     int T = 1024; // sequence length max
@@ -1498,6 +1561,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'a') { async_checkpointing = atoi(argv[i+1]); }
         else { error_usage(); }
     }
 
@@ -1798,8 +1862,26 @@ int main(int argc, char *argv[]) {
         // once in a while checkpoint the optimization state (all ranks)
         if ((checkpoint_every > 0 && output_log_dir != NULL && resuming == 0) &&
             ((step > 0 && step % checkpoint_every == 0) || last_step)) {
+            if (async_checkpointing == 1) {
+                // finish the previous file writer threads
+                if (writer_threads_started == 1){
+                    pthread_join(writer_threads[0], NULL);
+                    pthread_join(writer_threads[1], NULL);
+                    writer_threads[0] = 0;
+                    writer_threads[1] = 0;
+
+                    // DONE file is a signal that this checkpoint as a whole is complete
+                    multi_gpu_barrier(&multi_gpu_config);
+                    if (multi_gpu_config.process_rank == 0) {
+                        snprintf(filename_buffer, sizeof(filename_buffer), "%s/DONE_%08d", output_log_dir, step - checkpoint_every);
+                        FILE* done_file = fopenCheck(filename_buffer, "w");
+                        fcloseCheck(done_file);
+                    }
+                }
+            }
             // writes model .bin file, state .bin files, and DONE file for step
-            write_checkpoint(output_log_dir, step, &model, &train_loader, &multi_gpu_config);
+            write_checkpoint(output_log_dir, step, &model, &train_loader, &multi_gpu_config, async_checkpointing);
+            writer_threads_started = 1;
             // we only keep checkpoints_keep checkpoints on disk to save space
             // so now that we wrote a new checkpoint, delete one old one (unless it is a "major" checkpoint)
             // we only do this is checkpoint keeping is turned on (checkpoints_keep > 0)
