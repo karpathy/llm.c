@@ -28,6 +28,18 @@ There will be other versions of this code that specialize it and make it fast.
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
 
+#ifndef NDEBUG // Make zero cost when not debugging
+    #define CHECK_NULL(ptr) \
+    if ((ptr) == NULL) { \
+        fprintf(stderr, "Null pointer encountered at %s:%d\n", __FILE__, __LINE__); \
+        fflush(stdout);  \
+        fflush(stderr);  \
+        exit(1); \
+    } 
+#else  
+     #define CHECK_NULL(ptr) ((void)0)
+#endif
+
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
 // B = batch_size, T = sequence_length, C = channels, V = vocab_size
@@ -1010,7 +1022,9 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     // lazily allocate the memory for m_memory and v_memory
     if (model->m_memory == NULL) {
         model->m_memory = (float*)calloc(model->num_parameters, sizeof(float));
+        CHECK_NULL(model->m_memory);
         model->v_memory = (float*)calloc(model->num_parameters, sizeof(float));
+        CHECK_NULL(model->v_memory);
     }
 
     for (size_t i = 0; i < model->num_parameters; i++) {
