@@ -94,26 +94,23 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
 
     const float eps = 1e-5f;
     float sum = 0.0f;
+    float sum2 = 0.0f;
     for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
         const x128 in_data = load128cs(inp + c);
         for(int k = 0; k < x128::size; ++k) {
-            sum += (float)in_data[k];
+            float xi = (float)in_data[k];
+            sum += xi;
+            sum2 += xi * xi;
         }
         s_in[c / x128::size] = in_data;
     }
 
     sum = warpReduceSum(sum);
-    float m = sum / C;
-    float v = 0.f;
-
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 in_data = s_in[c / x128::size];
-        for(int k = 0; k < x128::size; ++k) {
-            v += ((float)in_data[k] - m) * ((float)in_data[k] - m);
-        }
-    }
-
-    v = warpReduceSum(v) / C;
+    sum2 = warpReduceSum(sum2);
+    sum /= C;
+    sum2 /= C;
+    float m = sum;
+    float v = sum2 - sum * sum;
     float s = rsqrtf(v + eps);
 
     for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
