@@ -80,6 +80,32 @@ __global__ void gelu_backward2(floatX* dinp, const floatX* inp, const floatX* do
     }
 }
 
+template <typename Ti, typename Tdout, typename Tdinp>
+__global__ void gelu_backward3(Tdinp* dinp, const Ti* inp, const Tdout* dout, const int N) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * Packed128<Tdout>::size;
+    if (idx >= N) { return; }
+
+    Packed128<Tdinp> packed_dinp;
+    Packed128<Ti> packed_inp = load128cs(inp + idx);
+    Packed128<Tdout> packed_dout = load128(dout + idx);
+    for (int k = 0; k < Packed128<Tdout>::size; ++k) {
+        float x = (float)packed_inp[k];
+        float cube = 0.044715f * x * x * x;
+
+        float tanh_in_out = GELU_SCALING_FACTOR * (x + cube);
+        #if !defined(PRECISE_GELU_TANH) && __CUDA_ARCH__ >= 750
+        asm ("tanh.approx.f32 %0,%1;" : "=f"(tanh_in_out) : "f"(tanh_in_out));
+        #else
+        tanh_in_out = tanhf(tanh_in_out);
+        #endif
+
+        float sech_out = 1.0f - (tanh_in_out * tanh_in_out);
+        float local_grad = 0.5f * ((1.0f + tanh_in_out) + x * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x));
+        float result = local_grad * (float)packed_dout[k];
+        packed_dinp[k] = (Tdinp)(result);
+    }
+    store128(dinp + idx, packed_dinp);
+}
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -95,10 +121,16 @@ void gelu_backward2(floatX* dinp, const floatX* inp, const floatX* dout, int N, 
     cudaCheck(cudaGetLastError());
 }
 
+void gelu_backward3(floatX* dinp, const floatX* inp, const floatX* dout, int N, const int block_size) {
+    const int grid_size = ceil_div(N, block_size * x128::size);
+    gelu_backward3<<<grid_size, block_size>>>(dinp, inp, dout, N);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void gelu_backward(int kernel_num,
-                  floatX* dinp, 
-                  const floatX* inp, 
+                  floatX* dinp,
+                  const floatX* inp,
                   const floatX* dout,
                   int B, int T, int C,
                   int block_size) {
@@ -108,6 +140,9 @@ void gelu_backward(int kernel_num,
             break;
         case 2:
             gelu_backward2(dinp, inp, dout, B * T * C, block_size);
+            break;
+        case 3:
+            gelu_backward3(dinp, inp, dout, B * T * C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -120,7 +155,7 @@ void gelu_backward(int kernel_num,
 int main(int argc, char **argv) {
     setup_main();
 
-    int B = 8;
+    int B = 128;
     int T = 1024;
     int C = 768;
 
@@ -157,9 +192,9 @@ int main(int argc, char **argv) {
         printf("Checking block size %d.\n", block_size);
         gelu_backward(kernel_num, d_dinp, d_inp, d_dout, B, T, C, block_size);
 #if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
-        float tol = 1e-5;
+        float tol = 1e-5f;
 #else
-        float tol = 1e-2f;
+        float tol = 1e-3f;
 #endif
         validate_result(d_dinp, dinp, "dinp", B * T * C, tol);
     }
@@ -178,7 +213,7 @@ int main(int argc, char **argv) {
         // napkin math: estimate the memory bandwidth achieved
         // for each (B,T,C) output element, we do 1 read and 1 write, 4 bytes each
         // and e.g. A100 40GB PCIe is advertised at 1,555GB/s
-        long memory_ops = B * T * C * 2 * 4;
+        long memory_ops = B * T * C * 3 * (int)sizeof(floatX);
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
 
         printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);

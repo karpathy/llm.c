@@ -315,7 +315,7 @@ void validate_result(D* device_result, const T* cpu_reference, const char* name,
 #ifndef ENABLE_BF16
     float epsilon = FLT_EPSILON;
 #else
-    float epsilon = 0.079;
+    float epsilon = 0.0079; // ~2^-7 (where 7 is the number of mantissa bits in BF16)
 #endif
     for (int i = 0; i < num_elements; i++) {
         // Skip masked elements
