@@ -56,11 +56,11 @@ int main(int argc, char *argv[]) {
 
     // override number of layers to 1 because all layers repeat the same kernels, only profile once
     model.config.num_layers = 1;
-    set_zero_configs(&multi_gpu_config, 0, model.num_parameters);
+    set_zero_configs(&multi_gpu_config, 0, model.num_parameters, model.high_perf_mode);
 
     gpt2_allocate_state(&model, B, T);
     // do a training step
-    gpt2_forward(&model, x, B, T);
+    gpt2_forward(&model, x, B, T, NULL);
     gpt2_backward_and_reduce(&model, x, y, 1, 0);
     float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
     float grad_scale = (grad_norm > 1.0f) ? 1.0f / grad_norm : 1.0f;

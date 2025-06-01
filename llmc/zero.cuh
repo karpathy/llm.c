@@ -555,7 +555,7 @@ void multi_gpu_async_reduce_gradient(
 // convenience macro that only prints if the rank of process is zero
 #define printf0(...) if (::multi_gpu_config.process_rank == 0) { printf(__VA_ARGS__); }
 
-void set_zero_configs(MultiGpuConfig* config, int zero_stage, size_t total_parameters) {
+void set_zero_configs(MultiGpuConfig* config, int zero_stage, size_t total_parameters, int high_perf_mode) {
     config->zero_stage = 0;
     config->shard_num_parameters = total_parameters;
     // Check the Zero Stage and define sharding parameters
@@ -564,8 +564,15 @@ void set_zero_configs(MultiGpuConfig* config, int zero_stage, size_t total_param
     }
     else if (zero_stage == 1) {
         if (total_parameters % config->num_processes != 0) {
-            printf0("| Zero Optimization is disabled, Can't equally partition parameters          |\n");
             config->zero_stage = 0;
+            printf0("!!!!!!!!\n");
+            printf0("WARNING:\n");
+            printf0("| Zero Optimization is disabled, Can't equally partition parameters          |\n");
+            printf0("!!!!!!!!\n");
+            if (high_perf_mode) {
+                printf0("high-perf mode: failed to use ZeRO stage 1 - exiting.\n");
+                exit(EXIT_FAILURE);
+            }
         }
         else {
             config->zero_stage = 1;
