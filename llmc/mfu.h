@@ -40,6 +40,7 @@ typedef struct {
 
 // basic default data from the nvidia whitepapers
 static const PerfData VOLTA = {125.0f, -1.f, 125.f, -1.f, -1.f, -1.f, 1530.f, 640.f};
+static const PerfData AMPERE = {62.5f, 125.f, 125.f, 125.f, 250.f, 500.f, 885.f, 72.f};
 static const PerfData AMPERE_DATACENTER = {156.f, 312.f, 312.f, 312.f, -1.f, -1.f, 1410.f, 432.f};
 static const PerfData AMPERE_CONSUMER = {40.f, 80.f, 80.f, 160.f, -1.f, -1.f, 1860.f, 336.f};
 static const PerfData HOPPER = {378.f, 756.f, 756.f, 756.f, 1513.f, 1513.f, 1620.f, 456.f};
@@ -56,6 +57,7 @@ typedef struct {
 static GPUEntry gpu_db[] = {
     {"Tesla V100-SXM2-16GB", &VOLTA, 640, 1530},
     {"Tesla V100-PCIE-32GB", &VOLTA, 640, 1530},
+    {"NVIDIA A10", &AMPERE, 72, 885},
     {"NVIDIA A100-PCIE-40GB", &AMPERE_DATACENTER, 432, 1410},
     {"NVIDIA A100-PCIE-80GB", &AMPERE_DATACENTER, 432, 1410},
     {"NVIDIA A100-SXM4-40GB", &AMPERE_DATACENTER, 432, 1410},
