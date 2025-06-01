@@ -185,6 +185,7 @@ else
       # Check for OpenMP support in GCC or Clang on Linux
       ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
         CFLAGS += -fopenmp -DOMP
+        NVCC_FLAGS += -Xcompiler -fopenmp -DOMP
         LDLIBS += -lgomp
         $(info ✓ OpenMP found)
       else
