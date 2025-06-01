@@ -208,13 +208,14 @@ typedef struct {
 
 
 struct TensorSpec {
+    const char* name;
     void** ptr;
     size_t size;
     DType type;
 };
 
 
-#define TENSOR_SPEC(pointer, size) TensorSpec{(void**)(&pointer), (size), dtype_of(pointer)};
+#define TENSOR_SPEC(pointer, size) TensorSpec{#pointer, (void**)(&pointer), (size), dtype_of(pointer)};
 
 void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS], size_t B, size_t T, GPT2Config config, int recompute) {
     size_t Vp = config.padded_vocab_size;
@@ -320,6 +321,35 @@ typedef struct {
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
 } GPT2;
+
+void gpt2_log_activations(GPT2* model) {
+    cudaCheck(cudaDeviceSynchronize());
+    if(model->recompute != 0) {
+        fprintf(stderr, "Logging activations requires running with recompute disabled (-r 0)\n");
+        return;
+    }
+    float* tmp;
+    cudaCheck(cudaMalloc(&tmp, sizeof(float) * 1024));
+    printf("%20s %5s %10s %10s\n", "name", "layer", "size", "rms");
+    for(int i = 0; i < NUM_ACTIVATION_TENSORS; ++i) {
+        TensorSpec spec = model->acts_specs[i];
+        int L = i != 0 && i < 13 ? model->config.num_layers : 1;
+        for(int l = 0; l < L; ++l) {
+            size_t ls = spec.size / L;
+            if (spec.type == DType::FP32) {
+                global_norm_squared(tmp, ((const float *) (*spec.ptr)) + l*ls, ls, ls, 1, 1024, true, main_stream);
+            } else {
+                global_norm_squared(tmp, ((const nv_bfloat16 *) (*spec.ptr)) + l*ls, ls, ls, 1, 1024, true,
+                                    main_stream);
+            }
+            cudaCheck(cudaDeviceSynchronize());
+            float result;
+            cudaCheck(cudaMemcpy(&result, tmp, sizeof(float), cudaMemcpyDeviceToHost));
+            printf("%20s %5d %10ld %10f\n", spec.name, l, spec.size, sqrtf(result / spec.size));
+        }
+    }
+    cudaCheck(cudaFree(tmp));
+}
 
 void gpt2_init_common(GPT2 *model) {
     // common inits outside of the model weights
@@ -1831,6 +1861,7 @@ int main(int argc, char *argv[]) {
             dataloader_next_batch(&train_loader);
             // forward pass. note that we pass in grad_accum_steps, which scales down the loss
             gpt2_forward(&model, train_loader.inputs, B, T);
+            gpt2_log_activations(&model);
             // backward pass. all model params accumulate gradients with += inside this inner loop
             gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
         }
