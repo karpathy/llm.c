@@ -3,19 +3,22 @@ Script for running benchmarks on the Modal platform.
 This is useful for folks who do not have access to expensive GPUs locally.
 Example usage for cuda kernels:
 GPU_MEM=80 modal run benchmark_on_modal.py \
-    --compile-command "nvcc -O3 --use_fast_math attention_forward.cu -o attention_forward -lcublas" \
+    --data-command="./dev/download_starter_pack.sh" \
+    --compile-command "nvcc -O3 --use_fast_math attention_forward.cu -o attention_forward -lcublas -lcublasLt" \
     --run-command "./attention_forward 1"
 OR if you want to use cuDNN etc.
 
 
 For training the gpt2 model with cuDNN use:
 GPU_MEM=80 modal run dev/cuda/benchmark_on_modal.py \
-    --compile-command "make train_gpt2cu USE_CUDNN=1"
+    --data-command="./dev/download_starter_pack.sh" \
+    --compile-command "make train_gpt2cu USE_CUDNN=1" \
     --run-command "./train_gpt2cu -i dev/data/tinyshakespeare/tiny_shakespeare_train.bin -j dev/data/tinyshakespeare/tiny_shakespeare_val.bin -v 250 -s 250 -g 144 -f shakespeare.log -b 4"
 
 
 For profiling using nsight system:
 GPU_MEM=80 modal run dev/cuda/benchmark_on_modal.py \
+    --data-command="./dev/download_starter_pack.sh" \
     --compile-command "make train_gpt2cu USE_CUDNN=1" \
     --run-command "nsys profile --cuda-graph-trace=graph --python-backtrace=cuda --cuda-memory-usage=true \
     ./train_gpt2cu -i dev/data/tinyshakespeare/tiny_shakespeare_train.bin \
@@ -62,10 +65,10 @@ image = (
     "rm cmake-3.28.1-Linux-x86_64.sh",
     "ln -s /usr/local/bin/cmake /usr/bin/cmake",)
     .run_commands(
-        "apt-get install -y --allow-change-held-packages libcudnn8 libcudnn8-dev",
+        "apt-get install -y --allow-change-held-packages libcudnn9-cuda-12 libcudnn9-dev-cuda-12",
         "apt-get install -y openmpi-bin openmpi-doc libopenmpi-dev kmod sudo",
         "git clone https://github.com/NVIDIA/cudnn-frontend.git /root/cudnn-frontend",
-        "cd /root/cudnn-frontend && mkdir build && cd build && cmake .. && make"
+        "cd /root/cudnn-frontend && mkdir build && cd build && cmake .. && make -j$(nproc)"
     )
     .run_commands(
         "wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-ubuntu2204.pin && \
@@ -75,6 +78,8 @@ image = (
         apt-get update"
     ).run_commands(
         "apt-get install -y nsight-systems-2023.3.3"
+    ).run_commands(
+        "apt-get install -y curl"
     )
 )
 
@@ -98,16 +103,16 @@ def execute_command(command: str):
     # using in a directory in your volume, where the name contains the timestamp unique id.
     # This script will generate a "report1_{timestamp} folder in volume"
     # and you can download it with 'modal volume get {volume-name} report1_{timestamp}
-    volumes={"/cuda-env": modal.Volume.from_name("cuda-env")},
+    volumes={"/llmc": modal.Volume.from_name("llmc")},
 )
-def run_benchmark(compile_command: str, run_command: str):
+def run_benchmark(data_command: str, compile_command: str, run_command: str):
     execute_command("pwd")
     execute_command("ls")
+    execute_command(data_command)
     execute_command(compile_command)
     execute_command(run_command)
     # Use this section if you want to profile using nsight system and install the reports on your volume to be locally downloaded
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-
     execute_command("mkdir report1_" + timestamp)
     execute_command("mv /root/report1.nsys-rep /root/report1_" + timestamp + "/")
     execute_command("mv /root/report1.qdstrm /root/report1_" + timestamp + "/")
@@ -116,6 +121,6 @@ def run_benchmark(compile_command: str, run_command: str):
     return None
 
 @stub.local_entrypoint()
-def inference_main(compile_command: str, run_command: str):
-    results = run_benchmark.remote(compile_command, run_command)
+def inference_main(data_command: str, compile_command: str, run_command: str):
+    results = run_benchmark.remote(data_command, compile_command, run_command)
     return results
