@@ -49,7 +49,9 @@ typedef struct {
     // random shuffle related variables
     mt19937_state shuffle_rng;
     int should_shuffle;
+    mt19937_state shard_rng;    // rng state used for shuffling shards
     int* shard_indices;
+    mt19937_state intra_shard_rng;    // rng state used for shuffling within the current shard
     int* intra_shard_indices;
     // sizes in bytes
     size_t total_batch_size_bytes;  // total across all processes
@@ -96,7 +98,7 @@ int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
     return ntok;
 }
 
-void prepare_intra_shard_indices_(DataLoader *loader) {
+void prepare_intra_shard_indices_(DataLoader *loader, mt19937_state* rng) {
     // shuffle the examples inside the shards
     if (loader->intra_shard_indices != NULL) {
         // in case shards have different number of samples / sizes
@@ -104,7 +106,7 @@ void prepare_intra_shard_indices_(DataLoader *loader) {
     }
     loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
     init_identity_permutation(loader->intra_shard_indices, (int) loader->shard_num_samples);
-    random_permutation(loader->intra_shard_indices, (int) loader->shard_num_samples, &loader->shuffle_rng);
+    random_permutation(loader->intra_shard_indices, (int) loader->shard_num_samples, rng);
 }
 
 void dataloader_reset(DataLoader *loader) {
@@ -112,13 +114,15 @@ void dataloader_reset(DataLoader *loader) {
     loader->current_sample_idx = 0;
 
     if (loader->should_shuffle) {  // shuffle the shards
+        loader->shard_rng = loader->shuffle_rng;
         random_permutation(loader->shard_indices, (int) loader->glob_result.gl_pathc, &loader->shuffle_rng);
     }
 
     dataloader_load_shard_(loader, (int) loader->current_shard_idx);
 
     if (loader->should_shuffle) {
-        prepare_intra_shard_indices_(loader);
+        loader->intra_shard_rng = loader->shuffle_rng;
+        prepare_intra_shard_indices_(loader, &loader->shuffle_rng);
     }
 }
 
@@ -135,7 +139,8 @@ void dataloader_advance_(DataLoader *loader) {
     dataloader_load_shard_(loader, (int) loader->current_shard_idx);
 
     if (loader->should_shuffle) {
-        prepare_intra_shard_indices_(loader);
+        loader->intra_shard_rng = loader->shuffle_rng;
+        prepare_intra_shard_indices_(loader, &loader->shuffle_rng);
     }
 }
 
@@ -233,7 +238,22 @@ void dataloader_resume(DataLoader *loader, size_t current_shard_idx, size_t curr
     // used during model resumption (-y 1) flag
     loader->current_shard_idx = current_shard_idx;
     loader->current_sample_idx = current_sample_idx;
+
+    if(loader->should_shuffle) {
+        // restore shuffling of shard indices
+        mt19937_state copy = loader->shard_rng;
+        random_permutation(loader->shard_indices, loader->glob_result.gl_pathc, &copy);
+
+        // now we know which shard we are in
+    }
+    loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
+
     dataloader_load_shard_(loader, (int) loader->current_shard_idx);
+
+    if (loader->should_shuffle) {
+        mt19937_state copy = loader->intra_shard_rng;
+        prepare_intra_shard_indices_(loader, &copy);
+    }
 }
 
 void dataloader_free(DataLoader *loader) {
