@@ -202,7 +202,7 @@ else
     # Detect if running on macOS or Linux
     ifeq ($(SHELL_UNAME), Darwin)
       $(info ✗ Multi-GPU on CUDA on Darwin is not supported, skipping NCCL support)
-    else ifeq ($(shell dpkg -l | grep -q nccl && echo "exists"), exists)
+    else ifeq ($(shell dpkg -l | grep -q libnccl && echo "exists"), exists)
       $(info ✓ NCCL found, OK to train with multiple GPUs)
       NVCC_FLAGS += -DMULTI_GPU
       NVCC_LDLIBS += -lnccl
