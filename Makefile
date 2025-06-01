@@ -17,7 +17,7 @@ FORCE_NVCC_O ?= 3
 # NVCC flags
 # -t=0 is short for --threads, 0 = number of CPUs on the machine
 NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O$(FORCE_NVCC_O)
-NVCC_LDFLAGS = -lcublas -lcublasLt
+NVCC_LDFLAGS = -lcublas -lcublasLt -lcurand
 NVCC_INCLUDES =
 NVCC_LDLIBS =
 NCLL_INCUDES =
