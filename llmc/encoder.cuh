@@ -43,6 +43,24 @@ __global__ void encoder_forward_kernel3(floatX* out,
     store128(out_btc, packed_out);
 }
 
+// same kernel but without the positional encoder
+__global__ void encoder_forward_kernel3_nowpe(floatX* out,
+                               const int* inp, const floatX* wte,
+                               int B, int T, int C) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    int N = B * T * C;
+    if (idx >= N) { return; }
+    int bt = idx / C;
+    int b = bt / T;
+    int t = bt % T;
+    int c = idx % C;
+    int ix = inp[b * T + t];
+    floatX* out_btc = out + b * T * C + t * C + c;
+    const floatX* wte_ix = wte + ix * C + c;
+    x128 wte128 = load128cs(wte_ix);
+    store128(out_btc, wte128);
+}
+
 template <int BLOCK_SIZE=256>
 __global__ void wte_backward_kernel(floatX* dwte,
                                     const int4* bucket_info, const int* workload_indices, const floatX* dout, const int* inp,
@@ -161,7 +179,13 @@ void encoder_forward(floatX* out,
     const int block_size = 256;
     const int N = B * T * C;
     const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
-    encoder_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, inp, wte, wpe, B, T, C);
+    if (wpe == NULL) {
+        // Llama 3 does not use positional encoder
+        encoder_forward_kernel3_nowpe<<<grid_size, block_size, 0, stream>>>(out, inp, wte, B, T, C);
+    } else {
+        // GPT-2 does, so we use the full encoder kernel
+        encoder_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, inp, wte, wpe, B, T, C);
+    }
     cudaCheck(cudaGetLastError());
 }
 
@@ -173,11 +197,14 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
     NVTX_RANGE_FN();
 
     // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
-    const int block_size = 256;
-    const int N = T * C / x128::size;
-    const int grid_size = CEIL_DIV(N, block_size);
-    wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
-    cudaCheck(cudaGetLastError());
+    // GPT-2 has wpe (absolute positional encoding), but Llama 3 does not as it uses RoPE
+    if (dwpe != NULL) {
+        const int block_size = 256;
+        const int N = T * C / x128::size;
+        const int grid_size = CEIL_DIV(N, block_size);
+        wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
+        cudaCheck(cudaGetLastError());
+    }
 
     // check the GPU scratch buffer is large enough to hold the bucket info and workload indices
     // todo - this is trivially true given hardcoded scratch buffer size here, is this useful?

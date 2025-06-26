@@ -263,7 +263,7 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     matmul_cublaslt(dv, scratch, att, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
     const float scale = 1.0f / sqrtf((float)HS);
     // backward into preatt. this is an in-place operation; datt turns into dpreatt here
-    softmax_autoregressive_backward_inplace_kernel<<<dim3(T / 4, B * NH), 256>>>(datt, att, B, T, C, scale);
+    softmax_autoregressive_backward_inplace_kernel<<<dim3(T / 4, B * NH), 256, 0, stream>>>(datt, att, B, T, C, scale);
     const floatX* dpreatt = datt;
     // backward into q
     matmul_cublaslt(dq, k, dpreatt, nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);

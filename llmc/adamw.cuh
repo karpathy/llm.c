@@ -16,22 +16,28 @@ __device__ float lerp(float start, float end, float weight) {
 }
 
 template <typename Tp, typename Tg>
-__device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+__device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, floatOpt* m_memory, floatOpt* v_memory, size_t num_parameters,
                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                              float grad_scale, unsigned int seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_parameters) { return; }  // guard
 
+    // random number generation (reuse same rng shifted, since 32 bits is overkill for FP32->BF16)
+    // note this all gets optimised away by the compiler if everything is FP32
+    unsigned int random = Get2dNoiseUint(idx, blockIdx.y, seed);
+    unsigned int random_m = __funnelshift_l(random, random, 10); // rotate by 10 bits
+    unsigned int random_v = __funnelshift_l(random, random, 20); // rotate by 20 bits
+
     // get the gradient, m, and v for this parameter
     float grad = grad_scale * (float)grads_memory[idx];
-    float m = m_memory[idx];
-    float v = v_memory[idx];
+    float m = (float)m_memory[idx];
+    float v = (float)v_memory[idx];
     // update the first moment (momentum)
     m = lerp(grad, m, beta1);
-    m_memory[idx] = m;
+    stochastic_rounding(m, &m_memory[idx], random_m, false);
     // update the second moment (RMSprop)
     v = lerp(grad * grad, v, beta2);
-    v_memory[idx] = v;
+    stochastic_rounding(v, &v_memory[idx], random_v, false);
     m /= beta1_correction;  // m_hat
     v /= beta2_correction;  // v_hat
     // fetch the old value of this parameter as a float, from either source
@@ -40,14 +46,14 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
     float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * old_param));
     // update our low precision version of the parameters using stochastic rounding
     // this will be used in the next forward pass
-    stochastic_rounding(param, &params_memory[idx], seed);
+    stochastic_rounding(param, &params_memory[idx], random, false);
     // write the full, float version of the param into our master copy, if we maintain one
     // this will be used in the next update
     if (master_params_memory != NULL) { master_params_memory[idx] = param; }
 }
 
 template <typename Tp, typename Tg>
-__global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+__global__ void adamw_kernel3(Tp* params_memory, float* master_params_memory, Tg* grads_memory, floatOpt* m_memory, floatOpt* v_memory, size_t num_parameters,
                               ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                               float grad_scale, unsigned int seed) {
@@ -68,11 +74,12 @@ __global__ void init_from_master_kernel(Tp* params_memory, float* master_params_
     if (idx >= num_parameters) { return; }
     params_memory += blockIdx.y * w_stride; // adjust for layer offset
     master_params_memory += blockIdx.y * s_stride;
-    stochastic_rounding(master_params_memory[idx], &params_memory[idx], seed);
+    unsigned int random = Get2dNoiseUint(idx, blockIdx.y, seed);
+    stochastic_rounding(master_params_memory[idx], &params_memory[idx], random, false);
 }
 
 template <typename Tp, typename Tg>
-void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
+void adamw_update(Tp* params_memory, float* master_params_memory, Tg* grads_memory, floatOpt* m_memory, floatOpt* v_memory, size_t num_parameters,
                   ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride,  int num_slices, float learning_rate, float beta1, float beta2, int t, float eps, float weight_decay,
                   float grad_scale, unsigned int seed, cudaStream_t stream) {
     // AdamW update

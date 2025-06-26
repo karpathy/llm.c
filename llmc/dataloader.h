@@ -36,6 +36,7 @@ typedef struct {
     size_t T;
     size_t num_tokens; // total number of tokens
     size_t shard_num_samples;  // total number of samples in the current shard per process
+    size_t token_dtype; // sizeof(uint16_t) (GPT-2) or sizeof(uint32_t) (Llama 3)
     // shards and current position
     glob_t glob_result; // stores the result of glob, for all shards we want to iterate
     size_t current_shard_idx; // the current shard we are reading from
@@ -43,7 +44,7 @@ typedef struct {
     // file handle
     FILE* tokens_file;
     // data buffers
-    uint16_t* buffer; // we fread data from file into this buffer
+    void* buffer; // we fread data from file into this buffer
     int* inputs;  // input tokens into transformer
     int* targets; // target tokens for the transformer
     // random shuffle related variables
@@ -59,6 +60,7 @@ typedef struct {
 } DataLoader;
 
 int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
+    // re-map the shard index via the generated permutation, if data shuffling
     if (loader->should_shuffle) {
         shard_index = loader->shard_indices[shard_index];
     }
@@ -72,13 +74,30 @@ int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
     // validate the header
     int header[HEADER_SIZE];
     freadCheck(header, sizeof(int), HEADER_SIZE, loader->tokens_file);
-    if (header[0] != 20240520) {
+    int magic = header[0];
+    int gpt2_datafile_magic = 20240520;
+    int llama3_datafile_magic = 20240801;
+    if (!(magic == gpt2_datafile_magic || magic == llama3_datafile_magic)) {
         printf("Bad magic in the data file\n");
         printf("---> HINT: Are you passing in a correct file?\n");
         printf("---> HINT: The data encoding may have changed, re-run data prepro or refer again to README.\n");
         exit(EXIT_FAILURE);
     }
-    if (header[1] != 1) { printf("Bad version in data file\n"); exit(EXIT_FAILURE); }
+    int version = header[1];
+    if (magic == gpt2_datafile_magic && version != 1) { printf("Bad version in data file\n"); exit(EXIT_FAILURE); }
+    if (magic == llama3_datafile_magic && version != 7) { printf("Bad version in data file\n"); exit(EXIT_FAILURE); }
+    // token dtype related logic
+    size_t token_dtype = (magic == gpt2_datafile_magic) ? sizeof(uint16_t) : sizeof(uint32_t);
+    if (loader->token_dtype == 0) {
+        // this is the first data shard; set the token dtype and some helper variables
+        loader->token_dtype = token_dtype;
+        loader->total_batch_size_bytes = ((loader->num_processes * (loader->B * loader->T)) * loader->token_dtype);
+        loader->local_batch_offset_bytes = loader->process_rank * loader->B * loader->T * loader->token_dtype;
+    } else {
+        // we expect consistency across shards
+        assert(loader->token_dtype == token_dtype);
+    }
+    // load the tokens
     int64_t ntok = header[2]; // number of tokens in the file
     assert(ntok > 0); // we expect some tokens in the file. this should never trip, right?
     // determine the file size and make sure it is consistent with the number of tokens
@@ -86,13 +105,13 @@ int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
     loader->file_size_bytes = ftell(loader->tokens_file); // read the offset, i.e. file size
     fseekCheck(loader->tokens_file, 0, SEEK_SET); // seek back to the beginning
     // we expect ntok in the file to be consistent with filesize, assert that is the case
-    int64_t expected_file_size = HEADER_SIZE * sizeof(int) + ntok * sizeof(uint16_t);
+    int64_t expected_file_size = HEADER_SIZE * sizeof(int) + ntok * loader->token_dtype;
     if (loader->file_size_bytes != expected_file_size) {
         printf("Error: file size is not as expected\n");
         exit(EXIT_FAILURE);
     }
-    // -1 uint16_t due to us taking B*T+1 tokens but moving by B*T tokens
-    loader->shard_num_samples = (ntok * sizeof(uint16_t) - sizeof(uint16_t)) / loader->total_batch_size_bytes;
+    // -1 token due to us taking B*T+1 tokens but moving by B*T tokens
+    loader->shard_num_samples = (ntok * loader->token_dtype - loader->token_dtype) / loader->total_batch_size_bytes;
     return ntok;
 }
 
@@ -153,8 +172,7 @@ void dataloader_init(DataLoader *loader,
     loader->tokens_file = NULL;
     loader->should_shuffle = should_shuffle;
     loader->header_bytes = HEADER_SIZE * sizeof(int);
-    loader->total_batch_size_bytes = ((loader->num_processes * (loader->B * loader->T)) * sizeof(uint16_t));
-    loader->local_batch_offset_bytes = loader->process_rank * loader->B * loader->T * sizeof(uint16_t);
+    loader->token_dtype = 0; // set to 0 to indicate that it is not yet set. it will be on first shard load
 
     // glob to get the list of files matching the pattern, these are our data shards
     int glob_status = glob(filename_pattern, 0, NULL, &loader->glob_result);
@@ -181,17 +199,13 @@ void dataloader_init(DataLoader *loader,
     int64_t ntok_total = 0;
     for (int shard_index = 0; shard_index < loader->glob_result.gl_pathc; shard_index++) {
         int64_t shard_ntok = dataloader_load_shard_(loader, shard_index);
-        // we need at least one batch/shard, the way things are written right now.
-        // can be relaxed a lot later.
+        // we need at least one batch/shard, the way things are written right now, can be relaxed later
         assert(shard_ntok >= (int64_t) (num_processes * B * T + 1));
         ntok_total += shard_ntok;
     }
-    // debugging prints
-    // printf("DataLoader: filename_pattern: %s\n", filename_pattern);
-    // printf("DataLoader: Found %ld tokens across %zu shards\n", ntok_total, loader->glob_result.gl_pathc);
 
     // allocate all the space we'll need
-    loader->buffer = (uint16_t*)mallocCheck((B * T + 1) * sizeof(uint16_t));
+    loader->buffer = mallocCheck((B * T + 1) * loader->token_dtype);
     loader->inputs = (int*)mallocCheck(B * T * sizeof(int));
     loader->targets = (int*)mallocCheck(B * T * sizeof(int));
     loader->num_tokens = ntok_total;
@@ -200,22 +214,28 @@ void dataloader_init(DataLoader *loader,
     dataloader_reset(loader);
 }
 
+typedef int (*access_func_t)(const void*, size_t);
+int access_uint16(const void* buffer, size_t i) { return (int)((uint16_t*)buffer)[i]; }
+int access_uint32(const void* buffer, size_t i) { return (int)((uint32_t*)buffer)[i]; }
+
 void dataloader_load_batch(DataLoader* loader) {
     assert(!loader->should_shuffle || (loader->should_shuffle && loader->intra_shard_indices != NULL));
     assert(loader->current_sample_idx < loader->shard_num_samples);
     size_t idx = loader->should_shuffle ? loader->intra_shard_indices[loader->current_sample_idx] : loader->current_sample_idx;
     size_t global_batch_offset_bytes = idx * loader->total_batch_size_bytes;
     int64_t current_offset = loader->header_bytes + global_batch_offset_bytes + loader->local_batch_offset_bytes;
-
     size_t B = loader->B;
     size_t T = loader->T;
-    // read B*T+1 uint16_t tokens from the file into buffer
+    // read B*T+1 tokens from the file into buffer
     fseekCheck(loader->tokens_file, (int) current_offset, SEEK_SET);
-    freadCheck(loader->buffer, sizeof(uint16_t), B*T+1, loader->tokens_file);
+    freadCheck(loader->buffer, loader->token_dtype, B*T+1, loader->tokens_file);
+    // depending on the dtype we have to access buffer differently
+    assert(loader->token_dtype == sizeof(uint16_t) || loader->token_dtype == sizeof(uint32_t));
+    access_func_t access_func = (loader->token_dtype == sizeof(uint16_t)) ? access_uint16 : access_uint32;
     // decode the buffer into inputs and targets (cast to int)
-    for (int i = 0; i < B*T; i++) {
-        loader->inputs[i] = (int)loader->buffer[i];
-        loader->targets[i] = (int)loader->buffer[i+1];
+    for (size_t i = 0; i < B*T; i++) {
+        loader->inputs[i] = access_func(loader->buffer, i);
+        loader->targets[i] = access_func(loader->buffer, i + 1);
     }
 }
 
@@ -227,7 +247,6 @@ void dataloader_next_batch(DataLoader *loader) {
     dataloader_load_batch(loader);
     loader->current_sample_idx += 1;
 }
-
 
 void dataloader_resume(DataLoader *loader, size_t current_shard_idx, size_t current_sample_idx) {
     // used during model resumption (-y 1) flag

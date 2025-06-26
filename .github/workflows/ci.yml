@@ -219,3 +219,18 @@ jobs:
 
       - name: Build project
         run: make -j4 -C dev/cuda
+
+  build-llama3:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build FP32
+        run: PRECISION=FP32 make test_llama3cu train_llama3cu
+
+      - name: Build BF16
+        run: PRECISION=BF16 make test_llama3cu train_llama3cu
