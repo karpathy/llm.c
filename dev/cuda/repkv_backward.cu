@@ -57,6 +57,56 @@ void repkv_backward_cpu(float* dinp, const float* dout,
 }
 
 // kernels
+__global__ void repkv_backward_kernel2(floatX* dinp, const floatX* dout,
+                                int B, int N, int NH, int replicate_factor, int HD) {
+    // we have a single tensor dout of shapae of (B, N 3 * NH * HD)
+    // we want to reduce sum (for K and V) into  (B, N, (NH + 2*(NH/replicate_factor)) * HD)
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // we use idx for dinp indexing
+    int dinp_idx = idx; // keep backup
+
+    int NKV = NH / replicate_factor;
+    int nkv_factor = (replicate_factor + 2);    // replicate_factor is for (replicate_factor * NKV == NH), 2 for K V
+                                                // use NKV size instead of NH size
+
+    if (idx >= B * N * nkv_factor * NKV * HD) { return;}
+
+    // decode the dinp index
+    int d = idx % HD;
+    idx /= HD;
+    int nkv = idx % NKV;
+    idx /= NKV;
+    int c = idx % nkv_factor;
+    idx /= nkv_factor;
+    int n = idx % N;
+    int b = idx / N;
+
+    int dout_idx;
+    int nh_total = 3 * NH;
+
+    if (c >= 0 && c < replicate_factor) {
+        dout_idx = b * N * nh_total * HD + n * nh_total * HD + c * NKV * HD + nkv * HD + d;
+        dinp[dinp_idx] = __ldcs(&dout[dout_idx]);
+    } else if (c == replicate_factor) {
+        float reduced_sum = 0.0f;
+        dout_idx = b * N * nh_total * HD + n * nh_total * HD + c * NKV * HD + nkv * HD * replicate_factor + d;
+        for (int i = 0; i < replicate_factor; i++) {
+            reduced_sum += __ldcs(&dout[dout_idx + HD * i]);
+        }
+        dinp[dinp_idx] = reduced_sum;
+    } else {
+        float reduced_sum = 0.0f;
+        c = 2 * replicate_factor;   // we need this to align for dout_idx (full KV)
+        dout_idx = b * N * nh_total * HD + n * nh_total * HD + c * NKV * HD + nkv * HD * replicate_factor + d;
+        for (int i = 0; i < replicate_factor; i++) {
+            reduced_sum += __ldcs(&dout[dout_idx + HD * i]);
+        }
+        dinp[dinp_idx] = reduced_sum;
+    }
+}
+
+// kernels
 __global__ void repkv_backward_kernel1(floatX* dinp, const floatX* dout,
                                 int B, int N, int NH, int replicate_factor, int HD) {
     // we have a single tensor dout of shapae of (B, N 3 * NH * HD)
@@ -105,6 +155,16 @@ __global__ void repkv_backward_kernel1(floatX* dinp, const floatX* dout,
 }
 
 // kernel launchers
+void repkv_backward2(floatX* dinp, const floatX* dout,
+    const int B, const int T, const int NH, const int NH_KV, const int d, int block_size) {
+    int total_threads = B * T * (NH + 2 * NH_KV) * d;
+    int num_blocks = ceil_div(total_threads, block_size);
+    int replicate_factor = NH / NH_KV;
+    repkv_backward_kernel2<<<num_blocks, block_size>>>(dinp, dout, B, T, NH, replicate_factor, d);
+    cudaCheck(cudaGetLastError());
+}
+
+// kernel launchers
 void repkv_backward1(floatX* dinp, const floatX* dout,
     const int B, const int T, const int NH, const int NH_KV, const int d, int block_size) {
     int total_threads = B * T * (3 * NH) * d;
@@ -122,6 +182,9 @@ void repkv_backward(int kernel_num,
     switch (kernel_num) {
         case 1:
             repkv_backward1(dinp, dout, B, T, NH, NH_KV, d, block_size);
+            break;
+        case 2:
+            repkv_backward2(dinp, dout, B, T, NH, NH_KV, d, block_size);
             break;
         default:
             printf("Invalid kernel number\n");

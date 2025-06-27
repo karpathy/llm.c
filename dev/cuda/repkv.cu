@@ -67,6 +67,53 @@ void repkv_forward_cpu(float* out, const float* inp,
 }
 
 // kernels
+__global__ void repkv_forward_kernel2(floatX* replicated_qkv,
+                               const floatX* gqa_qkv,
+                               int B, int N, int NH, int replicate_factor, int HD) {
+    // we have a single tensor gqa_qkv of shape (B, N, (NH + 2*(NH/replicate_factor)) * HD)
+    // we want to replicate it into (B, N, 3 * NH * HD)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // we use idx for gqa_qkv indexing
+    int inp_idx = idx; // keep backup
+
+    int NKV = NH / replicate_factor;
+    int nkv_factor = (replicate_factor + 2);    // replicate_factor is for (replicate_factor * NKV == NH), 2 for K V
+                                                // use NKV size instead of NH size
+
+    if (idx >= B * N * nkv_factor * NKV * HD) { return;}
+
+    // decode the gqa_qkv index
+    int d = idx % HD;
+    idx /= HD;
+    int nkv = idx % NKV;
+    idx /= NKV;
+    int c = idx % nkv_factor;
+    idx /= nkv_factor;
+    int n = idx % N;
+    int b = idx / N;
+
+    int idx_flat;
+    int nh_total = 3 * NH;
+
+    if (c >= 0 && c < replicate_factor) {
+        idx_flat = b * N * nh_total * HD + n * nh_total * HD + c * NKV * HD + nkv * HD + d;
+        replicated_qkv[idx_flat] = __ldcs(&gqa_qkv[inp_idx]);
+    } else if (c == replicate_factor) {
+        idx_flat = b * N * nh_total * HD + n * nh_total * HD + c * NKV * HD + nkv * HD * replicate_factor + d;
+        for (int i = 0; i < replicate_factor; i++) {
+            replicated_qkv[idx_flat + HD * i] = __ldcs(&gqa_qkv[inp_idx]);
+        }
+    } else {
+        c = 2 * replicate_factor;   // we need this to align for dout_idx (full KV)
+        idx_flat = b * N * nh_total * HD + n * nh_total * HD + c * NKV * HD + nkv * HD * replicate_factor + d;
+        for (int i = 0; i < replicate_factor; i++) {
+            replicated_qkv[idx_flat + HD * i] = __ldcs(&gqa_qkv[inp_idx]);
+        }
+    }
+}
+
+// kernels
 __global__ void repkv_forward_kernel1(floatX* replicated_qkv,
                                const floatX* gqa_qkv,
                                int B, int N, int NH, int replicate_factor, int HD) {
@@ -100,6 +147,15 @@ __global__ void repkv_forward_kernel1(floatX* replicated_qkv,
 }
 
 // kernel launchers
+void repkv_forward2(floatX* out, const floatX* inp, int B, int T, int NH, int NH_KV, int d, int block_size) {
+    int total_threads = B * T * (NH + 2 * NH_KV) * d;
+    int num_blocks = ceil_div(total_threads, block_size);
+    int replicate_factor = NH / NH_KV;
+    repkv_forward_kernel2<<<num_blocks, block_size>>>(out, inp, B, T, NH, replicate_factor, d);
+    cudaCheck(cudaGetLastError());
+}
+
+// kernel launchers
 void repkv_forward1(floatX* out, const floatX* inp, int B, int T, int NH, int NH_KV, int d, int block_size) {
     int total_threads = B * T * (3 * NH) * d;
     int num_blocks = ceil_div(total_threads, block_size);
@@ -116,6 +172,9 @@ void repkv_forward(int kernel_num,
     switch (kernel_num) {
         case 1:
             repkv_forward1(out, inp, B, T, NH, NH_KV, d, block_size);
+            break;
+        case 2:
+            repkv_forward2(out, inp, B, T, NH, NH_KV, d, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
