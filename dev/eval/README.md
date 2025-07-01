@@ -4,7 +4,7 @@ The goal here is to run the Eleuther Eval harness exactly in the same way as tha
 
 The starting point is a `.bin` file trained by llm.c. We now have to export it to a huggingface model and then evaluate it.
 
-To export the model, use [export_hf.py](export_hf.py). See its documentation up top. Eample usage, from this directory:
+To export the model, use [export_hf.py](export_hf.py). See its documentation up top. Example usage, from this directory:
 
 ```bash
 cd dev/eval
@@ -34,7 +34,7 @@ And then run the run_eval.sh script:
 ./dev/eval/run_eval.sh output_dir result_dir
 ```
 
-Where output_dir can either be local output dir (above), or a huggingface repo name.This will write eval json objects to `./lm-evaluation-harness/results/results_dir`. It will print the results into console, e.g. for a 774M model we see:
+Where output_dir can either be local output dir (above), or a huggingface repo name. This will write eval json objects to `./lm-evaluation-harness/results/results_dir`. It will print the results into console, e.g. for a 774M model we see:
 
 ```
 ----------------------------------------
