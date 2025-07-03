@@ -342,7 +342,7 @@ class DistributedDataLoader:
         for fname in self.files:
             shard_ntok = _peek_data_shard(fname)
             assert shard_ntok >= num_processes * B * T + 1
-            ntok_total += shard_ntok
+            ntok_total += int(shard_ntok)
         self.ntok_total = ntok_total
         print0(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
 
