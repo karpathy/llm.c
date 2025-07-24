@@ -50,7 +50,7 @@ def tokenize(model_desc):
         encode = lambda s: enc.encode_ordinary(s)
         eot = enc._special_tokens['<|endoftext|>'] # end of text token
     elif model_desc == "llama-3":
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
+        tokenizer = AutoTokenizer.from_pretrained("unsloth/Llama-3.2-1B")
         encode = lambda s: tokenizer.encode(s, add_special_tokens=False, verbose=False, split_special_tokens=True)
         eot = tokenizer.encode('')[0] # by default the tokenizer adds the EOT token (128000)
     else:

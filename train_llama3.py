@@ -297,6 +297,7 @@ MODEL_DICT: Dict[str, LlamaConfig] = {
     "meta-llama/Meta-Llama-3.1-8B": LLama3_8BConfig,
     "meta-llama/Llama-3.2-3B": LLama3_3BConfig,
     "meta-llama/Llama-3.2-1B": LLama3_1BConfig,
+    "unsloth/Llama-3.2-1B": LLama3_1BConfig,
 }
 
 
@@ -1044,7 +1045,7 @@ if __name__ == "__main__":
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B", help="chose the llama model")
+    parser.add_argument("--model", type=str, default="unsloth/Llama-3.2-1B", help="chose the llama model")
     parser.add_argument("--depth", type=int, default=-1, help="load only a subset of the model's layers")
     parser.add_argument("--untie", type=int, default=False, help="Untie token embeddings and LM-head, even if they are tied in the checkpoint.")
     # token layout for each step of the optimization
