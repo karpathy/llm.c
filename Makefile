@@ -195,6 +195,30 @@ else
 endif
 
 # Check if NCCL is available, include if so, for multi-GPU training
+# If exactly 1 GPU is detected and FORCE_MULTI_GPU != 1, default to NO_MULTI_GPU
+ifneq ($(OS), Windows_NT)
+  ifneq ($(call file_exists_in_path, nvidia-smi),)
+    GPU_COUNT := $(strip $(shell nvidia-smi -L 2>/dev/null | grep -c "^GPU "))
+  endif
+endif
+
+ifeq ($(strip $(FORCE_MULTI_GPU)),1)
+  ifeq ($(GPU_COUNT),1)
+    $(info → Detected 1 GPU but FORCE_MULTI_GPU=1; building with MULTI_GPU)
+  endif
+else
+  ifeq ($(GPU_COUNT),1)
+    ifeq ($(origin NO_MULTI_GPU), undefined)
+      NO_MULTI_GPU := 1
+      $(info → Detected exactly 1 GPU; defaulting to NO_MULTI_GPU. Set FORCE_MULTI_GPU=1 to override.)
+    endif
+    ifeq ($(origin NO_USE_MPI), undefined)
+      NO_USE_MPI := 1
+      $(info → Disabling MPI as well since NO_MULTI_GPU is active.)
+    endif
+  endif
+endif
+
 ifeq ($(NO_MULTI_GPU), 1)
   $(info → Multi-GPU (NCCL) is manually disabled)
 else
