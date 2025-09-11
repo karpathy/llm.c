@@ -238,6 +238,7 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
   - [llm.c](https://github.com/krrishnarraj/llm.c) by @[krrishnarraj](https://github.com/krrishnarraj): an OpenCL port of this project
 
 - Rust
+  -  [llm.rs](https://github.com/phildav/llm.rs) by @[phildav](https://github.com/phildav): Rust port with safe/idiomatic Rust and CUDA support
   -  [llm.rs](https://github.com/yijunyu/llm.rs) by @[Yijun Yu](https://github.com/yijunyu): a Rust rewrite with the aim to have same performance
   -  [llm.rs](https://github.com/ToJen/llm.rs) by @[ToJen](https://github.com/ToJen): a Rust port of this project
 
