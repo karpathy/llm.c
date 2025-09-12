@@ -210,7 +210,7 @@ void dataloader_load_batch(DataLoader* loader) {
     size_t B = loader->B;
     size_t T = loader->T;
     // read B*T+1 uint16_t tokens from the file into buffer
-    fseekCheck(loader->tokens_file, (int) current_offset, SEEK_SET);
+    fseekCheck(loader->tokens_file, current_offset, SEEK_SET);
     freadCheck(loader->buffer, sizeof(uint16_t), B*T+1, loader->tokens_file);
     // decode the buffer into inputs and targets (cast to int)
     for (int i = 0; i < B*T; i++) {
