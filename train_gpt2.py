@@ -46,59 +46,110 @@ class NewGELU(nn.Module):
 FLASH = 0
 
 class CausalSelfAttention(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
-        # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                     .view(1, 1, config.block_size, config.block_size))
+        self.head_dim = config.n_embd // config.n_head
 
+        # GQA
+        self.use_gqa = config.use_gqa
+        self.n_kv_head = config.n_kv_head if self.use_gqa else self.n_head
+        assert self.n_head % self.n_kv_head == 0, "n_head must be divisible by n_kv_head for GQA"
+        self.n_rep = self.n_head // self.n_kv_head  # times to repeat kv across q groups
+
+        # Projections (note: q has n_head*head_dim, k and v only n_kv_head*head_dim)
+        self.q_proj = nn.Linear(config.n_embd, self.n_head * self.head_dim)
+        self.k_proj = nn.Linear(config.n_embd, self.n_kv_head * self.head_dim)
+        self.v_proj = nn.Linear(config.n_embd, self.n_kv_head * self.head_dim)
+
+        # Output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+
+        # causal mask (unchanged)
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones(config.block_size, config.block_size)).view(1,1,config.block_size,config.block_size),
+            persistent=False
+        )
+
+        # RoPE setup
+        self.use_rope = config.use_rope
+        if self.use_rope:
+            rope_dim = int(self.head_dim * config.rope_partial_factor)
+            rope_dim = rope_dim - (rope_dim % 2)  # even
+            self.rope_dim = max(2, rope_dim)
+            self.rope_theta = config.rope_theta
+            # buffers for cos/sin are computed on the fly per T for simplicity; or precompute up to block_size.
+    def _rope_freqs(self, dim, max_pos, device):
+        # returns cos,sin with shapes (max_pos, dim) to rotate first `dim` features
+        inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, dim, 2, device=device).float() / dim))
+        t = torch.arange(max_pos, device=device).float()
+        freqs = torch.einsum('i,j->ij', t, inv_freq)  # (max_pos, dim/2)
+        emb = torch.cat((freqs, freqs), dim=-1)      # (max_pos, dim)
+        return emb.cos(), emb.sin()
+
+    def _apply_rope(self, x, cos, sin):
+        # x: (B, heads, T, head_dim); rotate first rope_dim, keep remainder
+        x_ro = x[..., :self.rope_dim]
+        x_pass = x[..., self.rope_dim:]
+        x1 = x_ro[..., ::2]
+        x2 = x_ro[..., 1::2]
+        # broadcast cos/sin: (T, rope_dim) -> (1,1,T,rope_dim/2)
+        cos = cos.view(1,1,cos.size(0),cos.size(1))
+        sin = sin.view(1,1,sin.size(0),sin.size(1))
+        # (a,b) -> (a*cos - b*sin, a*sin + b*cos)
+        x_ro_rot = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
+        return torch.cat([x_ro_rot, x_pass], dim=-1)
+    
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        B, T, C = x.size()
+        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)         # (B, h, T, d)
+        k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)      # (B, hk, T, d)
+        v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)      # (B, hk, T, d)
+
+        # GQA: repeat k,v across query groups
+        if self.n_kv_head != self.n_head:
+            k = k.repeat_interleave(self.n_rep, dim=1)  # (B, h, T, d)
+            v = v.repeat_interleave(self.n_rep, dim=1)  # (B, h, T, d)
+
+        # RoPE (on q,k)
+        if self.use_rope:
+            cos, sin = self._rope_freqs(self.rope_dim, T, x.device)
+            q = self._apply_rope(q, cos, sin)
+            k = self._apply_rope(k, cos, sin)
+
         if FLASH:
-            # flashattention
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
-            # manual implementation of attention
-            # this materializes the large (T,T) matrix for all the queries and keys
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-        # output projection
+            y = att @ v
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
 
 class MLP(nn.Module):
-
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu    = NewGELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
+        hidden = int(config.swiglu_hidden_mult * config.n_embd)  # ≈ 2.67 * d_model
+        # gate+up in one matmul; output size = 2*hidden
+        self.c_fc = nn.Linear(config.n_embd, 2 * hidden)
+        self.act = nn.SiLU()  # "Swish"
+        self.c_proj = nn.Linear(hidden, config.n_embd)
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
+        x_in = self.c_fc(x)                       # (B,T,2H)
+        x_gate, x_up = x_in.chunk(2, dim=-1)      # (B,T,H),(B,T,H)
+        x = self.act(x_gate) * x_up               # (B,T,H)  <-- SwiGLU
+        x = self.c_proj(x)                        # (B,T,C)
         return x
+
 
 class Block(nn.Module):
 
@@ -125,18 +176,40 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
 
+    # NEW:
+    use_rope: bool = True
+    rope_theta: float = 10000.0     # standard RoPE base
+    rope_partial_factor: float = 1.0  # 0<..<=1; 1.0 = full-dim rotary
+
+    use_gqa: bool = True
+    n_kv_head: int = 4              # e.g. n_kv_head | n_head, so 12/4=3 groups
+
+    use_swiglu: bool = True
+    swiglu_hidden_mult: float = 2.6666667  # ~8/3 to keep params roughly similar
+    
+
 class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.config = config
-
+        '''
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
+        '''
+        mods = dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embd),
+        )
+        if not config.use_rope:
+            mods["wpe"] = nn.Embedding(config.block_size, config.n_embd)
+        self.transformer = nn.ModuleDict(mods)
+        
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
@@ -163,12 +236,13 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = tok_emb + pos_emb
+        tok_emb = self.transformer.wte(idx)
+        if self.config.use_rope:
+            x = tok_emb  # RoPE happens inside attention, no add here
+        else:
+            pos = torch.arange(0, t, dtype=torch.long, device=idx.device)
+            pos_emb = self.transformer.wpe(pos)
+            x = tok_emb + pos_emb
 
         for block in self.transformer.h:
             x = block(x)
