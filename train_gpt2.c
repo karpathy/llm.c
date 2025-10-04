@@ -117,6 +117,30 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     }
 }
 
+void rmsnorm_forward(float* out, float* rstd,
+                     float* inp, float* weight,
+                     int B, int T, int C) {
+    float eps = 1e-5f;
+    for (int i = 0; i < B * T; i++) {
+        float* x = inp + i * C;
+        // calculate sum of squares
+        float ss = 0.0f;
+        for (int j = 0; j < C; j++) {
+            ss += x[j] * x[j];
+        }
+        ss /= C;
+        ss += eps;
+        float s = 1.0f / sqrtf(ss);
+        // cache the rstd for the backward pass
+        rstd[i] = s;
+        // normalize and scale
+        float* out_i = out + i * C;
+        for (int j = 0; j < C; j++) {
+            out_i[j] = weight[j] * (s * x[j]);
+        }
+    }
+}
+
 void layernorm_backward(float* dinp, float* dweight, float* dbias,
                         float* dout, float* inp, float* weight, float* mean, float* rstd,
                         int B, int T, int C) {
@@ -156,6 +180,33 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
                 dval *= rstd_bt; // final scale
                 dinp_bt[i] += dval;
             }
+        }
+    }
+}
+
+void rmsnorm_backward(float* dinp, float* dweight,
+                      float* dout, float* inp, float* weight, float* rstd,
+                      int B, int T, int C) {
+    for (int i = 0; i < B * T; i++) {
+        float* x = inp + i * C;
+        float* dx = dinp + i * C;
+        float* dout_i = dout + i * C;
+        float s = rstd[i];
+
+        // backward pass for dweight
+        for (int j = 0; j < C; j++) {
+            dweight[j] += (s * x[j]) * dout_i[j];
+        }
+
+        // backward pass for dinp
+        float d_ss = 0.0f;
+        for (int j = 0; j < C; j++) {
+            d_ss += (weight[j] * x[j] * dout_i[j]);
+        }
+        d_ss *= -0.5f * s * s * s / C;
+
+        for (int j = 0; j < C; j++) {
+            dx[j] += s * weight[j] * dout_i[j] + 2.0f * x[j] * d_ss;
         }
     }
 }
@@ -533,24 +584,24 @@ typedef struct {
 } GPT2Config;
 
 // the parameters of the model
-#define NUM_PARAMETER_TENSORS 16
+#define NUM_PARAMETER_TENSORS 13
 typedef struct {
     float* wte; // (V, C)
     float* wpe; // (maxT, C)
     float* ln1w; // (L, C)
-    float* ln1b; // (L, C)
+    // float* ln1b; // (L, C)
     float* qkvw; // (L, 3*C, C)
     float* qkvb; // (L, 3*C)
     float* attprojw; // (L, C, C)
     float* attprojb; // (L, C)
     float* ln2w; // (L, C)
-    float* ln2b; // (L, C)
+    // float* ln2b; // (L, C)
     float* fcw; // (L, 4*C, C)
     float* fcb; // (L, 4*C)
     float* fcprojw; // (L, C, 4*C)
     float* fcprojb; // (L, C)
     float* lnfw; // (C)
-    float* lnfb; // (C)
+    // float* lnfb; // (C)
 } ParameterTensors;
 
 void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
@@ -561,19 +612,19 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
     param_sizes[0] = Vp * C; // wte
     param_sizes[1] = maxT * C; // wpe
     param_sizes[2] = L * C; // ln1w
-    param_sizes[3] = L * C; // ln1b
-    param_sizes[4] = L * (3 * C) * C; // qkvw
-    param_sizes[5] = L * (3 * C); // qkvb
-    param_sizes[6] = L * C * C; // attprojw
-    param_sizes[7] = L * C; // attprojb
-    param_sizes[8] = L * C; // ln2w
-    param_sizes[9] = L * C; // ln2b
-    param_sizes[10] = L * (4 * C) * C; // fcw
-    param_sizes[11] = L * (4 * C); // fcb
-    param_sizes[12] = L * C * (4 * C); // fcprojw
-    param_sizes[13] = L * C; // fcprojb
-    param_sizes[14] = C; // lnfw
-    param_sizes[15] = C; // lnfb
+    // param_sizes[3] = L * C; // ln1b
+    param_sizes[3] = L * (3 * C) * C; // qkvw
+    param_sizes[4] = L * (3 * C); // qkvb
+    param_sizes[5] = L * C * C; // attprojw
+    param_sizes[6] = L * C; // attprojb
+    param_sizes[7] = L * C; // ln2w
+    // param_sizes[9] = L * C; // ln2b
+    param_sizes[8] = L * (4 * C) * C; // fcw
+    param_sizes[9] = L * (4 * C); // fcb
+    param_sizes[10] = L * C * (4 * C); // fcprojw
+    param_sizes[11] = L * C; // fcprojb
+    param_sizes[12] = C; // lnfw
+    // param_sizes[15] = C; // lnfb
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
@@ -586,9 +637,9 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     float* params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
     // assign all the tensors
     float** ptrs[] = {
-        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
-        &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
+        &params->wte, &params->wpe, &params->ln1w, &params->qkvw, &params->qkvb,
+        &params->attprojw, &params->attprojb, &params->ln2w, &params->fcw, &params->fcb,
+        &params->fcprojw, &params->fcprojb, &params->lnfw
     };
     float* params_memory_iterator = params_memory;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -598,11 +649,11 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
     return params_memory;
 }
 
-#define NUM_ACTIVATION_TENSORS 23
+#define NUM_ACTIVATION_TENSORS 20
 typedef struct {
     float* encoded; // (B, T, C)
     float* ln1; // (L, B, T, C)
-    float* ln1_mean; // (L, B, T)
+    // float* ln1_mean; // (L, B, T)
     float* ln1_rstd; // (L, B, T)
     float* qkv; // (L, B, T, 3*C)
     float* atty; // (L, B, T, C)
@@ -611,14 +662,14 @@ typedef struct {
     float* attproj; // (L, B, T, C)
     float* residual2; // (L, B, T, C)
     float* ln2; // (L, B, T, C)
-    float* ln2_mean; // (L, B, T)
+    // float* ln2_mean; // (L, B, T)
     float* ln2_rstd; // (L, B, T)
     float* fch; // (L, B, T, 4*C)
     float* fch_gelu; // (L, B, T, 4*C)
     float* fcproj; // (L, B, T, C)
     float* residual3; // (L, B, T, C)
     float* lnf; // (B, T, C)
-    float* lnf_mean; // (B, T)
+    // float* lnf_mean; // (B, T)
     float* lnf_rstd; // (B, T)
     float* logits; // (B, T, V)
     float* probs; // (B, T, V)
@@ -632,27 +683,27 @@ void fill_in_activation_sizes(size_t* act_sizes, GPT2Config config, int B, int T
     size_t Vp = config.padded_vocab_size;
     act_sizes[0] = B * T * C; // encoded
     act_sizes[1] = L * B * T * C; // ln1
-    act_sizes[2] = L * B * T; // ln1_mean
-    act_sizes[3] = L * B * T; // ln1_rstd
-    act_sizes[4] = L * B * T * 3 * C; // qkv
-    act_sizes[5] = L * B * T * C; // atty
-    act_sizes[6] = L * B * NH * T * T; // preatt
-    act_sizes[7] = L * B * NH * T * T; // att
-    act_sizes[8] = L * B * T * C; // attproj
-    act_sizes[9] = L * B * T * C; // residual2
-    act_sizes[10] = L * B * T * C; // ln2
-    act_sizes[11] = L * B * T; // ln2_mean
-    act_sizes[12] = L * B * T; // ln2_rstd
-    act_sizes[13] = L * B * T * 4 * C; // fch
-    act_sizes[14] = L * B * T * 4 * C; // fch_gelu
-    act_sizes[15] = L * B * T * C; // fcproj
-    act_sizes[16] = L * B * T * C; // residual3
-    act_sizes[17] = B * T * C; // lnf
-    act_sizes[18] = B * T; // lnf_mean
-    act_sizes[19] = B * T; // lnf_rstd
-    act_sizes[20] = B * T * Vp; // logits
-    act_sizes[21] = B * T * Vp; // probs
-    act_sizes[22] = B * T; // losses
+    // act_sizes[2] = L * B * T; // ln1_mean
+    act_sizes[2] = L * B * T; // ln1_rstd
+    act_sizes[3] = L * B * T * 3 * C; // qkv
+    act_sizes[4] = L * B * T * C; // atty
+    act_sizes[5] = L * B * NH * T * T; // preatt
+    act_sizes[6] = L * B * NH * T * T; // att
+    act_sizes[7] = L * B * T * C; // attproj
+    act_sizes[8] = L * B * T * C; // residual2
+    act_sizes[9] = L * B * T * C; // ln2
+    // act_sizes[11] = L * B * T; // ln2_mean
+    act_sizes[10] = L * B * T; // ln2_rstd
+    act_sizes[11] = L * B * T * 4 * C; // fch
+    act_sizes[12] = L * B * T * 4 * C; // fch_gelu
+    act_sizes[13] = L * B * T * C; // fcproj
+    act_sizes[14] = L * B * T * C; // residual3
+    act_sizes[15] = B * T * C; // lnf
+    // act_sizes[18] = B * T; // lnf_mean
+    act_sizes[16] = B * T; // lnf_rstd
+    act_sizes[17] = B * T * Vp; // logits
+    act_sizes[18] = B * T * Vp; // probs
+    act_sizes[19] = B * T; // losses
 }
 
 float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) {
@@ -662,10 +713,10 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
     }
     float* acts_memory = (float*)mallocCheck(num_activations * sizeof(float));
     float** ptrs[] = {
-        &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
-        &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
+        &acts->encoded, &acts->ln1, &acts->ln1_rstd, &acts->qkv, &acts->atty,
+        &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
-        &acts->lnf_mean, &acts->lnf_rstd, &acts->logits, &acts->probs, &acts->losses
+        &acts->lnf_rstd, &acts->logits, &acts->probs, &acts->losses
     };
     float* acts_memory_iterator = acts_memory;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
@@ -829,13 +880,13 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 
         // get the pointers of the weights for this layer
         float* l_ln1w = params.ln1w + l * C;
-        float* l_ln1b = params.ln1b + l * C;
+        // float* l_ln1b = params.ln1b + l * C;
         float* l_qkvw = params.qkvw + l * 3*C * C;
         float* l_qkvb = params.qkvb + l * 3*C;
         float* l_attprojw = params.attprojw + l * C * C;
         float* l_attprojb = params.attprojb + l * C;
         float* l_ln2w = params.ln2w + l * C;
-        float* l_ln2b = params.ln2b + l * C;
+        // float* l_ln2b = params.ln2b + l * C;
         float* l_fcw = params.fcw + l * 4*C * C;
         float* l_fcb = params.fcb + l * 4*C;
         float* l_fcprojw = params.fcprojw + l * C * 4*C;
@@ -843,7 +894,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 
         // get the pointers of the activations for this layer
         float* l_ln1 = acts.ln1 + l * B * T * C;
-        float* l_ln1_mean = acts.ln1_mean + l * B * T;
+        // float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         float* l_qkv = acts.qkv + l * B * T * 3*C;
         float* l_atty = acts.atty + l * B * T * C;
@@ -852,7 +903,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         float* l_attproj = acts.attproj + l * B * T * C;
         float* l_residual2 = acts.residual2 + l * B * T * C;
         float* l_ln2 = acts.ln2 + l * B * T * C;
-        float* l_ln2_mean = acts.ln2_mean + l * B * T;
+        // float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         float* l_fch = acts.fch + l * B * T * 4*C;
         float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
@@ -860,19 +911,19 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         float* l_residual3 = acts.residual3 + l * B * T * C;
 
         // now do the forward pass
-        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+        rmsnorm_forward(l_ln1, l_ln1_rstd, residual, l_ln1w, B, T, C); // no mean, no bias
         matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
-        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        rmsnorm_forward(l_ln2, l_ln2_rstd, l_residual2, l_ln2w, B, T, C); // no mean, no bias
         matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
         matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
+    rmsnorm_forward(acts.lnf, acts.lnf_rstd, residual, params.lnfw, B, T, C); // no mean, no bias
     matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp);
     softmax_forward(acts.probs, acts.logits, B, T, V, Vp);
 
@@ -935,7 +986,7 @@ void gpt2_backward(GPT2 *model) {
     matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, Vp);
     float* residual = acts.residual3 + (L-1) * B * T * C; // last layer's residual
     float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // write to last layer's residual
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+    rmsnorm_backward(dresidual, grads.lnfw, grads_acts.lnf, residual, params.lnfw, acts.lnf_rstd, B, T, C); // no bias grad, no mean
 
     for (int l = L-1; l >= 0; l--) {
 
@@ -951,13 +1002,13 @@ void gpt2_backward(GPT2 *model) {
         float* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
         float* dl_ln1w = grads.ln1w + l * C;
-        float* dl_ln1b = grads.ln1b + l * C;
+        // float* dl_ln1b = grads.ln1b + l * C;
         float* dl_qkvw = grads.qkvw + l * 3*C * C;
         float* dl_qkvb = grads.qkvb + l * 3*C;
         float* dl_attprojw = grads.attprojw + l * C * C;
         float* dl_attprojb = grads.attprojb + l * C;
         float* dl_ln2w = grads.ln2w + l * C;
-        float* dl_ln2b = grads.ln2b + l * C;
+        // float* dl_ln2b = grads.ln2b + l * C;
         float* dl_fcw = grads.fcw + l * 4*C * C;
         float* dl_fcb = grads.fcb + l * 4*C;
         float* dl_fcprojw = grads.fcprojw + l * C * 4*C;
@@ -990,7 +1041,7 @@ void gpt2_backward(GPT2 *model) {
         float* dl_residual3 = grads_acts.residual3 + l * B * T * C;
 
         // backprop this layer
-        residual_backward(dl_residual2, dl_fcproj, dl_residual3, B*T*C);
+        rmsnorm_backward(dl_residual2, dl_ln2w, dl_ln2, l_residual2, l_ln2w, l_ln2_rstd, B, T, C); // no bias grad, no mean
         matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dl_fcproj, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
         gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C);
         matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C);
@@ -999,7 +1050,7 @@ void gpt2_backward(GPT2 *model) {
         matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dl_attproj, l_atty, l_attprojw, B, T, C, C);
         attention_backward(dl_qkv, dl_preatt, dl_att, dl_atty, l_qkv, l_att, B, T, C, NH);
         matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+        rmsnorm_backward(dresidual, dl_ln1w, dl_ln1, residual, l_ln1w, l_ln1_rstd, B, T, C); // no bias grad, no mean
     }
     encoder_backward(grads.wte, grads.wpe, grads_acts.encoded, model->inputs, B, T, C);
 }

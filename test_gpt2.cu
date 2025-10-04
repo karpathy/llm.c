@@ -50,19 +50,19 @@ typedef struct {
     float*  wte; // (Vp, C)
     float*  wpe; // (maxT, C)
     float*  ln1w; // (L, C)
-    float*  ln1b; // (L, C)
+    // float*  ln1b; // (L, C)
     float*  qkvw; // (L, 3*C, C)
     float*  qkvb; // (L, 3*C)
     float*  attprojw; // (L, C, C)
     float*  attprojb; // (L, C)
     float*  ln2w; // (L, C)
-    float*  ln2b; // (L, C)
+    // float*  ln2b; // (L, C)
     float*  fcw; // (L, 4*C, C)
     float*  fcb; // (L, 4*C)
     float*  fcprojw; // (L, C, 4*C)
     float*  fcprojb; // (L, C)
     float*  lnfw; // (C)
-    float*  lnfb; // (C)
+    // float*  lnfb; // (C)
 } FloatParameterTensors;
 static_assert(sizeof(FloatParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
@@ -76,9 +76,9 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
     // everything is float so number of bytes to allocate is a simple multiplication
     float* params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
     float** ptrs[] = {
-        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
-        &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
+        &params->wte, &params->wpe, &params->ln1w, &params->qkvw, &params->qkvb,
+        &params->attprojw, &params->attprojb, &params->ln2w, &params->fcw, &params->fcb,
+        &params->fcprojw, &params->fcprojb, &params->lnfw
     };
     float* params_memory_iterator = params_memory;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -277,9 +277,9 @@ int main(int argc, char *argv[]) {
             }
             #endif
             const char* names[NUM_PARAMETER_TENSORS] = {
-                    "wte", "wpe", "ln1w", "ln1b", "qkvw", "qkvb", "attrpojw",
-                    "attprojb", "ln2w", "ln2b", "fcw", "fcb", "fcprojw", "fcprojb",
-                    "lnfw", "lnfb"
+                    "wte", "wpe", "ln1w", "qkvw", "qkvb", "attrpojw",
+                    "attprojb", "ln2w", "fcw", "fcb", "fcprojw", "fcprojb",
+                    "lnfw"
             };
             size_t* count = model.param_elements;
             for(int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {

@@ -151,19 +151,16 @@ int main(int argc, char *argv[]) {
             gradoks[0] = check_tensor(grads.wte, expected_grads.wte, V*C, "dwte");
             gradoks[1] = check_tensor(grads.wpe, expected_grads.wpe, maxT*C, "dwpe");
             gradoks[2] = check_tensor(grads.ln1w, expected_grads.ln1w, L*C, "dln1w");
-            gradoks[3] = check_tensor(grads.ln1b, expected_grads.ln1b, L*C, "dln1b");
             gradoks[4] = check_tensor(grads.qkvw, expected_grads.qkvw, L*3*C*C, "dqkvw");
             gradoks[5] = check_tensor(grads.qkvb, expected_grads.qkvb, L*3*C, "dqkvb");
             gradoks[6] = check_tensor(grads.attprojw, expected_grads.attprojw, L*C*C, "dattprojw");
             gradoks[7] = check_tensor(grads.attprojb, expected_grads.attprojb, L*C, "dattprojb");
             gradoks[8] = check_tensor(grads.ln2w, expected_grads.ln2w, L*C, "dln2w");
-            gradoks[9] = check_tensor(grads.ln2b, expected_grads.ln2b, L*C, "dln2b");
             gradoks[10] = check_tensor(grads.fcw, expected_grads.fcw, L*4*C*C, "dfcw");
             gradoks[11] = check_tensor(grads.fcb, expected_grads.fcb, L*4*C, "dfcb");
             gradoks[12] = check_tensor(grads.fcprojw, expected_grads.fcprojw, L*C*4*C, "dfcprojw");
             gradoks[13] = check_tensor(grads.fcprojb, expected_grads.fcprojb, L*C, "dfcprojb");
             gradoks[14] = check_tensor(grads.lnfw, expected_grads.lnfw, C, "dlnfw");
-            gradoks[15] = check_tensor(grads.lnfb, expected_grads.lnfb, C, "dlnfb");
             for (int i = 0; i < 16; i++) {
                 allok = allok && gradoks[i];
             }
