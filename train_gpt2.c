@@ -27,6 +27,8 @@ There will be other versions of this code that specialize it and make it fast.
 #include "llmc/tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
+// defines: manual_seed, normal_, mt19937_state, randfloat32
+#include "llmc/rand.h"
 
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
@@ -704,6 +706,16 @@ typedef struct {
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
 } GPT2;
 
+// GPT2-124M configuration (matches checkpoint file dimensions)
+static const GPT2Config GPT2_124M = {
+    .max_seq_len = 1024,
+    .vocab_size = 50257,
+    .padded_vocab_size = 50304,
+    .num_layers = 12,
+    .num_heads = 12,
+    .channels = 768
+};
+
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in model from a checkpoint file
@@ -760,6 +772,72 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
+}
+
+void gpt2_init(GPT2 *model) {
+    // Initialize model from scratch using GPT2-124M configuration.
+    // Follows the same pattern as train_gpt2.cu: memset to zero, then fill in
+    // layer norm gains and random normal weights directly into params_memory.
+    model->config = GPT2_124M;
+
+    size_t maxT = model->config.max_seq_len;
+    size_t V = model->config.vocab_size;
+    size_t L = model->config.num_layers;
+    size_t C = model->config.channels;
+
+    printf("[GPT-2 Init from Scratch]\n");
+    printf("max_seq_len: %zu\n", maxT);
+    printf("vocab_size: %zu\n", V);
+    printf("padded_vocab_size: %zu\n", (size_t)model->config.padded_vocab_size);
+    printf("num_layers: %zu\n", L);
+    printf("num_heads: %zu\n", (size_t)model->config.num_heads);
+    printf("channels: %zu\n", C);
+
+    // allocate space for all the parameters
+    fill_in_parameter_sizes(model->param_sizes, model->config);
+    size_t num_parameters = 0;
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        num_parameters += model->param_sizes[i];
+    }
+    printf("num_parameters: %zu\n", num_parameters);
+    model->num_parameters = num_parameters;
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
+
+    // zero everything: all biases start at 0, padding stays at 0
+    memset(model->params_memory, 0, num_parameters * sizeof(float));
+
+    // set layer norm gains to 1.0
+    for (size_t i = 0; i < L * C; i++) { model->params.ln1w[i] = 1.0f; }
+    for (size_t i = 0; i < L * C; i++) { model->params.ln2w[i] = 1.0f; }
+    for (size_t i = 0; i < C; i++)     { model->params.lnfw[i] = 1.0f; }
+
+    // init RNG and generate random normal weights
+    // the draw order matches PyTorch's module init order (wte, wpe, then per-layer)
+    mt19937_state init_rng;
+    manual_seed(&init_rng, 42);
+    float residual_scale = 1.0f / sqrtf(2.0f * L);
+    ParameterTensors params = model->params;
+
+    normal_(params.wte, V * C, 0.0f, 0.02f, &init_rng);        // only V rows, not Vp
+    normal_(params.wpe, maxT * C, 0.0f, 0.02f, &init_rng);
+    for (size_t l = 0; l < L; l++) {
+        normal_(params.qkvw + l*3*C*C, 3*C*C, 0.0f, 0.02f, &init_rng);
+        normal_(params.attprojw + l*C*C, C*C, 0.0f, 0.02f * residual_scale, &init_rng);
+        normal_(params.fcw + l*4*C*C, 4*C*C, 0.0f, 0.02f, &init_rng);
+        normal_(params.fcprojw + l*C*4*C, C*4*C, 0.0f, 0.02f * residual_scale, &init_rng);
+    }
+
+    // other inits
+    model->acts_memory = NULL;
+    model->grads_memory = NULL;
+    model->m_memory = NULL;
+    model->v_memory = NULL;
+    model->grads_acts_memory = NULL;
+    model->inputs = NULL;
+    model->targets = NULL;
+    model->batch_size = 0;
+    model->seq_len = 0;
+    model->mean_loss = -1.0f;
 }
 
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
@@ -1048,20 +1126,9 @@ void gpt2_free(GPT2 *model) {
 // ----------------------------------------------------------------------------
 // sampler
 
-unsigned int random_u32(uint64_t *state) {
-    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-    *state ^= *state >> 12;
-    *state ^= *state << 25;
-    *state ^= *state >> 27;
-    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
-}
-float random_f32(uint64_t *state) { // random float32 in [0,1)
-    return (random_u32(state) >> 8) / 16777216.0f;
-}
-
 int sample_mult(float* probabilities, int n, float coin) {
     // sample index from probabilities (they must sum to 1!)
-    // coin is a random number in [0, 1), usually from random_f32()
+    // coin is a random number in [0, 1), usually from randfloat32()
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
         cdf += probabilities[i];
@@ -1074,11 +1141,27 @@ int sample_mult(float* probabilities, int n, float coin) {
 
 // ----------------------------------------------------------------------------
 // main training loop
-int main() {
+int main(int argc, char *argv[]) {
 
-    // build the GPT-2 model from a checkpoint
+    // parse command line arguments
+    int init_from_scratch = 0; // default: load from checkpoint
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-' && argv[i][1] == 'i') { init_from_scratch = 1; }
+        else if (argv[i][0] == '-' && argv[i][1] == 'h') {
+            printf("Usage: %s [-i] [-h]\n", argv[0]);
+            printf("  -i    initialize model from scratch (GPT-2 124M)\n");
+            printf("  -h    show this help message\n");
+            return 0;
+        }
+    }
+
+    // build the GPT-2 model
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    if (init_from_scratch) {
+        gpt2_init(&model);
+    } else {
+        gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    }
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
     const char* tiny_stories_train = "dev/data/tinystories/TinyStories_train.bin";
@@ -1101,7 +1184,8 @@ int main() {
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
     // some memory for generating samples from the model
-    uint64_t rng_state = 1337;
+    mt19937_state rng_state;
+    manual_seed(&rng_state, 1337);
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     const int genT = 64; // number of steps of inference we will do
 
@@ -1141,7 +1225,7 @@ int main() {
                 // but only using position 0
                 // get the Vp-dimensional vector probs[0, t-1, :]
                 float* probs = model.acts.probs + (t-1) * model.config.padded_vocab_size;
-                float coin = random_f32(&rng_state);
+                float coin = randfloat32(&rng_state);
                 // note we're only sampling from the first V elements, ignoring padding
                 // (the probabilities in the padded region should be zero anyway)
                 int next_token = sample_mult(probs, model.config.vocab_size, coin);
