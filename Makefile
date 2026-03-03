@@ -194,6 +194,31 @@ else
   endif
 endif
 
+# Optional BLAS for CPU matmul acceleration (USE_BLAS=1 to enable)
+# e.g. on Linux: sudo apt-get install libopenblas-dev
+# e.g. on macOS: available via Accelerate framework (no install needed)
+USE_BLAS ?= 0
+ifeq ($(USE_BLAS), 1)
+  ifeq ($(SHELL_UNAME), Darwin)
+    CFLAGS += -DUSE_BLAS
+    LDLIBS += -framework Accelerate
+    $(info ✓ BLAS found (Apple Accelerate))
+  else
+    ifneq ($(OS), Windows_NT)
+      # Try pkg-config for openblas first, then fall back to direct linking
+      ifneq ($(shell pkg-config --exists openblas 2>/dev/null; echo $$?), 0)
+        CFLAGS += -DUSE_BLAS
+        LDLIBS += -lopenblas
+        $(info ✓ BLAS enabled (linking -lopenblas))
+      else
+        CFLAGS += -DUSE_BLAS $(shell pkg-config --cflags openblas)
+        LDLIBS += $(shell pkg-config --libs openblas)
+        $(info ✓ BLAS found via pkg-config)
+      endif
+    endif
+  endif
+endif
+
 # Check if NCCL is available, include if so, for multi-GPU training
 ifeq ($(NO_MULTI_GPU), 1)
   $(info → Multi-GPU (NCCL) is manually disabled)

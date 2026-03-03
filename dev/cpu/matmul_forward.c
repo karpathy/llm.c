@@ -14,6 +14,13 @@ CPU Kernels for matmul forward pass.
 #include <math.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef USE_BLAS
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
+#endif
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -87,7 +94,27 @@ void matmul_forward_ngc92(float* out,
     }
 }
 
+#ifdef USE_BLAS
+void matmul_forward_blas(float* out,
+    const float* inp, const float* weight, const float* bias,
+    int B, int T, int C, int OC) {
+    // Use BLAS sgemm: out = inp @ weight^T
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                B*T, OC, C,
+                1.0f, inp, C, weight, C,
+                0.0f, out, OC);
+    if (bias != NULL) {
+        for (int i = 0; i < B*T; i++) {
+            for (int o = 0; o < OC; o++) {
+                out[i * OC + o] += bias[o];
+            }
+        }
+    }
+}
+#define NUM_KERNELS 3
+#else
 #define NUM_KERNELS 2
+#endif
 
 void matmul_forward(int kernel_num,
     float* out,
@@ -101,6 +128,11 @@ void matmul_forward(int kernel_num,
         case 1:
             matmul_forward_ngc92(out, inp, weight, bias, B, T, C, OC);
             break;
+#ifdef USE_BLAS
+        case 2:
+            matmul_forward_blas(out, inp, weight, bias, B, T, C, OC);
+            break;
+#endif
         default:
             printf("Invalid kernel number\n");
             exit(1);
