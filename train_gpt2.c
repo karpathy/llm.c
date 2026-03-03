@@ -20,6 +20,13 @@ There will be other versions of this code that specialize it and make it fast.
 #ifdef OMP
 #include <omp.h>
 #endif
+#ifdef USE_BLAS
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
+#endif
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 #include "llmc/utils.h"
@@ -185,11 +192,26 @@ void matmul_forward(float* out,
                     const float* inp, const float* weight, const float* bias,
                     int B, int T, int C, int OC) {
     // most of the running time is spent here and in matmul_backward
-    // therefore, the implementation below is very mildly optimized
-    // this function is otherwise identical to that of matmul_forward_naive()
     // OC is short for "output channels"
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
     // out will be (B,T,OC)
+#ifdef USE_BLAS
+    // Use BLAS sgemm: out = inp @ weight^T
+    // inp is (B*T, C), weight is (OC, C), out is (B*T, OC)
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                B*T, OC, C,
+                1.0f, inp, C, weight, C,
+                0.0f, out, OC);
+    if (bias != NULL) {
+        for (int i = 0; i < B*T; i++) {
+            for (int o = 0; o < OC; o++) {
+                out[i * OC + o] += bias[o];
+            }
+        }
+    }
+#else
+    // this implementation below is very mildly optimized
+    // this function is otherwise identical to that of matmul_forward_naive()
 
     // make sure the tiled loop will be correct or fallback to naive version
     const int LOOP_UNROLL = 8;
@@ -226,12 +248,34 @@ void matmul_forward(float* out,
             }
         }
     }
+#endif
 }
 
 void matmul_backward(float* dinp, float* dweight, float* dbias,
                      const float* dout, const float* inp, const float* weight,
                      int B, int T, int C, int OC) {
     // most of the running time is spent here and in matmul_forward
+#ifdef USE_BLAS
+    // dinp = dout @ weight  (B*T,OC) @ (OC,C) = (B*T,C)
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                B*T, C, OC,
+                1.0f, dout, OC, weight, C,
+                0.0f, dinp, C);
+    // dweight += dout^T @ inp  (OC,B*T) @ (B*T,C) = (OC,C)
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                OC, C, B*T,
+                1.0f, dout, OC, inp, C,
+                1.0f, dweight, C);
+    if (dbias != NULL) {
+        for (int o = 0; o < OC; o++) {
+            float sum = 0.0f;
+            for (int i = 0; i < B*T; i++) {
+                sum += dout[i * OC + o];
+            }
+            dbias[o] += sum;
+        }
+    }
+#else
     // this backward could be done in a single "round" of loops
     // but that doesn't afford an efficient parallelization strategy
 
@@ -266,6 +310,7 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
             }
         }
     }
+#endif
 }
 
 void attention_forward(float* out, float* preatt, float* att,
