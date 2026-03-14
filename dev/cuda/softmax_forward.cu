@@ -25,6 +25,12 @@ version 6 is softmax_online that parallelizes over all of B,T,C
 
 version 7 is softmax optimized for very large C.
 ./softmax_forward 7
+
+version 8 is online softmax with manual warp shuffle reductions, one warp per row
+./softmax_forward 8
+
+version 9 is online softmax like kernel 8, but with 4x unrolled loads for memory-level parallelism
+./softmax_forward 9
 */
 
 #include <stdio.h>
@@ -563,6 +569,92 @@ __global__ void softmax_forward_online_kernel8(float* out, const float* inp, int
     }
 }
 
+__global__ void softmax_forward_online_kernel9(float* out, const float* inp, int N, int C) {
+    // same as kernel 8 (online softmax, one warp per row, manual warp reductions)
+    // but with 4x unrolled coarsening loops to increase memory-level parallelism
+    // multiple loads are issued together so the memory system can service them in parallel
+    // ~9% faster than kernel 8 on RTX 4060
+    const int UNROLL = 4;
+    const int warpsPerBlock = blockDim.x / warpSize;
+    int tid = threadIdx.x;
+
+    int warpId = tid / warpSize;
+    int laneId = tid % warpSize;
+    // one warp one row
+    int row = blockIdx.x * warpsPerBlock + warpId;
+
+    if (row >= N) {
+        return;
+    }
+
+    const float* x = inp + row * C;
+    float* const y = out + row * C;
+
+    // merge calculating maxval and sumval in one loop, unrolled by 4
+    // all 4 loads issue together for memory-level parallelism
+    float maxval = -INFINITY, sumval = 0.0f, bigger;
+    for (int i = laneId; i < C; i += warpSize * UNROLL) {
+        // issue all 4 loads at once, min(C-1, ...) avoids branch divergence
+        float v0 = x[min(C - 1, i)];
+        float v1 = x[min(C - 1, i + warpSize)];
+        float v2 = x[min(C - 1, i + 2 * warpSize)];
+        float v3 = x[min(C - 1, i + 3 * warpSize)];
+        // process each value sequentially through the online max+sum update
+        if (i < C) {
+            bigger = fmaxf(maxval, v0);
+            sumval = sumval * expf(maxval - bigger) + expf(v0 - bigger);
+            maxval = bigger;
+        }
+        if (i + warpSize < C) {
+            bigger = fmaxf(maxval, v1);
+            sumval = sumval * expf(maxval - bigger) + expf(v1 - bigger);
+            maxval = bigger;
+        }
+        if (i + 2 * warpSize < C) {
+            bigger = fmaxf(maxval, v2);
+            sumval = sumval * expf(maxval - bigger) + expf(v2 - bigger);
+            maxval = bigger;
+        }
+        if (i + 3 * warpSize < C) {
+            bigger = fmaxf(maxval, v3);
+            sumval = sumval * expf(maxval - bigger) + expf(v3 - bigger);
+            maxval = bigger;
+        }
+    }
+
+    // warp-level reduction for maxval and sumval
+    float offsetMaxval, offsetSumval;
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        __syncwarp();
+        offsetMaxval = __shfl_down_sync(0xFFFFFFFF, maxval, offset);
+        offsetSumval = __shfl_down_sync(0xFFFFFFFF, sumval, offset);
+        if (offsetMaxval > maxval) {
+            sumval *= expf(maxval - offsetMaxval);
+            maxval = offsetMaxval;
+        } else {
+            offsetSumval *= expf(offsetMaxval - maxval);
+        }
+        sumval += offsetSumval;
+    }
+
+    // broadcast the maxval and sumval to all lanes
+    maxval = __shfl_sync(0xFFFFFFFF, maxval, 0);
+    sumval = __shfl_sync(0xFFFFFFFF, sumval, 0);
+
+    // compute exp(x - max) * inv_sum, unrolled by 4
+    float inv_sumval = 1.0f / sumval;
+    for (int i = laneId; i < C; i += warpSize * UNROLL) {
+        float v0 = x[min(C - 1, i)];
+        float v1 = x[min(C - 1, i + warpSize)];
+        float v2 = x[min(C - 1, i + 2 * warpSize)];
+        float v3 = x[min(C - 1, i + 3 * warpSize)];
+        if (i < C)                  y[i]                  = expf(v0 - maxval) * inv_sumval;
+        if (i + warpSize < C)       y[i + warpSize]       = expf(v1 - maxval) * inv_sumval;
+        if (i + 2 * warpSize < C)   y[i + 2 * warpSize]   = expf(v2 - maxval) * inv_sumval;
+        if (i + 3 * warpSize < C)   y[i + 3 * warpSize]   = expf(v3 - maxval) * inv_sumval;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -616,6 +708,12 @@ void softmax_forward_online8(float* out, const float* inp, int N, int C, int blo
     cudaCheck(cudaGetLastError());
 }
 
+void softmax_forward_online9(float* out, const float* inp, int N, int C, int block_size) {
+    const int grid_size = ceil_div(N * 32, block_size);
+    softmax_forward_online_kernel9<<<grid_size, block_size>>>(out, inp, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void softmax_forward(int kernel_num, float* out, const float* inp, int N, int C, const int block_size) {
     switch (kernel_num) {
@@ -642,6 +740,9 @@ void softmax_forward(int kernel_num, float* out, const float* inp, int N, int C,
             break;
         case 8:
             softmax_forward_online8(out, inp, N, C, block_size);
+            break;
+        case 9:
+            softmax_forward_online9(out, inp, N, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
