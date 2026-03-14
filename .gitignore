@@ -34,3 +34,5 @@ dev/cuda/global_norm
 
 # log files
 *.log
+.claude/
+CLAUDE.md
