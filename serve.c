@@ -23,6 +23,7 @@ Usage:
 #endif
 
 #include "llmc/gguf.h"
+#include "llmc/gguf_dequant.h"
 #include "llmc/bpe_tokenizer.h"
 #include "llmc/sampler.h"
 
@@ -163,7 +164,7 @@ static void matvec(float *out, GGUFTensor *W, const float *in, int m, int n) {
     for (int i = 0; i < m; i++) {
         // dequantize row i
         float *row_local = (float *)malloc(n * sizeof(float));
-        gguf_dequantize_row(W, i, row_local);
+        gguf_dequant_row(W, i, row_local);
         float dot = 0.0f;
         for (int j = 0; j < n; j++) dot += row_local[j] * in[j];
         out[i] = dot;
@@ -219,13 +220,13 @@ static void llama_forward(LlamaConfig *cfg, LlamaWeights *w, RunState *s,
 
     // --- Token embedding ---
     // token_embd: [vocab_size, embed_dim] stored as (vocab_size rows, embed_dim cols)
-    gguf_dequantize_row(w->token_embd, token_id, s->x);
+    gguf_dequant_row(w->token_embd, token_id, s->x);
 
     // --- Transformer layers ---
     for (int l = 0; l < cfg->n_layers; l++) {
         // RMSNorm before attention
         float *norm_w = (float *)malloc(d * sizeof(float));
-        gguf_dequantize_row(w->attn_norm[l], 0, norm_w);
+        gguf_dequant_row(w->attn_norm[l], 0, norm_w);
         rmsnorm(s->xb, s->x, norm_w, d, eps);
         free(norm_w);
 
@@ -275,7 +276,7 @@ static void llama_forward(LlamaConfig *cfg, LlamaWeights *w, RunState *s,
 
         // RMSNorm before FFN
         float *fnorm_w = (float *)malloc(d * sizeof(float));
-        gguf_dequantize_row(w->ffn_norm[l], 0, fnorm_w);
+        gguf_dequant_row(w->ffn_norm[l], 0, fnorm_w);
         rmsnorm(s->xb, s->x, fnorm_w, d, eps);
         free(fnorm_w);
 
@@ -291,7 +292,7 @@ static void llama_forward(LlamaConfig *cfg, LlamaWeights *w, RunState *s,
 
     // --- Output norm + logits ---
     float *onorm_w = (float *)malloc(d * sizeof(float));
-    gguf_dequantize_row(w->output_norm, 0, onorm_w);
+    gguf_dequant_row(w->output_norm, 0, onorm_w);
     rmsnorm(s->xb, s->x, onorm_w, d, eps);
     free(onorm_w);
 
@@ -390,6 +391,7 @@ static GGUFTensor *require_tensor(GGUFContext *ctx, const char *name) {
 
 static LlamaModel *llama_load(const char *path, int context_override) {
     fprintf(stderr, "Loading GGUF model: %s\n", path);
+    gguf_dequant_init();  // ensure all dequant types are registered
     GGUFContext *ctx = gguf_load(path);
 
     const char *arch = gguf_get_str(ctx, "general.architecture", "llama");

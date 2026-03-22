@@ -21,7 +21,7 @@ fail() { ((FAIL++)); echo -e "  ${RED}✗${NC} $1"; }
 
 # ---------------------------------------------------------------------------
 # Config
-MODEL="${1:-$HOME/Projects/TestInference/models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf}"
+MODEL="${1:-$HOME/Projects/TestInference/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf}"
 PORT=18199  # high port to avoid conflicts
 SERVER_PID=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

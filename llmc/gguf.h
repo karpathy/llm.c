@@ -48,7 +48,14 @@ static const int ggml_blk_size[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F16]  = 1,
     [GGML_TYPE_Q4_0] = 32,
     [GGML_TYPE_Q4_1] = 32,
+    [6]  = 32,   // Q5_0
+    [7]  = 32,   // Q5_1
     [GGML_TYPE_Q8_0] = 32,
+    [10] = 256,  // Q2_K
+    [11] = 256,  // Q3_K
+    [12] = 256,  // Q4_K
+    [13] = 256,  // Q5_K
+    [14] = 256,  // Q6_K
 };
 
 static const int ggml_type_size[GGML_TYPE_COUNT] = {
@@ -56,7 +63,14 @@ static const int ggml_type_size[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F16]  = 2,
     [GGML_TYPE_Q4_0] = 18,  // 2 (f16 scale) + 16 (32 x 4bit)
     [GGML_TYPE_Q4_1] = 20,  // 2 + 2 + 16
+    [6]  = 22,   // Q5_0
+    [7]  = 24,   // Q5_1
     [GGML_TYPE_Q8_0] = 34,  // 2 (f16 scale) + 32 (int8 quants)
+    [10] = 84,   // Q2_K
+    [11] = 110,  // Q3_K
+    [12] = 144,  // Q4_K
+    [13] = 176,  // Q5_K
+    [14] = 210,  // Q6_K
 };
 
 // ----------------------------------------------------------------------------
