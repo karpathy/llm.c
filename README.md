@@ -113,6 +113,110 @@ make test_gpt2cu USE_CUDNN=1 && ./test_gpt2cu
 
 This tests both the fp32 path and the mixed precision path. The test should pass and print `overall okay: 1`.
 
+## llm-serve (inference server)
+
+`llm-serve` is a lightweight LLaMA inference server that loads GGUF model files and serves an OpenAI-compatible HTTP API. It runs entirely in C with no external dependencies beyond libc and (optionally) OpenMP.
+
+### building
+
+```bash
+make llm-serve
+```
+
+This produces the `./llm-serve` binary.
+
+### running
+
+```bash
+./llm-serve -m /path/to/model.gguf [-p port] [-c context_size] [-t threads]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-m` | *(required)* | Path to a GGUF model file |
+| `-p` | 8080 | HTTP port |
+| `-c` | model default | Context window size override |
+| `-t` | 4 | Number of OpenMP threads |
+
+Example with TinyLlama:
+
+```bash
+./llm-serve -m ~/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p 8080 -t 4
+```
+
+### API endpoints
+
+**`GET /health`** — Returns `{"status":"ok"}` when the server is ready.
+
+**`POST /v1/completions`** — OpenAI-compatible text completion.
+
+```bash
+curl -X POST http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "The capital of France is",
+    "max_tokens": 32,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "stream": false
+  }'
+```
+
+Response:
+```json
+{
+  "choices": [{"text": " Paris, which...", "finish_reason": "stop"}],
+  "usage": {"prompt_tokens": 7, "completion_tokens": 32}
+}
+```
+
+Set `"stream": true` for Server-Sent Events (SSE) streaming.
+
+### integration test
+
+An integration test script verifies the happy path end-to-end: build, server startup, health check, completions (greedy + sampled), streaming, and error handling.
+
+**Prerequisites:** `curl` and `jq` must be installed.
+
+```bash
+# Run with the default model path
+./test_serve_integration.sh
+
+# Or specify a model explicitly
+./test_serve_integration.sh /path/to/model.gguf
+```
+
+The test uses port 18199 to avoid conflicts and automatically cleans up the server process on exit. It takes 1–2 minutes depending on model size (most of that is model loading and generation).
+
+**What it tests:**
+
+| # | Test | What's checked |
+|---|------|----------------|
+| 1 | `GET /health` | Returns `{"status":"ok"}` |
+| 2 | `POST /v1/completions` (greedy) | Valid JSON, non-empty text, finish_reason, usage tokens |
+| 3 | `POST /v1/completions` (sampling) | temp=0.8, top_p=0.95 returns text |
+| 4 | Missing prompt | Returns HTTP 400 |
+| 5 | Unknown route | Returns HTTP 404 |
+| 6 | Streaming | SSE `data:` lines + `[DONE]` sentinel |
+
+Output looks like:
+
+```
+=== llm-serve integration test ===
+Building llm-serve...
+Starting server on port 18199...
+Server ready (PID 12345).
+
+Test 1: GET /health
+  ✓ /health returns {"status":"ok"}
+Test 2: POST /v1/completions (basic)
+  ✓ Response is valid JSON
+  ✓ Response has non-empty choices array
+  ✓ Generated text is non-empty: "Paris, the city of..."
+  ...
+=== Results: 12 passed, 0 failed ===
+```
+
 ## tutorial
 
 I attached a very small tutorial here, in [doc/layernorm/layernorm.md](doc/layernorm/layernorm.md). It's a simple, step-by-step guide to implementing a single layer of the GPT-2 model, the layernorm layer. This is a good starting point to understand how the layers are implemented in C.
