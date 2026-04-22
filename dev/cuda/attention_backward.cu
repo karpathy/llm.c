@@ -650,6 +650,7 @@ __global__ void softmax_autoregressive_backward_kernel7(float* dpreatt, const fl
     if(warp.meta_group_rank() == 0) {
         block_acc[warp.thread_rank()] = 0;
     }
+    block.sync();
 
     float local_sum = 0;
     for(int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
@@ -690,6 +691,7 @@ __global__ void softmax_autoregressive_backward_kernel8(float* dpreatt, const fl
     if (warp.meta_group_rank() == 0) {
         block_acc[warp.thread_rank()] = 0;
     }
+    block.sync();
 
     for(int to = 0; to < T_per_block; ++to) {
         int t = t0 - to;
