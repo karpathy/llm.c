@@ -217,7 +217,7 @@ int cudaMallocConditionallyManaged(void** out, size_t bytes, const char *file, i
         // if we OOM, fallback to a managed allocation. slower but at least won't crash.
         cudaGetLastError(); // reset the error before the next API call
         cudaCheck_(cudaMallocManaged(out, bytes), file, line);
-        cudaCheck_(cudaMemAdvise(*out, bytes, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId), file, line);
+        cudaCheck_(cudaMemAdvise(*out, bytes, cudaMemAdviseSetPreferredLocation, cudaMemLocation{cudaMemLocationTypeHost, 0}), file, line);
         return 1;
     } else {
         cudaCheck_(err, file, line);
