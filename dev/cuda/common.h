@@ -359,15 +359,23 @@ float benchmark_kernel(int repeats, Kernel kernel, KernelArgs&&... kernel_args) 
     cudaCheck(cudaSetDevice(deviceIdx));
     cudaDeviceProp deviceProp;
     cudaCheck(cudaGetDeviceProperties(&deviceProp, deviceIdx));
+    // 2x L2 so a single memset is guaranteed to evict everything
     void* flush_buffer;
-    cudaCheck(cudaMalloc(&flush_buffer, deviceProp.l2CacheSize));
+    size_t flush_size = 2 * (size_t)deviceProp.l2CacheSize;
+    cudaCheck(cudaMalloc(&flush_buffer, flush_size));
+
+    // disable persisting L2 so kernels can't keep data resident across iters
+    size_t prev_persist_size = 0;
+    cudaCheck(cudaDeviceGetLimit(&prev_persist_size, cudaLimitPersistingL2CacheSize));
+    cudaCheck(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0));
 
     cudaCheck(cudaEventCreate(&start));
     cudaCheck(cudaEventCreate(&stop));
     float elapsed_time = 0.f;
     for (int i = 0; i < repeats; i++) {
-        // clear L2
-        cudaCheck(cudaMemset(flush_buffer, 0, deviceProp.l2CacheSize));
+        // clear L2 — reset before memset so any persisting lines become evictable
+        cudaCheck(cudaCtxResetPersistingL2Cache());
+        cudaCheck(cudaMemset(flush_buffer, 0, flush_size));
         // now we can start recording the timing of the kernel
         cudaCheck(cudaEventRecord(start, nullptr));
         kernel(std::forward<KernelArgs>(kernel_args)...);
@@ -380,6 +388,7 @@ float benchmark_kernel(int repeats, Kernel kernel, KernelArgs&&... kernel_args) 
     }
 
     cudaCheck(cudaFree(flush_buffer));
+    cudaCheck(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, prev_persist_size));
 
     return elapsed_time / repeats;
 }

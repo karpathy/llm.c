@@ -501,6 +501,26 @@ void layernorm_forward6(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
+// intentionally broken kernel — passes pre-bench, corrupts out[0] later, for the post-bench check
+__device__ int kernel7_call_counter = 0;
+
+__global__ void kernel7_corrupt_after_n(float* out) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int c = atomicAdd(&kernel7_call_counter, 1);
+        if (c >= 10) {
+            out[0] = 1234.5f;
+        }
+    }
+}
+
+void layernorm_forward7(float* out, float* mean, float* rstd,
+                        const float* inp, const float* weight, const float* bias,
+                        int B, int T, int C, const int block_size) {
+    layernorm_forward5(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
+    kernel7_corrupt_after_n<<<1, 1>>>(out);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void layernorm_forward(int kernel_num,
                     float* out, float* mean, float* rstd,
@@ -525,6 +545,9 @@ void layernorm_forward(int kernel_num,
             break;
         case 6:
             layernorm_forward6(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
+            break;
+        case 7:
+            layernorm_forward7(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -610,6 +633,13 @@ int main(int argc, char **argv) {
 
         printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
     }
+
+    // re-check correctness after the benchmark loop to catch any across-iter drift
+    printf("\nPost-benchmark correctness re-check.\n");
+    validate_result(d_out, out, "out (post-bench)", B * T * C, 1e-5f);
+    validate_result(d_mean, mean, "mean (post-bench)", B * T, 1e-5f);
+    validate_result(d_rstd, rstd, "rstd (post-bench)", B * T, 1e-5f);
+    printf("Post-benchmark results still match the CPU reference.\n");
 
     // free memory
     free(out);
