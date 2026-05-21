@@ -148,7 +148,7 @@ int main(int argc, char *argv[]) {
             // finally check all the gradients
             int gradoks[16];
             ParameterTensors grads = model.grads;
-            gradoks[0] = check_tensor(grads.wte, expected_grads.wte, V*C, "dwte");
+            gradoks[0] = check_tensor(grads.wte, expected_grads.wte, Vp*C, "dwte");
             gradoks[1] = check_tensor(grads.wpe, expected_grads.wpe, maxT*C, "dwpe");
             gradoks[2] = check_tensor(grads.ln1w, expected_grads.ln1w, L*C, "dln1w");
             gradoks[3] = check_tensor(grads.ln1b, expected_grads.ln1b, L*C, "dln1b");
