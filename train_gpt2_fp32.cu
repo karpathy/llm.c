@@ -815,7 +815,16 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     // backward to bias, if given, does a +=
     if (dbias != NULL) {
         const int block_size = 1024;
-        const int grid_size = OC / 32; // for now, OC must be divisible by 32 for this kernel to work
+        // each block reduces warpSize columns (tl = blockIdx.x * warpSize in the
+        // kernel), so the grid must stride by the wavefront width: 32 on NVIDIA /
+        // RDNA, 64 on CDNA. Spacing blocks by a literal 32 on wave64 would make
+        // adjacent blocks overlap and the last block read past dout (-> NaN dbias).
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+        const int warp_width = LLMC_WARP_SIZE;
+#else
+        const int warp_width = 32;
+#endif
+        const int grid_size = OC / warp_width; // OC must be divisible by the wavefront width
         matmul_backward_bias_kernel4<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
         cudaCheck(cudaGetLastError());
     }

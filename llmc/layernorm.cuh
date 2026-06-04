@@ -443,7 +443,9 @@ void layernorm_forward(floatX* out, float* mean, float* rstd,
     // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
     // this may fail, in which case we fall back to the smem free implementation.
     cudaCheck(cudaGetLastError());
-    auto status = cudaFuncSetAttribute(layernorm_forward_kernel6, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    // hipFuncSetAttribute takes the kernel as const void* (CUDA also accepts this
+    // and additionally has a templated T* overload); cast for portability.
+    auto status = cudaFuncSetAttribute((const void*)layernorm_forward_kernel6, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaCheck(cudaGetLastError());
     if (status == cudaSuccess) {
         layernorm_forward_kernel6<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(out, mean, rstd, inp, weight, bias, N, C);
@@ -476,7 +478,7 @@ void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, floa
     // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
     // this may fail, in which case we fall back to the smem free implementation.
     cudaCheck(cudaGetLastError());
-    auto status = cudaFuncSetAttribute(fused_residual_forward_kernel5, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    auto status = cudaFuncSetAttribute((const void*)fused_residual_forward_kernel5, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaCheck(cudaGetLastError());
     if(status == cudaSuccess) {
         fused_residual_forward_kernel5<<<grid_size, dim3(WARP_SIZE, block_y), smem, stream>>>(residual, normed,
@@ -497,7 +499,13 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     const int blocks_per_sm = 2; // supported on every architecture and less cache thrashing than 3
     const int grid_size = blocks_per_sm * deviceProp.multiProcessorCount;
     size_t rounded_C = CEIL_DIV(C, (32 * x128::size)) * (32 * x128::size);
-    size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - 32) * f128::size) * sizeof(float);
+    // The kernel bases the dbias/dweight temp-shared regions at offsets of
+    // WARP_SIZE*f128::size (see *_tmp_shared in layernorm_backward_kernel10), so
+    // the host reservation uses WARP_SIZE to match the kernel's exact footprint.
+    // A literal 32 on wave64 reserves 2*(64-32)*f128::size floats MORE than the
+    // device uses -- a harmless over-allocation, not corruption -- but keeping it
+    // WARP_SIZE keeps the host reservation and device layout consistent.
+    size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - WARP_SIZE) * f128::size) * sizeof(float);
 
     cudaCheck(cudaMemsetAsync(scratch, 0, 1 * sizeof(float), stream)); // only need to reset the flag to 0
     layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);

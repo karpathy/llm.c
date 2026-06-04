@@ -143,17 +143,29 @@ __global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n, ptrdiff_t
 // ----------------------------------------------------------------------------
 // Warp/Block communication primitives
 
+// Full-warp shuffle mask and starting butterfly offset. On HIP the mask must be
+// 64-bit (it will not compile otherwise) and the offset must span the whole
+// wavefront (WARP_SIZE/2 == 32 on wave64), or a wave64 reduction would silently
+// fold only 32 of 64 lanes. On NVIDIA both reduce to the original 0xFFFFFFFF/16.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+#define WARP_REDUCE_MASK   LLMC_FULL_WARP_MASK
+#define WARP_REDUCE_OFFSET (WARP_SIZE / 2)
+#else
+#define WARP_REDUCE_MASK   0xFFFFFFFFU
+#define WARP_REDUCE_OFFSET 16
+#endif
+
 // warp-level reduction for summing values
 __device__ inline float warpReduceSum(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    for (int offset = WARP_REDUCE_OFFSET; offset > 0; offset /= 2) {
+        val += __shfl_xor_sync(WARP_REDUCE_MASK, val, offset);
     }
     return val;
 }
 // warp-level reduction for finding the maximum value
 __device__ inline float warpReduceMax(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
+    for (int offset = WARP_REDUCE_OFFSET; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_xor_sync(WARP_REDUCE_MASK, val, offset));
     }
     return val;
 }
@@ -166,7 +178,12 @@ template<reduction_func_t warp_reduction>
 __device__ inline float blockReduce(float val, bool final_sync=false, float out_of_bounds=0.0f) {
     // two reductions of up to 1024 threads:
     // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
-    __shared__ float shared_val[WARP_SIZE];
+    // The cross-warp scratch is indexed by warp_id, so it must hold one entry per
+    // warp. The runtime warp count is not a constant expression, so size it to the
+    // compile-time upper bound: a 1024-thread block has at most 1024/32 = 32 warps
+    // (the narrowest wave is 32 lanes), which also covers wave64 (<=16 warps).
+    constexpr int kMaxWarpsPerBlock = 1024 / 32;
+    __shared__ float shared_val[kMaxWarpsPerBlock];
     const int lane_id = threadIdx.x % WARP_SIZE;
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int num_warps = blockDim.x / WARP_SIZE;
