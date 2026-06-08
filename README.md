@@ -27,6 +27,17 @@ python dev/data/tinyshakespeare.py
 python train_gpt2.py
 ```
 
+## quick start (AMD GPU, ROCm/HIP)
+
+llm.c also builds and trains on AMD GPUs through ROCm/HIP. With a [ROCm](https://rocm.docs.amd.com/) installation (7.2 or newer), build any of the GPU targets by adding `USE_HIP=1` and your GPU architecture to the make command:
+
+```bash
+make train_gpt2cu USE_HIP=1 AMDGPU_TARGETS=gfx90a
+./train_gpt2cu
+```
+
+Set `AMDGPU_TARGETS` to your GPU (for example `gfx90a` for CDNA2 / MI200, or `gfx1100` for RDNA3). The default NVIDIA/CUDA build is unchanged; `USE_HIP=1` repoints the build at `hipcc`.
+
 ## quick start (CPU)
 
 The "I am so GPU poor that I don't even have one GPU" section. You can still enjoy seeing llm.c train! But you won't go too far. Just like the fp32 version above, the CPU version is an even earlier checkpoint in the history of llm.c, back when it was just a simple reference implementation in C. For example, instead of training from scratch, you can finetune a GPT-2 small (124M) to output Shakespeare-like text, as an example:
