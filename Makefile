@@ -123,6 +123,7 @@ ifeq ($(USE_CUDNN), 1)
     endif
     NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH)
     NVCC_LDFLAGS += -lcudnn
+	NVCC_LDFLAGS += -lnvrtc
     NVCC_FLAGS += -DENABLE_CUDNN
     NVCC_CUDNN = $(BUILD_DIR)/cudnn_att.o
   else
