@@ -50,11 +50,13 @@ __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout
 
     __shared__ float sub_results[x128::size][WARP_SIZE][bdy];
 
-    // reduce within-warp results
+    // reduce within-warp results. WARP_REDUCE_MASK is the full-warp mask (64-bit
+    // on HIP, which will not compile with the 0xffffffff literal); the width-4
+    // sub-group is wave-size-agnostic (4 <= warpSize on both wave32 and wave64).
     for (int k = 0; k < x128::size; k++) {
         float v = accumulators[k];
-        v += __shfl_down_sync(0xffffffff, v, 1, 4);
-        v += __shfl_down_sync(0xffffffff, v, 2, 4);
+        v += __shfl_down_sync(WARP_REDUCE_MASK, v, 1, 4);
+        v += __shfl_down_sync(WARP_REDUCE_MASK, v, 2, 4);
         if(warp_d == 0) {
             sub_results[k][block_d][warp_c] = v;
         }
@@ -66,8 +68,8 @@ __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout
         float a = 0.f;
         for (int r = warp_d; r < blockDim.z; r += bdx) {
             float v = sub_results[k][r][warp_c];
-            v += __shfl_down_sync(0xffffffff, v, 1, 4);
-            v += __shfl_down_sync(0xffffffff, v, 2, 4);
+            v += __shfl_down_sync(WARP_REDUCE_MASK, v, 1, 4);
+            v += __shfl_down_sync(WARP_REDUCE_MASK, v, 2, 4);
             a += v;
         }
         if(warp_d == 0 && global_oc < OC) {
@@ -198,8 +200,12 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
     }
 
     // set scale type to FP32 (needs to be FP16 if and only if using CUBLAS_COMPUTE_16F, so it's FP32 even for FP8!)
+    // hipBLASLt has no CUBLASLT_MATMUL_DESC_SCALE_TYPE attribute; the scale type
+    // follows the compute type (FP32 here), so this is a no-op on HIP.
+#if !defined(USE_HIP) && !defined(__HIP_PLATFORM_AMD__)
     cublasDataType_t scale_type = CUDA_R_32F;
     cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &scale_type, sizeof(scale_type)));
+#endif
 
     // find a suitable algorithm (cached internally so shouldn't take much CPU time in practice)
     cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc, ALayout, BLayout, CLayout, DLayout,
@@ -255,8 +261,11 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
 
         const int block_size = deviceProp.maxThreadsPerMultiProcessor == 1536 ? 768 : 1024;
 
-        dim3 block_dim = {4, 8, (unsigned)block_size/WARP_SIZE};
-        const int OC_per_warp = block_dim.y * x128::size; // 64 at BF16
+        // block_dim.y must equal the kernel's bdy = WARP_SIZE/bdx (bdx==4), so the
+        // warp is fully tiled into width-4 sub-groups; hardcoding 8 (the wave32
+        // value) trips the kernel's assert(blockDim.y == bdy) on wave64.
+        dim3 block_dim = {4, WARP_SIZE / 4, (unsigned)block_size/WARP_SIZE};
+        const int OC_per_warp = block_dim.y * x128::size; // 64 at BF16 on wave32
         const int grid_size_x = CEIL_DIV(OC, OC_per_warp); // e.g. 12 horizontal blocks for 768 OCs at BF16
         const int grid_size_y = max(1, deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / (block_size * grid_size_x)); // full GPU!
 

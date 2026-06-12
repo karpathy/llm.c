@@ -25,6 +25,39 @@ NVCC_CUDNN =
 # By default we don't build with cudnn because it blows up compile time from a few seconds to ~minute
 USE_CUDNN ?= 0
 
+# ROCm / HIP build for AMD GPUs. Set USE_HIP=1 to compile the .cu sources with
+# hipcc instead of nvcc; the same target names (train_gpt2cu, test_gpt2cu, ...)
+# then build for AMD. The target arch is auto-detected with amdgpu-arch and can
+# be overridden with AMDGPU_TARGETS=<arch>; gfx90a is the fallback default.
+USE_HIP ?= 0
+ifeq ($(USE_HIP), 1)
+  # Mirror the nvidia-smi compute_cap query below: when the arch is not given,
+  # detect the installed GPUs with amdgpu-arch (ships with ROCm/LLVM). The tool
+  # is often not on PATH (it lives in <rocm>/llvm/bin), so fall back to locating
+  # it via hipconfig --rocmpath. An absent tool yields empty output, so the
+  # strip-check below falls back to gfx90a.
+  ifndef AMDGPU_TARGETS
+    ifneq ($(CI),true)
+      AMDGPU_ARCH_TOOL := $(shell which amdgpu-arch 2>/dev/null)
+      ifeq ($(AMDGPU_ARCH_TOOL),)
+        AMDGPU_ARCH_TOOL := $(shell hipconfig --rocmpath 2>/dev/null)/llvm/bin/amdgpu-arch
+      endif
+      AMDGPU_TARGETS := $(shell $(AMDGPU_ARCH_TOOL) 2>/dev/null | sort -u | paste -sd ';')
+    endif
+  endif
+  ifeq ($(strip $(AMDGPU_TARGETS)),)
+    AMDGPU_TARGETS := gfx90a
+  endif
+  # Wavefront width is 64 on CDNA (gfx9xx) and 32 on RDNA (gfx10xx/gfx11xx).
+  # Derive it from the target arch and pass it to both HIP compile passes; the
+  # sources use it for host launch geometry and device reductions alike.
+  ifneq ($(filter gfx9%,$(AMDGPU_TARGETS)),)
+    LLMC_WARP_SIZE ?= 64
+  else
+    LLMC_WARP_SIZE ?= 32
+  endif
+endif
+
 # We will place .o files in the `build` directory (create it if it doesn't exist)
 BUILD_DIR = build
 ifeq ($(OS), Windows_NT)
@@ -47,7 +80,8 @@ endef
 endif
 
 ifneq ($(CI),true) # if not in CI, then use the GPU query
-  ifndef GPU_COMPUTE_CAPABILITY # set to defaults if: make GPU_COMPUTE_CAPABILITY=
+  ifeq ($(USE_HIP), 1) # HIP build: arch comes from AMDGPU_TARGETS, skip nvidia-smi
+  else ifndef GPU_COMPUTE_CAPABILITY # set to defaults if: make GPU_COMPUTE_CAPABILITY=
     ifneq ($(call file_exists_in_path, nvidia-smi),)
       # Get the compute capabilities of all GPUs
       # Remove decimal points, sort numerically in ascending order, and select the first (lowest) value
@@ -66,8 +100,47 @@ endif
 $(info ---------------------------------------------)
 
 ifneq ($(OS), Windows_NT)
-  NVCC := $(shell which nvcc 2>/dev/null)
-  NVCC_LDFLAGS += -lnvidia-ml
+  ifeq ($(USE_HIP), 1)
+    # HIP toolchain: hipcc compiles the .cu sources directly (no hipify step).
+    # The compat header (llmc/cuda_to_hip.h) is force-included on every HIP TU so
+    # the CUDA-spelled symbols resolve, and llmc/hip_shims is on the include path
+    # so the CUDA-named toolkit headers (<cuda_runtime.h>, <cublasLt.h>, ...)
+    # forward to it. NVCC is repointed at hipcc so the existing build rules apply.
+    HIPCC ?= $(shell which hipcc 2>/dev/null)
+    NVCC := $(HIPCC)
+    # NOTE: do NOT use clang's -ffast-math here. It is far more aggressive than
+    # nvcc's --use_fast_math (it enables -fassociative-math / -funsafe-math-
+    # optimizations / -fno-signed-zeros), which reassociates the online-softmax
+    # and layernorm-backward reductions on gfx90a into NaN gradients (the forward
+    # loss stays correct, only the backward NaNs). -ffp-contract=fast gives the
+    # FMA contraction that matters for perf while keeping IEEE semantics.
+    NVCC_FLAGS := -O$(FORCE_NVCC_O) -std=c++17 -ffp-contract=fast -fno-math-errno \
+                  $(addprefix --offload-arch=,$(AMDGPU_TARGETS)) \
+                  -DUSE_HIP=1 -DLLMC_WARP_SIZE=$(LLMC_WARP_SIZE) \
+                  -include llmc/cuda_to_hip.h -I llmc/hip_shims
+    # ROCm's clang selects the highest /usr/lib/gcc/<triple>/<ver> dir even when
+    # that GCC's libstdc++ headers are absent (e.g. Ubuntu installs libgcc-14-dev
+    # without libstdc++-14-dev), failing with "Could not find standard C++ header".
+    # Probe for that and pin --gcc-install-dir to the newest GCC version that has
+    # matching headers under /usr/include/c++/<ver>.
+    HIP_STDLIB_OK := $(shell $(HIPCC) -x c++ -fsyntax-only -include cmath /dev/null >/dev/null 2>&1 && echo 1)
+    ifneq ($(HIP_STDLIB_OK),1)
+      HIP_GCC_DIR := $(shell for d in /usr/lib/gcc/*/*; do v=$$(basename "$$d"); [ -d "/usr/include/c++/$$v" ] && echo "$$d"; done | sort -V | tail -n1)
+      ifneq ($(strip $(HIP_GCC_DIR)),)
+        $(info → hipcc cannot find libstdc++ headers; pinning --gcc-install-dir=$(HIP_GCC_DIR))
+        NVCC_FLAGS += --gcc-install-dir=$(HIP_GCC_DIR)
+      endif
+    endif
+    NVCC_LDFLAGS := -lhipblas -lhipblaslt
+    NVCC_INCLUDES :=
+    NVCC_LDLIBS :=
+    # -lineinfo is nvcc-only; hipcc (clang) rejects it.
+    LINEINFO :=
+  else
+    NVCC := $(shell which nvcc 2>/dev/null)
+    NVCC_LDFLAGS += -lnvidia-ml
+    LINEINFO := -lineinfo
+  endif
 
   # Function to test if the compiler accepts a given flag.
   define check_and_add_flag
@@ -83,7 +156,16 @@ else
   CFLAGS :=
   REMOVE_FILES = del *.exe,*.obj,*.lib,*.exp,*.pdb && del
   SHELL_UNAME := Windows
-  ifneq ($(shell where nvcc 2> nul),"")
+  ifeq ($(USE_HIP), 1)
+    # HIP toolchain on Windows. Mirrors the non-Windows USE_HIP branch above but
+    # uses cmd `where` (not the unix `which`) for detection. hipcc compiles the
+    # .cu sources directly; the compat header is force-included and hip_shims is
+    # on the include path so the CUDA-named toolkit headers forward to HIP.
+    # `where` can return several matches (hipcc.bat, hipcc.exe, ...); take the first.
+    HIPCC ?= $(firstword $(shell where hipcc 2> nul))
+    NVCC := $(HIPCC)
+    LINEINFO :=
+  else ifneq ($(shell where nvcc 2> nul),"")
     NVCC := nvcc
   else
     NVCC :=
@@ -94,7 +176,24 @@ else
   LDFLAGS :=
   LDLIBS :=
   INCLUDES :=
-  NVCC_FLAGS += -I"dev"
+  ifeq ($(USE_HIP), 1)
+    # -DNOMINMAX/-DWIN32_LEAN_AND_MEAN: the HIP runtime headers pull in <windows.h>,
+    # whose min/max macros otherwise break std::min/std::max in the sources.
+    NVCC_FLAGS := -O3 -std=c++17 -ffp-contract=fast -fno-math-errno \
+                  $(addprefix --offload-arch=,$(AMDGPU_TARGETS)) \
+                  -DUSE_HIP=1 -DLLMC_WARP_SIZE=$(LLMC_WARP_SIZE) -DNOMINMAX -DWIN32_LEAN_AND_MEAN \
+                  -include llmc/cuda_to_hip.h -I llmc/hip_shims -I"dev"
+    # Windows ROCm lib linkage: hipblas ships an MSVC import lib (hipblas.lib),
+    # but hipblaslt ships only a GNU import lib (libhipblaslt.dll.a) with no
+    # hipblaslt.lib, so lld-link must consume it by full path, not via -l. Pass
+    # HIP_LIB_DIR=<rocm>/lib on the make command line (the ROCm lib directory).
+    # -Xlinker for the .dll.a so hipcc's -x hip does not treat it as a source file.
+    NVCC_LDFLAGS := -L"$(HIP_LIB_DIR)" -lhipblas -Xlinker "$(HIP_LIB_DIR)/libhipblaslt.dll.a"
+    NVCC_INCLUDES :=
+    NVCC_LDLIBS :=
+  else
+    NVCC_FLAGS += -I"dev"
+  endif
   ifeq ($(WIN_CI_BUILD),1)
     $(info Windows CI build)
     OUTPUT_FILE = /link /OUT:$@
@@ -102,7 +201,13 @@ else
   else
     $(info Windows local build)
     OUTPUT_FILE = /link /OUT:$@ && copy /Y $@ $@.exe
-    CUDA_OUTPUT_FILE = -o $@ && copy /Y $@.exe $@
+    # hipcc/clang emits $@.exe from -o $@.exe; copy to the extensionless name the
+    # README/test commands invoke. (nvcc's -o $@ already produces $@.exe.)
+    ifeq ($(USE_HIP), 1)
+      CUDA_OUTPUT_FILE = -o $@.exe && copy /Y $@.exe $@
+    else
+      CUDA_OUTPUT_FILE = -o $@ && copy /Y $@.exe $@
+    endif
   endif
 endif
 
@@ -283,7 +388,7 @@ test_gpt2fp32cu: test_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE)
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $(LINEINFO) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE)
 
 clean:
 	$(REMOVE_FILES) $(TARGETS)

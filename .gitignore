@@ -34,3 +34,13 @@ dev/cuda/global_norm
 
 # log files
 *.log
+
+# ROCm/HIP build artifacts
+build/
+test_gpt2cu*
+train_gpt2cu*
+*.bin
+*.dll
+amd_comgr*
+rocblas/
+nul

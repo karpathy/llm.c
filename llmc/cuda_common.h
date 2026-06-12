@@ -28,11 +28,21 @@ extern cudaDeviceProp deviceProp;
 
 // WarpSize is not a compile time constant
 // Defining here like this possibly allows the compiler to optimize better
+// On ROCm the wavefront is 64 on CDNA (gfx90a/gfx94x) and 32 on RDNA; the build
+// derives LLMC_WARP_SIZE from the single target arch and defines it for both the
+// host and device compile passes (see llmc/cuda_to_hip.h), so the host launch
+// geometry and the device reductions agree.
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+#define WARP_SIZE ((unsigned)LLMC_WARP_SIZE)
+#else
 #define WARP_SIZE 32U
+#endif
 
 // try to make sure that 2 blocks fit on A100/H100 to maximise latency tolerance
 // this needs to be defines rather than queried to be used for __launch_bounds__
-#if __CUDA_ARCH__ == 800 || __CUDA_ARCH__ >= 900
+#if defined(USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+#define MAX_1024_THREADS_BLOCKS 1
+#elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ >= 900
 #define MAX_1024_THREADS_BLOCKS 2
 #else
 #define MAX_1024_THREADS_BLOCKS 1
@@ -98,7 +108,9 @@ typedef __nv_bfloat16 floatX;
 // our own versions if none already exist, otherwise the compiler will complain.
 // If not, you easily get "no viable overload" (for sm52) and "function already exists" (sm_80)
 
-#if defined(ENABLE_BF16) && (__CUDACC_VER_MAJOR__ < 12) && !((__CUDA_ARCH__ >= 800) || !defined(__CUDA_ARCH__))
+// On HIP the compat header (llmc/cuda_to_hip.h) supplies generic __ldcs/__stcs,
+// so this NVIDIA-only bf16 fallback is excluded.
+#if !defined(USE_HIP) && !defined(__HIP_PLATFORM_AMD__) && defined(ENABLE_BF16) && (__CUDACC_VER_MAJOR__ < 12) && !((__CUDA_ARCH__ >= 800) || !defined(__CUDA_ARCH__))
 __device__ floatX __ldcs(const floatX* address) {
     unsigned short bf = __ldcs(reinterpret_cast<const unsigned short*>(address));
     return __nv_bfloat16_raw{bf};
