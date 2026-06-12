@@ -32,11 +32,17 @@ USE_CUDNN ?= 0
 USE_HIP ?= 0
 ifeq ($(USE_HIP), 1)
   # Mirror the nvidia-smi compute_cap query below: when the arch is not given,
-  # detect the installed GPUs with amdgpu-arch (ships with ROCm/LLVM). An absent
-  # tool yields empty output, so the strip-check below falls back to gfx90a.
+  # detect the installed GPUs with amdgpu-arch (ships with ROCm/LLVM). The tool
+  # is often not on PATH (it lives in <rocm>/llvm/bin), so fall back to locating
+  # it via hipconfig --rocmpath. An absent tool yields empty output, so the
+  # strip-check below falls back to gfx90a.
   ifndef AMDGPU_TARGETS
     ifneq ($(CI),true)
-      AMDGPU_TARGETS := $(shell amdgpu-arch 2>/dev/null | sort -u | paste -sd ';')
+      AMDGPU_ARCH_TOOL := $(shell which amdgpu-arch 2>/dev/null)
+      ifeq ($(AMDGPU_ARCH_TOOL),)
+        AMDGPU_ARCH_TOOL := $(shell hipconfig --rocmpath 2>/dev/null)/llvm/bin/amdgpu-arch
+      endif
+      AMDGPU_TARGETS := $(shell $(AMDGPU_ARCH_TOOL) 2>/dev/null | sort -u | paste -sd ';')
     endif
   endif
   ifeq ($(strip $(AMDGPU_TARGETS)),)
@@ -112,6 +118,19 @@ ifneq ($(OS), Windows_NT)
                   $(addprefix --offload-arch=,$(AMDGPU_TARGETS)) \
                   -DUSE_HIP=1 -DLLMC_WARP_SIZE=$(LLMC_WARP_SIZE) \
                   -include llmc/cuda_to_hip.h -I llmc/hip_shims
+    # ROCm's clang selects the highest /usr/lib/gcc/<triple>/<ver> dir even when
+    # that GCC's libstdc++ headers are absent (e.g. Ubuntu installs libgcc-14-dev
+    # without libstdc++-14-dev), failing with "Could not find standard C++ header".
+    # Probe for that and pin --gcc-install-dir to the newest GCC version that has
+    # matching headers under /usr/include/c++/<ver>.
+    HIP_STDLIB_OK := $(shell $(HIPCC) -x c++ -fsyntax-only -include cmath /dev/null >/dev/null 2>&1 && echo 1)
+    ifneq ($(HIP_STDLIB_OK),1)
+      HIP_GCC_DIR := $(shell for d in /usr/lib/gcc/*/*; do v=$$(basename "$$d"); [ -d "/usr/include/c++/$$v" ] && echo "$$d"; done | sort -V | tail -n1)
+      ifneq ($(strip $(HIP_GCC_DIR)),)
+        $(info → hipcc cannot find libstdc++ headers; pinning --gcc-install-dir=$(HIP_GCC_DIR))
+        NVCC_FLAGS += --gcc-install-dir=$(HIP_GCC_DIR)
+      endif
+    endif
     NVCC_LDFLAGS := -lhipblas -lhipblaslt
     NVCC_INCLUDES :=
     NVCC_LDLIBS :=
