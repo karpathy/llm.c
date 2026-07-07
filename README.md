@@ -233,6 +233,7 @@ Lastly, I will be a lot more sensitive to complexity in the root folder of the p
 
 - Mojo
   - [llm.🔥](https://github.com/dorjeduck/llm.mojo) by @[dorjeduck](https://github.com/dorjeduck): a Mojo port of this project
+  - [llm.🔥](https://github.com/ulmentflam/llm.mojo) by @[ulmentflam](https://github.com/ulmentflam): a Mojo port of this project extending @[dorjeduck](https://github.com/dorjeduck)'s port with CUDA and Apple Metal GPU training kernels on Mojo 1.0
 
 - OpenCL
   - [llm.c](https://github.com/krrishnarraj/llm.c) by @[krrishnarraj](https://github.com/krrishnarraj): an OpenCL port of this project
