@@ -410,9 +410,13 @@ __global__ void softmax_forward_kernel7(float* out, const float* inp, int N, int
     float* maxvals = shared;
     float* sumvals = &shared[warpsPerBlock];
 
-    if (tid >= C) {
-        maxvals[warpId] = -INFINITY;
-        sumvals[warpId] = 0.0f;
+    // only whole warps may exit early: the warp reductions below shuffle with all 32 lanes.
+    // lanes of a partial warp with tid >= C stay in and contribute -INFINITY / 0.
+    if (warpId * 32 >= C) {
+        if (laneId == 0) {
+            maxvals[warpId] = -INFINITY;
+            sumvals[warpId] = 0.0f;
+        }
         return;
     }
 
@@ -510,10 +514,6 @@ __global__ void softmax_forward_online_kernel8(float* out, const float* inp, int
     const int warpsPerBlock = blockDim.x / warpSize;
     int tid = threadIdx.x;
 
-    if (tid >= C) {
-        return;
-    }
-
     int warpId = tid / warpSize;
     int laneId = tid % warpSize;
     // one warp one row
@@ -547,7 +547,7 @@ __global__ void softmax_forward_online_kernel8(float* out, const float* inp, int
         if (offsetMaxval > maxval) {
             sumval *= expf(maxval - offsetMaxval);
             maxval = offsetMaxval;
-        } else {
+        } else if (offsetMaxval != -INFINITY) {
             offsetSumval *= expf(offsetMaxval - maxval);
         }
         sumval += offsetSumval;
