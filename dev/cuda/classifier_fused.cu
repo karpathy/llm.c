@@ -492,7 +492,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
 
     // special-case loop to handle the unaligned elements at the end of the array
     // this lets us skip the bounds check in the main loop below, which improves performance
-    while ((i+1)*x128::size > V) {
+    while (i >= 0 && (i+1)*x128::size > V) {
         for(int k = 0; k < x128::size; ++k) {
             if (i*x128::size+k >= V) {
                 break; // bounds checking against real V (rather than padded P)
@@ -577,7 +577,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     // handle remaining elements after the last multiple of x128::size
     // e.g. if V = 8003, and x128::size = 8, we need to handle the last 3 elements
     int unaligned_start = V & ~(x128::size - 1); // round down to multiple of x128::size
-    for (int i = threadIdx.x + unaligned_start; i < V; i++) {
+    for (int i = threadIdx.x + unaligned_start; i < V; i += blockDim.x) {
         float prob = expf((float)logits_vec[i] - sp.Offset) * sp.Scale;
         float indicator = (i == ix) ? 1.0f : 0.0f;
         float dlogit = (prob - indicator) * dloss;
