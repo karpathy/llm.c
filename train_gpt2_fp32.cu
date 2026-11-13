@@ -587,6 +587,9 @@ __global__ void fused_classifier_kernel3(float* logits, float* losses, float* pr
         float prob = expf(logits[idx * P + ix] - sp.Offset) * sp.Scale;
         losses[idx] = -logf(prob);
     }
+    // thread 0 must read logits[idx * P + ix] above before the loop below overwrites it
+    // with its gradient (same fix as in llmc/fused_classifier.cuh)
+    __syncthreads();
 
     // very sensible default for dlosses is 1/(B*T), which is the uniform loss
     float dloss = dlosses != NULL ? dlosses[idx] : 1.0f / (B*T);
